@@ -183,6 +183,14 @@ impl ControllerManagerService {
     /// Performs a single reconciliation pass over all workloads in all active namespaces.
     pub async fn reconcile_once(&self) -> Result<usize, ControllerError> {
         let summaries = self.reconcile_all().await?;
+        for summary in &summaries {
+            if !summary.errors.is_empty() {
+                tracing::warn!(
+                    errors = ?summary.errors,
+                    "controller reconciliation encountered errors"
+                );
+            }
+        }
         Ok(summaries
             .iter()
             .map(ReconciliationSummary::total_workloads)
