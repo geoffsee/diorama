@@ -206,7 +206,7 @@ async fn wait_for_file(path: &Path) {
 #[tokio::test]
 #[ignore = "invoked only by the owned crash fixture"]
 async fn crash_runtime_child() {
-    let root = std::env::var_os("diorama_RECOVERY_FIXTURE_ROOT").expect("private fixture root");
+    let root = std::env::var_os("DIORAMA_RECOVERY_FIXTURE_ROOT").expect("private fixture root");
     let root = Path::new(&root);
     let config = test_config(&root.join("diorama-state"), "127.0.0.1", false, false);
     let runtime = NodeRuntime::from_config(config).expect("fixture runtime");
@@ -266,7 +266,7 @@ async fn test_crash_reboot_preserves_datastore_pki_and_ownership() {
                 "recovery_lifecycle::crash_runtime_child",
                 "--ignored",
             ])
-            .env("diorama_RECOVERY_FIXTURE_ROOT", temp.path())
+            .env("DIORAMA_RECOVERY_FIXTURE_ROOT", temp.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
