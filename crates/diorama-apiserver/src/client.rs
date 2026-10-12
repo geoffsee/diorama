@@ -552,6 +552,8 @@ impl KubernetesApiClient {
             "replicasets" => &["rs"],
             "statefulsets" => &["sts"],
             "daemonsets" => &["ds"],
+            "endpoints" => &["ep"],
+            "endpointslices" => &["es"],
             _ => &[],
         };
         json!({

@@ -70,13 +70,24 @@ async fn api_discovery_returns_core_and_group_resources() {
     let discovery_group = client
         .discover_group_resources("discovery.k8s.io", "v1")
         .expect("discover discovery.k8s.io/v1 succeeds");
-    let disc_res_names: Vec<&str> = discovery_group["resources"]
+    let slice_resource = discovery_group["resources"]
         .as_array()
         .expect("discovery resources array")
         .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
-    assert!(disc_res_names.contains(&"endpointslices"));
+        .find(|r| r["name"] == "endpointslices")
+        .expect("endpointslices in discovery");
+    assert_eq!(slice_resource["shortNames"], json!(["es"]));
+
+    let core_resources = client
+        .discover_core()
+        .expect("discover core resources succeeds");
+    let endpoints_resource = core_resources["resources"]
+        .as_array()
+        .expect("core resources array")
+        .iter()
+        .find(|r| r["name"] == "endpoints")
+        .expect("endpoints in core discovery");
+    assert_eq!(endpoints_resource["shortNames"], json!(["ep"]));
 
     let storage_group = client
         .discover_group_resources("storage.k8s.io", "v1")
