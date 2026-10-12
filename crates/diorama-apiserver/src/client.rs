@@ -2916,6 +2916,7 @@ impl KubernetesApiClient {
                 }
 
                 if !needs_node_port {
+                    port_obj.remove("nodePort");
                     continue;
                 }
 

@@ -253,6 +253,29 @@ async fn clusterip_service_does_not_allocate_node_port() {
 }
 
 #[tokio::test]
+async fn clusterip_service_strips_supplied_node_port_on_create() {
+    let temp = TempDir::new().unwrap();
+    let service = setup_service(&temp);
+    let client = service.admin_client();
+
+    let svc = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "clusterip-supplied-nodeport" },
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [{
+                "port": 80,
+                "nodePort": 30555
+            }]
+        }
+    });
+    let created = client.create_service("default", svc).await.unwrap();
+    assert_eq!(created["spec"]["type"], "ClusterIP");
+    assert!(created["spec"]["ports"][0].get("nodePort").is_none());
+}
+
+#[tokio::test]
 async fn kubernetes_service_allocates_reserved_dot_one_ip() {
     let temp = TempDir::new().unwrap();
     let service = setup_service(&temp);
