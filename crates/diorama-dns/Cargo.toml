@@ -7,7 +7,7 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
-async-trait = "=0.1.89"
+async-trait = "=0.1.92"
 k8s-openapi = { version = "=0.28.0", default-features = false, features = ["v1_35"] }
 diorama-apiserver = { version = "=0.1.0", path = "../diorama-apiserver" }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
