@@ -10,6 +10,7 @@ pub(crate) enum Route {
     GroupDiscovery { group: String, version: String },
     OpenApiV3Index,
     OpenApiV3Core,
+    OpenApiV3StorageV1,
     Resource(ResourcePath),
     NotFound,
 }
@@ -31,6 +32,7 @@ pub(crate) fn parse(path: &str) -> Route {
         ["version"] => Route::Version,
         ["openapi", "v3"] => Route::OpenApiV3Index,
         ["openapi", "v3", "api", "v1"] => Route::OpenApiV3Core,
+        ["openapi", "v3", "apis", "storage.k8s.io", "v1"] => Route::OpenApiV3StorageV1,
         ["api"] => Route::ApiVersions,
         ["api", "v1"] => Route::CoreDiscovery,
         ["api", "v1", rest @ ..] => parse_resource("", rest),
@@ -123,6 +125,10 @@ mod tests {
         ));
         assert!(matches!(parse("/openapi/v3"), Route::OpenApiV3Index));
         assert!(matches!(parse("/openapi/v3/api/v1"), Route::OpenApiV3Core));
+        assert!(matches!(
+            parse("/openapi/v3/apis/storage.k8s.io/v1"),
+            Route::OpenApiV3StorageV1
+        ));
         assert!(matches!(parse("/openapi/v2"), Route::NotFound));
     }
 

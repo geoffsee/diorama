@@ -1461,3 +1461,221 @@ async fn test_pre_stop_hook_and_linux_resources_and_port_mappings() {
         "preStop hook must have been executed via exec_sync prior to stop"
     );
 }
+
+#[tokio::test]
+async fn test_persistent_volume_claim_mount_and_recreate_persistence() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = apiserver_arc.admin_client();
+
+    let storage_dir = temp.path().join("local-storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+
+    // 1. Create a PV with local path
+    let volume_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {
+            "name": "pv-smoke-1",
+        },
+        "spec": {
+            "capacity": {
+                "storage": "1Gi"
+            },
+            "accessModes": ["ReadWriteOnce"],
+            "persistentVolumeReclaimPolicy": "Retain",
+            "storageClassName": "local-path",
+            "local": {
+                "path": storage_dir.display().to_string(),
+            },
+            "nodeAffinity": {
+                "required": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "kubernetes.io/hostname",
+                                    "operator": "In",
+                                    "values": ["test-node"]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    client.create_pv(volume_spec).await.unwrap();
+
+    // 2. Create PVC bound to that PV
+    let claim_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": "smoke-pvc",
+            "namespace": "default",
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": "local-path",
+            "volumeName": "pv-smoke-1",
+            "resources": {
+                "requests": {
+                    "storage": "1Gi"
+                }
+            }
+        },
+        "status": {
+            "phase": "Bound"
+        }
+    });
+    client.create_pvc("default", claim_spec).await.unwrap();
+
+    // 3. Create Pod mounting the PVC
+    let pod_spec_1 = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "writer-pod",
+            "namespace": "default",
+            "uid": "uid-writer-pod",
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "volumes": [
+                {
+                    "name": "data-vol",
+                    "persistentVolumeClaim": {
+                        "claimName": "smoke-pvc"
+                    }
+                }
+            ],
+            "containers": [
+                {
+                    "name": "writer",
+                    "image": "alpine:latest",
+                    "volumeMounts": [
+                        {
+                            "name": "data-vol",
+                            "mountPath": "/var/data"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    client.create_pod("default", pod_spec_1).await.unwrap();
+
+    // Reconcile pod 1
+    let count = kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Verify mount host path points to the storage_dir canonical path
+    let configs = runtime.container_configs("uid-writer-pod");
+    assert_eq!(configs.len(), 1);
+    let mount = configs[0]
+        .mounts
+        .iter()
+        .find(|m| m.container_path == "/var/data")
+        .expect("mount found");
+    let canonical_storage_dir = std::fs::canonicalize(&storage_dir).unwrap();
+    assert_eq!(
+        mount.host_path,
+        canonical_storage_dir.to_string_lossy().to_string()
+    );
+
+    // Write a test file into the storage directory (simulating container write)
+    std::fs::write(
+        storage_dir.join("smoke-test.txt"),
+        "hello alpine local-path",
+    )
+    .unwrap();
+
+    // Verify container can read it via exec
+    let res = kubelet
+        .exec_in_container(
+            "uid-writer-pod",
+            "writer",
+            &["cat".to_string(), "/var/data/smoke-test.txt".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.exit_code, 0);
+    assert_eq!(res.stdout, "hello alpine local-path");
+
+    // 4. Delete the first pod
+    client.delete_pod("default", "writer-pod").await.unwrap();
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    // 5. Create a second pod mounting the same PVC
+    let pod_spec_2 = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "reader-pod",
+            "namespace": "default",
+            "uid": "uid-reader-pod",
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "volumes": [
+                {
+                    "name": "data-vol",
+                    "persistentVolumeClaim": {
+                        "claimName": "smoke-pvc"
+                    }
+                }
+            ],
+            "containers": [
+                {
+                    "name": "reader",
+                    "image": "alpine:latest",
+                    "volumeMounts": [
+                        {
+                            "name": "data-vol",
+                            "mountPath": "/mnt/shared"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    client.create_pod("default", pod_spec_2).await.unwrap();
+
+    // Reconcile pod 2
+    let count2 = kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+    assert!(count2 >= 1);
+
+    // Verify reader pod can read the persisted file from the PVC!
+    let res2 = kubelet
+        .exec_in_container(
+            "uid-reader-pod",
+            "reader",
+            &["cat".to_string(), "/mnt/shared/smoke-test.txt".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.exit_code, 0);
+    assert_eq!(res2.stdout, "hello alpine local-path");
+}

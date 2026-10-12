@@ -11,6 +11,7 @@ use crate::config::{LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LocalPathC
 use crate::error::{Result, StorageError};
 use crate::health::LocalPathHealthReport;
 use crate::reconciler::{LocalPathReconciler, ReconciliationReport};
+use crate::volume::LocalPathVolumeManager;
 
 /// Managed `local-path` storage service governing deployment reconciliation, readiness, and lifecycle.
 #[derive(Clone)]
@@ -56,6 +57,16 @@ impl LocalPathService {
     #[must_use]
     pub fn config(&self) -> &LocalPathConfig {
         &self.config
+    }
+
+    #[must_use]
+    pub fn client(&self) -> &Arc<KubernetesApiClient> {
+        &self.client
+    }
+
+    #[must_use]
+    pub fn volume_manager(&self) -> LocalPathVolumeManager {
+        LocalPathVolumeManager::new(self.config.clone(), (*self.client).clone())
     }
 
     #[must_use]

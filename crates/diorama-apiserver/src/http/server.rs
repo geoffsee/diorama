@@ -184,6 +184,7 @@ async fn handle(
         Route::ApiVersions => authenticated_document(&client, || api_versions(service)),
         Route::OpenApiV3Index => authenticated_document(&client, crate::openapi::v3_index),
         Route::OpenApiV3Core => authenticated_document(&client, crate::openapi::v3_core),
+        Route::OpenApiV3StorageV1 => authenticated_document(&client, crate::openapi::v3_storage_v1),
         Route::CoreDiscovery => aggregated_or(
             accept.as_deref(),
             || core_aggregated(&client),

@@ -161,18 +161,41 @@ impl DeploymentReconciler {
         self.sync_child_replicaset(namespace, name, uid, desired_replicas, selector, template)
             .await?;
 
+        let child_rs_name = format!("{name}-rs");
+        let (ready_replicas, available_replicas, updated_replicas) =
+            match self.client.get_replicaset(namespace, &child_rs_name).await {
+                Ok(rs) => {
+                    let ready = rs
+                        .pointer("/status/readyReplicas")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let available = rs
+                        .pointer("/status/availableReplicas")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    (ready, available, desired_replicas)
+                },
+                Err(_) => (0, 0, desired_replicas),
+            };
+
         let mut updated_deployment = deployment.clone();
         if let Some(status) = updated_deployment
             .get_mut("status")
             .and_then(Value::as_object_mut)
         {
             status.insert("replicas".to_string(), json!(desired_replicas));
+            status.insert("readyReplicas".to_string(), json!(ready_replicas));
+            status.insert("availableReplicas".to_string(), json!(available_replicas));
+            status.insert("updatedReplicas".to_string(), json!(updated_replicas));
             status.insert("observedGeneration".to_string(), json!(1));
         } else if let Some(dep_obj) = updated_deployment.as_object_mut() {
             dep_obj.insert(
                 "status".to_string(),
                 json!({
                     "replicas": desired_replicas,
+                    "readyReplicas": ready_replicas,
+                    "availableReplicas": available_replicas,
+                    "updatedReplicas": updated_replicas,
                     "observedGeneration": 1
                 }),
             );

@@ -411,6 +411,7 @@ impl KubernetesApiClient {
                     "singularName": "persistentvolumeclaim",
                     "namespaced": true,
                     "kind": "PersistentVolumeClaim",
+                    "shortNames": ["pvc"],
                     "verbs": ["create", "delete", "get", "list", "update", "watch"]
                 },
                 {
@@ -418,6 +419,7 @@ impl KubernetesApiClient {
                     "singularName": "persistentvolume",
                     "namespaced": false,
                     "kind": "PersistentVolume",
+                    "shortNames": ["pv"],
                     "verbs": ["create", "delete", "get", "list", "update", "watch"]
                 }
             ]
@@ -461,6 +463,13 @@ impl KubernetesApiClient {
                     { "groupVersion": "apiregistration.k8s.io/v1", "version": "v1" }
                 ],
                 "preferredVersion": { "groupVersion": "apiregistration.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "storage.k8s.io",
+                "versions": [
+                    { "groupVersion": "storage.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "storage.k8s.io/v1", "version": "v1" }
             }),
         ];
 
@@ -530,6 +539,7 @@ impl KubernetesApiClient {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn discover_group_resources(
         &self,
         group: &str,
@@ -584,6 +594,16 @@ impl KubernetesApiClient {
                 ] {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
+            },
+            ("storage.k8s.io", "v1") => {
+                resources.push(json!({
+                    "name": "storageclasses",
+                    "singularName": "storageclass",
+                    "namespaced": false,
+                    "kind": "StorageClass",
+                    "shortNames": ["sc"],
+                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                }));
             },
             _ => {},
         }

@@ -336,6 +336,14 @@ fn resolve_volume_host_path(
             .join("volumes")
             .join("kubernetes.io~empty-dir")
             .join(vol_name)
+    } else if vol.get("persistentVolumeClaim").is_some() {
+        let pvc_vol_path = root
+            .join("pods")
+            .join(uid)
+            .join("volumes")
+            .join("kubernetes.io~persistent-volume-claim")
+            .join(vol_name);
+        std::fs::canonicalize(&pvc_vol_path).unwrap_or(pvc_vol_path)
     } else {
         let hp = vol.get("hostPath")?;
         PathBuf::from(hp.get("path")?.as_str()?)
@@ -1815,6 +1823,7 @@ impl PodReconciler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prepare_single_volume(
         &self,
         namespace: &str,
@@ -1898,6 +1907,94 @@ impl PodReconciler {
                     ),
                 }
             })?;
+        } else if let Some(pvc) = vol.get("persistentVolumeClaim") {
+            let claim_name = pvc
+                .get("claimName")
+                .and_then(Value::as_str)
+                .unwrap_or(vol_name);
+            let claim_doc = self
+                .client
+                .get_pvc(namespace, claim_name)
+                .await
+                .map_err(|e| KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!("failed to fetch pvc '{claim_name}': {e}"),
+                })?;
+            let pv_name = claim_doc
+                .pointer("/spec/volumeName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!("pvc '{claim_name}' is not yet bound to a volume"),
+                })?;
+            let volume_doc = self.client.get_pv(pv_name).await.map_err(|e| {
+                KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!("failed to fetch pv '{pv_name}': {e}"),
+                }
+            })?;
+            let host_path_str = volume_doc
+                .pointer("/spec/local/path")
+                .or_else(|| volume_doc.pointer("/spec/hostPath/path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!("pv '{pv_name}' missing local.path or hostPath.path"),
+                })?;
+
+            let host_path = PathBuf::from(host_path_str);
+            std::fs::create_dir_all(&host_path).map_err(|e| {
+                KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!(
+                        "failed to create persistent volume host directory {}: {e}",
+                        host_path.display()
+                    ),
+                }
+            })?;
+
+            let vol_dir =
+                self.get_pod_volume_dir(pod_uid, "kubernetes.io~persistent-volume-claim", vol_name);
+            if let Some(parent) = vol_dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!(
+                            "failed to create volume parent directory {}: {e}",
+                            parent.display()
+                        ),
+                    }
+                })?;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(&vol_dir) {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    let _ = std::fs::remove_file(&vol_dir);
+                } else {
+                    let _ = std::fs::remove_dir_all(&vol_dir);
+                }
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&host_path, &vol_dir).map_err(|e| {
+                    KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!("failed to symlink volume {}: {e}", vol_dir.display()),
+                    }
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &host_path;
+                std::fs::create_dir_all(&vol_dir).map_err(|e| {
+                    KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!(
+                            "failed to create volume directory {}: {e}",
+                            vol_dir.display()
+                        ),
+                    }
+                })?;
+            }
         } else if let Some(path_str) = vol
             .get("hostPath")
             .and_then(|hp| hp.get("path"))
