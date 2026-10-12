@@ -54,8 +54,6 @@ jobs:
           cache-key: clippy
       - name: Enforce repository language policy
         run: cargo run --locked -p diorama-dev --bin diorama-language-policy
-      - name: Gate performance baselines and rebaseline policy
-        run: cargo run --locked -p diorama-dev --bin diorama-perf -- gate-ci tools/perf
       - run: cargo lint
 
   test:

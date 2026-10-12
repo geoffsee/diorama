@@ -1,30 +1,15 @@
-//! Repository maintenance tools. This crate is not a node runtime dependency.
+//! Repository development and policy checks.
 
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
-
-pub mod defaults;
-#[cfg(not(test))]
-pub mod drift;
-pub mod fixture_capture;
-pub mod fixture_oracles;
-pub mod json;
 pub mod language_policy;
-#[path = "parity/process.rs"]
-pub mod process;
-pub mod resolved_capture;
-pub mod resolved_report;
-pub mod state_transition;
-#[cfg(not(test))]
-pub mod upstream;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Find the repository from an explicit starting path, without consulting the shell.
+/// Find the repository from an explicit starting path.
 pub fn repository_root(start: &Path) -> Result<PathBuf> {
     for path in start.canonicalize()?.ancestors() {
         if path.join("Cargo.toml").is_file() && path.join("rust-toolchain.toml").is_file() {
@@ -58,24 +43,11 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn sha256(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(HEX[usize::from(byte >> 4)]),
-                char::from(HEX[usize::from(byte & 15)]),
-            ]
-        })
-        .collect()
-}
-
-/// Run a maintenance command with inherited output and propagate unsuccessful status.
+/// Run a command with inherited output and propagate unsuccessful status.
 pub fn run_checked(command: &mut Command) -> Result<()> {
     let status = command.status()?;
     if !status.success() {
-        return Err(io::Error::other(format!("command {command:?} failed: {status}")).into());
+        return Err(std::io::Error::other(format!("command {command:?} failed: {status}")).into());
     }
     Ok(())
 }
@@ -101,28 +73,4 @@ mod tests {
         }
         Ok(())
     }
-
-    #[test]
-    fn hashes_known_bytes() {
-        assert_eq!(
-            sha256(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
 }
-
-#[path = "fixture_oracles/probes.rs"]
-pub mod preflight_probes;
-
-pub mod api_json;
-pub mod component_boundary;
-pub mod conformance;
-pub mod disposable_node;
-pub mod operator_rehearsal;
-pub mod perf;
-pub mod platform_management;
-pub mod platform_soak;
-pub mod provenance;
-pub mod recovery_rehearsal;
-pub mod release;
-pub mod release_qualification;

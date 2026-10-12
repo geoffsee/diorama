@@ -1,19 +1,10 @@
-name: Publish
+name: Release
 
 on:
   push:
     tags:
       - "**"
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version (e.g., v1.0.0)"
-        required: true
-        type: string
-      candidate_run_id:
-        description: "Successful default-branch CI run containing a complete release-candidate artifact"
-        required: true
-        type: string
 
 permissions:
   actions: read
@@ -103,66 +94,3 @@ jobs:
             gh release create "$tag" release/* --repo "$REPOSITORY" \
               --target "$GITHUB_SHA" --title "$tag" --verify-tag --generate-notes
           fi
-
-  publish:
-    name: Verify prepared candidate and publish
-    permissions:
-      actions: read
-      contents: write
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    steps:
-      - name: Set up Docker to use mirror.gcr.io mirror
-        run: |
-          sudo mkdir -p /etc/docker
-          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: $/.github/actions/setup-rust
-        with:
-          cache-key: publish
-      - name: Select a successful trusted candidate run for this revision
-        env:
-          VERSION: ${{ inputs.version }}
-          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EXPECTED_SHA: ${{ github.sha }}
-        run: |
-          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || exit 1
-          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]] || exit 1
-          # A failed lookup must fail the job; only an absent exact tag permits publication.
-          gh api "repos/$REPOSITORY/git/matching-refs/tags/$VERSION" > candidate-tags.json
-          jq -e --arg tag "refs/tags/$VERSION" \
-            'type == "array" and all(.[]; .ref != $tag)' candidate-tags.json
-          gh api "repos/$REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > candidate-run.json
-          jq -e --arg repository "$REPOSITORY" --arg branch "$DEFAULT_BRANCH" --arg sha "$EXPECTED_SHA" \
-            '.conclusion == "success" and .event == "push" and .head_branch == $branch and .head_sha == $sha and .head_repository.full_name == $repository and .path == ".github/workflows/ci.yml"' \
-            candidate-run.json
-          gh run download "$CANDIDATE_RUN_ID" --repo "$REPOSITORY" --name release-candidate --dir candidate
-      - name: Verify the complete prepared publication before generating metadata
-        env:
-          VERSION: ${{ inputs.version }}
-          diorama_CANDIDATE_INVENTORY_PATH: candidate/dist/cell-inventory.json
-          diorama_RECEIPTS_DIR: candidate/dist/receipts
-        run: |
-          # Missing artifacts, incomplete target matrices and invalid inventories fail closed.
-          cargo run --locked -p diorama-dev --bin diorama-provenance -- candidate/dist "$VERSION" . candidate/inventories
-          cargo run --locked -p diorama-dev --bin diorama-matrix -- verify-manifest candidate/dist/release-manifest.json --expected-version "$VERSION"
-          # Regenerate candidate-bound reports and verify all 11 criteria
-          cargo run --locked -p diorama-dev --bin diorama-release -- regenerate-reports candidate/dist
-          cargo run --locked -p diorama-dev --bin diorama-qualification -- candidate/dist
-      - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
-          REPOSITORY: ${{ github.repository }}
-          EXPECTED_SHA: ${{ github.sha }}
-        run: |
-          shopt -s failglob
-          gh release create "$VERSION" candidate/dist/* --repo "$REPOSITORY" \
-            --target "$EXPECTED_SHA" --title "$VERSION" --notes ""
