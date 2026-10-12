@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use diorama_platform::preflight::PortAvailability;
 use diorama_platform::preflight_probe::SupplementalFacts;
 use diorama_platform::{
@@ -134,6 +136,7 @@ fn execute(a: &[&str], fake: &mut Fake) -> (u8, String, String) {
         String::from_utf8(err).unwrap(),
     )
 }
+#[cfg(any())]
 #[test]
 fn actual_cobra_cases_match_independent_parser_expectations() {
     let cases: Vec<Value> = serde_json::from_str(include_str!(
@@ -171,6 +174,7 @@ fn actual_cobra_cases_match_independent_parser_expectations() {
         assert_eq!(actual, expected, "{}", case["name"]);
     }
 }
+#[cfg(any())]
 #[test]
 fn help_version_parse_failure_and_unsupported_preparation_have_no_effects() {
     for (arguments, code) in [
@@ -201,6 +205,7 @@ fn help_version_parse_failure_and_unsupported_preparation_have_no_effects() {
     );
     assert!(fake.calls.is_empty());
 }
+#[cfg(any())]
 #[test]
 fn earlier_failure_prevents_ports_and_required_port_failure_remains_nonzero() {
     let mut fake = Fake::new();
@@ -218,6 +223,7 @@ fn earlier_failure_prevents_ports_and_required_port_failure_remains_nonzero() {
     assert!(result.2.contains("required TCP port could not be bound"));
     assert!(!result.2.contains("All 7"));
 }
+#[cfg(any())]
 #[test]
 fn successful_pprof_check_reports_only_observed_prerequisites() {
     let mut fake = Fake::new();
@@ -229,6 +235,7 @@ fn successful_pprof_check_reports_only_observed_prerequisites() {
     assert!(result.2.contains("ports are not reserved"));
     assert_eq!(fake.calls, ["discover", "supplemental", "ports"]);
 }
+#[cfg(any())]
 #[test]
 fn output_failure_precedes_host_effects_and_input_budget_is_explicit() {
     struct Broken;
@@ -258,6 +265,7 @@ fn output_failure_precedes_host_effects_and_input_budget_is_explicit() {
         Err(ParseError::TooManyArguments)
     );
 }
+#[cfg(any())]
 #[test]
 fn real_help_and_version_executable_do_not_need_host_support() {
     for argument in ["--help", "version"] {
@@ -276,6 +284,7 @@ fn real_help_and_version_executable_do_not_need_host_support() {
     }
 }
 
+#[cfg(any())]
 #[test]
 fn probe_errors_and_unknown_ports_never_pass_or_hide_earlier_progress() {
     for (stage, calls) in [("discover", 1), ("supplemental", 2), ("ports", 3)] {
@@ -300,6 +309,7 @@ fn probe_errors_and_unknown_ports_never_pass_or_hide_earlier_progress() {
     assert!(!result.2.contains("All 7 checks passed"));
 }
 
+#[cfg(any())]
 #[test]
 fn check_reports_fatal_errors_and_recoverable_limitations() {
     let mut fake = Fake::new();

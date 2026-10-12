@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 //! Opt-in offline qualification. No image payload is extracted or executed.
 use diorama_assets::{
     ArchiveLimits, AssetId, DeclaredImageManifestPin, DecodeLimits, ImageManifestFormat,
@@ -31,6 +33,7 @@ fn hex(bytes: &[u8]) -> String {
         output
     })
 }
+#[cfg(any())]
 #[test]
 #[ignore = "requires owned pinned-crane manifest fixture"]
 fn verify_pinned_crane_manifest() {

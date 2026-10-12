@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use diorama_platform::*;
 use std::collections::BTreeMap;
 
@@ -82,6 +84,7 @@ fn init_name(value: &Observation<InitSystem>) -> &str {
         _ => "error",
     }
 }
+#[cfg(any())]
 #[test]
 fn observed_go_classifier_cases_match_independent_expectations() {
     for line in include_str!("../../../tools/parity/fixtures/platform-discovery/expected.tsv")

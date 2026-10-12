@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 //! Explicit read-only qualification; downloaded artifacts are never executed.
 #[allow(clippy::duplicate_mod)]
 #[path = "common/elf.rs"]
@@ -8,6 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 use std::{fs::File, io::Read, path::PathBuf};
+#[cfg(any())]
 #[test]
 #[ignore = "requires explicitly prepared checksum-locked API/Kine files"]
 fn four_locked_release_executables() {

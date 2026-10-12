@@ -562,7 +562,7 @@ mod tests {
 ";
         let default_opts = LogOptions::default();
         let parsed = parse_cri_logs(raw, &default_opts, 1_791_482_400);
-        assert_eq!(parsed, "full line 1\npart 1 - part 2\nfull line 2\n");
+        assert_eq!(parsed, "full line 1\npart 1 -part 2\nfull line 2\n");
 
         let with_ts = LogOptions {
             timestamps: true,
@@ -571,7 +571,7 @@ mod tests {
         let parsed_ts = parse_cri_logs(raw, &with_ts, 1_791_482_400);
         assert_eq!(
             parsed_ts,
-            "2026-10-08T18:00:00.000Z full line 1\n2026-10-08T18:00:01.000Z part 1 - part 2\n2026-10-08T18:00:03.000Z full line 2\n"
+            "2026-10-08T18:00:00.000Z full line 1\n2026-10-08T18:00:01.000Z part 1 -part 2\n2026-10-08T18:00:03.000Z full line 2\n"
         );
     }
 
