@@ -1042,14 +1042,14 @@ fn extract_subset_endpoints(subset: &Value, eps: &mut Vec<String>) {
             continue;
         };
         match ports {
-            Some(ports) => {
+            Some(ports) if !ports.is_empty() => {
                 for port_val in ports {
                     if let Some(port) = port_val.get("port").and_then(Value::as_i64) {
                         eps.push(format!("{ip}:{port}"));
                     }
                 }
             },
-            None => eps.push(ip.to_string()),
+            _ => eps.push(ip.to_string()),
         }
     }
 }
