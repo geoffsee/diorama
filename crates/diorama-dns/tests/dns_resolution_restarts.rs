@@ -750,4 +750,27 @@ async fn test_headless_service_dns_resolution() {
         pod_res.details
     );
     assert_eq!(pod_res.resolved_ips, vec![pod_ip]);
+
+    // 4. Verify valid dashed-IP query in service: 10-244-2-100.db-headless.tier5-headless.svc.cluster.local
+    let mut dashed_probe =
+        DnsResolutionProbe::headless("db-headless", ns, pod_ip, DnsProtocol::Udp);
+    dashed_probe.query_name = format!("10-244-2-100.db-headless.{ns}.svc.cluster.local");
+    let dashed_res = prober.execute_probe(&dashed_probe).await.unwrap();
+    assert!(
+        dashed_res.success,
+        "Valid dashed-IP query must resolve to pod IP: {}",
+        dashed_res.details
+    );
+    assert_eq!(dashed_res.resolved_ips, vec![pod_ip]);
+
+    // 5. Verify unassociated dashed-IP query fails: 10-244-9-99.db-headless.tier5-headless.svc.cluster.local
+    let unassociated_ip: Ipv4Addr = "10.244.9.99".parse().unwrap();
+    let mut invalid_dashed_probe =
+        DnsResolutionProbe::headless("db-headless", ns, unassociated_ip, DnsProtocol::Udp);
+    invalid_dashed_probe.query_name = format!("10-244-9-99.db-headless.{ns}.svc.cluster.local");
+    let invalid_res = prober.execute_probe(&invalid_dashed_probe).await.unwrap();
+    assert!(
+        !invalid_res.success,
+        "Dashed-IP not belonging to service must fail to resolve"
+    );
 }

@@ -208,16 +208,20 @@ async fn test_service_recreation_on_cluster_ip_change() {
     // Initial reconciliation
     reconciler.reconcile(&client).await.unwrap();
 
-    // Modify Service to simulate drift/mismatched ClusterIP
+    // Modify Service to simulate drift/mismatched ClusterIP (clusterIP is immutable on update, so recreate)
     let mut svc = client
         .get_service(COREDNS_NAMESPACE, COREDNS_SERVICE_NAME)
         .await
         .unwrap();
     svc["spec"]["clusterIP"] = json!("10.43.0.99");
+    if let Some(obj) = svc.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        obj.remove("resourceVersion");
+    }
     client
-        .update_service(COREDNS_NAMESPACE, COREDNS_SERVICE_NAME, svc)
+        .delete_service(COREDNS_NAMESPACE, COREDNS_SERVICE_NAME)
         .await
         .unwrap();
+    client.create_service(COREDNS_NAMESPACE, svc).await.unwrap();
 
     // Repeat reconciliation must detect changed ClusterIP and recreate service
     let report = reconciler.reconcile(&client).await.unwrap();

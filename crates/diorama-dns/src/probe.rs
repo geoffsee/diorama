@@ -948,13 +948,18 @@ async fn resolve_pod_in_service(
     namespace: &str,
     service_name: &str,
     target_pod: &str,
-    _svc_val: &serde_json::Value,
+    svc_val: &serde_json::Value,
     resolved_ips: &mut Vec<Ipv4Addr>,
 ) {
     if target_pod.contains('-') {
         let dotted = target_pod.replace('-', ".");
         if let Ok(ip) = dotted.parse::<Ipv4Addr>() {
-            resolved_ips.push(ip);
+            let mut backends = Vec::new();
+            resolve_headless_endpoints(client, namespace, service_name, svc_val, &mut backends)
+                .await;
+            if backends.contains(&ip) {
+                resolved_ips.push(ip);
+            }
             return;
         }
     }
