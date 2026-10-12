@@ -176,10 +176,10 @@ impl ReplicaSetReconciler {
     async fn scale_down_pods(
         &self,
         namespace: &str,
-        owned_pods: Vec<Value>,
+        owned_pods: &[Value],
         desired_replicas: usize,
     ) -> Result<(), ControllerError> {
-        for pod in owned_pods.into_iter().skip(desired_replicas) {
+        for pod in owned_pods.iter().skip(desired_replicas) {
             if let Some(pod_name) = pod
                 .get("metadata")
                 .and_then(|m| m.get("name"))
@@ -245,11 +245,14 @@ impl ReplicaSetReconciler {
             )
             .await?;
         } else if current_count > desired_replicas {
-            self.scale_down_pods(namespace, owned_pods, desired_replicas)
+            self.scale_down_pods(namespace, &owned_pods, desired_replicas)
                 .await?;
         }
-
-        let updated_owned_pods = self.get_owned_pods(namespace, name, uid).await?;
+        let updated_owned_pods = if current_count == desired_replicas {
+            owned_pods
+        } else {
+            self.get_owned_pods(namespace, name, uid).await?
+        };
         let ready_replicas = updated_owned_pods
             .iter()
             .take(desired_replicas)
@@ -282,4 +285,19 @@ impl ReplicaSetReconciler {
                 reason: e.to_string(),
             })
     }
+}
+
+pub(crate) fn is_pod_ready(pod: &Value) -> bool {
+    let Some(status) = pod.get("status") else {
+        return false;
+    };
+    if let Some(conditions) = status.get("conditions").and_then(Value::as_array)
+        && conditions.iter().any(|c| {
+            c.get("type").and_then(Value::as_str) == Some("Ready")
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+    {
+        return true;
+    }
+    status.get("phase").and_then(Value::as_str) == Some("Running")
 }

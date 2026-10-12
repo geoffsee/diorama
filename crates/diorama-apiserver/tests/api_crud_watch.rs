@@ -45,6 +45,18 @@ async fn api_discovery_returns_core_and_group_resources() {
     assert!(names.contains(&"secrets"));
     assert!(names.contains(&"pods"));
     assert!(names.contains(&"endpoints"));
+    assert!(names.contains(&"persistentvolumeclaims"));
+    assert!(names.contains(&"persistentvolumes"));
+    let claim_resource = res_array
+        .iter()
+        .find(|r| r["name"] == "persistentvolumeclaims")
+        .unwrap();
+    assert_eq!(claim_resource["shortNames"], json!(["pvc"]));
+    let volume_resource = res_array
+        .iter()
+        .find(|r| r["name"] == "persistentvolumes")
+        .unwrap();
+    assert_eq!(volume_resource["shortNames"], json!(["pv"]));
 
     let apis = client.discover_apis().expect("discover_apis succeeds");
     assert_eq!(apis["kind"], "APIGroupList");
@@ -53,6 +65,7 @@ async fn api_discovery_returns_core_and_group_resources() {
     assert!(group_names.contains(&"apps"));
     assert!(group_names.contains(&"apiextensions.k8s.io"));
     assert!(group_names.contains(&"discovery.k8s.io"));
+    assert!(group_names.contains(&"storage.k8s.io"));
 
     let discovery_group = client
         .discover_group_resources("discovery.k8s.io", "v1")
@@ -64,6 +77,13 @@ async fn api_discovery_returns_core_and_group_resources() {
         .filter_map(|r| r["name"].as_str())
         .collect();
     assert!(disc_res_names.contains(&"endpointslices"));
+
+    let storage_group = client
+        .discover_group_resources("storage.k8s.io", "v1")
+        .expect("storage group discovery");
+    let sc_res = &storage_group["resources"][0];
+    assert_eq!(sc_res["name"], "storageclasses");
+    assert_eq!(sc_res["shortNames"], json!(["sc"]));
 }
 
 #[tokio::test]

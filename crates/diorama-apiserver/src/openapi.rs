@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 
 /// Stable identifier kubectl uses to cache the core document.
 pub const CORE_HASH: &str = "diorama-core-v1";
+/// Stable identifier kubectl uses to cache the storage document.
+pub const STORAGE_HASH: &str = "diorama-storage-v1";
 
 /// `GET /openapi/v3`: discovery of per-group documents.
 #[must_use]
@@ -17,6 +19,9 @@ pub fn v3_index() -> Value {
         "paths": {
             "api/v1": {
                 "serverRelativeURL": format!("/openapi/v3/api/v1?hash={CORE_HASH}")
+            },
+            "apis/storage.k8s.io/v1": {
+                "serverRelativeURL": format!("/openapi/v3/apis/storage.k8s.io/v1?hash={STORAGE_HASH}")
             }
         }
     })
@@ -39,10 +44,31 @@ pub fn v3_core() -> Value {
             "/api/v1/namespaces/{namespace}/endpoints/{name}",
         ),
         ("Secret", "/api/v1/namespaces/{namespace}/secrets/{name}"),
+        (
+            "PersistentVolumeClaim",
+            "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}",
+        ),
+        ("PersistentVolume", "/api/v1/persistentvolumes/{name}"),
     ] {
         let collection = path.trim_end_matches("/{name}");
         paths.insert(collection.to_string(), json!({ "post": operation(kind) }));
     }
+    json!({
+        "openapi": "3.0.0",
+        "info": { "title": "Kubernetes", "version": "v1.35.7" },
+        "paths": paths,
+        "components": { "schemas": {} }
+    })
+}
+
+/// `GET /openapi/v3/apis/storage.k8s.io/v1`: storage.k8s.io group paths.
+#[must_use]
+pub fn v3_storage_v1() -> Value {
+    let mut paths = serde_json::Map::new();
+    paths.insert(
+        "/apis/storage.k8s.io/v1/storageclasses".to_string(),
+        json!({ "post": storage_operation("StorageClass") }),
+    );
     json!({
         "openapi": "3.0.0",
         "info": { "title": "Kubernetes", "version": "v1.35.7" },
@@ -70,22 +96,64 @@ fn operation(kind: &str) -> Value {
     })
 }
 
+fn storage_operation(kind: &str) -> Value {
+    json!({
+        "parameters": [
+            {
+                "name": "fieldValidation",
+                "in": "query",
+                "schema": { "type": "string", "uniqueItems": true }
+            },
+            {
+                "name": "dryRun",
+                "in": "query",
+                "schema": { "type": "string", "uniqueItems": true }
+            }
+        ],
+        "responses": { "200": { "description": "OK" } },
+        "x-kubernetes-group-version-kind": { "group": "storage.k8s.io", "version": "v1", "kind": kind }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CORE_HASH, v3_core, v3_index};
+    use super::{CORE_HASH, STORAGE_HASH, v3_core, v3_index, v3_storage_v1};
     use serde_json::Value;
 
     #[test]
-    fn index_points_at_core_document() {
+    fn index_points_at_core_and_storage_documents() {
         let url = v3_index()["paths"]["api/v1"]["serverRelativeURL"]
             .as_str()
             .unwrap()
             .to_string();
         assert_eq!(url, format!("/openapi/v3/api/v1?hash={CORE_HASH}"));
+
+        let storage_url = v3_index()["paths"]["apis/storage.k8s.io/v1"]["serverRelativeURL"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            storage_url,
+            format!("/openapi/v3/apis/storage.k8s.io/v1?hash={STORAGE_HASH}")
+        );
     }
 
     #[test]
-    fn pod_create_advertises_field_validation() {
+    fn storage_create_advertises_field_validation() {
+        let doc = v3_storage_v1();
+        let post = &doc["paths"]["/apis/storage.k8s.io/v1/storageclasses"]["post"];
+        assert_eq!(
+            post["x-kubernetes-group-version-kind"]["kind"],
+            "StorageClass"
+        );
+        assert_eq!(
+            post["x-kubernetes-group-version-kind"]["group"],
+            "storage.k8s.io"
+        );
+    }
+
+    #[test]
+    fn pod_and_pvc_create_advertises_field_validation() {
         let doc = v3_core();
         let post = &doc["paths"]["/api/v1/namespaces/{namespace}/pods"]["post"];
         assert_eq!(post["x-kubernetes-group-version-kind"]["kind"], "Pod");
@@ -98,6 +166,14 @@ mod tests {
         assert!(names.contains(&"fieldValidation"));
         assert!(matches!(
             doc["paths"]["/api/v1/namespaces"]["post"],
+            Value::Object(_)
+        ));
+        assert!(matches!(
+            doc["paths"]["/api/v1/namespaces/{namespace}/persistentvolumeclaims"]["post"],
+            Value::Object(_)
+        ));
+        assert!(matches!(
+            doc["paths"]["/api/v1/persistentvolumes"]["post"],
             Value::Object(_)
         ));
     }

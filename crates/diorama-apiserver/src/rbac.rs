@@ -199,6 +199,7 @@ impl RbacAuthorizer {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn seed_system_cluster_roles(&self) {
         self.add_cluster_role(ClusterRole {
             name: "system:kube-controller-manager".to_string(),
@@ -283,7 +284,11 @@ impl RbacAuthorizer {
                 PolicyRule {
                     verbs: vec!["get".to_string()],
                     api_groups: vec![String::new()],
-                    resources: vec!["secrets".to_string()],
+                    resources: vec![
+                        "secrets".to_string(),
+                        "persistentvolumeclaims".to_string(),
+                        "persistentvolumes".to_string(),
+                    ],
                     resource_names: Vec::new(),
                     non_resource_urls: Vec::new(),
                 },

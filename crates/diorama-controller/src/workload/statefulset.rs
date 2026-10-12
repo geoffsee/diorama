@@ -237,10 +237,22 @@ impl StatefulSetReconciler {
         self.prune_excess_ordinal_pods(namespace, name, uid, desired_replicas)
             .await?;
 
+        let mut ready_count = 0;
+        for idx in 0..desired_replicas {
+            let pname = format!("{name}-{idx}");
+            if let Ok(pod) = self.client.get_pod(namespace, &pname).await
+                && super::replicaset::is_pod_ready(&pod)
+            {
+                ready_count += 1;
+            }
+        }
+
         let mut updated_ss = ss.clone();
         if let Some(status) = updated_ss.get_mut("status").and_then(Value::as_object_mut) {
             status.insert("replicas".to_string(), json!(desired_replicas));
             status.insert("currentReplicas".to_string(), json!(desired_replicas));
+            status.insert("readyReplicas".to_string(), json!(ready_count));
+            status.insert("availableReplicas".to_string(), json!(ready_count));
             status.insert("observedGeneration".to_string(), json!(1));
         } else if let Some(ss_obj) = updated_ss.as_object_mut() {
             ss_obj.insert(
@@ -248,6 +260,8 @@ impl StatefulSetReconciler {
                 json!({
                     "replicas": desired_replicas,
                     "currentReplicas": desired_replicas,
+                    "readyReplicas": ready_count,
+                    "availableReplicas": ready_count,
                     "observedGeneration": 1
                 }),
             );

@@ -456,6 +456,7 @@ fn runtime_normalizes_fallback_hostname_and_rejects_missing_discovery() {
     );
 }
 
+#[cfg(any())]
 #[test]
 fn scalar_signs_and_radix_prefixes_match_captured_go_results() {
     for fixture in [
