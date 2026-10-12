@@ -288,16 +288,25 @@ impl ReplicaSetReconciler {
 }
 
 pub(crate) fn is_pod_ready(pod: &Value) -> bool {
-    let Some(status) = pod.get("status") else {
-        return false;
-    };
-    if let Some(conditions) = status.get("conditions").and_then(Value::as_array)
-        && conditions.iter().any(|c| {
-            c.get("type").and_then(Value::as_str) == Some("Ready")
-                && c.get("status").and_then(Value::as_str) == Some("True")
-        })
-    {
-        return true;
+    super::is_pod_ready(pod)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_replicaset_is_pod_ready_respects_not_ready_condition() {
+        let pod = json!({
+            "metadata": { "name": "rs-pod-1" },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    { "type": "Ready", "status": "False" }
+                ]
+            }
+        });
+        assert!(!is_pod_ready(&pod));
     }
-    status.get("phase").and_then(Value::as_str) == Some("Running")
 }
