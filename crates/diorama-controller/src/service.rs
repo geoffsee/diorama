@@ -166,4 +166,42 @@ impl ControllerManagerService {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
+
+    /// Performs a single reconciliation pass over all workloads in all active namespaces.
+    pub async fn reconcile_once(&self) -> Result<usize, ControllerError> {
+        let namespaces = list_active_namespaces(&self.client()).await;
+        let wm = self.workload_manager();
+        let mut total = 0;
+        for ns in namespaces {
+            if let Ok(summary) = wm.reconcile_namespace(&ns).await {
+                total += summary.total_workloads();
+            }
+        }
+        Ok(total)
+    }
+}
+
+async fn list_active_namespaces(
+    client: &diorama_apiserver::client::KubernetesApiClient,
+) -> Vec<String> {
+    let Ok(val) = client.list_namespaces().await else {
+        return vec!["default".to_string(), "kube-system".to_string()];
+    };
+
+    let items = val.get("items").and_then(serde_json::Value::as_array);
+    let ns_list: Vec<String> = items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    if ns_list.is_empty() {
+        vec!["default".to_string(), "kube-system".to_string()]
+    } else {
+        ns_list
+    }
 }

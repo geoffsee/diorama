@@ -22,6 +22,7 @@ pub use replicaset::ReplicaSetReconciler;
 pub use statefulset::StatefulSetReconciler;
 
 use crate::error::ControllerError;
+use serde_json::Value;
 
 /// Outcome of reconciling a specific workload resource collection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -163,4 +164,115 @@ pub struct ReconciliationSummary {
     pub endpoints_reconciled: usize,
     pub garbage_collected: usize,
     pub errors: Vec<String>,
+}
+
+impl ReconciliationSummary {
+    #[must_use]
+    pub fn total_workloads(&self) -> usize {
+        self.deployments_reconciled
+            + self.replicasets_reconciled
+            + self.statefulsets_reconciled
+            + self.daemonsets_reconciled
+            + self.cronjobs_reconciled
+            + self.jobs_reconciled
+            + self.endpointslices_reconciled
+            + self.endpoints_reconciled
+            + self.garbage_collected
+    }
+}
+
+/// Returns true if a pod is ready and not marked for deletion.
+#[must_use]
+pub fn is_pod_ready(pod: &Value) -> bool {
+    if pod.pointer("/metadata/deletionTimestamp").is_some() {
+        return false;
+    }
+
+    if let Some(conditions) = pod.pointer("/status/conditions").and_then(|c| c.as_array()) {
+        for condition in conditions {
+            if condition.get("type").and_then(|t| t.as_str()) == Some("Ready") {
+                return condition.get("status").and_then(|s| s.as_str()) == Some("True");
+            }
+        }
+    }
+
+    if let Some(phase) = pod.pointer("/status/phase").and_then(|p| p.as_str()) {
+        return phase == "Running";
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_is_pod_ready() {
+        let ready_pod = json!({
+            "metadata": { "name": "pod-1" },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    { "type": "Ready", "status": "True" }
+                ]
+            }
+        });
+        assert!(is_pod_ready(&ready_pod));
+
+        let not_ready_pod = json!({
+            "metadata": { "name": "pod-2" },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    { "type": "Ready", "status": "False" }
+                ]
+            }
+        });
+        assert!(!is_pod_ready(&not_ready_pod));
+
+        let deleting_pod = json!({
+            "metadata": {
+                "name": "pod-3",
+                "deletionTimestamp": "2026-10-12T00:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    { "type": "Ready", "status": "True" }
+                ]
+            }
+        });
+        assert!(!is_pod_ready(&deleting_pod));
+
+        let running_pod = json!({
+            "metadata": { "name": "pod-4" },
+            "status": { "phase": "Running" }
+        });
+        assert!(is_pod_ready(&running_pod));
+
+        let pending_pod = json!({
+            "metadata": { "name": "pod-5" },
+            "status": { "phase": "Pending" }
+        });
+        assert!(!is_pod_ready(&pending_pod));
+    }
+
+    #[test]
+    fn test_total_workloads() {
+        let summary = ReconciliationSummary {
+            deployments_reconciled: 1,
+            replicasets_reconciled: 2,
+            statefulsets_reconciled: 3,
+            daemonsets_reconciled: 4,
+            cronjobs_reconciled: 5,
+            jobs_reconciled: 6,
+            endpointslices_reconciled: 7,
+            endpoints_reconciled: 8,
+            garbage_collected: 9,
+            errors: Vec::new(),
+        };
+        assert_eq!(summary.total_workloads(), 45);
+    }
 }

@@ -9,16 +9,32 @@ use crate::service::ControllerManagerService;
 
 pub const COMPONENT_CONTROLLER_MANAGER: &str = "controller-manager";
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
+pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct ControllerManagerAdapter {
     service: ControllerManagerService,
+    reconcile_interval: Duration,
 }
 
 impl ControllerManagerAdapter {
     #[must_use]
     pub fn new(service: ControllerManagerService) -> Self {
-        Self { service }
+        Self {
+            service,
+            reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reconcile_interval(mut self, interval: Duration) -> Self {
+        self.reconcile_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn reconcile_interval(&self) -> Duration {
+        self.reconcile_interval
     }
 
     pub fn registration(
@@ -77,14 +93,22 @@ impl Adapter for ControllerManagerAdapter {
                 });
             }
 
-            // 5. Await supervisor stop phase
+            // 5. Periodic reconciliation until supervisor stops us
+            let mut ticker = tokio::time::interval(self.reconcile_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
-                match context.changed().await {
-                    StopPhase::Running => {},
-                    StopPhase::Graceful | StopPhase::Force => {
-                        self.service.stop();
-                        break;
-                    },
+                tokio::select! {
+                    biased;
+                    phase = context.changed() => {
+                        if matches!(phase, StopPhase::Graceful | StopPhase::Force) {
+                            self.service.stop();
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let _ = self.service.reconcile_once().await;
+                    }
                 }
             }
 

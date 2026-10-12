@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use diorama_apiserver::time::{now_unix, parse_rfc3339_seconds};
 use diorama_apiserver::{ApiserverError, ApiserverService, KubernetesApiClient};
 
-use crate::config::{detect_host_cpu_count, format_cpuset};
+use crate::config::{
+    DEFAULT_CLUSTER_DNS, DEFAULT_CLUSTER_DOMAIN, detect_host_cpu_count, format_cpuset,
+};
 use crate::error::KubeletError;
 use crate::status::{
     ContainerView, CpuAssignment, PodViews, attempt_of, attempts_by_name, pending_status,
@@ -131,9 +133,162 @@ fn uid_filter(pod_uid: &str) -> cri::PodSandboxFilter {
     }
 }
 
-/// Builds the CRI sandbox configuration for a pod.
+fn extract_custom_servers(custom: &Value) -> Vec<String> {
+    custom
+        .get("nameservers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_custom_searches(custom: &Value) -> Vec<String> {
+    custom
+        .get("searches")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_custom_options(custom: &Value) -> Vec<String> {
+    custom
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|opt| {
+                    let name = opt.get("name").and_then(Value::as_str)?;
+                    if let Some(val) = opt.get("value").and_then(Value::as_str) {
+                        Some(format!("{name}:{val}"))
+                    } else {
+                        Some(name.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Builds the CRI DNS configuration for a pod based on `dnsPolicy`, `dnsConfig`,
+/// cluster DNS IPs and cluster domain.
 #[must_use]
-pub fn sandbox_config(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
+pub fn build_dns_config(
+    pod: &Value,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+) -> Option<cri::DnsConfig> {
+    let namespace = pod
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+
+    let host_network = pod
+        .pointer("/spec/hostNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let default_policy = if host_network {
+        "Default"
+    } else {
+        "ClusterFirst"
+    };
+    let dns_policy = pod
+        .pointer("/spec/dnsPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or(default_policy);
+
+    match dns_policy {
+        "Default" => {
+            if let Some(custom) = pod.pointer("/spec/dnsConfig") {
+                let servers = extract_custom_servers(custom);
+                let searches = extract_custom_searches(custom);
+                let options = extract_custom_options(custom);
+                if servers.is_empty() && searches.is_empty() && options.is_empty() {
+                    None
+                } else {
+                    Some(cri::DnsConfig {
+                        servers,
+                        searches,
+                        options,
+                    })
+                }
+            } else {
+                None
+            }
+        },
+        "None" => {
+            let mut servers = Vec::new();
+            let mut searches = Vec::new();
+            let mut options = Vec::new();
+            if let Some(custom) = pod.pointer("/spec/dnsConfig") {
+                servers = extract_custom_servers(custom);
+                searches = extract_custom_searches(custom);
+                options = extract_custom_options(custom);
+            }
+            Some(cri::DnsConfig {
+                servers,
+                searches,
+                options,
+            })
+        },
+        _ => {
+            // "ClusterFirst", "ClusterFirstWithHostNet", or fallback
+            if cluster_dns.is_empty() {
+                return None;
+            }
+            let mut servers = cluster_dns.to_vec();
+            let effective_domain = if cluster_domain.is_empty() {
+                DEFAULT_CLUSTER_DOMAIN
+            } else {
+                cluster_domain
+            };
+            let mut searches = vec![
+                format!("{namespace}.svc.{effective_domain}"),
+                format!("svc.{effective_domain}"),
+                effective_domain.to_string(),
+            ];
+            let mut options = vec!["ndots:5".to_string()];
+
+            if let Some(custom) = pod.pointer("/spec/dnsConfig") {
+                for s in extract_custom_servers(custom) {
+                    if !servers.contains(&s) {
+                        servers.push(s);
+                    }
+                }
+                for search in extract_custom_searches(custom) {
+                    if !searches.contains(&search) {
+                        searches.push(search);
+                    }
+                }
+                for opt in extract_custom_options(custom) {
+                    if opt.starts_with("ndots:") {
+                        options.retain(|o| !o.starts_with("ndots:"));
+                    }
+                    if !options.contains(&opt) {
+                        options.push(opt);
+                    }
+                }
+            }
+
+            Some(cri::DnsConfig {
+                servers,
+                searches,
+                options,
+            })
+        },
+    }
+}
+
+fn sandbox_config_base(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
     let name = pod_name(pod);
     let namespace = pod
         .pointer("/metadata/namespace")
@@ -206,6 +361,30 @@ pub fn sandbox_config(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
         port_mappings,
         ..cri::PodSandboxConfig::default()
     }
+}
+
+/// Builds the CRI sandbox configuration for a pod with custom cluster DNS and domain.
+#[must_use]
+pub fn sandbox_config_with_dns(
+    pod: &Value,
+    attempt: u32,
+    cluster_dns: &[String],
+    cluster_domain: &str,
+) -> cri::PodSandboxConfig {
+    let mut config = sandbox_config_base(pod, attempt);
+    config.dns_config = build_dns_config(pod, cluster_dns, cluster_domain);
+    config
+}
+
+/// Builds the CRI sandbox configuration for a pod with default cluster DNS and domain.
+#[must_use]
+pub fn sandbox_config(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
+    sandbox_config_with_dns(
+        pod,
+        attempt,
+        &[DEFAULT_CLUSTER_DNS.to_string()],
+        DEFAULT_CLUSTER_DOMAIN,
+    )
 }
 
 /// Builds the CRI container configuration for one attempt of a spec container,
@@ -564,6 +743,8 @@ pub struct PodReconciler {
     checkpoint_invalidated: Arc<AtomicBool>,
     root_dir: PathBuf,
     apiserver: Option<Arc<ApiserverService>>,
+    cluster_dns: Vec<String>,
+    cluster_domain: String,
     backoff: Arc<Mutex<BTreeMap<String, RestartBackoff>>>,
     terminating: Arc<Mutex<BTreeSet<String>>>,
     probe_trackers: Arc<Mutex<BTreeMap<String, ProbeTracker>>>,
@@ -599,10 +780,34 @@ impl PodReconciler {
             checkpoint_invalidated: Arc::new(AtomicBool::new(false)),
             root_dir: PathBuf::from("/var/lib/kubelet"),
             apiserver: None,
+            cluster_dns: vec![DEFAULT_CLUSTER_DNS.to_string()],
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             backoff: Arc::new(Mutex::new(BTreeMap::new())),
             terminating: Arc::new(Mutex::new(BTreeSet::new())),
             probe_trackers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[must_use]
+    pub fn with_cluster_dns(mut self, cluster_dns: Vec<String>) -> Self {
+        self.cluster_dns = cluster_dns;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cluster_domain(mut self, cluster_domain: impl Into<String>) -> Self {
+        self.cluster_domain = cluster_domain.into();
+        self
+    }
+
+    #[must_use]
+    pub fn cluster_dns(&self) -> &[String] {
+        &self.cluster_dns
+    }
+
+    #[must_use]
+    pub fn cluster_domain(&self) -> &str {
+        &self.cluster_domain
     }
 
     #[must_use]
@@ -928,7 +1133,10 @@ impl PodReconciler {
             .find(|s| s.state == cri::PodSandboxState::SandboxReady as i32)
         {
             let attempt = ready.metadata.as_ref().map_or(0, |m| m.attempt);
-            return Ok((ready.id.clone(), sandbox_config(pod, attempt)));
+            return Ok((
+                ready.id.clone(),
+                sandbox_config_with_dns(pod, attempt, &self.cluster_dns, &self.cluster_domain),
+            ));
         }
         let mut attempt = 0;
         for stale in &sandboxes {
@@ -940,7 +1148,7 @@ impl PodReconciler {
             self.patch_status_if_changed(namespace, name, pod, pending)
                 .await?;
         }
-        let config = sandbox_config(pod, attempt);
+        let config = sandbox_config_with_dns(pod, attempt, &self.cluster_dns, &self.cluster_domain);
         let id = self.runtime.run_pod_sandbox(&config).await?;
         Ok((id, config))
     }
@@ -1998,4 +2206,118 @@ fn dead_container_views<'a>(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_dns_config_cluster_first_default() {
+        let pod = json!({
+            "metadata": {
+                "name": "test-pod",
+                "namespace": "production"
+            },
+            "spec": {
+                "containers": [{ "name": "app", "image": "busybox" }]
+            }
+        });
+        let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local").unwrap();
+        assert_eq!(dns.servers, vec!["10.43.0.10"]);
+        assert_eq!(
+            dns.searches,
+            vec![
+                "production.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local"
+            ]
+        );
+        assert_eq!(dns.options, vec!["ndots:5"]);
+    }
+
+    #[test]
+    fn test_build_dns_config_with_custom_dns_config() {
+        let pod = json!({
+            "metadata": {
+                "name": "test-pod",
+                "namespace": "default"
+            },
+            "spec": {
+                "dnsConfig": {
+                    "nameservers": ["8.8.8.8"],
+                    "searches": ["custom.domain"],
+                    "options": [
+                        { "name": "ndots", "value": "2" },
+                        { "name": "single-request-reopen" }
+                    ]
+                }
+            }
+        });
+        let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local").unwrap();
+        assert_eq!(dns.servers, vec!["10.43.0.10", "8.8.8.8"]);
+        assert_eq!(
+            dns.searches,
+            vec![
+                "default.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "custom.domain"
+            ]
+        );
+        assert_eq!(dns.options, vec!["ndots:2", "single-request-reopen"]);
+    }
+
+    #[test]
+    fn test_build_dns_config_default_policy_without_custom_config() {
+        let pod = json!({
+            "metadata": {
+                "name": "coredns-pod",
+                "namespace": "kube-system"
+            },
+            "spec": {
+                "dnsPolicy": "Default"
+            }
+        });
+        let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local");
+        assert!(dns.is_none(), "Default dnsPolicy should inherit host DNS");
+    }
+
+    #[test]
+    fn test_build_dns_config_none_policy() {
+        let pod = json!({
+            "metadata": {
+                "name": "custom-pod",
+                "namespace": "default"
+            },
+            "spec": {
+                "dnsPolicy": "None",
+                "dnsConfig": {
+                    "nameservers": ["1.1.1.1"],
+                    "searches": ["foo.bar"]
+                }
+            }
+        });
+        let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local").unwrap();
+        assert_eq!(dns.servers, vec!["1.1.1.1"]);
+        assert_eq!(dns.searches, vec!["foo.bar"]);
+        assert!(dns.options.is_empty());
+    }
+
+    #[test]
+    fn test_sandbox_config_populates_dns_config() {
+        let pod = json!({
+            "metadata": {
+                "name": "nginx",
+                "namespace": "default"
+            },
+            "spec": {
+                "containers": [{ "name": "nginx", "image": "nginx" }]
+            }
+        });
+        let config = sandbox_config(&pod, 0);
+        let dns = config.dns_config.expect("dns_config is populated");
+        assert_eq!(dns.servers, vec!["10.43.0.10"]);
+        assert_eq!(dns.searches[0], "default.svc.cluster.local");
+    }
 }

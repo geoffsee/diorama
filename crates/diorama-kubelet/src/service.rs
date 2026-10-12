@@ -53,6 +53,8 @@ impl KubeletService {
             &options.node_name,
             &options.node_ip,
         )
+        .with_cluster_dns(options.cluster_dns.clone())
+        .with_cluster_domain(options.cluster_domain.clone())
         .with_cpu_manager(cpu_manager)
         .with_root_dir(options.root_dir.clone())
         .with_apiserver(apiserver.clone());

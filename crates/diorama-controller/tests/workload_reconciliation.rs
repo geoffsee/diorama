@@ -564,3 +564,96 @@ async fn test_replicaset_and_job_gap_recovery() {
         "Job scale-up must recover when pod indices have gaps"
     );
 }
+
+#[tokio::test]
+async fn test_deployment_and_replicaset_readiness_propagation() {
+    let temp = TempDir::new().unwrap();
+    let controller_svc = setup_test_controller(&temp);
+    controller_svc.start().await.unwrap();
+
+    let client = controller_svc.client();
+    let wm = controller_svc.workload_manager();
+    let ns = "test-readiness-ns";
+
+    client.create_namespace(ns).await.unwrap();
+
+    let deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "readiness-deploy",
+            "namespace": ns
+        },
+        "spec": {
+            "replicas": 2,
+            "selector": {
+                "matchLabels": { "app": "readiness" }
+            },
+            "template": {
+                "metadata": {
+                    "labels": { "app": "readiness" }
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "app",
+                        "image": "busybox"
+                    }]
+                }
+            }
+        }
+    });
+
+    client.create_deployment(ns, deployment).await.unwrap();
+
+    // Pass 1: Deployment creates ReplicaSet
+    let _ = wm.reconcile_namespace(ns).await.unwrap();
+    // Pass 2: ReplicaSet creates Pods
+    let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+    // Initially pods are Pending, so readyReplicas should be 0
+    let rs = client
+        .get_replicaset(ns, "readiness-deploy-rs")
+        .await
+        .unwrap();
+    assert_eq!(rs["status"]["readyReplicas"], 0);
+    assert_eq!(rs["status"]["availableReplicas"], 0);
+
+    let dep = client.get_deployment(ns, "readiness-deploy").await.unwrap();
+    assert_eq!(dep["status"]["readyReplicas"], 0);
+    assert_eq!(dep["status"]["availableReplicas"], 0);
+
+    // Simulate pod becoming ready: update pod status to Running with Ready=True condition
+    let pod_list = client.list_pods(ns).await.unwrap();
+    let pods = pod_list["items"].as_array().unwrap();
+    assert_eq!(pods.len(), 2);
+
+    let mut target_pod = pods[0].clone();
+    target_pod["status"] = json!({
+        "phase": "Running",
+        "conditions": [
+            { "type": "Ready", "status": "True" }
+        ]
+    });
+    let pod_name = target_pod["metadata"]["name"].as_str().unwrap().to_string();
+    client.update_pod(ns, &pod_name, target_pod).await.unwrap();
+
+    // Reconcile namespace again
+    let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+    // Now ReplicaSet and Deployment must report readyReplicas = 1
+    let rs = client
+        .get_replicaset(ns, "readiness-deploy-rs")
+        .await
+        .unwrap();
+    assert_eq!(rs["status"]["readyReplicas"], 1);
+    assert_eq!(rs["status"]["availableReplicas"], 1);
+
+    let dep = client.get_deployment(ns, "readiness-deploy").await.unwrap();
+    assert_eq!(dep["status"]["readyReplicas"], 1);
+    assert_eq!(dep["status"]["availableReplicas"], 1);
+    assert_eq!(dep["status"]["updatedReplicas"], 2);
+
+    // Test reconcile_once
+    let total = controller_svc.reconcile_once().await.unwrap();
+    assert!(total > 0);
+}

@@ -249,15 +249,26 @@ impl ReplicaSetReconciler {
                 .await?;
         }
 
+        let updated_owned_pods = self.get_owned_pods(namespace, name, uid).await?;
+        let ready_replicas = updated_owned_pods
+            .iter()
+            .take(desired_replicas)
+            .filter(|p| super::is_pod_ready(p))
+            .count();
+
         let mut updated_rs = replicaset.clone();
         if let Some(status) = updated_rs.get_mut("status").and_then(Value::as_object_mut) {
             status.insert("replicas".to_string(), json!(desired_replicas));
+            status.insert("readyReplicas".to_string(), json!(ready_replicas));
+            status.insert("availableReplicas".to_string(), json!(ready_replicas));
             status.insert("observedGeneration".to_string(), json!(1));
         } else if let Some(rs_obj) = updated_rs.as_object_mut() {
             rs_obj.insert(
                 "status".to_string(),
                 json!({
                     "replicas": desired_replicas,
+                    "readyReplicas": ready_replicas,
+                    "availableReplicas": ready_replicas,
                     "observedGeneration": 1
                 }),
             );
