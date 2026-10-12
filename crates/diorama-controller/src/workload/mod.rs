@@ -184,7 +184,11 @@ impl ReconciliationSummary {
 /// Returns true if a pod is ready and not marked for deletion.
 #[must_use]
 pub fn is_pod_ready(pod: &Value) -> bool {
-    if pod.pointer("/metadata/deletionTimestamp").is_some() {
+    if pod
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some()
+    {
         return false;
     }
 
@@ -245,6 +249,20 @@ mod tests {
             }
         });
         assert!(!is_pod_ready(&deleting_pod));
+
+        let null_deleting_pod = json!({
+            "metadata": {
+                "name": "pod-3-null",
+                "deletionTimestamp": null
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    { "type": "Ready", "status": "True" }
+                ]
+            }
+        });
+        assert!(is_pod_ready(&null_deleting_pod));
 
         let running_pod = json!({
             "metadata": { "name": "pod-4" },
