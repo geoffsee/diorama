@@ -592,3 +592,44 @@ async fn test_deterministic_pv_recovery_on_retry() {
     assert_eq!(bound_pvc["status"]["phase"], "Bound");
     assert_eq!(bound_pvc["spec"]["volumeName"], pv_name);
 }
+
+#[tokio::test]
+async fn test_empty_storage_class_name_disables_dynamic_provisioning() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("Immediate")
+        .with_reclaim_policy("Delete");
+
+    let ns = "test-empty-sc";
+    client.create_namespace(ns).await.unwrap();
+
+    // 1. PVC with storageClassName: ""
+    let empty_sc_pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "manual-bind-claim", "namespace": ns },
+        "spec": { "accessModes": ["ReadWriteOnce"], "storageClassName": "" },
+        "status": { "phase": "Pending" }
+    });
+    client.create_pvc(ns, empty_sc_pvc).await.unwrap();
+
+    let volume_mgr = LocalPathVolumeManager::new(config, client.clone());
+    let err = volume_mgr
+        .provision_volume_for_pvc(ns, "manual-bind-claim", "node-1")
+        .await
+        .unwrap_err();
+
+    match err {
+        StorageError::VolumeBindingFailed(msg) => {
+            assert!(msg.contains("dynamic provisioning disabled"));
+        },
+        other => panic!("expected VolumeBindingFailed error, got: {other:?}"),
+    }
+}

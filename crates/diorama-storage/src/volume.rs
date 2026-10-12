@@ -240,17 +240,28 @@ impl LocalPathVolumeManager {
             }
         }
 
-        // Validate storage class
+        // Validate storage class:
+        // - None: defaults to default StorageClass (local-path)
+        // - Some("local-path"): supported
+        // - Some(""): disables dynamic provisioning in Kubernetes
+        // - Some(other): unsupported
         let requested_sc = pvc
             .get("spec")
             .and_then(|s| s.get("storageClassName"))
-            .and_then(Value::as_str)
-            .unwrap_or(LOCAL_PATH_STORAGE_CLASS_NAME);
+            .and_then(Value::as_str);
 
-        if requested_sc != LOCAL_PATH_STORAGE_CLASS_NAME && !requested_sc.is_empty() {
-            return Err(StorageError::VolumeBindingFailed(format!(
-                "PVC '{pvc_name}' requests unsupported StorageClass '{requested_sc}'"
-            )));
+        match requested_sc {
+            Some(LOCAL_PATH_STORAGE_CLASS_NAME) | None => {},
+            Some("") => {
+                return Err(StorageError::VolumeBindingFailed(format!(
+                    "PVC '{pvc_name}' has empty storageClassName (dynamic provisioning disabled)"
+                )));
+            },
+            Some(other) => {
+                return Err(StorageError::VolumeBindingFailed(format!(
+                    "PVC '{pvc_name}' requests unsupported StorageClass '{other}'"
+                )));
+            },
         }
 
         let pvc_uid = pvc

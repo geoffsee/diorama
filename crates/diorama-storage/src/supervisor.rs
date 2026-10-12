@@ -154,8 +154,16 @@ impl Adapter for LocalPathAdapter {
                                     && let Some(pvcs) = pvc_list.get("items").and_then(Value::as_array)
                                 {
                                     for pvc in pvcs {
-                                        let sc = pvc.pointer("/spec/storageClassName").and_then(Value::as_str).unwrap_or("");
-                                        if sc == LOCAL_PATH_STORAGE_CLASS_NAME || sc.is_empty() {
+                                        // In standard Kubernetes, omitting storageClassName defaults to the default
+                                        // StorageClass (local-path), whereas storageClassName: "" explicitly disables
+                                        // dynamic provisioning.
+                                        let sc_opt = pvc.pointer("/spec/storageClassName").and_then(Value::as_str);
+                                        let is_local_path = match sc_opt {
+                                            None => true,
+                                            Some(s) if s == LOCAL_PATH_STORAGE_CLASS_NAME => true,
+                                            _ => false,
+                                        };
+                                        if is_local_path {
                                             let phase = pvc.pointer("/status/phase").and_then(Value::as_str);
                                             let vol_name = pvc.pointer("/spec/volumeName").and_then(Value::as_str);
                                             if phase != Some("Bound") || vol_name.is_none() {
@@ -163,6 +171,9 @@ impl Adapter for LocalPathAdapter {
                                                     .pointer("/metadata/annotations/volume.kubernetes.io~1selected-node")
                                                     .and_then(Value::as_str)
                                                     .map(std::string::ToString::to_string);
+                                                // For standalone PVC provisioning before pod scheduling, defaulting to
+                                                // default_node allows single-node local environments to bind volumes.
+                                                // Note: In multi-node topologies, this would bind before scheduler assignment.
                                                 let node_to_use = selected_node.or_else(|| default_node.clone());
                                                 if let (Some(pvc_name), Some(node)) = (
                                                     pvc.pointer("/metadata/name").and_then(Value::as_str),
