@@ -18,7 +18,7 @@ diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
 bytes = "=1.12.1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
-hyper = { version = "=1.11.1", features = ["http1", "server"] }
+hyper = { version = "=1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server", "http1"] }
 tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal", "net", "io-util", "fs"] }
 
