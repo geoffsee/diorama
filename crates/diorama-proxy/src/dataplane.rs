@@ -642,6 +642,12 @@ impl NftablesDataplane {
                 continue;
             };
             for port in &svc.ports {
+                let endpoints = table
+                    .get_ready_endpoints(&svc.namespace, &svc.name, port.port, port.protocol)
+                    .unwrap_or_default();
+                if endpoints.is_empty() {
+                    continue;
+                }
                 let proto = port.protocol.as_str().to_lowercase();
                 let needle = format!("ip daddr {cluster_ip} {proto} dport {} ", port.port);
                 if !existing_rules.lines().any(|l| l.contains(&needle)) {
