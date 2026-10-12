@@ -2810,7 +2810,7 @@ impl KubernetesApiClient {
         })?;
         let (network, broadcast) = self.cidr_bounds()?;
         let ip_u32 = u32::from(ip);
-        if ip_u32 < network || ip_u32 > broadcast {
+        if ip_u32 <= network || ip_u32 >= broadcast {
             return Err(ApiserverError::InvalidInput {
                 field: "spec.clusterIP".to_string(),
                 reason: format!(

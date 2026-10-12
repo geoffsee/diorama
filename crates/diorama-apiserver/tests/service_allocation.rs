@@ -334,3 +334,53 @@ async fn service_update_preserves_allocations_and_enforces_cluster_ip_immutabili
     assert_eq!(converted["spec"]["clusterIP"], "10.43.0.2");
     assert!(converted["spec"]["ports"][0].get("nodePort").is_none());
 }
+
+#[tokio::test]
+async fn test_reject_network_and_broadcast_cluster_ips() {
+    let temp = TempDir::new().unwrap();
+    let service = setup_service(&temp);
+    let client = service.admin_client();
+
+    // Default service_cluster_ip_range is 10.43.0.0/16
+    // 10.43.0.0 is network address
+    let net_svc = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "net-svc" },
+        "spec": {
+            "clusterIP": "10.43.0.0",
+            "ports": [{ "port": 80 }]
+        }
+    });
+    let err_net = client.create_service("default", net_svc).await.unwrap_err();
+    assert!(matches!(err_net, ApiserverError::InvalidInput { .. }));
+
+    // 10.43.255.255 is broadcast address
+    let bcast_svc = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "bcast-svc" },
+        "spec": {
+            "clusterIP": "10.43.255.255",
+            "ports": [{ "port": 80 }]
+        }
+    });
+    let err_bcast = client
+        .create_service("default", bcast_svc)
+        .await
+        .unwrap_err();
+    assert!(matches!(err_bcast, ApiserverError::InvalidInput { .. }));
+
+    // A valid IP within bounds should succeed
+    let valid_svc = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": "valid-svc" },
+        "spec": {
+            "clusterIP": "10.43.0.10",
+            "ports": [{ "port": 80 }]
+        }
+    });
+    let created = client.create_service("default", valid_svc).await.unwrap();
+    assert_eq!(created["spec"]["clusterIP"], "10.43.0.10");
+}
