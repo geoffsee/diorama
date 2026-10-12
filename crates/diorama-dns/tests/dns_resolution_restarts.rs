@@ -596,3 +596,158 @@ async fn test_dns_suite_aggregation_report() {
     assert!(report.udp_external_name_passed);
     assert!(report.tcp_external_name_passed);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_headless_service_dns_resolution() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let ns = "tier5-headless";
+    client.create_namespace(ns).await.unwrap();
+
+    let pod_ip: Ipv4Addr = "10.244.2.100".parse().unwrap();
+
+    // 1. Create headless Service (clusterIP: "None") with Endpoints
+    let svc_val = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "db-headless",
+            "namespace": ns
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "clusterIP": "None",
+            "ports": [{
+                "name": "postgres",
+                "port": 5432,
+                "protocol": "TCP"
+            }]
+        }
+    });
+    client.create_service(ns, svc_val).await.unwrap();
+
+    let ep_val = json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": "db-headless",
+            "namespace": ns
+        },
+        "subsets": [{
+            "addresses": [{
+                "ip": pod_ip.to_string(),
+                "targetRef": {
+                    "kind": "Pod",
+                    "name": "db-headless-0",
+                    "namespace": ns
+                }
+            }],
+            "ports": [{
+                "name": "postgres",
+                "port": 5432,
+                "protocol": "TCP"
+            }]
+        }]
+    });
+    client.create_endpoints(ns, ep_val).await.unwrap();
+
+    let config = CoreDnsConfig::new();
+    let prober = DnsProber::new(ProbeTransport::Synthetic {
+        client: Arc::new(client.clone()),
+        config,
+    });
+
+    // Verify headless service resolution (UDP and TCP)
+    let probe_udp = DnsResolutionProbe::headless("db-headless", ns, pod_ip, DnsProtocol::Udp);
+    let res_udp = prober.execute_probe(&probe_udp).await.unwrap();
+    assert!(
+        res_udp.success,
+        "Headless UDP probe must succeed: {}",
+        res_udp.details
+    );
+    assert_eq!(res_udp.resolved_ips, vec![pod_ip]);
+
+    let probe_tcp = DnsResolutionProbe::headless("db-headless", ns, pod_ip, DnsProtocol::Tcp);
+    let res_tcp = prober.execute_probe(&probe_tcp).await.unwrap();
+    assert!(
+        res_tcp.success,
+        "Headless TCP probe must succeed: {}",
+        res_tcp.details
+    );
+    assert_eq!(res_tcp.resolved_ips, vec![pod_ip]);
+
+    // 2. Create headless Service resolved via EndpointSlice
+    let slice_pod_ip: Ipv4Addr = "10.244.2.101".parse().unwrap();
+    let slice_svc_val = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "cache-headless",
+            "namespace": ns
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "clusterIP": "None",
+            "ports": [{
+                "name": "redis",
+                "port": 6379,
+                "protocol": "TCP"
+            }]
+        }
+    });
+    client.create_service(ns, slice_svc_val).await.unwrap();
+
+    let slice_val = json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "cache-headless-slice",
+            "namespace": ns,
+            "labels": {
+                "kubernetes.io/service-name": "cache-headless"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": [{
+            "addresses": [slice_pod_ip.to_string()],
+            "conditions": {
+                "ready": true
+            },
+            "targetRef": {
+                "kind": "Pod",
+                "name": "cache-headless-0",
+                "namespace": ns
+            }
+        }],
+        "ports": [{
+            "name": "redis",
+            "port": 6379,
+            "protocol": "TCP"
+        }]
+    });
+    client.create_endpointslice(ns, slice_val).await.unwrap();
+
+    let slice_probe =
+        DnsResolutionProbe::headless("cache-headless", ns, slice_pod_ip, DnsProtocol::Udp);
+    let slice_res = prober.execute_probe(&slice_probe).await.unwrap();
+    assert!(
+        slice_res.success,
+        "EndpointSlice-backed headless probe must succeed: {}",
+        slice_res.details
+    );
+    assert_eq!(slice_res.resolved_ips, vec![slice_pod_ip]);
+
+    // 3. Verify pod-in-service query: db-headless-0.db-headless.tier5-headless.svc.cluster.local
+    let mut pod_probe = DnsResolutionProbe::headless("db-headless", ns, pod_ip, DnsProtocol::Udp);
+    pod_probe.query_name = format!("db-headless-0.db-headless.{ns}.svc.cluster.local");
+    let pod_res = prober.execute_probe(&pod_probe).await.unwrap();
+    assert!(
+        pod_res.success,
+        "Pod-in-service query must resolve to pod IP: {}",
+        pod_res.details
+    );
+    assert_eq!(pod_res.resolved_ips, vec![pod_ip]);
+}
