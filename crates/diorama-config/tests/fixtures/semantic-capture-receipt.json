@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "exit_code": 0,
+  "errors": [],
+  "source_sha256": {
+    "run.py": "b81a0fb298d762c4feee7d6e6b7be2f61aaa029a404c1e179329469153333f3d",
+    "driver.py": "85d2d930740d9f51ab3e685e1a93481604eb2544666f0e9f8f82c16a76fb7d0f",
+    "Dockerfile": "40ce30dcbcda0dbf0e8953c7552197b7b60b5838569b54c2d11d5072ea6b2882",
+    "suite": "a00c18bb1bc668509882f723523de75c9df18939828901b1536c1835367c135b",
+    "artifact_descriptor": "8116cd99591c295d0253d265bc0dde3063c7ccce321600dc6cbd01431bd33bef"
+  },
+  "owned_container": "diorama-parity-d9d1afeaa0cc4aa8b2da24f9ebb5af83",
+  "owned_image": "diorama-parity-d9d1afeaa0cc4aa8b2da24f9ebb5af83:test",
+  "owned_volume": "diorama-parity-d9d1afeaa0cc4aa8b2da24f9ebb5af83-evidence"
+}

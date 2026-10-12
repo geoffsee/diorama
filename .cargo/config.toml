@@ -1,0 +1,11 @@
+[alias]
+lint = "clippy --locked --workspace --all-targets --all-features -- -D warnings"
+fmt-check = "fmt --all -- --check"
+test-all = "test --workspace --all-targets --all-features"
+test-ci = "nextest run --locked --workspace --all-targets --all-features --profile ci --no-capture --hide-progress-bar --no-input-handler --no-pager"
+doc-all = "doc --workspace --all-features --no-deps"
+
+[net]
+git-fetch-with-cli = true
+retry = 10
+

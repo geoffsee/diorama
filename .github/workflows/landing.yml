@@ -1,0 +1,123 @@
+name: Landing
+
+on:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-release:
+    name: Tests (release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: test-release
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - name: Test all targets
+        run: cargo nextest run --locked --workspace --all-targets --all-features --release --profile ci
+      - name: Doctests
+        run: cargo test --locked --workspace --doc --all-features --release
+      - uses: dorny/test-reporter@31a54ee7ebcacc03a09ea97a7e5465a47b84aea5 # v1.9.1
+        if: always()
+        with:
+          name: Tests (release)
+          path: target/nextest/ci/results.xml
+          reporter: java-junit
+
+  dist:
+    name: Dist build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: dist
+      - name: Build ship binaries
+        run: cargo build --locked --profile dist -p diorama -p dioramactl
+      - name: Upload ship binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-binaries-${{ github.run_id }}
+          path: |
+            target/dist/diorama
+            target/dist/dioramactl
+          if-no-files-found: error
+          retention-days: 14
+
+  upstream:
+    name: Upstream inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: upstream
+      - name: Restore prepared upstream inputs
+        id: upstream-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/upstream
+          key: upstream-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/upstream/inputs.json') }}
+      - name: Verify generated clients and independent source inventories
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- fetch
+          cargo fetch --locked
+          cargo build -p diorama-upstream-codegen --locked
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- verify
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- check-cri
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- check-containerd
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- check-kubernetes-bindings
+          cargo run --locked -p diorama-dev --bin diorama-drift -- check
+      - name: Test prepared protocol parser with verified compiler
+        env:
+          diorama_UPSTREAM_CACHE: ${{ github.workspace }}/target/upstream
+        run: cargo test --locked -p diorama-dev --test upstream_internals -- --ignored --exact drift::tests::actual_verified_protoc_detects_field_number_type_rpc_and_streaming_mutations
+      - name: Save verified upstream inputs
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.upstream-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/upstream
+          key: ${{ steps.upstream-cache.outputs.cache-primary-key }}

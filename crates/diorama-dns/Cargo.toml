@@ -1,0 +1,32 @@
+[package]
+name = "diorama-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autotests = false
+
+[dependencies]
+async-trait = "=0.1.89"
+k8s-openapi = { version = "=0.28.0", default-features = false, features = ["v1_35"] }
+diorama-apiserver = { version = "=0.1.0", path = "../diorama-apiserver" }
+diorama-config = { version = "=0.1.0", path = "../diorama-config" }
+diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.18"
+tokio = { version = "=1.53.1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+tracing = "=0.1.44"
+
+[dev-dependencies]
+diorama-datastore = { version = "=0.1.0", path = "../diorama-datastore" }
+diorama-pki = { version = "=0.1.0", path = "../diorama-pki" }
+tempfile = "3.8"
+tokio = { version = "=1.53.1", features = ["test-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

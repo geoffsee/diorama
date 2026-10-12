@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Lint, tests, doctests, language policy, and dependency checks before commits leave this clone.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Run in non-interactive CI mode to avoid TTY input handler / pager traps in background executions.
+export CI=1
+export NEXTEST_SHOW_PROGRESS=none
+export NEXTEST_HIDE_PROGRESS_BAR=1
+export NEXTEST_NO_INPUT_HANDLER=1
+
+run() {
+    printf 'pre-push: %s\n' "$*"
+    "$@"
+}
+
+run cargo lint
+run cargo test-ci
+run cargo test --locked --workspace --doc --all-features
+run cargo run --locked -p diorama-dev --bin diorama-language-policy
+run cargo deny check

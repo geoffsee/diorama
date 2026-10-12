@@ -1,0 +1,23 @@
+[package]
+name = "diorama-pki"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autotests = false
+
+[dependencies]
+pem = "4.0.0"
+pkcs8 = { version = "0.10.2", features = ["pem", "alloc"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+tempfile = "3.8"
+x509-parser = "0.18.1"
+sha2 = { version = "=0.11.0", default-features = false }
+base64 = "=0.22.1"
+
+[lints]
+workspace = true
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

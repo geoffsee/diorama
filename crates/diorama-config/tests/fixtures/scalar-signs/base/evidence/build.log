@@ -1,0 +1,66 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 822B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [build 1/5] FROM docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+#4 resolve docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd done
+#4 DONE 0.0s
+
+#5 [build 2/5] WORKDIR /src
+#5 CACHED
+
+#6 [build 3/5] RUN curl --fail --location --retry 3 --output /tmp/source.tar.gz https://codeload.github.com/portainer/kubesolo/tar.gz/2ef1c4787989f11f868f81bb84ae2afd4a49a81d     && echo '9d5f3ce1f3fbda971fb1e2fb6da18ae3880caeec677f0e5d928a3bbe7bb76aec  /tmp/source.tar.gz' | sha256sum --check     && tar --extract --gzip --file /tmp/source.tar.gz --strip-components=1
+#6 CACHED
+
+#7 [internal] load build context
+#7 transferring context: 993B done
+#7 DONE 0.0s
+
+#8 [build 4/5] COPY scalar_capture_test.go /src/internal/config/diorama_scalar_review_test.go
+#8 DONE 0.0s
+
+#9 [build 5/5] RUN mkdir /out && go test -c -p 2 -tags external_deps -trimpath -o /out/scalar.test ./internal/config
+#9 0.082 go: downloading github.com/distribution/reference v0.6.0
+#9 0.083 go: downloading sigs.k8s.io/yaml v1.6.0
+#9 0.136 go: downloading github.com/rs/zerolog v1.33.0
+#9 0.137 go: downloading github.com/k3s-io/kubernetes/staging/src/k8s.io/apimachinery v1.35.7-k3s1
+#9 0.137 go: downloading k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
+#9 0.139 go: downloading github.com/alecthomas/kingpin/v2 v2.4.0
+#9 1.539 go: downloading go.yaml.in/yaml/v2 v2.4.4
+#9 1.539 go: downloading github.com/opencontainers/go-digest v1.0.0
+#9 1.539 go: downloading github.com/xhit/go-str2duration/v2 v2.1.0
+#9 1.539 go: downloading github.com/mattn/go-colorable v0.1.13
+#9 1.540 go: downloading github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b
+#9 1.745 go: downloading gopkg.in/inf.v0 v0.9.1
+#9 1.745 go: downloading sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+#9 1.745 go: downloading github.com/fxamacker/cbor/v2 v2.9.0
+#9 1.815 go: downloading github.com/mattn/go-isatty v0.0.20
+#9 2.094 go: downloading github.com/x448/float16 v0.8.4
+#9 2.094 go: downloading golang.org/x/sys v0.47.0
+#9 DONE 8.2s
+
+#10 [capture 1/1] WORKDIR /tmp
+#10 DONE 0.0s
+
+#11 exporting to image
+#11 exporting layers
+#11 exporting layers 2.2s done
+#11 exporting manifest sha256:190fe1906a15897ae2972f5fd4abcbc6807e20c725696eb69e19c44fe0c7e5e7 done
+#11 exporting config sha256:fab7bfd17af49f7114814c471865c2ad44eaf4599dc4c4dcd841923a931d6b67 done
+#11 exporting attestation manifest sha256:54875f7db212ee90a3f9bb147af1b4be11f38a8d5c783ea13968322e48678ac2 done
+#11 exporting manifest list sha256:91ef07b93b895e6688bf81bf20617bb086268758f8409d40afa5565e085520a1 done
+#11 naming to docker.io/library/diorama-scalar-review-1f35e493fa4a443db50ef7192438d040:latest done
+#11 unpacking to docker.io/library/diorama-scalar-review-1f35e493fa4a443db50ef7192438d040:latest
+#11 unpacking to docker.io/library/diorama-scalar-review-1f35e493fa4a443db50ef7192438d040:latest 0.6s done
+#11 DONE 2.9s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/nslts4i80p8q211uwyvqlzghm

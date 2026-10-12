@@ -1,0 +1,61 @@
+[
+    {
+        "Id": "sha256:e350343548fbca39956dbab289560669c980a9cd1b0a0ce1870ead1089623fb4",
+        "RepoTags": [
+            "diorama-config-scalar-base-txy96g:latest"
+        ],
+        "RepoDigests": [
+            "diorama-config-scalar-base-txy96g@sha256:e350343548fbca39956dbab289560669c980a9cd1b0a0ce1870ead1089623fb4"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-09-29T07:31:03.599890591Z",
+        "Config": {
+            "User": "65532:65532",
+            "Env": [
+                "PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "GOLANG_VERSION=1.26.5",
+                "GOTOOLCHAIN=local",
+                "GOPATH=/go",
+                "CGO_ENABLED=1",
+                "GOFLAGS=-mod=readonly"
+            ],
+            "WorkingDir": "/tmp"
+        },
+        "Architecture": "arm64",
+        "Os": "linux",
+        "Size": 324057003,
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:fc7ac19cfb2d64221e26478ffac9248cfff72f76adbb89ca5e362b37cc21c84a",
+                "sha256:c1cf7a9b7c84052ffa15e8621c27a229e6d79203dee6c5ebb63ce76230f7349e",
+                "sha256:304cc516c4dc516b48304bc637d27673284810a377052ad62afaaf10a4c6eade",
+                "sha256:a325f5bdd3224a58b19bff0c4b9f8adaefe11fe481473dc3abcb6014c7129732",
+                "sha256:28fd8b5d89238feec4841a53d475df7ea1114068b51edea6f95ff4b28b492616",
+                "sha256:97c6c689c0d641d335745f59cb47ed87a6dffe8e8cae1de54715db524a6aef7f",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+                "sha256:cefc91f6ee36a5dd7fe051d1e4d49121f94b5bdf98c29e88c60882d7c863acfc",
+                "sha256:89e8c1a498d66a2155a581feb21a032650ac64b05d4c00fec6594ac27484aa0e",
+                "sha256:96db2378027402ae5c19131fa609f008e02296d5dae33ddd3b926a4930cde484",
+                "sha256:c4517c69828f37c88b1fb59a1ab238ab4bf3cf62f7754b43e727de9f0f85b360",
+                "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-09-29T07:31:05.824728134Z"
+        },
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:e350343548fbca39956dbab289560669c980a9cd1b0a0ce1870ead1089623fb4",
+            "size": 856
+        },
+        "Identity": {
+            "Build": [
+                {
+                    "Ref": "oatyxl33tn2cvfsc9bxzmyyuw",
+                    "CreatedAt": "2026-09-29T07:31:06.291365301Z"
+                }
+            ]
+        }
+    }
+]

@@ -1,0 +1,244 @@
+{
+  "source": "tools/parity/fixtures/config-api/configapi.json",
+  "source_sha256": "e850eaa89e1b0a2caee30a2c92ee049b948470f8e9d0f658d55ad1fb1576f51e",
+  "settings": [
+    {
+      "default": false,
+      "envar": "KUBESOLO_API_ENABLED",
+      "mutability": "restart",
+      "path": "api.enabled",
+      "type": "boolean"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_API_SOCKET_PATH",
+      "mutability": "restart",
+      "path": "api.socketPath",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_D2K",
+      "flag": "d2k",
+      "mutability": "restart",
+      "path": "d2k.enabled",
+      "type": "boolean"
+    },
+    {
+      "default": "d2k",
+      "envar": "KUBESOLO_D2K_NAMESPACE",
+      "flag": "d2k-namespace",
+      "mutability": "restart",
+      "path": "d2k.namespace",
+      "type": "string"
+    },
+    {
+      "default": null,
+      "envar": "KUBESOLO_APISERVER_EXTRA_SANS",
+      "flag": "apiserver-extra-sans",
+      "mutability": "restart",
+      "path": "kubernetes.apiServer.extraSANs",
+      "type": "array"
+    },
+    {
+      "default": 600,
+      "envar": "KUBESOLO_STARTUP_TIMEOUT",
+      "flag": "startup-timeout",
+      "mutability": "restart",
+      "path": "kubernetes.apiServer.startupTimeoutSeconds",
+      "type": "integer"
+    },
+    {
+      "default": "none",
+      "envar": "KUBESOLO_CPU_MANAGER_POLICY",
+      "flag": "cpu-manager-policy",
+      "mutability": "restart",
+      "path": "kubernetes.kubelet.cpuManager.policy",
+      "type": "string"
+    },
+    {
+      "default": null,
+      "envar": "KUBESOLO_CPU_MANAGER_POLICY_OPTIONS",
+      "flag": "cpu-manager-policy-options",
+      "mutability": "restart",
+      "path": "kubernetes.kubelet.cpuManager.policyOptions",
+      "type": "object"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_RESERVED_CPUS",
+      "flag": "reserved-cpus",
+      "mutability": "restart",
+      "path": "kubernetes.kubelet.cpuManager.reservedCPUs",
+      "type": "string"
+    },
+    {
+      "default": null,
+      "envar": "KUBESOLO_SYSTEM_RESERVED",
+      "flag": "system-reserved",
+      "mutability": "restart",
+      "path": "kubernetes.kubelet.systemReserved",
+      "type": "object"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_NODE_NAME",
+      "mutability": "restart",
+      "path": "kubernetes.nodeName",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_DEBUG",
+      "flag": "debug",
+      "mutability": "restart",
+      "path": "logging.debug",
+      "type": "boolean"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_PPROF_SERVER",
+      "flag": "pprof-server",
+      "mutability": "restart",
+      "path": "logging.pprof",
+      "type": "boolean"
+    },
+    {
+      "default": "127.0.0.1:9105",
+      "envar": "KUBESOLO_METRICS_BIND_ADDRESS",
+      "flag": "metrics-bind-address",
+      "mutability": "restart",
+      "path": "metrics.bindAddress",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_METRICS_SERVER",
+      "flag": "metrics-server",
+      "mutability": "restart",
+      "path": "metrics.enabled",
+      "type": "boolean"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_DISABLE_IPV6",
+      "flag": "disable-ipv6",
+      "mutability": "restart",
+      "path": "network.disableIPv6",
+      "type": "boolean"
+    },
+    {
+      "default": true,
+      "envar": "KUBESOLO_LOAD_BALANCER",
+      "flag": "load-balancer",
+      "mutability": "restart",
+      "path": "network.loadBalancer.enabled",
+      "type": "boolean"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_LOAD_BALANCER_IP",
+      "flag": "load-balancer-ip",
+      "mutability": "restart",
+      "path": "network.loadBalancer.ip",
+      "type": "string"
+    },
+    {
+      "default": 0,
+      "envar": "KUBESOLO_MTU",
+      "flag": "mtu",
+      "mutability": "restart",
+      "path": "network.mtu",
+      "type": "integer"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_NODE_IP",
+      "flag": "node-ip",
+      "mutability": "restart",
+      "path": "network.nodeIP",
+      "type": "string"
+    },
+    {
+      "default": "/var/lib/diorama",
+      "envar": "KUBESOLO_PATH",
+      "flag": "path",
+      "mutability": "immutable",
+      "path": "path",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_PORTAINER_EDGE_ASYNC",
+      "flag": "portainer-edge-async",
+      "mutability": "restart",
+      "path": "portainer.async",
+      "type": "boolean"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_PORTAINER_EDGE_ID",
+      "flag": "portainer-edge-id",
+      "mutability": "restart",
+      "path": "portainer.edgeID",
+      "type": "string"
+    },
+    {
+      "default": null,
+      "envar": "KUBESOLO_PORTAINER_EDGE_KEY",
+      "flag": "portainer-edge-key",
+      "mutability": "restart",
+      "path": "portainer.edgeKey",
+      "secret": true,
+      "type": "string"
+    },
+    {
+      "default": "docker.io/portainer/agent:lts",
+      "envar": "KUBESOLO_PORTAINER_EDGE_IMAGE",
+      "flag": "portainer-edge-image",
+      "mutability": "restart",
+      "path": "portainer.image",
+      "type": "string"
+    },
+    {
+      "default": null,
+      "envar": "KUBESOLO_CONTAINER_MODE",
+      "flag": "container-mode",
+      "mutability": "restart",
+      "path": "runtime.containerMode",
+      "type": "boolean"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_CONTAINER_RUNTIME_ENDPOINT",
+      "flag": "container-runtime-endpoint",
+      "mutability": "restart",
+      "path": "runtime.endpoint",
+      "type": "string"
+    },
+    {
+      "default": false,
+      "envar": "KUBESOLO_DB_WAL_REPAIR",
+      "flag": "db-wal-repair",
+      "mutability": "restart",
+      "path": "storage.dbWALRepair",
+      "type": "boolean"
+    },
+    {
+      "default": true,
+      "envar": "KUBESOLO_LOCAL_STORAGE",
+      "flag": "local-storage",
+      "mutability": "restart",
+      "path": "storage.localPath.enabled",
+      "type": "boolean"
+    },
+    {
+      "default": "",
+      "envar": "KUBESOLO_LOCAL_STORAGE_SHARED_PATH",
+      "flag": "local-storage-shared-path",
+      "mutability": "restart",
+      "path": "storage.localPath.sharedPath",
+      "type": "string"
+    }
+  ]
+}

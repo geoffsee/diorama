@@ -1,0 +1,613 @@
+{
+  "schema_version": 1,
+  "id": "cli-startup",
+  "cases": [
+    {
+      "id": "version-long",
+      "argv": [
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "version-short",
+      "argv": [
+        "-v"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "version-invalid-bool-env",
+      "argv": [
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_DEBUG": "invalid"
+      }
+    },
+    {
+      "id": "version-invalid-int-env",
+      "argv": [
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_MTU": "invalid"
+      }
+    },
+    {
+      "id": "version-invalid-map-env",
+      "argv": [
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_SYSTEM_RESERVED": "invalid"
+      }
+    },
+    {
+      "id": "version-directory-file",
+      "argv": [
+        "--version",
+        "--config=/tmp"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "version-before-full",
+      "argv": [
+        "--version",
+        "--full"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "kubesolo version",
+          "version"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "version-invalid-explicit-int",
+      "argv": [
+        "--version",
+        "--mtu=invalid"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "invalid"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "version-unknown-flag",
+      "argv": [
+        "--version",
+        "--unknown"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unknown long flag '--unknown'"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "unknown-before-version",
+      "argv": [
+        "--unknown",
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unknown long flag '--unknown'"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "help-long-name",
+      "argv": [
+        "--help"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "usage: kubesolo",
+          "--[no-]print-config"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "help-invalid-env",
+      "argv": [
+        "--help"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "usage: kubesolo",
+          "--[no-]print-config"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_DEBUG": "invalid"
+      }
+    },
+    {
+      "id": "help-invalid-explicit-int",
+      "argv": [
+        "--help",
+        "--mtu=invalid"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "usage: kubesolo",
+          "--[no-]print-config"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "help-unknown-flag",
+      "argv": [
+        "--help",
+        "--unknown"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unknown long flag '--unknown'"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "short-h",
+      "argv": [
+        "-h"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unknown short flag '-h'"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "duplicate-bool",
+      "argv": [
+        "--print-config",
+        "--debug",
+        "--debug"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "flag 'debug' cannot be repeated"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "duplicate-positive-negative",
+      "argv": [
+        "--print-config",
+        "--debug",
+        "--no-debug"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "flag 'debug' cannot be repeated"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "duplicate-version-alias",
+      "argv": [
+        "--version",
+        "-v"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "flag 'version' cannot be repeated"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "duplicate-string",
+      "argv": [
+        "--print-config",
+        "--path=/one",
+        "--path=/two"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "flag 'path' cannot be repeated"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "bool-equals-false",
+      "argv": [
+        "--print-config",
+        "--debug=false"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected false"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "bool-equals-true",
+      "argv": [
+        "--print-config",
+        "--debug=true"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected true"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "bool-following-false",
+      "argv": [
+        "--print-config",
+        "--debug",
+        "false"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected false"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "bool-empty-equals",
+      "argv": [
+        "--print-config",
+        "--debug="
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "string-empty-argv",
+      "argv": [
+        "--print-config",
+        "--node-ip",
+        ""
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "string-empty-equals",
+      "argv": [
+        "--print-config",
+        "--node-ip="
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "integer-empty-equals",
+      "argv": [
+        "--print-config",
+        "--mtu="
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "invalid"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "empty-positional",
+      "argv": [
+        "--print-config",
+        ""
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "delimiter-empty-tail",
+      "argv": [
+        "--print-config",
+        "--"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "delimiter-flag-is-positional",
+      "argv": [
+        "--print-config",
+        "--",
+        "--version"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "unexpected --version"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "missing-argument",
+      "argv": [
+        "--print-config",
+        "--node-ip"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "expected argument"
+        ]
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "invalid-env-overridden-boolean",
+      "argv": [
+        "--print-config",
+        "--debug"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "KUBESOLO_DEBUG"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_DEBUG": "invalid"
+      }
+    },
+    {
+      "id": "invalid-env-overridden-integer",
+      "argv": [
+        "--print-config",
+        "--mtu=1400"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "KUBESOLO_MTU"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_MTU": "invalid"
+      }
+    },
+    {
+      "id": "directory-before-string-map-env",
+      "argv": [
+        "--print-config",
+        "--config=/tmp"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "is a directory"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_SYSTEM_RESERVED": "invalid"
+      }
+    },
+    {
+      "id": "primitive-env-before-directory",
+      "argv": [
+        "--print-config",
+        "--config=/tmp"
+      ],
+      "expect": {
+        "exit_code": 1,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "invalid"
+        ]
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_MTU": "invalid"
+      }
+    },
+    {
+      "id": "empty-full-env",
+      "argv": [
+        "--print-config"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_FULL": ""
+      }
+    },
+    {
+      "id": "empty-config-env",
+      "argv": [
+        "--print-config"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5,
+      "env": {
+        "KUBESOLO_CONFIG": ""
+      }
+    },
+    {
+      "id": "empty-config-equals",
+      "argv": [
+        "--print-config",
+        "--config="
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "no-version-print",
+      "argv": [
+        "--no-version",
+        "--print-config"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stderr_equals": ""
+      },
+      "timeout_seconds": 5
+    },
+    {
+      "id": "no-help",
+      "argv": [
+        "--no-help"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_equals": "",
+        "stderr_contains": [
+          "usage: kubesolo",
+          "--[no-]print-config"
+        ]
+      },
+      "timeout_seconds": 5
+    }
+  ]
+}

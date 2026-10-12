@@ -1,0 +1,194 @@
+name: Disposable integration
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'crates/**'
+      - 'tools/dev/**'
+      - 'tools/api-json/**'
+      - 'tools/defaults/**'
+      - 'tools/resolved-defaults/**'
+      - 'tools/integration/**'
+      - 'tools/upstream/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/integration.yml'
+      - '.github/actions/setup-rust/**'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'tools/dev/**'
+      - 'tools/api-json/**'
+      - 'tools/defaults/**'
+      - 'tools/resolved-defaults/**'
+      - 'tools/integration/**'
+      - 'tools/upstream/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/integration.yml'
+      - '.github/actions/setup-rust/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '47 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  defaults:
+    name: Official defaults (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: integration-defaults-arm64
+      - name: Restore source archives
+        id: archives
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/default-inputs
+          key: defaults-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/defaults/inputs.json') }}
+      - name: Prepare checksum-locked archives
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-defaults -- prepare-archives --cache target/default-inputs
+      - name: Extract real official defaults twice per variant
+        env:
+          CAPTURE_DIRECTORY: ${{ runner.temp }}/official-defaults
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-defaults -- capture \
+            --source-archive target/default-inputs/source.tar.gz \
+            --go-archive target/default-inputs/go.tar.gz \
+            --output "$CAPTURE_DIRECTORY"
+          cargo run --locked -p diorama-dev --bin diorama-defaults -- verify "$CAPTURE_DIRECTORY/run0.json"
+          cargo run --locked -p diorama-dev --bin diorama-defaults -- verify "$CAPTURE_DIRECTORY/apiserver0.json" \
+            --expected tools/defaults/apiserver.expected.json
+          cargo run --locked -p diorama-dev --bin diorama-defaults -- verify-evidence "$CAPTURE_DIRECTORY"
+      - name: Extract actual API-server completed options twice
+        env:
+          CAPTURE_DIRECTORY: ${{ runner.temp }}/resolved-defaults
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-resolved-defaults -- capture \
+            --source-archive target/default-inputs/source.tar.gz \
+            --go-archive target/default-inputs/go.tar.gz \
+            --output "$CAPTURE_DIRECTORY"
+          cargo run --locked -p diorama-dev --bin diorama-resolved-defaults -- verify "$CAPTURE_DIRECTORY/run0.json"
+          cargo run --locked -p diorama-dev --bin diorama-resolved-defaults -- verify-evidence "$CAPTURE_DIRECTORY"
+      - name: Save verified source archives
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.archives.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/default-inputs
+          key: ${{ steps.archives.outputs.cache-primary-key }}
+      - name: Retain public capture and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: official-defaults-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/official-defaults/
+            ${{ runner.temp }}/resolved-defaults/
+          if-no-files-found: warn
+          retention-days: 14
+
+  api-json:
+    name: API JSON and Rust consumer (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: integration-api-json-arm64
+      - name: Capture actual API responses in a disposable container
+        env:
+          diorama_API_JSON_CAPTURE_DIR: ${{ runner.temp }}/api-json
+        run: cargo run --locked -p diorama-dev --bin diorama-api-json -- capture --output "$diorama_API_JSON_CAPTURE_DIR"
+      - name: Compare live observations and consume them in Rust
+        env:
+          diorama_API_JSON_CAPTURE_DIR: ${{ runner.temp }}/api-json
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-api-json -- check-capture "$diorama_API_JSON_CAPTURE_DIR"
+          cargo test -p diorama-upstream-codegen --test suite api_json:: --locked
+      - name: Retain public capture and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-json-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/api-json/
+          if-no-files-found: warn
+          retention-days: 14
+
+  disposable-node:
+    name: Disposable Linux node scaffold (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: integration-disposable-node-arm64
+      - name: Build candidate binaries
+        run: |
+          cargo build --locked -p diorama -p dioramactl
+      - name: Execute disposable Linux node scaffold capture
+        env:
+          CAPTURE_DIR: ${{ runner.temp }}/disposable-node
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-disposable-node -- capture --output "$CAPTURE_DIR"
+      - name: Verify schema-2 receipt against contract
+        env:
+          CAPTURE_DIR: ${{ runner.temp }}/disposable-node
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-disposable-node -- verify "$CAPTURE_DIR"
+      - name: Execute Linux candidate conformance qualification (Criterion 6)
+        env:
+          CONFORMANCE_DIR: ${{ runner.temp }}/conformance-qualification
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-conformance -- run --output "$CONFORMANCE_DIR"
+      - name: Verify Criterion 6 candidate qualification receipt
+        env:
+          CONFORMANCE_DIR: ${{ runner.temp }}/conformance-qualification
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-conformance -- verify-receipt "$CONFORMANCE_DIR/receipt.json"
+      - name: Rehearse operator handoff and verify Criterion 11 receipt
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-operator-rehearsal -- capture --output "${{ runner.temp }}/operator-handoff-rehearsal"
+          cargo run --locked -p diorama-dev --bin diorama-operator-rehearsal -- verify-receipt "${{ runner.temp }}/operator-handoff-rehearsal/criterion-11-operator-handoff.json"
+      - name: Retain public capture and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: disposable-node-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/disposable-node/
+            ${{ runner.temp }}/conformance-qualification/
+            ${{ runner.temp }}/operator-handoff-rehearsal/
+          if-no-files-found: warn
+          retention-days: 14
+

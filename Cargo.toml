@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["third_party/saphyr-parser"]
+default-members = ["crates/diorama-kube"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+missing_debug_implementations = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+await_holding_lock = "deny"
+dbg_macro = "deny"
+exit = "deny"
+todo = "deny"
+unimplemented = "deny"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+# Line tables keep panic locations. Full debuginfo is what makes dev builds slow.
+[profile.dev]
+incremental = true
+debug = "line-tables-only"
+
+# Optimize dependencies in dev so runtime isn't a debug build of the world.
+# Workspace crates are reset below so editing them stays at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+# Artifact you actually ship: fat LTO, no symbols.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+debug = false
+strip = "symbols"
+
+# Release-like speed with full symbols for profilers.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false
+
+[patch.crates-io]
+saphyr-parser = { path = "third_party/saphyr-parser" }

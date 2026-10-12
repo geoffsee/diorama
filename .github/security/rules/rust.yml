@@ -1,0 +1,37 @@
+rules:
+  - id: diorama-invalid-tls-certificates
+    languages: [rust]
+    severity: ERROR
+    message: Keep TLS certificate verification enabled; configure the trusted CA instead.
+    pattern: $CLIENT.danger_accept_invalid_certs(true)
+  - id: diorama-invalid-tls-hostnames
+    languages: [rust]
+    severity: ERROR
+    message: Keep TLS hostname verification enabled; correct the endpoint or certificate SANs.
+    pattern: $CLIENT.danger_accept_invalid_hostnames(true)
+  - id: diorama-native-tls-verification
+    languages: [rust]
+    severity: ERROR
+    message: Keep TLS peer and hostname verification enabled.
+    pattern-either:
+      - pattern: $CLIENT.set_verify(openssl::ssl::SslVerifyMode::NONE)
+      - pattern: $CLIENT.ssl_verify_peer(false)
+      - pattern: $CLIENT.ssl_verify_host(false)
+  - id: diorama-weak-hash
+    languages: [rust]
+    severity: WARNING
+    message: Review MD5/SHA-1 use; use a modern digest for security-sensitive identities and integrity.
+    pattern-either:
+      - pattern: md5::compute(...)
+      - pattern: md5::Md5::new(...)
+      - pattern: sha1::Sha1::new(...)
+      - pattern: sha1::Sha1::digest(...)
+  - id: diorama-formatted-shell-command
+    languages: [rust]
+    severity: WARNING
+    message: Pass executable arguments separately instead of interpolating a shell command.
+    patterns:
+      - pattern: $CMD::new($SHELL). ... .arg("-c").arg(format!(...))
+      - metavariable-regex:
+          metavariable: $SHELL
+          regex: '"(/bin/)?(sh|bash)"'

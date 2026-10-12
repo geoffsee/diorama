@@ -1,0 +1,22 @@
+{
+  "builder": "golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd",
+  "capture_driver_sha256": "93ba7efdef6b653b9a97abbd985ab4bff6a924001bfdbd75452d668cbca8901d",
+  "cleanup_errors": [],
+  "harness_sha256": {
+    "Capture.Dockerfile": "a7e7ce58fe73e1bb2bc6cb05e18024d519739104f77aace0b0ed4ac7226ecd98",
+    "api_capture_test.go": "f25a6ab06c25c1ffad3608e05cf1a0d531ba50b70e010d8fbc48d05096891377",
+    "file_capture_test.go": "2fefc13357b340f5bb3f58b227bca514e5836f45ae99e1462a7cf6d656bb1c03"
+  },
+  "image_id": "sha256:7f1f418ad115e7b349a9d06b80c6d8b07241c38b834f308a43b2e4091a82c963",
+  "reference_revision": "2ef1c4787989f11f868f81bb84ae2afd4a49a81d",
+  "remaining_containers": [],
+  "remaining_images": [],
+  "runs": {
+    "config": {
+      "exit_code": 0,
+      "stdout_sha256": "00cd04faa5a8f964d0d57d21badd13338a4bb8b00b0fec7c8998f88d0b757f4a"
+    }
+  },
+  "schema": 1,
+  "source_archive_sha256": "9d5f3ce1f3fbda971fb1e2fb6da18ae3880caeec677f0e5d928a3bbe7bb76aec"
+}

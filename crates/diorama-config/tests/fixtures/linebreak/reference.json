@@ -1,0 +1,348 @@
+{
+  "revision": "2ef1c4787989f11f868f81bb84ae2afd4a49a81d",
+  "capture": "/tmp/diorama-config-linebreak-internals-20260927-r4",
+  "cases": [
+    {
+      "id": "nel-double-literal",
+      "input": "d2k: {namespace: \"a    b\"}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-double-escaped",
+      "input": "d2k: {namespace: \"a\\u0085    b\"}\n",
+      "namespace": "a    b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-single-literal",
+      "input": "d2k: {namespace: 'a    b'}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-plain",
+      "input": "d2k:\n  namespace: a    b\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-literal-block",
+      "input": "d2k:\n  namespace: |\n    a    b\n",
+      "namespace": "a\nb\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a\n    b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-folded-block",
+      "input": "d2k:\n  namespace: >\n    a    b\n",
+      "namespace": "a b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-between-fields",
+      "input": "logging: {debug: true}d2k: {namespace: ok}\n",
+      "namespace": "ok",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: ok\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-double-literal",
+      "input": "d2k: {namespace: \"a     b\"}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-double-escaped",
+      "input": "d2k: {namespace: \"a\\u2028    b\"}\n",
+      "namespace": "a     b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\L    b\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-single-literal",
+      "input": "d2k: {namespace: 'a     b'}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-plain",
+      "input": "d2k:\n  namespace: a     b\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-literal-block",
+      "input": "d2k:\n  namespace: |\n    a     b\n",
+      "namespace": "a b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-folded-block",
+      "input": "d2k:\n  namespace: >\n    a     b\n",
+      "namespace": "a b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-between-fields",
+      "input": "logging: {debug: true} d2k: {namespace: ok}\n",
+      "namespace": "ok",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: ok\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-double-literal",
+      "input": "d2k: {namespace: \"a     b\"}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-double-escaped",
+      "input": "d2k: {namespace: \"a\\u2029    b\"}\n",
+      "namespace": "a     b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\P    b\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-single-literal",
+      "input": "d2k: {namespace: 'a     b'}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-plain",
+      "input": "d2k:\n  namespace: a     b\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-literal-block",
+      "input": "d2k:\n  namespace: |\n    a     b\n",
+      "namespace": "a b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-folded-block",
+      "input": "d2k:\n  namespace: >\n    a     b\n",
+      "namespace": "a b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-between-fields",
+      "input": "logging: {debug: true} d2k: {namespace: ok}\n",
+      "namespace": "ok",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: ok\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-explicit-block-indent",
+      "input": "d2k:\n  namespace: |2\n      a       b\n",
+      "namespace": "  a   b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |2\n      a       b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-more-indented-block",
+      "input": "d2k:\n  namespace: |\n    a       b\n",
+      "namespace": "a   b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a       b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-double-consecutive",
+      "input": "d2k: {namespace: \"a      b\"}\n",
+      "namespace": "a  b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a      b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-trailing-strip",
+      "input": "d2k:\n  namespace: |-\n    a \n",
+      "namespace": "a",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-trailing-clip",
+      "input": "d2k:\n  namespace: |\n    a \n",
+      "namespace": "a ",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a '\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-unicode-before",
+      "input": "d2k: {namespace: \"雪     b\"}\n",
+      "namespace": "雪 b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: '雪     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-escaped-marker",
+      "input": "d2k: {namespace: \"\\uE000     \\U0000E001\"}\n",
+      "namespace": " ",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: '     '\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-explicit-block-indent",
+      "input": "d2k:\n  namespace: |2\n      a       b\n",
+      "namespace": "  a   b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |2\n      a       b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-more-indented-block",
+      "input": "d2k:\n  namespace: |\n    a       b\n",
+      "namespace": "a   b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a       b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-double-consecutive",
+      "input": "d2k: {namespace: \"a      b\"}\n",
+      "namespace": "a  b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a      b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-trailing-strip",
+      "input": "d2k:\n  namespace: |-\n    a \n",
+      "namespace": "a",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-trailing-clip",
+      "input": "d2k:\n  namespace: |\n    a \n",
+      "namespace": "a ",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a '\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-unicode-before",
+      "input": "d2k: {namespace: \"雪     b\"}\n",
+      "namespace": "雪 b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: '雪     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-escaped-marker",
+      "input": "d2k: {namespace: \"\\uE000     \\U0000E001\"}\n",
+      "namespace": " ",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: '     '\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-continued",
+      "input": "d2k: {namespace: \"a\\     b\"}\n",
+      "namespace": "ab",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: ab\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-escaped-slash",
+      "input": "d2k: {namespace: \"a\\\\     b\"}\n",
+      "namespace": "a\\ b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a\\     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-keep-cr",
+      "input": "d2k:\n  namespace: |+\n    a \r",
+      "namespace": "a \n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |+\n    a \nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-keep-crlf",
+      "input": "d2k:\n  namespace: |+\n    a \r\n",
+      "namespace": "a \n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |+\n    a \nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-continued",
+      "input": "d2k: {namespace: \"a\\     b\"}\n",
+      "namespace": "ab",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: ab\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-escaped-slash",
+      "input": "d2k: {namespace: \"a\\\\     b\"}\n",
+      "namespace": "a\\ b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a\\     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-keep-cr",
+      "input": "d2k:\n  namespace: |+\n    a \r",
+      "namespace": "a \n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |+\n    a \nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-keep-crlf",
+      "input": "d2k:\n  namespace: |+\n    a \r\n",
+      "namespace": "a \n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |+\n    a \nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-cr",
+      "input": "{\"d2k\": {\"namespace\": \"a\\rb\"}}",
+      "namespace": "a\rb",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\rb\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-crlf",
+      "input": "{\"d2k\": {\"namespace\": \"a\\r\\nb\"}}",
+      "namespace": "a\r\nb",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\r\\nb\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-tab",
+      "input": "{\"d2k\": {\"namespace\": \"a\\tb\"}}",
+      "namespace": "a\tb",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\tb\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-null",
+      "input": "{\"d2k\": {\"namespace\": \"a\\u0000b\"}}",
+      "namespace": "a\u0000b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\0b\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-bell",
+      "input": "{\"d2k\": {\"namespace\": \"a\\u0007b\"}}",
+      "namespace": "a\u0007b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\ab\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-nel-space",
+      "input": "{\"d2k\": {\"namespace\": \"a\\u0085 b\"}}",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: a b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-ls-space",
+      "input": "{\"d2k\": {\"namespace\": \"a\\u2028 b\"}}",
+      "namespace": "a  b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\L b\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "escaped-control-ps-space",
+      "input": "{\"d2k\": {\"namespace\": \"a\\u2029 b\"}}",
+      "namespace": "a  b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: \"a\\P b\"\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-cr-before-block",
+      "input": "d2k:\n  namespace: |+\n    a\r    b\n",
+      "namespace": "a\n\nb\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a\n\n    b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "nel-cr-before-quoted",
+      "input": "d2k: {namespace: \"a\r    b\"}\n",
+      "namespace": "a\nb",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |-\n    a\n    b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-cr-before-block",
+      "input": "d2k:\n  namespace: |+\n    a\r     b\n",
+      "namespace": "a\n b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a\n     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ls-cr-before-quoted",
+      "input": "d2k: {namespace: \"a\r     b\"}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-cr-before-block",
+      "input": "d2k:\n  namespace: |+\n    a\r     b\n",
+      "namespace": "a\n b\n",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: |\n    a\n     b\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    },
+    {
+      "id": "ps-cr-before-quoted",
+      "input": "d2k: {namespace: \"a\r     b\"}\n",
+      "namespace": "a b",
+      "printed": "api:\n  enabled: false\n  socketPath: \"\"\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: 'a     b'\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n"
+    }
+  ]
+}

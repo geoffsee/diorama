@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "2ef1c4787989f11f868f81bb84ae2afd4a49a81d",
+  "source_sha256": {
+    "internal/config/file.go": "9a9af1ea2d94ff1fa1f2306f868721fb88f2e4b1d0d3fa286879b18de61749de",
+    "internal/config/defaults.go": "902db154b17cd88d24f18b4f9aeb87d286470b5113c18b1f2066d20ab596a24b",
+    "internal/config/registry.go": "bd03078025b503a8d16610692dbbb195ad8170a4d2efd37371062931ad8d4bbc",
+    "internal/config/loader.go": "0d4fb3b8780400fd07dffbaee9ced14fd46fdb801f82869b9623b1692f81ba8f",
+    "internal/config/embedded.go": "1466fdcd701ea6fe8a5da77db5e8320977e9b50e4b13cf3e7042681058ac84e0",
+    "internal/config/validate.go": "cd8bbc27f9a88bc148033bed7597e65c47d118d53e657d9767658e7707aae1b4",
+    "internal/config/cpumanager/cpumanager.go": "f356a1bc77afe13ceb8a7e3e85e366890882831721b73f1aed496110a040920d",
+    "types/config.go": "e59764b93fd6689f091e79a17a633d94e910ebc23ae7db375734e212211ce4fa",
+    "types/types.go": "5af0870971322424fcb8ba24ccf4399b23bfcaa3e6c0a8e0ed95fc12f8d1d4ab",
+    "types/const.go": "f60c550e2f40060a51b0ec45a0da0bb7c5add84a30e06570517c87588f55d52d",
+    "types/var.go": "239e6613f489f238ca6726b19eea6f8086df3efc1315cf8d3cac55be808e153a"
+  },
+  "expected_conversion": {
+    "tool": "Ruby system Psych 3.1.0 YAML.safe_load; JSON.pretty_generate",
+    "script": "extract_expected.rb",
+    "normalization": "Restore only five source-declared omitted zero fields; no validation or image/resource normalization. Tests deserialize frozen JSON independently of Rust YAML decoder."
+  },
+  "fixtures_sha256": {
+    "bindings-reference.json": "4bd299fe4d45c52913357ac469932a3105dba4aa55214429cce05197674db9fe",
+    "config-command.json": "c725faa34638b8ba8cf8aafc77efedc33620054c1b7feefb4f9f9ffce9cd0ffe",
+    "extract_expected.rb": "2813d689c585aa831b9972da1f48a81cd69f7db3491a478cd9810c2ae83874d9",
+    "layers-capture-receipt.json": "561ec00702e92e5f93a79a7ca061a5855f0363d366fcf6ba2ae04e3d6c07526c",
+    "layers-reference.json": "8340614d60fa806cf90d61336456417784be6e9ec5114d286c77c03c78edd8e7",
+    "layers-suite.json": "e4b001d6c1705467fd6ee5801410ba548f19b3ff9b332ed6afdb600fd2991c40",
+    "linebreak/Capture.Dockerfile": "a7e7ce58fe73e1bb2bc6cb05e18024d519739104f77aace0b0ed4ac7226ecd98",
+    "linebreak/README.md": "af4ad85eca7bf95ae3170a6814532769dbcb7b2518fcc4c2909de4e382979a0d",
+    "linebreak/api_capture_test.go": "f25a6ab06c25c1ffad3608e05cf1a0d531ba50b70e010d8fbc48d05096891377",
+    "linebreak/capture-receipt.json": "44cf71f7ac457293e4da6bc941a49ac93da7b4b90338d5b881f65bcf1f0b96f0",
+    "linebreak/capture.py": "93ba7efdef6b653b9a97abbd985ab4bff6a924001bfdbd75452d668cbca8901d",
+    "linebreak/file_capture_test.go": "2fefc13357b340f5bb3f58b227bca514e5836f45ae99e1462a7cf6d656bb1c03",
+    "linebreak/reference.json": "ba963f7a8e24177873542c6edaf2f485d4457b4083e8d7492a57b435a3940294",
+    "map-capture-receipt.json": "88420c251dd6978b401fc8e45287e2d63e10e259ffc41fa89213d4bac56022f3",
+    "map-reference.json": "6ce6a9d252bd282e4d6da529b661cb83ad4e44fb3c7e4a30a689fb02abc0c83e",
+    "print-preservation/Capture.Dockerfile": "a7e7ce58fe73e1bb2bc6cb05e18024d519739104f77aace0b0ed4ac7226ecd98",
+    "print-preservation/README.md": "90a3193c459b739fdde6816e64d5cccf8ed1868fc7005db7a73c243ca0c3c808",
+    "print-preservation/api_capture_test.go": "f25a6ab06c25c1ffad3608e05cf1a0d531ba50b70e010d8fbc48d05096891377",
+    "print-preservation/capture-receipt.json": "810bee1b1c8945a178b7431ab0272e8865900f2ce9c5adb27104f3877e4021af",
+    "print-preservation/capture.py": "93ba7efdef6b653b9a97abbd985ab4bff6a924001bfdbd75452d668cbca8901d",
+    "print-preservation/file_capture_test.go": "0cad4c1293cb6bbe45f8f0e728cd15a56aaf52048ef1a1ebf9e2d8e379c6d864",
+    "print-preservation/inputs.json": "169c0717bf834753ade38e03998662a34b35f74f9945905e663b97e59a7852c0",
+    "print-preservation/reference.json": "6a1d43a5b91d85dced90b98d463cc4f66681a3cd39fcfb622b5293a8f617ef78",
+    "semantic-capture-receipt.json": "aae4256232772cefc11fee68c0913a5cd6615742722d274f809cdd8ca9b408d3",
+    "semantic-reference.json": "2e437cb42e9f99ff55177e7f8ba3748737627469d0049f3d67187abd6bfdad0d",
+    "yaml-capture-receipt.json": "06f1d5c5a2f39296ed496e05dba9503b23ff721c0554a1a75d551da60a48baea",
+    "yaml-reference.json": "b101a073b4cd54f413d454e8408b9cad9c4e40943524bd1f666d7c83e93bd337"
+  },
+  "capture_scope": "Real immutable Go artifact in isolated nonprivileged disposable Linux Docker; supplied Rust validation host arm64 8 CPUs container true, overridable by file. No production startup or full platform certification.",
+  "layering": {
+    "source": "internal/config/loader.go and registry.go at pinned baseline",
+    "raw_go_capture": "/tmp/diorama-config-layers-probe-20260927-r3",
+    "preservation_capture": "/tmp/diorama-config-print-preservation-20260927-r1",
+    "intentional_deviations": [
+      "Always emit explicitly empty path to preserve its value",
+      "Quote/escape NEL/LS/PS strings to preserve exact content and adjacent spaces"
+    ],
+    "structural_normalization": "Empty extraSANs is omitted and reparses as null; both mean no extra SANs."
+  }
+}

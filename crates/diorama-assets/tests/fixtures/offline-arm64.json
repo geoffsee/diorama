@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "target": {
+    "os": "linux",
+    "architecture": "arm64",
+    "libc": "glibc"
+  },
+  "variant": "offline",
+  "scope": "supervised-bundle",
+  "assets": [
+    {
+      "id": "kube-apiserver",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-apiserver",
+        "encoding": "identity",
+        "encoded_bytes": 79888568,
+        "sha256": "4e5fe160e7b90e84faab827e71a101f0472a920385abfb7f6bba36ee783529e1"
+      }
+    },
+    {
+      "id": "kube-controller-manager",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-controller-manager",
+        "encoding": "identity",
+        "encoded_bytes": 67043512,
+        "sha256": "9125fca53876e58137305cf177bc2c67eab38adc7f2f70cfe1444d124c39d012"
+      }
+    },
+    {
+      "id": "kubelet",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kubelet",
+        "encoding": "identity",
+        "encoded_bytes": 54264100,
+        "sha256": "0dc3f53fc51f6a6c26c437ec9eded016106ef931db2dd9b3905c656796bed438"
+      }
+    },
+    {
+      "id": "kube-proxy",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-proxy",
+        "encoding": "identity",
+        "encoded_bytes": 40632504,
+        "sha256": "216b76b4ab7f642a1e305f6402a0a466af7cea1287bf89fefb9269396ba04dc2"
+      }
+    },
+    {
+      "id": "kine",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kine",
+        "encoding": "identity",
+        "encoded_bytes": 44465296,
+        "sha256": "ced586344c072454336002cb07d1146400f70f989ecc1576fcf98fbf3e6e5cd8"
+      }
+    },
+    {
+      "id": "containerd",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/containerd",
+        "encoding": "identity",
+        "encoded_bytes": 45332336,
+        "sha256": "b0e4f5a10a8d18e77b276c8cb89638c9d2438579b35286d29ca9fe2521bd2c12"
+      }
+    },
+    {
+      "id": "fuse-overlayfs-snapshotter",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/fuse-overlayfs-snapshotter",
+        "encoding": "identity",
+        "encoded_bytes": 11534520,
+        "sha256": "eb5e7ace1b1b15ab104f387276d62e1e0405b9925baf99018e0224db3f05cc5e"
+      }
+    },
+    {
+      "id": "containerd-shim-runc-v2",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/containerd-shim-runc-v2",
+        "encoding": "zstd",
+        "encoded_bytes": 2359700,
+        "sha256": "a539169644149dc606034a3fc78d4061116ea8b413ac96bc7d1c797244a877bb"
+      }
+    },
+    {
+      "id": "crun",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/crun",
+        "encoding": "zstd",
+        "encoded_bytes": 1186244,
+        "sha256": "67a4299d7a39b5ed52014092c7c7cf347cccec6716f9083906236ce58006c08c"
+      }
+    },
+    {
+      "id": "cni-bridge",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-bridge",
+        "encoding": "zstd",
+        "encoded_bytes": 2696184,
+        "sha256": "814c1614ae9e96ae240da32b667f0011d100bec0acdd6835cc83002e58c44d53"
+      }
+    },
+    {
+      "id": "cni-host-local",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-host-local",
+        "encoding": "zstd",
+        "encoded_bytes": 2132112,
+        "sha256": "1c501f73bbeeab9ac680857eed608cc7c6c0653e31a2e0a200a86c70d3bb65ca"
+      }
+    },
+    {
+      "id": "cni-portmap",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-portmap",
+        "encoding": "zstd",
+        "encoded_bytes": 2451234,
+        "sha256": "5bccb64a8abbf3c9c86dae0f843b1a72494da4e2858b284a35ad3ca853400eb0"
+      }
+    },
+    {
+      "id": "cni-loopback",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-loopback",
+        "encoding": "zstd",
+        "encoded_bytes": 2106418,
+        "sha256": "1005af08976311547fe2b0a41c389c612bfe542622ce2f644e17117c76c8a57f"
+      }
+    },
+    {
+      "id": "image-coredns",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-coredns",
+        "encoding": "gzip",
+        "encoded_bytes": 21035204,
+        "sha256": "3533745d553d9ada7a5fec2018567473c4c60df3a1646fc129efcdc780708e13"
+      }
+    },
+    {
+      "id": "image-pause",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-pause",
+        "encoding": "gzip",
+        "encoded_bytes": 277677,
+        "sha256": "012543d9e326717065a20db77e054190ae25e6bdfcf68b3e3793d4b55727f0c5"
+      }
+    },
+    {
+      "id": "image-local-path",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-local-path",
+        "encoding": "gzip",
+        "encoded_bytes": 84212031,
+        "sha256": "36f9db385a63293a58c1c8308da6341e59072c78cb3c255766243f002b464373"
+      }
+    },
+    {
+      "id": "image-local-path-helper",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-local-path-helper",
+        "encoding": "gzip",
+        "encoded_bytes": 1912967,
+        "sha256": "10d8c9d113fdc1c5fa1cbb2a941dd33f31e0da986e9852c6d5e6024fad052278"
+      }
+    },
+    {
+      "id": "image-portainer-agent",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-portainer-agent",
+        "encoding": "gzip",
+        "encoded_bytes": 43659205,
+        "sha256": "b138701456bf3e836ca831a7e28cc6581dea14f5f59eb01a8baad6ee4c1de91f"
+      }
+    },
+    {
+      "id": "image-d2k",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-d2k",
+        "encoding": "gzip",
+        "encoded_bytes": 12129075,
+        "sha256": "59aebbc8922ad7ce4b5deb43a1256482d63f9250cf20c85cf9a521453f28a59f"
+      }
+    },
+    {
+      "id": "image-kubesolo",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-kubesolo",
+        "encoding": "gzip",
+        "encoded_bytes": 85689657,
+        "sha256": "868c6b3b9b563800bbe02b14219f549314138415955d8537d6dc2701c518a678"
+      }
+    }
+  ]
+}

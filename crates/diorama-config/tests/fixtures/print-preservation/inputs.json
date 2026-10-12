@@ -1,0 +1,8 @@
+{
+  "empty-path": "{\"path\": \"\"}",
+  "empty-sans": "{\"kubernetes\": {\"apiServer\": {\"extraSANs\": []}}}",
+  "space-ls": "{\"d2k\": {\"namespace\": \" \\u2028aa\"}}",
+  "space-ps": "{\"d2k\": {\"namespace\": \" \\u2029aa\"}}",
+  "leading-ls-space": "{\"d2k\": {\"namespace\": \"\\u2028\\n a\"}}",
+  "leading-ps-space": "{\"d2k\": {\"namespace\": \"\\u2029\\n a\"}}"
+}

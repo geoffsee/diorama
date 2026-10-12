@@ -1,0 +1,70 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Capture.Dockerfile
+#1 transferring dockerfile: 900B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [build 1/6] FROM docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd
+#4 resolve docker.io/library/golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 1.16kB done
+#5 DONE 0.0s
+
+#6 [build 2/6] WORKDIR /src
+#6 CACHED
+
+#7 [build 3/6] RUN curl --fail --location --retry 3 --output /tmp/source.tar.gz https://codeload.github.com/portainer/kubesolo/tar.gz/2ef1c4787989f11f868f81bb84ae2afd4a49a81d     && echo '9d5f3ce1f3fbda971fb1e2fb6da18ae3880caeec677f0e5d928a3bbe7bb76aec  /tmp/source.tar.gz' | sha256sum --check     && tar --extract --gzip --file /tmp/source.tar.gz --strip-components=1
+#7 CACHED
+
+#8 [build 4/6] COPY file_capture_test.go /src/internal/config/diorama_capture_test.go
+#8 DONE 0.0s
+
+#9 [build 5/6] COPY api_capture_test.go /src/pkg/components/configapi/diorama_capture_test.go
+#9 DONE 0.0s
+
+#10 [build 6/6] RUN mkdir /out && go test -c -p 2 -tags external_deps -trimpath -o /out/config.test ./internal/config
+#10 0.101 go: downloading sigs.k8s.io/yaml v1.6.0
+#10 0.101 go: downloading github.com/distribution/reference v0.6.0
+#10 0.105 go: downloading github.com/rs/zerolog v1.33.0
+#10 0.105 go: downloading github.com/k3s-io/kubernetes/staging/src/k8s.io/apimachinery v1.35.7-k3s1
+#10 0.105 go: downloading k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
+#10 0.106 go: downloading github.com/alecthomas/kingpin/v2 v2.4.0
+#10 1.222 go: downloading go.yaml.in/yaml/v2 v2.4.4
+#10 1.222 go: downloading github.com/opencontainers/go-digest v1.0.0
+#10 1.223 go: downloading github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b
+#10 1.224 go: downloading github.com/xhit/go-str2duration/v2 v2.1.0
+#10 1.297 go: downloading github.com/mattn/go-colorable v0.1.13
+#10 1.396 go: downloading gopkg.in/inf.v0 v0.9.1
+#10 1.396 go: downloading sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+#10 1.396 go: downloading github.com/fxamacker/cbor/v2 v2.9.0
+#10 1.526 go: downloading github.com/mattn/go-isatty v0.0.20
+#10 1.626 go: downloading github.com/x448/float16 v0.8.4
+#10 1.728 go: downloading golang.org/x/sys v0.47.0
+#10 DONE 7.0s
+
+#11 [capture 1/1] WORKDIR /tmp
+#11 DONE 0.0s
+
+#12 exporting to image
+#12 exporting layers
+#12 exporting layers 2.2s done
+#12 exporting manifest sha256:fec2ac5b5afa7cde9e39c828ea50127d57739b28c1d96b8aff205bc16f8208be
+#12 exporting manifest sha256:fec2ac5b5afa7cde9e39c828ea50127d57739b28c1d96b8aff205bc16f8208be done
+#12 exporting config sha256:8fe7e84257ba556dd295ad65671ddd7e2af927bddf6fd4858c1bab57d0a2c414 done
+#12 exporting attestation manifest sha256:6a878c93fe0742940e736996542224b2a0d5d28b31a1a17fcef8062dc8011da1 done
+#12 exporting manifest list sha256:4eba3cf07123ae20bdba4655aa6c7721d1bd7ab3a8f527d7635204046ef41833 done
+#12 naming to docker.io/library/diorama-config-print-preservation-y3zkld:latest done
+#12 unpacking to docker.io/library/diorama-config-print-preservation-y3zkld:latest
+#12 unpacking to docker.io/library/diorama-config-print-preservation-y3zkld:latest 0.5s done
+#12 DONE 2.7s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/dlyxhaw82fvxboctcfpjin1oe

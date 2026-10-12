@@ -1,0 +1,546 @@
+{
+  "schema_version": 1,
+  "id": "layers-render-characterization",
+  "cases": [
+    {
+      "id": "quoting-00",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"yes\"}, \"d2k\": {\"namespace\": \"yes\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-01",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"0123\"}, \"d2k\": {\"namespace\": \"0123\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-02",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"1e3\"}, \"d2k\": {\"namespace\": \"1e3\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-03",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"1:20\"}, \"d2k\": {\"namespace\": \"1:20\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-04",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"hello: world\"}, \"d2k\": {\"namespace\": \"hello: world\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-05",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"hello # world\"}, \"d2k\": {\"namespace\": \"hello # world\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-06",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"plain#hash\"}, \"d2k\": {\"namespace\": \"plain#hash\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-07",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \" café 雪 😀 \"}, \"d2k\": {\"namespace\": \" café 雪 😀 \"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-08",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a\\nb\"}, \"d2k\": {\"namespace\": \"a\\nb\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-09",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a\\nb\\n\"}, \"d2k\": {\"namespace\": \"a\\nb\\n\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-10",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a\\nb\\n\\n\"}, \"d2k\": {\"namespace\": \"a\\nb\\n\\n\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-11",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \" a\\nb\"}, \"d2k\": {\"namespace\": \" a\\nb\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-12",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a \\nb\"}, \"d2k\": {\"namespace\": \"a \\nb\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-13",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a\\tb\"}, \"d2k\": {\"namespace\": \"a\\tb\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-14",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"a\\u0000b\"}, \"d2k\": {\"namespace\": \"a\\u0000b\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-15",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"true\"}, \"d2k\": {\"namespace\": \"true\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-16",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"2026-09-27\"}, \"d2k\": {\"namespace\": \"2026-09-27\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "quoting-17",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \"128Mi\"}, \"d2k\": {\"namespace\": \"128Mi\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "semantic-repair",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "env": {
+        "KUBESOLO_CPU_MANAGER_POLICY": "none"
+      },
+      "files": {
+        "config.yaml": "{\"kubernetes\": {\"kubelet\": {\"cpuManager\": {\"policy\": \"bogus\"}}}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "invalid-env-overridden",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}",
+        "--mtu",
+        "1400"
+      ],
+      "env": {
+        "KUBESOLO_MTU": "bad"
+      },
+      "files": {
+        "config.yaml": "{}"
+      },
+      "expect": {
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "collections",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "env": {
+        "KUBESOLO_APISERVER_EXTRA_SANS": " a.example, , b.example,",
+        "KUBESOLO_SYSTEM_RESERVED": "memory=1Mi,, memory=2Mi, "
+      },
+      "files": {
+        "config.yaml": "{}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "derived-path",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "env": {
+        "KUBESOLO_PATH": "/env/../final"
+      },
+      "files": {
+        "config.yaml": "{}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "empty-socket",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "env": {
+        "KUBESOLO_API_SOCKET_PATH": "",
+        "KUBESOLO_PATH": "/changed"
+      },
+      "files": {
+        "config.yaml": "{\"api\": {\"socketPath\": \"/file.sock\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "explicit-socket",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "env": {
+        "KUBESOLO_PATH": "/changed"
+      },
+      "files": {
+        "config.yaml": "{\"api\": {\"socketPath\": \"/file.sock\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "surrogate-escape-rejected",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"portainer\": {\"edgeKey\": \" caf\\u00e9 \\u96ea \\ud83d\\ude00 \"}, \"d2k\": {\"namespace\": \" caf\\u00e9 \\u96ea \\ud83d\\ude00 \"}}"
+      },
+      "expect": {
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "extended-quote-00",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word \"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-01",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"head longword longword longword longword longword longword longword longword longword longword longword longword longword longword longword longword longword longword tail\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-02",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"\\n\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-03",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"\\n\\n\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-04",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"\\nabc\\n\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-05",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"ab\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-06",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"a b\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-07",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"a b\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-08",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"<<\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-09",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"2026-99-99\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-10",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"2026-9-7T12:3:4Z\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "extended-quote-11",
+      "argv": [
+        "--print-config",
+        "--config",
+        "{fixture:config.yaml}"
+      ],
+      "files": {
+        "config.yaml": "{\"d2k\": {\"namespace\": \"a﻿b\"}}"
+      },
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

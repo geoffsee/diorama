@@ -1,0 +1,290 @@
+{
+  "revision": "2ef1c4787989f11f868f81bb84ae2afd4a49a81d",
+  "artifact_sha256": "67348b2560d0f831de20ef722c53cc317e385ab7cfbf406633fbbb6a7b73f81e",
+  "capture": "/tmp/diorama-config-map-probe-20260927-r2",
+  "suite_sha256": "cc4b6520e1e76a2c11c7e84c73187641f2fff65deb39da165df80263f50fb768",
+  "cases": [
+    {
+      "id": "resource-comma",
+      "input": "kubernetes: {kubelet: {systemReserved: {cpu: \"100m,memory=128Mi\"}}}\n",
+      "exit_code": 0,
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\n    systemReserved:\n      cpu: 100m\n      memory: 128Mi\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"/fixtures/000/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "expected_typed": {
+        "api": {
+          "enabled": false,
+          "socketPath": "/var/lib/diorama/config.sock"
+        },
+        "apiVersion": "kubesolo.io/v1alpha1",
+        "d2k": {
+          "enabled": false,
+          "namespace": "d2k"
+        },
+        "kind": "Config",
+        "kubernetes": {
+          "apiServer": {
+            "startupTimeoutSeconds": 600,
+            "extraSANs": null
+          },
+          "kubelet": {
+            "cpuManager": {
+              "policy": "none",
+              "reservedCPUs": "",
+              "policyOptions": null
+            },
+            "systemReserved": {
+              "cpu": "100m",
+              "memory": "128Mi"
+            }
+          },
+          "nodeName": ""
+        },
+        "logging": {
+          "debug": false,
+          "pprof": false
+        },
+        "metrics": {
+          "bindAddress": "127.0.0.1:9105",
+          "enabled": false
+        },
+        "network": {
+          "disableIPv6": false,
+          "loadBalancer": {
+            "enabled": true,
+            "ip": ""
+          },
+          "mtu": 0,
+          "nodeIP": ""
+        },
+        "path": "/var/lib/diorama",
+        "portainer": {
+          "async": false,
+          "edgeID": "",
+          "edgeKey": "",
+          "image": "docker.io/portainer/agent:lts"
+        },
+        "runtime": {
+          "endpoint": "",
+          "containerMode": null
+        },
+        "storage": {
+          "dbWALRepair": false,
+          "localPath": {
+            "enabled": true,
+            "sharedPath": ""
+          }
+        }
+      }
+    },
+    {
+      "id": "policy-comma",
+      "input": "runtime: {containerMode: false}\nkubernetes: {kubelet: {cpuManager: {policy: static, policyOptions: {full-pcpus-only: \"true,strict-cpu-reservation=true\"}}}}\n",
+      "exit_code": 0,
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: static\n      policyOptions:\n        full-pcpus-only: \"true\"\n        strict-cpu-reservation: \"true\"\n      reservedCPUs: \"0\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  containerMode: false\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"cpumanager\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"neither --reserved-cpus nor --system-reserved cpu is set, defaulting to cpu \\\"0\\\"\"}\n{\"level\":\"info\",\"component\":\"cpumanager\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"cpu pinning enabled: 1 of 16 cpus reserved for the host (cpuset \\\"0\\\"), 15 available for exclusive allocation\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"/fixtures/001/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "expected_typed": {
+        "api": {
+          "enabled": false,
+          "socketPath": "/var/lib/diorama/config.sock"
+        },
+        "apiVersion": "kubesolo.io/v1alpha1",
+        "d2k": {
+          "enabled": false,
+          "namespace": "d2k"
+        },
+        "kind": "Config",
+        "kubernetes": {
+          "apiServer": {
+            "startupTimeoutSeconds": 600,
+            "extraSANs": null
+          },
+          "kubelet": {
+            "cpuManager": {
+              "policy": "static",
+              "policyOptions": {
+                "full-pcpus-only": "true",
+                "strict-cpu-reservation": "true"
+              },
+              "reservedCPUs": "0"
+            },
+            "systemReserved": null
+          },
+          "nodeName": ""
+        },
+        "logging": {
+          "debug": false,
+          "pprof": false
+        },
+        "metrics": {
+          "bindAddress": "127.0.0.1:9105",
+          "enabled": false
+        },
+        "network": {
+          "disableIPv6": false,
+          "loadBalancer": {
+            "enabled": true,
+            "ip": ""
+          },
+          "mtu": 0,
+          "nodeIP": ""
+        },
+        "path": "/var/lib/diorama",
+        "portainer": {
+          "async": false,
+          "edgeID": "",
+          "edgeKey": "",
+          "image": "docker.io/portainer/agent:lts"
+        },
+        "runtime": {
+          "containerMode": false,
+          "endpoint": ""
+        },
+        "storage": {
+          "dbWALRepair": false,
+          "localPath": {
+            "enabled": true,
+            "sharedPath": ""
+          }
+        }
+      }
+    },
+    {
+      "id": "hex-tag",
+      "input": "portainer: {image: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:latest}\n",
+      "exit_code": 0,
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/library/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:latest\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"/fixtures/002/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "expected_typed": {
+        "api": {
+          "enabled": false,
+          "socketPath": "/var/lib/diorama/config.sock"
+        },
+        "apiVersion": "kubesolo.io/v1alpha1",
+        "d2k": {
+          "enabled": false,
+          "namespace": "d2k"
+        },
+        "kind": "Config",
+        "kubernetes": {
+          "apiServer": {
+            "startupTimeoutSeconds": 600,
+            "extraSANs": null
+          },
+          "kubelet": {
+            "cpuManager": {
+              "policy": "none",
+              "reservedCPUs": "",
+              "policyOptions": null
+            },
+            "systemReserved": null
+          },
+          "nodeName": ""
+        },
+        "logging": {
+          "debug": false,
+          "pprof": false
+        },
+        "metrics": {
+          "bindAddress": "127.0.0.1:9105",
+          "enabled": false
+        },
+        "network": {
+          "disableIPv6": false,
+          "loadBalancer": {
+            "enabled": true,
+            "ip": ""
+          },
+          "mtu": 0,
+          "nodeIP": ""
+        },
+        "path": "/var/lib/diorama",
+        "portainer": {
+          "async": false,
+          "edgeID": "",
+          "edgeKey": "",
+          "image": "docker.io/library/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:latest"
+        },
+        "runtime": {
+          "endpoint": "",
+          "containerMode": null
+        },
+        "storage": {
+          "dbWALRepair": false,
+          "localPath": {
+            "enabled": true,
+            "sharedPath": ""
+          }
+        }
+      }
+    },
+    {
+      "id": "long-domain-path",
+      "input": "portainer: {image: registry.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n",
+      "exit_code": 0,
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: registry.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:latest\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:19:19Z\",\"message\":\"/fixtures/003/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "expected_typed": {
+        "api": {
+          "enabled": false,
+          "socketPath": "/var/lib/diorama/config.sock"
+        },
+        "apiVersion": "kubesolo.io/v1alpha1",
+        "d2k": {
+          "enabled": false,
+          "namespace": "d2k"
+        },
+        "kind": "Config",
+        "kubernetes": {
+          "apiServer": {
+            "startupTimeoutSeconds": 600,
+            "extraSANs": null
+          },
+          "kubelet": {
+            "cpuManager": {
+              "policy": "none",
+              "reservedCPUs": "",
+              "policyOptions": null
+            },
+            "systemReserved": null
+          },
+          "nodeName": ""
+        },
+        "logging": {
+          "debug": false,
+          "pprof": false
+        },
+        "metrics": {
+          "bindAddress": "127.0.0.1:9105",
+          "enabled": false
+        },
+        "network": {
+          "disableIPv6": false,
+          "loadBalancer": {
+            "enabled": true,
+            "ip": ""
+          },
+          "mtu": 0,
+          "nodeIP": ""
+        },
+        "path": "/var/lib/diorama",
+        "portainer": {
+          "async": false,
+          "edgeID": "",
+          "edgeKey": "",
+          "image": "registry.example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:latest"
+        },
+        "runtime": {
+          "endpoint": "",
+          "containerMode": null
+        },
+        "storage": {
+          "dbWALRepair": false,
+          "localPath": {
+            "enabled": true,
+            "sharedPath": ""
+          }
+        }
+      }
+    }
+  ]
+}

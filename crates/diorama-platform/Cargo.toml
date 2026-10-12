@@ -1,0 +1,19 @@
+[package]
+name = "diorama-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autotests = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.5", features = ["system", "process", "fs", "net"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

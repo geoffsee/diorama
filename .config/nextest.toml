@@ -1,0 +1,13 @@
+[profile.default]
+fail-fast = false
+status-level = "leak"
+final-status-level = "slow"
+
+[profile.ci]
+inherits = "default"
+fail-fast = false
+retries = 0
+status-level = "pass"
+
+[profile.ci.junit]
+path = "results.xml"

@@ -1,0 +1,972 @@
+[
+  {
+    "checks": {
+      "injected_error_propagated": true,
+      "repeat_success": true
+    },
+    "component": "coredns",
+    "objects": {
+      "clusterrolebindings": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "system:coredns"
+          },
+          "subjects": [
+            {
+              "kind": "ServiceAccount",
+              "name": "coredns",
+              "namespace": "kube-system"
+            }
+          ]
+        }
+      ],
+      "clusterroles": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "rules": [
+            {
+              "apiGroups": [
+                ""
+              ],
+              "resources": [
+                "endpoints",
+                "services",
+                "pods",
+                "namespaces"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            },
+            {
+              "apiGroups": [
+                "discovery.k8s.io"
+              ],
+              "resources": [
+                "endpointslices"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            }
+          ]
+        }
+      ],
+      "configmaps": [
+        {
+          "data": {
+            "Corefile": ".:53 {\n\terrors\n\tloop\n\tcache 30 {\n\t\tdisable denial cluster.local\n\t}\n\tkubernetes cluster.local in-addr.arpa ip6.arpa {\n\t\tpods insecure\n\t\tfallthrough in-addr.arpa ip6.arpa\n\t\tttl 30\n\t}\n\tforward . /etc/resolv.conf\n\tminimal\n\treload\n\thealth :8080\n\tready :8181\n}"
+          },
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "deployments": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "coredns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "k8s-app": "coredns"
+              }
+            },
+            "strategy": {
+              "rollingUpdate": {
+                "maxUnavailable": 1
+              },
+              "type": "RollingUpdate"
+            },
+            "template": {
+              "metadata": {
+                "labels": {
+                  "k8s-app": "coredns"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "args": [
+                      "-conf",
+                      "/etc/coredns/Corefile"
+                    ],
+                    "image": "docker.io/coredns/coredns:1.14.4",
+                    "imagePullPolicy": "IfNotPresent",
+                    "livenessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8080,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 60,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "name": "coredns",
+                    "ports": [
+                      {
+                        "containerPort": 53,
+                        "name": "dns",
+                        "protocol": "UDP"
+                      },
+                      {
+                        "containerPort": 53,
+                        "name": "dns-tcp",
+                        "protocol": "TCP"
+                      },
+                      {
+                        "containerPort": 8080,
+                        "name": "metrics",
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "readinessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/ready",
+                        "port": 8181,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 10,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "resources": {
+                      "limits": {
+                        "memory": "64Mi"
+                      },
+                      "requests": {
+                        "cpu": "50m",
+                        "memory": "20Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "mountPath": "/etc/coredns",
+                        "name": "config-volume"
+                      }
+                    ]
+                  }
+                ],
+                "dnsPolicy": "Default",
+                "priorityClassName": "system-cluster-critical",
+                "serviceAccountName": "coredns",
+                "volumes": [
+                  {
+                    "configMap": {
+                      "items": [
+                        {
+                          "key": "Corefile",
+                          "path": "Corefile"
+                        }
+                      ],
+                      "name": "coredns"
+                    },
+                    "name": "config-volume"
+                  }
+                ]
+              }
+            }
+          },
+          "status": {}
+        }
+      ],
+      "namespaces": null,
+      "rolebindings": null,
+      "roles": null,
+      "secrets": null,
+      "serviceaccounts": [
+        {
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "services": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "kube-dns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "clusterIP": "10.43.0.10",
+            "ports": [
+              {
+                "name": "dns",
+                "port": 53,
+                "protocol": "UDP",
+                "targetPort": 0
+              },
+              {
+                "name": "dns-tcp",
+                "port": 53,
+                "protocol": "TCP",
+                "targetPort": 0
+              }
+            ],
+            "selector": {
+              "k8s-app": "coredns"
+            }
+          },
+          "status": {
+            "loadBalancer": {}
+          }
+        }
+      ],
+      "storageclasses": null
+    },
+    "variant": "host-dual"
+  },
+  {
+    "checks": {
+      "injected_error_propagated": true,
+      "repeat_success": true
+    },
+    "component": "coredns",
+    "objects": {
+      "clusterrolebindings": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "system:coredns"
+          },
+          "subjects": [
+            {
+              "kind": "ServiceAccount",
+              "name": "coredns",
+              "namespace": "kube-system"
+            }
+          ]
+        }
+      ],
+      "clusterroles": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "rules": [
+            {
+              "apiGroups": [
+                ""
+              ],
+              "resources": [
+                "endpoints",
+                "services",
+                "pods",
+                "namespaces"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            },
+            {
+              "apiGroups": [
+                "discovery.k8s.io"
+              ],
+              "resources": [
+                "endpointslices"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            }
+          ]
+        }
+      ],
+      "configmaps": [
+        {
+          "data": {
+            "Corefile": ".:53 {\n\terrors\n\tloop\n\tcache 30 {\n\t\tdisable denial cluster.local\n\t}\n\tkubernetes cluster.local in-addr.arpa ip6.arpa {\n\t\tpods insecure\n\t\tfallthrough in-addr.arpa ip6.arpa\n\t\tttl 30\n\t}\n\tforward . 1.1.1.1 8.8.8.8\n\tminimal\n\treload\n\thealth :8080\n\tready :8181\n}"
+          },
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "deployments": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "coredns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "k8s-app": "coredns"
+              }
+            },
+            "strategy": {
+              "rollingUpdate": {
+                "maxUnavailable": 1
+              },
+              "type": "RollingUpdate"
+            },
+            "template": {
+              "metadata": {
+                "labels": {
+                  "k8s-app": "coredns"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "args": [
+                      "-conf",
+                      "/etc/coredns/Corefile"
+                    ],
+                    "image": "docker.io/coredns/coredns:1.14.4",
+                    "imagePullPolicy": "IfNotPresent",
+                    "livenessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8080,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 60,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "name": "coredns",
+                    "ports": [
+                      {
+                        "containerPort": 53,
+                        "name": "dns",
+                        "protocol": "UDP"
+                      },
+                      {
+                        "containerPort": 53,
+                        "name": "dns-tcp",
+                        "protocol": "TCP"
+                      },
+                      {
+                        "containerPort": 8080,
+                        "name": "metrics",
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "readinessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/ready",
+                        "port": 8181,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 10,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "resources": {
+                      "requests": {
+                        "cpu": "50m",
+                        "memory": "20Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "mountPath": "/etc/coredns",
+                        "name": "config-volume"
+                      }
+                    ]
+                  }
+                ],
+                "dnsPolicy": "Default",
+                "priorityClassName": "system-cluster-critical",
+                "serviceAccountName": "coredns",
+                "volumes": [
+                  {
+                    "configMap": {
+                      "items": [
+                        {
+                          "key": "Corefile",
+                          "path": "Corefile"
+                        }
+                      ],
+                      "name": "coredns"
+                    },
+                    "name": "config-volume"
+                  }
+                ]
+              }
+            }
+          },
+          "status": {}
+        }
+      ],
+      "namespaces": null,
+      "rolebindings": null,
+      "roles": null,
+      "secrets": null,
+      "serviceaccounts": [
+        {
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "services": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "kube-dns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "clusterIP": "10.43.0.10",
+            "ports": [
+              {
+                "name": "dns",
+                "port": 53,
+                "protocol": "UDP",
+                "targetPort": 0
+              },
+              {
+                "name": "dns-tcp",
+                "port": 53,
+                "protocol": "TCP",
+                "targetPort": 0
+              }
+            ],
+            "selector": {
+              "k8s-app": "coredns"
+            }
+          },
+          "status": {
+            "loadBalancer": {}
+          }
+        }
+      ],
+      "storageclasses": null
+    },
+    "variant": "container-dual"
+  },
+  {
+    "checks": {
+      "injected_error_propagated": true,
+      "repeat_success": true
+    },
+    "component": "coredns",
+    "objects": {
+      "clusterrolebindings": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "system:coredns"
+          },
+          "subjects": [
+            {
+              "kind": "ServiceAccount",
+              "name": "coredns",
+              "namespace": "kube-system"
+            }
+          ]
+        }
+      ],
+      "clusterroles": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "rules": [
+            {
+              "apiGroups": [
+                ""
+              ],
+              "resources": [
+                "endpoints",
+                "services",
+                "pods",
+                "namespaces"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            },
+            {
+              "apiGroups": [
+                "discovery.k8s.io"
+              ],
+              "resources": [
+                "endpointslices"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            }
+          ]
+        }
+      ],
+      "configmaps": [
+        {
+          "data": {
+            "Corefile": ".:53 {\n\terrors\n\tloop\n\tcache 30 {\n\t\tdisable denial cluster.local\n\t}\n\tkubernetes cluster.local in-addr.arpa {\n\t\tpods insecure\n\t\tfallthrough in-addr.arpa\n\t\tttl 30\n\t}\n\tforward . /etc/resolv.conf\n\tminimal\n\treload\n\thealth :8080\n\tready :8181\n}"
+          },
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "deployments": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "coredns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "k8s-app": "coredns"
+              }
+            },
+            "strategy": {
+              "rollingUpdate": {
+                "maxUnavailable": 1
+              },
+              "type": "RollingUpdate"
+            },
+            "template": {
+              "metadata": {
+                "labels": {
+                  "k8s-app": "coredns"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "args": [
+                      "-conf",
+                      "/etc/coredns/Corefile"
+                    ],
+                    "image": "docker.io/coredns/coredns:1.14.4",
+                    "imagePullPolicy": "IfNotPresent",
+                    "livenessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8080,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 60,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "name": "coredns",
+                    "ports": [
+                      {
+                        "containerPort": 53,
+                        "name": "dns",
+                        "protocol": "UDP"
+                      },
+                      {
+                        "containerPort": 53,
+                        "name": "dns-tcp",
+                        "protocol": "TCP"
+                      },
+                      {
+                        "containerPort": 8080,
+                        "name": "metrics",
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "readinessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/ready",
+                        "port": 8181,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 10,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "resources": {
+                      "limits": {
+                        "memory": "64Mi"
+                      },
+                      "requests": {
+                        "cpu": "50m",
+                        "memory": "20Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "mountPath": "/etc/coredns",
+                        "name": "config-volume"
+                      }
+                    ]
+                  }
+                ],
+                "dnsPolicy": "Default",
+                "priorityClassName": "system-cluster-critical",
+                "serviceAccountName": "coredns",
+                "volumes": [
+                  {
+                    "configMap": {
+                      "items": [
+                        {
+                          "key": "Corefile",
+                          "path": "Corefile"
+                        }
+                      ],
+                      "name": "coredns"
+                    },
+                    "name": "config-volume"
+                  }
+                ]
+              }
+            }
+          },
+          "status": {}
+        }
+      ],
+      "namespaces": null,
+      "rolebindings": null,
+      "roles": null,
+      "secrets": null,
+      "serviceaccounts": [
+        {
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "services": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "kube-dns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "clusterIP": "10.43.0.10",
+            "ports": [
+              {
+                "name": "dns",
+                "port": 53,
+                "protocol": "UDP",
+                "targetPort": 0
+              },
+              {
+                "name": "dns-tcp",
+                "port": 53,
+                "protocol": "TCP",
+                "targetPort": 0
+              }
+            ],
+            "selector": {
+              "k8s-app": "coredns"
+            }
+          },
+          "status": {
+            "loadBalancer": {}
+          }
+        }
+      ],
+      "storageclasses": null
+    },
+    "variant": "host-ipv4"
+  },
+  {
+    "checks": {
+      "injected_error_propagated": true,
+      "repeat_success": true
+    },
+    "component": "coredns",
+    "objects": {
+      "clusterrolebindings": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "system:coredns"
+          },
+          "subjects": [
+            {
+              "kind": "ServiceAccount",
+              "name": "coredns",
+              "namespace": "kube-system"
+            }
+          ]
+        }
+      ],
+      "clusterroles": [
+        {
+          "metadata": {
+            "name": "system:coredns"
+          },
+          "rules": [
+            {
+              "apiGroups": [
+                ""
+              ],
+              "resources": [
+                "endpoints",
+                "services",
+                "pods",
+                "namespaces"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            },
+            {
+              "apiGroups": [
+                "discovery.k8s.io"
+              ],
+              "resources": [
+                "endpointslices"
+              ],
+              "verbs": [
+                "list",
+                "watch"
+              ]
+            }
+          ]
+        }
+      ],
+      "configmaps": [
+        {
+          "data": {
+            "Corefile": ".:53 {\n\terrors\n\tloop\n\tcache 30 {\n\t\tdisable denial cluster.local\n\t}\n\tkubernetes cluster.local in-addr.arpa {\n\t\tpods insecure\n\t\tfallthrough in-addr.arpa\n\t\tttl 30\n\t}\n\tforward . 1.1.1.1 8.8.8.8\n\tminimal\n\treload\n\thealth :8080\n\tready :8181\n}"
+          },
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "deployments": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "coredns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "replicas": 1,
+            "selector": {
+              "matchLabels": {
+                "k8s-app": "coredns"
+              }
+            },
+            "strategy": {
+              "rollingUpdate": {
+                "maxUnavailable": 1
+              },
+              "type": "RollingUpdate"
+            },
+            "template": {
+              "metadata": {
+                "labels": {
+                  "k8s-app": "coredns"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "args": [
+                      "-conf",
+                      "/etc/coredns/Corefile"
+                    ],
+                    "image": "docker.io/coredns/coredns:1.14.4",
+                    "imagePullPolicy": "IfNotPresent",
+                    "livenessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8080,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 60,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "name": "coredns",
+                    "ports": [
+                      {
+                        "containerPort": 53,
+                        "name": "dns",
+                        "protocol": "UDP"
+                      },
+                      {
+                        "containerPort": 53,
+                        "name": "dns-tcp",
+                        "protocol": "TCP"
+                      },
+                      {
+                        "containerPort": 8080,
+                        "name": "metrics",
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "readinessProbe": {
+                      "failureThreshold": 3,
+                      "httpGet": {
+                        "path": "/ready",
+                        "port": 8181,
+                        "scheme": "HTTP"
+                      },
+                      "initialDelaySeconds": 10,
+                      "periodSeconds": 10,
+                      "successThreshold": 1,
+                      "timeoutSeconds": 5
+                    },
+                    "resources": {
+                      "requests": {
+                        "cpu": "50m",
+                        "memory": "20Mi"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "mountPath": "/etc/coredns",
+                        "name": "config-volume"
+                      }
+                    ]
+                  }
+                ],
+                "dnsPolicy": "Default",
+                "priorityClassName": "system-cluster-critical",
+                "serviceAccountName": "coredns",
+                "volumes": [
+                  {
+                    "configMap": {
+                      "items": [
+                        {
+                          "key": "Corefile",
+                          "path": "Corefile"
+                        }
+                      ],
+                      "name": "coredns"
+                    },
+                    "name": "config-volume"
+                  }
+                ]
+              }
+            }
+          },
+          "status": {}
+        }
+      ],
+      "namespaces": null,
+      "rolebindings": null,
+      "roles": null,
+      "secrets": null,
+      "serviceaccounts": [
+        {
+          "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system"
+          }
+        }
+      ],
+      "services": [
+        {
+          "metadata": {
+            "labels": {
+              "k8s-app": "coredns",
+              "kubernetes.io/name": "CoreDNS"
+            },
+            "name": "kube-dns",
+            "namespace": "kube-system"
+          },
+          "spec": {
+            "clusterIP": "10.43.0.10",
+            "ports": [
+              {
+                "name": "dns",
+                "port": 53,
+                "protocol": "UDP",
+                "targetPort": 0
+              },
+              {
+                "name": "dns-tcp",
+                "port": 53,
+                "protocol": "TCP",
+                "targetPort": 0
+              }
+            ],
+            "selector": {
+              "k8s-app": "coredns"
+            }
+          },
+          "status": {
+            "loadBalancer": {}
+          }
+        }
+      ],
+      "storageclasses": null
+    },
+    "variant": "container-ipv4"
+  }
+]

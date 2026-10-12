@@ -1,0 +1,35 @@
+[package]
+name = "diorama-containerd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+autotests = false
+
+[lints]
+workspace = true
+
+[dependencies]
+diorama-assets = { version = "=0.1.0", path = "../diorama-assets" }
+diorama-config = { version = "=0.1.0", path = "../diorama-config" }
+diorama-containerd-api = { version = "=0.1.0", path = "../diorama-containerd-api" }
+diorama-cri = { version = "=0.1.0", path = "../diorama-cri" }
+diorama-network = { version = "=0.1.0", path = "../diorama-network" }
+diorama-platform = { version = "=0.1.0", path = "../diorama-platform" }
+diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
+rustix = { version = "=1.1.5", features = ["fs"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.1", features = ["rt", "macros", "sync", "time", "fs", "net"] }
+toml = "=0.9.6"
+tonic = { version = "=0.14.6", default-features = false, features = ["transport"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio = { version = "=1.53.1", features = ["test-util"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"

@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "target": {
+    "os": "linux",
+    "architecture": "amd64",
+    "libc": "glibc"
+  },
+  "variant": "online",
+  "scope": "supervised-bundle",
+  "assets": [
+    {
+      "id": "kube-apiserver",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-apiserver",
+        "encoding": "identity",
+        "encoded_bytes": 85778616,
+        "sha256": "0317e382c47b721af23dfcf853073fbe76ebe26a592dffc42359e20be21047a8"
+      }
+    },
+    {
+      "id": "kube-controller-manager",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-controller-manager",
+        "encoding": "identity",
+        "encoded_bytes": 71790776,
+        "sha256": "82c0dc57f9d066e4aef869c88386b2e1baacd30d12746dd09e08cf8e41492df8"
+      }
+    },
+    {
+      "id": "kubelet",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kubelet",
+        "encoding": "identity",
+        "encoded_bytes": 58089764,
+        "sha256": "e48cbb9c62351aa95f455bdae3c9a9e9d7d644027c231ade7a67b868b2be3258"
+      }
+    },
+    {
+      "id": "kube-proxy",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-proxy",
+        "encoding": "identity",
+        "encoded_bytes": 43204792,
+        "sha256": "1c22a8ff41efba86b32d50a24b1d07149e2f8a96a43b914bafd92b984f8f40f0"
+      }
+    },
+    {
+      "id": "kine",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kine",
+        "encoding": "identity",
+        "encoded_bytes": 47431544,
+        "sha256": "1331b855502c9ba8f27d51531baa204e513b5d5056036d4ca453f06ef32ce976"
+      }
+    },
+    {
+      "id": "containerd",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/containerd",
+        "encoding": "identity",
+        "encoded_bytes": 48117256,
+        "sha256": "0d36f83ad8311019e32e2c15ebe63f9fae841f82d2ffe01b0d54cdc95efe51cb"
+      }
+    },
+    {
+      "id": "fuse-overlayfs-snapshotter",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/fuse-overlayfs-snapshotter",
+        "encoding": "identity",
+        "encoded_bytes": 12079288,
+        "sha256": "e048f9cc616299544fcdcd647cfecba10f60169537721c57e3628ac6c8a0c5c7"
+      }
+    },
+    {
+      "id": "containerd-shim-runc-v2",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/containerd-shim-runc-v2",
+        "encoding": "zstd",
+        "encoded_bytes": 2645520,
+        "sha256": "6cfdb015be1d8212a18354d9d11873e9700101866d9b5e4415669b3112dadfd2"
+      }
+    },
+    {
+      "id": "crun",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/crun",
+        "encoding": "zstd",
+        "encoded_bytes": 1281496,
+        "sha256": "48a16dd40f3aa45cd0dd8a3a62367abd874e16bf356e0daecb8ebfd3276e95b1"
+      }
+    },
+    {
+      "id": "cni-bridge",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-bridge",
+        "encoding": "zstd",
+        "encoded_bytes": 2935354,
+        "sha256": "e3c56c7d925a520d7c7045105001692da4168302d9cd2ad9f2d3272c22bff035"
+      }
+    },
+    {
+      "id": "cni-host-local",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-host-local",
+        "encoding": "zstd",
+        "encoded_bytes": 2311800,
+        "sha256": "1df67da3b5a6fab15cc99e85436c2ad07ee8857271bda17311b10aa85fa3c9af"
+      }
+    },
+    {
+      "id": "cni-portmap",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-portmap",
+        "encoding": "zstd",
+        "encoded_bytes": 2663776,
+        "sha256": "12ada2d3dc71a72d427f16458f003621765b14ac01483f6eeb9f7388ce98ae67"
+      }
+    },
+    {
+      "id": "cni-loopback",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/cni-loopback",
+        "encoding": "zstd",
+        "encoded_bytes": 2281531,
+        "sha256": "0aed308e7ca73d9775879faa49b2977973c798d60cf954c51cc3a4015131103c"
+      }
+    },
+    {
+      "id": "image-coredns",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-coredns",
+        "encoding": "gzip",
+        "encoded_bytes": 23563387,
+        "sha256": "0d595a7756626ad5446ce4adb5706d4b1927ae48f03ca009ecda54892b84ce49"
+      }
+    },
+    {
+      "id": "image-pause",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/image-pause",
+        "encoding": "gzip",
+        "encoded_bytes": 340417,
+        "sha256": "a4afc718f83d14fbbdf30d39349451f859fc2b663c302e22bfe80012e4800401"
+      }
+    },
+    {
+      "id": "image-local-path",
+      "delivery": {
+        "kind": "registry-required"
+      }
+    },
+    {
+      "id": "image-local-path-helper",
+      "delivery": {
+        "kind": "registry-required"
+      }
+    },
+    {
+      "id": "image-portainer-agent",
+      "delivery": {
+        "kind": "registry-required"
+      }
+    },
+    {
+      "id": "image-d2k",
+      "delivery": {
+        "kind": "registry-required"
+      }
+    },
+    {
+      "id": "image-kubesolo",
+      "delivery": {
+        "kind": "registry-required"
+      }
+    }
+  ]
+}

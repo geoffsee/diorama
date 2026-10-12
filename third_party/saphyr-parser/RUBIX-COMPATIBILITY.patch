@@ -1,0 +1,184 @@
+--- a/src/char_traits.rs
++++ b/src/char_traits.rs
+@@ -11,7 +11,7 @@
+ #[inline]
+ #[must_use]
+ pub fn is_break(c: char) -> bool {
+-    c == '\n' || c == '\r'
++    matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
+ }
+ 
+ /// Check whether the character is nil or a line break (`\0`, `\r`, `\n`).
+--- a/src/input/str.rs
++++ b/src/input/str.rs
+@@ -143,44 +143,21 @@
+ 
+     #[inline]
+     fn next_is_document_indicator(&self) -> bool {
+-        if self.buffer.len() < 3 {
+-            false
+-        } else {
+-            // Since all characters we look for are ascii, we can directly use the byte API of str.
+-            let bytes = self.buffer.as_bytes();
+-            (bytes.len() == 3 || is_blank_or_breakz(bytes[3] as char))
+-                && (bytes[0] == b'.' || bytes[0] == b'-')
+-                && bytes[0] == bytes[1]
+-                && bytes[1] == bytes[2]
+-        }
++        self.next_is_document_start() || self.next_is_document_end()
+     }
+ 
+     #[inline]
+     fn next_is_document_start(&self) -> bool {
+-        if self.buffer.len() < 3 {
+-            false
+-        } else {
+-            // Since all characters we look for are ascii, we can directly use the byte API of str.
+-            let bytes = self.buffer.as_bytes();
+-            (bytes.len() == 3 || is_blank_or_breakz(bytes[3] as char))
+-                && bytes[0] == b'-'
+-                && bytes[1] == b'-'
+-                && bytes[2] == b'-'
+-        }
++        self.buffer
++            .strip_prefix("---")
++            .is_some_and(|tail| is_blank_or_breakz(tail.chars().next().unwrap_or('\0')))
+     }
+ 
+     #[inline]
+     fn next_is_document_end(&self) -> bool {
+-        if self.buffer.len() < 3 {
+-            false
+-        } else {
+-            // Since all characters we look for are ascii, we can directly use the byte API of str.
+-            let bytes = self.buffer.as_bytes();
+-            (bytes.len() == 3 || is_blank_or_breakz(bytes[3] as char))
+-                && bytes[0] == b'.'
+-                && bytes[1] == b'.'
+-                && bytes[2] == b'.'
+-        }
++        self.buffer
++            .strip_prefix("...")
++            .is_some_and(|tail| is_blank_or_breakz(tail.chars().next().unwrap_or('\0')))
+     }
+ 
+     fn skip_ws_to_eol(&mut self, skip_tabs: SkipTabs) -> (usize, Result<SkipTabs, &'static str>) {
+@@ -255,16 +232,12 @@
+ 
+     #[inline]
+     fn next_is_blank_or_break(&self) -> bool {
+-        !self.buffer.is_empty()
+-            && (is_blank(self.buffer.as_bytes()[0] as char)
+-                || is_break(self.buffer.as_bytes()[0] as char))
++        is_blank(self.peek()) || is_break(self.peek())
+     }
+ 
+     #[inline]
+     fn next_is_blank_or_breakz(&self) -> bool {
+-        self.buffer.is_empty()
+-            || (is_blank(self.buffer.as_bytes()[0] as char)
+-                || is_breakz(self.buffer.as_bytes()[0] as char))
++        is_blank_or_breakz(self.peek())
+     }
+ 
+     #[inline]
+@@ -274,12 +247,12 @@
+ 
+     #[inline]
+     fn next_is_break(&self) -> bool {
+-        !self.buffer.is_empty() && is_break(self.buffer.as_bytes()[0] as char)
++        is_break(self.peek())
+     }
+ 
+     #[inline]
+     fn next_is_breakz(&self) -> bool {
+-        self.buffer.is_empty() || is_breakz(self.buffer.as_bytes()[0] as char)
++        is_breakz(self.peek())
+     }
+ 
+     #[inline]
+--- a/src/scanner.rs
++++ b/src/scanner.rs
+@@ -653,8 +653,9 @@
+     // If the next characters do not correspond to a line break.
+     #[inline]
+     fn read_break(&mut self, s: &mut String) {
++        let ch = self.input.peek();
+         self.skip_break();
+-        s.push('\n');
++        s.push(if matches!(ch, '\u{2028}' | '\u{2029}') { ch } else { '\n' });
+     }
+ 
+     // Read and consume a line break (either `\r`, `\n` or `\r\n`).
+@@ -889,7 +890,7 @@
+                     }
+                 }
+                 '\t' | ' ' => self.skip_blank(),
+-                '\n' | '\r' => {
++                '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+                     self.input.lookahead(2);
+                     self.skip_linebreak();
+                     if self.flow_level == 0 {
+@@ -943,7 +944,7 @@
+ 
+                     need_whitespace = false;
+                 }
+-                '\n' | '\r' => {
++                '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+                     self.input.lookahead(2);
+                     self.skip_linebreak();
+                     if self.flow_level == 0 {
+@@ -1780,7 +1781,7 @@
+ 
+             // We are at the first content character of a content line.
+             trailing_blank = self.input.next_is_blank();
+-            if !literal && !leading_break.is_empty() && !leading_blank && !trailing_blank {
++            if !literal && leading_break == "\n" && !leading_blank && !trailing_blank {
+                 string.push_str(&trailing_breaks);
+                 if trailing_breaks.is_empty() {
+                     string.push(' ');
+@@ -2002,7 +2003,8 @@
+                 ));
+             }
+ 
+-            if (self.mark.col as isize) < self.indent {
++            let closing_quote = (single && self.input.peek() == '\'' && self.input.peek_nth(1) != '\'') || (!single && self.input.peek() == '"');
++            if (self.mark.col as isize) < self.indent && !closing_quote {
+                 return Err(ScanError::new_str(
+                     start_mark,
+                     "invalid indentation in quoted scalar",
+@@ -2055,7 +2057,7 @@
+ 
+             // Join the whitespaces or fold line breaks.
+             if leading_blanks {
+-                if leading_break.is_empty() {
++                if leading_break != "\n" {
+                     string.push_str(&leading_break);
+                     string.push_str(&trailing_breaks);
+                     trailing_breaks.clear();
+@@ -2294,7 +2296,7 @@
+                 && self.input.next_can_be_plain_scalar(self.flow_level > 0)
+             {
+                 if self.leading_whitespace {
+-                    if self.buf_leading_break.is_empty() {
++                    if self.buf_leading_break != "\n" {
+                         string.push_str(&self.buf_leading_break);
+                         string.push_str(&self.buf_trailing_breaks);
+                         self.buf_trailing_breaks.clear();
+@@ -2371,12 +2373,14 @@
+                 } else {
+                     // Check if it is a first line break
+                     if self.leading_whitespace {
++                        let ch = self.input.peek();
+                         self.skip_break();
+-                        self.buf_trailing_breaks.push('\n');
++                        self.buf_trailing_breaks.push(if matches!(ch, '\u{2028}' | '\u{2029}') { ch } else { '\n' });
+                     } else {
+                         self.buf_whitespaces.clear();
++                        let ch = self.input.peek();
+                         self.skip_break();
+-                        self.buf_leading_break.push('\n');
++                        self.buf_leading_break.push(if matches!(ch, '\u{2028}' | '\u{2029}') { ch } else { '\n' });
+                         self.leading_whitespace = true;
+                     }
+                 }

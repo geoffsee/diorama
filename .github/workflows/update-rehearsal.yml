@@ -1,0 +1,48 @@
+name: Pinned upstream rehearsal
+
+on:
+  schedule:
+    - cron: '47 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rehearsal:
+    name: Verify pinned upstream inputs and compatibility fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Set up Docker to use mirror.gcr.io mirror
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
+        with:
+          cache-key: update-rehearsal
+      - name: Rehearse pinned upstream inputs
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- fetch
+          cargo run --locked -p diorama-dev --bin diorama-upstream -- verify
+          cargo run --locked -p diorama-dev --bin diorama-drift -- extract --cache-dir target/upstream --inventory target/rehearsal.json.gz
+      - name: Generate pinned-input comparison report
+        run: |
+          cargo run --locked -p diorama-dev --bin diorama-drift -- report \
+            --before tools/drift/inventory.json.gz \
+            --after target/rehearsal.json.gz \
+            --format markdown > update-report.md
+      - name: Publish comparison report
+        run: cat update-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Check independent pinned compatibility fixtures and API observations
+        run: |
+          cargo test --locked -p diorama-config --test suite compatibility:: layers::
+          cargo test --locked -p diorama-upstream-codegen --test suite api_json::
