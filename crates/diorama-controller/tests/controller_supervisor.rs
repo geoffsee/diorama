@@ -208,3 +208,13 @@ async fn test_controller_manager_prerequisite_failures() {
         Err(ControllerError::MissingCredential { component, .. }) if component == "service-account-key"
     ));
 }
+
+#[tokio::test]
+async fn test_controller_manager_adapter_custom_interval() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, controller_config) = setup_test_environment(&temp);
+    let controller_svc = ControllerManagerService::new(controller_config, Arc::new(apiserver));
+    let adapter = ControllerManagerAdapter::new(controller_svc)
+        .with_reconcile_interval(Duration::from_millis(250));
+    assert_eq!(adapter.reconcile_interval(), Duration::from_millis(250));
+}

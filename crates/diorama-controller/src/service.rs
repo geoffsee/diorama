@@ -170,28 +170,7 @@ impl ControllerManagerService {
     /// Reconciles workloads and endpoints across all namespaces in the cluster.
     pub async fn reconcile_all(&self) -> Result<Vec<ReconciliationSummary>, ControllerError> {
         let client = self.client();
-        let ns_list =
-            client
-                .list_namespaces()
-                .await
-                .map_err(|e| ControllerError::ApiserverUnavailable {
-                    reason: format!("failed to list namespaces for reconciliation: {e}"),
-                })?;
-        let mut namespaces = Vec::new();
-        if let Some(items) = ns_list.get("items").and_then(serde_json::Value::as_array) {
-            for item in items {
-                if let Some(name) = item
-                    .pointer("/metadata/name")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    namespaces.push(name.to_string());
-                }
-            }
-        }
-        if namespaces.is_empty() {
-            namespaces.push("default".to_string());
-        }
-
+        let namespaces = list_active_namespaces(&client).await;
         let workload_mgr = self.workload_manager();
         let mut summaries = Vec::new();
         for ns in &namespaces {
@@ -199,5 +178,39 @@ impl ControllerManagerService {
             summaries.push(summary);
         }
         Ok(summaries)
+    }
+
+    /// Performs a single reconciliation pass over all workloads in all active namespaces.
+    pub async fn reconcile_once(&self) -> Result<usize, ControllerError> {
+        let summaries = self.reconcile_all().await?;
+        Ok(summaries
+            .iter()
+            .map(ReconciliationSummary::total_workloads)
+            .sum())
+    }
+}
+
+async fn list_active_namespaces(
+    client: &diorama_apiserver::client::KubernetesApiClient,
+) -> Vec<String> {
+    let Ok(val) = client.list_namespaces().await else {
+        return vec!["default".to_string(), "kube-system".to_string()];
+    };
+
+    let items = val.get("items").and_then(serde_json::Value::as_array);
+    let ns_list: Vec<String> = items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    if ns_list.is_empty() {
+        vec!["default".to_string(), "kube-system".to_string()]
+    } else {
+        ns_list
     }
 }

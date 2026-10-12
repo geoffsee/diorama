@@ -161,18 +161,32 @@ impl DeploymentReconciler {
         self.sync_child_replicaset(namespace, name, uid, desired_replicas, selector, template)
             .await?;
 
+        let child_rs_name = format!("{name}-rs");
+        let (raw_ready, raw_available) = self
+            .resolve_replicas_status(namespace, &child_rs_name, name)
+            .await;
+
+        let ready_replicas = raw_ready.min(desired_replicas);
+        let available_replicas = raw_available.min(desired_replicas);
+
         let mut updated_deployment = deployment.clone();
         if let Some(status) = updated_deployment
             .get_mut("status")
             .and_then(Value::as_object_mut)
         {
             status.insert("replicas".to_string(), json!(desired_replicas));
+            status.insert("readyReplicas".to_string(), json!(ready_replicas));
+            status.insert("availableReplicas".to_string(), json!(available_replicas));
+            status.insert("updatedReplicas".to_string(), json!(desired_replicas));
             status.insert("observedGeneration".to_string(), json!(1));
         } else if let Some(dep_obj) = updated_deployment.as_object_mut() {
             dep_obj.insert(
                 "status".to_string(),
                 json!({
                     "replicas": desired_replicas,
+                    "readyReplicas": ready_replicas,
+                    "availableReplicas": available_replicas,
+                    "updatedReplicas": desired_replicas,
                     "observedGeneration": 1
                 }),
             );
@@ -186,4 +200,71 @@ impl DeploymentReconciler {
                 reason: e.to_string(),
             })
     }
+
+    async fn count_pod_ready_replicas(
+        &self,
+        namespace: &str,
+        child_rs_name: &str,
+        dep_name: &str,
+    ) -> i64 {
+        let Ok(pod_list) = self.client.list_pods(namespace).await else {
+            return 0;
+        };
+        let items = pod_list.get("items").and_then(Value::as_array);
+        let count = items
+            .into_iter()
+            .flatten()
+            .filter(|p| {
+                is_pod_owned_by_workload(p, child_rs_name, dep_name) && super::is_pod_ready(p)
+            })
+            .count();
+        i64::try_from(count).unwrap_or(i64::MAX)
+    }
+
+    async fn resolve_replicas_status(
+        &self,
+        namespace: &str,
+        child_rs_name: &str,
+        dep_name: &str,
+    ) -> (i64, i64) {
+        let mut ready_replicas = 0;
+        let mut available_replicas = 0;
+
+        if let Ok(rs) = self.client.get_replicaset(namespace, child_rs_name).await {
+            ready_replicas = rs
+                .pointer("/status/readyReplicas")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            available_replicas = rs
+                .pointer("/status/availableReplicas")
+                .and_then(Value::as_i64)
+                .unwrap_or(ready_replicas);
+        }
+
+        if ready_replicas == 0 {
+            let pod_count = self
+                .count_pod_ready_replicas(namespace, child_rs_name, dep_name)
+                .await;
+            ready_replicas = pod_count;
+            available_replicas = pod_count;
+        }
+
+        (ready_replicas, available_replicas)
+    }
+}
+
+fn is_pod_owned_by_workload(pod: &Value, child_rs_name: &str, dep_name: &str) -> bool {
+    let Some(owners) = pod
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+
+    owners.iter().any(|o| {
+        let kind = o.get("kind").and_then(Value::as_str);
+        let name = o.get("name").and_then(Value::as_str);
+        (kind == Some("ReplicaSet") && name == Some(child_rs_name))
+            || (kind == Some("Deployment") && name == Some(dep_name))
+    })
 }
