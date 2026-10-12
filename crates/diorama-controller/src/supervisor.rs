@@ -100,7 +100,9 @@ impl Adapter for ControllerManagerAdapter {
             }
 
             // Initial reconciliation pass
-            let _ = self.service.reconcile_all().await;
+            if let Err(err) = self.service.reconcile_all().await {
+                tracing::warn!(error = %err, "initial controller reconciliation pass failed");
+            }
 
             // 5. Periodic reconciliation until supervisor stops us
             let mut ticker = tokio::time::interval(self.reconcile_interval);
@@ -116,7 +118,9 @@ impl Adapter for ControllerManagerAdapter {
                         }
                     }
                     _ = ticker.tick() => {
-                        let _ = self.service.reconcile_all().await;
+                        if let Err(err) = self.service.reconcile_all().await {
+                            tracing::warn!(error = %err, "periodic controller reconciliation pass failed");
+                        }
                     }
                 }
             }
