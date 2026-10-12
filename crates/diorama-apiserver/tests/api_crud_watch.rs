@@ -44,6 +44,7 @@ async fn api_discovery_returns_core_and_group_resources() {
     assert!(names.contains(&"configmaps"));
     assert!(names.contains(&"secrets"));
     assert!(names.contains(&"pods"));
+    assert!(names.contains(&"endpoints"));
 
     let apis = client.discover_apis().expect("discover_apis succeeds");
     assert_eq!(apis["kind"], "APIGroupList");
@@ -51,6 +52,18 @@ async fn api_discovery_returns_core_and_group_resources() {
     let group_names: Vec<&str> = groups.iter().filter_map(|g| g["name"].as_str()).collect();
     assert!(group_names.contains(&"apps"));
     assert!(group_names.contains(&"apiextensions.k8s.io"));
+    assert!(group_names.contains(&"discovery.k8s.io"));
+
+    let discovery_group = client
+        .discover_group_resources("discovery.k8s.io", "v1")
+        .expect("discover discovery.k8s.io/v1 succeeds");
+    let disc_res_names: Vec<&str> = discovery_group["resources"]
+        .as_array()
+        .expect("discovery resources array")
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(disc_res_names.contains(&"endpointslices"));
 }
 
 #[tokio::test]
@@ -266,5 +279,100 @@ async fn unauthenticated_and_unauthorized_requests_are_rejected() {
     assert!(
         matches!(forbidden_err, Err(ApiserverError::Unauthorized { .. })),
         "Restricted user without admin RBAC role must be rejected with Unauthorized"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_crud_on_endpoints_and_endpointslices() {
+    let temp = TempDir::new().unwrap();
+    let service = setup_service(&temp);
+    let client = service.admin_client();
+
+    client.create_namespace("ep-test").await.unwrap();
+
+    // 1. Endpoints CRUD
+    let ep_doc = json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": "headless-svc",
+            "namespace": "ep-test"
+        },
+        "subsets": [{
+            "addresses": [{"ip": "10.244.1.5"}],
+            "ports": [{"port": 80, "protocol": "TCP"}]
+        }]
+    });
+    let created_ep = client.create_endpoints("ep-test", ep_doc).await.unwrap();
+    assert_eq!(created_ep["metadata"]["name"], "headless-svc");
+
+    let fetched_ep = client
+        .get_endpoints("ep-test", "headless-svc")
+        .await
+        .unwrap();
+    assert_eq!(fetched_ep["subsets"][0]["addresses"][0]["ip"], "10.244.1.5");
+
+    let ep_list = client.list_endpoints("ep-test").await.unwrap();
+    assert_eq!(ep_list["items"].as_array().unwrap().len(), 1);
+
+    // 2. EndpointSlice CRUD
+    let slice_doc = json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "headless-svc-slice",
+            "namespace": "ep-test",
+            "labels": {
+                "kubernetes.io/service-name": "headless-svc"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": [{
+            "addresses": ["10.244.1.5"],
+            "conditions": {
+                "ready": true
+            }
+        }],
+        "ports": [{
+            "port": 80,
+            "protocol": "TCP"
+        }]
+    });
+    let created_slice = client
+        .create_endpointslice("ep-test", slice_doc)
+        .await
+        .unwrap();
+    assert_eq!(created_slice["metadata"]["name"], "headless-svc-slice");
+
+    let fetched_slice = client
+        .get_endpointslice("ep-test", "headless-svc-slice")
+        .await
+        .unwrap();
+    assert_eq!(fetched_slice["endpoints"][0]["addresses"][0], "10.244.1.5");
+
+    let slice_list = client.list_endpointslices("ep-test").await.unwrap();
+    assert_eq!(slice_list["items"].as_array().unwrap().len(), 1);
+
+    // 3. Delete
+    client
+        .delete_endpoints("ep-test", "headless-svc")
+        .await
+        .unwrap();
+    assert!(
+        client
+            .get_endpoints("ep-test", "headless-svc")
+            .await
+            .is_err()
+    );
+
+    client
+        .delete_endpointslice("ep-test", "headless-svc-slice")
+        .await
+        .unwrap();
+    assert!(
+        client
+            .get_endpointslice("ep-test", "headless-svc-slice")
+            .await
+            .is_err()
     );
 }

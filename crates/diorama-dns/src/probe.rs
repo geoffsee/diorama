@@ -130,6 +130,27 @@ impl DnsResolutionProbe {
         }
     }
 
+    /// Constructs a headless service resolution probe.
+    #[must_use]
+    pub fn headless(
+        service_name: &str,
+        namespace: &str,
+        expected_ip: Ipv4Addr,
+        protocol: DnsProtocol,
+    ) -> Self {
+        Self {
+            category: ProbeCategory::SameNamespace,
+            query_name: format!("{service_name}.{namespace}.svc.cluster.local"),
+            record_type: DnsRecordType::A.as_u16(),
+            protocol,
+            client_namespace: namespace.to_string(),
+            expected_ip: Some(expected_ip),
+            expected_cname: None,
+            expected_ptr: None,
+            expected_rcode: DnsRcode::NoError.as_u8(),
+        }
+    }
+
     /// Constructs an upstream / external name resolution probe.
     #[must_use]
     pub fn upstream(domain: &str, expected_ip: Ipv4Addr, protocol: DnsProtocol) -> Self {
@@ -436,18 +457,75 @@ impl DnsProber {
                             {
                                 resolved_cnames.push(ext_name.trim_end_matches('.').to_string());
                             }
-                        } else if let Some(cluster_ip_str) = svc_val
-                            .pointer("/spec/clusterIP")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            if let Ok(ip) = cluster_ip_str.parse::<Ipv4Addr>() {
-                                resolved_ips.push(ip);
+                        } else {
+                            let cluster_ip_str = svc_val
+                                .pointer("/spec/clusterIP")
+                                .and_then(serde_json::Value::as_str);
+                            if let Some(ip_str) = cluster_ip_str {
+                                if ip_str == "None" {
+                                    resolve_headless_endpoints(
+                                        client,
+                                        svc_ns,
+                                        svc_name,
+                                        &svc_val,
+                                        &mut resolved_ips,
+                                    )
+                                    .await;
+                                } else if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                    resolved_ips.push(ip);
+                                }
+                            } else {
+                                resolve_headless_endpoints(
+                                    client,
+                                    svc_ns,
+                                    svc_name,
+                                    &svc_val,
+                                    &mut resolved_ips,
+                                )
+                                .await;
                             }
                         }
                     },
                     Err(_) => {
                         rcode = DnsRcode::NXDomain.as_u8();
                     },
+                }
+            } else if parts.len() == 3 {
+                let (target_pod, svc_name, svc_ns) = (parts[0], parts[1], parts[2]);
+                match client.get_service(svc_ns, svc_name).await {
+                    Ok(svc_val) => {
+                        resolve_pod_in_service(
+                            client,
+                            svc_ns,
+                            svc_name,
+                            target_pod,
+                            &svc_val,
+                            &mut resolved_ips,
+                        )
+                        .await;
+                        if resolved_ips.is_empty() {
+                            rcode = DnsRcode::NXDomain.as_u8();
+                        }
+                    },
+                    Err(_) => {
+                        rcode = DnsRcode::NXDomain.as_u8();
+                    },
+                }
+            } else {
+                rcode = DnsRcode::NXDomain.as_u8();
+            }
+        } else if let Some(pod_part) =
+            clean_name.strip_suffix(&format!(".pod.{}", config.cluster_domain))
+        {
+            // Parse Kubernetes pod query: <dashed-ip>.<ns>.pod.<cluster-domain>
+            let parts: Vec<&str> = pod_part.split('.').collect();
+            if parts.len() == 2 {
+                let (dashed_ip, _ns) = (parts[0], parts[1]);
+                let dotted = dashed_ip.replace('-', ".");
+                if let Ok(ip) = dotted.parse::<Ipv4Addr>() {
+                    resolved_ips.push(ip);
+                } else {
+                    rcode = DnsRcode::NXDomain.as_u8();
                 }
             } else {
                 rcode = DnsRcode::NXDomain.as_u8();
@@ -738,4 +816,244 @@ async fn send_tcp_query(server_addr: SocketAddr, query: &DnsMessage) -> Result<D
     let mut resp_buf = vec![0u8; len];
     stream.read_exact(&mut resp_buf).await?;
     DnsMessage::from_bytes(&resp_buf)
+}
+
+async fn resolve_headless_endpoints(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    service_name: &str,
+    svc_val: &serde_json::Value,
+    resolved_ips: &mut Vec<Ipv4Addr>,
+) {
+    if let Ok(ep) = client.get_endpoints(namespace, service_name).await {
+        if let Some(subsets) = ep.get("subsets").and_then(serde_json::Value::as_array) {
+            for subset in subsets {
+                if let Some(addrs) = subset
+                    .get("addresses")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for addr in addrs {
+                        if let Some(ip_str) = addr.get("ip").and_then(serde_json::Value::as_str) {
+                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                if !resolved_ips.contains(&ip) {
+                                    resolved_ips.push(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved_ips.is_empty() {
+        if let Ok(slice_list) = client.list_endpointslices(namespace).await {
+            if let Some(slices) = slice_list
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+            {
+                for slice in slices {
+                    let svc_label = slice
+                        .get("metadata")
+                        .and_then(|m| m.get("labels"))
+                        .and_then(|l| l.get("kubernetes.io/service-name"))
+                        .and_then(serde_json::Value::as_str);
+                    if svc_label == Some(service_name) {
+                        if let Some(eps) =
+                            slice.get("endpoints").and_then(serde_json::Value::as_array)
+                        {
+                            for ep in eps {
+                                let ready = ep
+                                    .pointer("/conditions/ready")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true);
+                                let terminating = ep
+                                    .pointer("/conditions/terminating")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false);
+                                if ready && !terminating {
+                                    if let Some(addrs) =
+                                        ep.get("addresses").and_then(serde_json::Value::as_array)
+                                    {
+                                        for addr in addrs {
+                                            if let Some(ip_str) = addr.as_str() {
+                                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                                    if !resolved_ips.contains(&ip) {
+                                                        resolved_ips.push(ip);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved_ips.is_empty() {
+        if let Some(selector) = svc_val
+            .pointer("/spec/selector")
+            .and_then(serde_json::Value::as_object)
+        {
+            if !selector.is_empty() {
+                if let Ok(pod_list) = client.list_pods(namespace).await {
+                    if let Some(pods) = pod_list.get("items").and_then(serde_json::Value::as_array)
+                    {
+                        for pod in pods {
+                            let pod_labels = pod
+                                .get("metadata")
+                                .and_then(|m| m.get("labels"))
+                                .and_then(serde_json::Value::as_object);
+                            let matches = selector.iter().all(|(k, v)| {
+                                pod_labels
+                                    .and_then(|labels| labels.get(k))
+                                    .is_some_and(|lv| lv == v)
+                            });
+                            if matches {
+                                let phase = pod
+                                    .pointer("/status/phase")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                if phase == "Running" || phase == "Pending" {
+                                    let pod_ip = pod
+                                        .pointer("/status/podIP")
+                                        .and_then(serde_json::Value::as_str)
+                                        .or_else(|| {
+                                            pod.pointer("/metadata/annotations/cni.projectcalico.org~1podIP")
+                                                .and_then(serde_json::Value::as_str)
+                                        });
+                                    if let Some(ip_str) = pod_ip {
+                                        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                            if !resolved_ips.contains(&ip) {
+                                                resolved_ips.push(ip);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn resolve_pod_in_service(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    service_name: &str,
+    target_pod: &str,
+    _svc_val: &serde_json::Value,
+    resolved_ips: &mut Vec<Ipv4Addr>,
+) {
+    if target_pod.contains('-') {
+        let dotted = target_pod.replace('-', ".");
+        if let Ok(ip) = dotted.parse::<Ipv4Addr>() {
+            resolved_ips.push(ip);
+            return;
+        }
+    }
+
+    if let Ok(ep) = client.get_endpoints(namespace, service_name).await {
+        if let Some(subsets) = ep.get("subsets").and_then(serde_json::Value::as_array) {
+            for subset in subsets {
+                if let Some(addrs) = subset
+                    .get("addresses")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for addr in addrs {
+                        let matches_target = addr
+                            .pointer("/targetRef/name")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(target_pod)
+                            || addr.get("hostname").and_then(serde_json::Value::as_str)
+                                == Some(target_pod);
+                        if matches_target {
+                            if let Some(ip_str) = addr.get("ip").and_then(serde_json::Value::as_str)
+                            {
+                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                    if !resolved_ips.contains(&ip) {
+                                        resolved_ips.push(ip);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !resolved_ips.is_empty() {
+        return;
+    }
+
+    if let Ok(slice_list) = client.list_endpointslices(namespace).await {
+        if let Some(slices) = slice_list
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+        {
+            for slice in slices {
+                let svc_label = slice
+                    .get("metadata")
+                    .and_then(|m| m.get("labels"))
+                    .and_then(|l| l.get("kubernetes.io/service-name"))
+                    .and_then(serde_json::Value::as_str);
+                if svc_label == Some(service_name) {
+                    if let Some(eps) = slice.get("endpoints").and_then(serde_json::Value::as_array)
+                    {
+                        for ep in eps {
+                            let matches_target = ep
+                                .pointer("/targetRef/name")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(target_pod)
+                                || ep.get("hostname").and_then(serde_json::Value::as_str)
+                                    == Some(target_pod);
+                            if matches_target {
+                                if let Some(addrs) =
+                                    ep.get("addresses").and_then(serde_json::Value::as_array)
+                                {
+                                    for addr in addrs {
+                                        if let Some(ip_str) = addr.as_str() {
+                                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                                if !resolved_ips.contains(&ip) {
+                                                    resolved_ips.push(ip);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !resolved_ips.is_empty() {
+        return;
+    }
+
+    if let Ok(pod) = client.get_pod(namespace, target_pod).await {
+        let pod_ip = pod
+            .pointer("/status/podIP")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                pod.pointer("/metadata/annotations/cni.projectcalico.org~1podIP")
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(ip_str) = pod_ip {
+            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                if !resolved_ips.contains(&ip) {
+                    resolved_ips.push(ip);
+                }
+            }
+        }
+    }
 }

@@ -542,6 +542,13 @@ impl KubernetesApiClient {
                 ],
                 "preferredVersion": { "groupVersion": "apiregistration.k8s.io/v1", "version": "v1" }
             }),
+            json!({
+                "name": "discovery.k8s.io",
+                "versions": [
+                    { "groupVersion": "discovery.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "discovery.k8s.io/v1", "version": "v1" }
+            }),
         ];
 
         // Dynamically add CRD groups
@@ -610,6 +617,7 @@ impl KubernetesApiClient {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn discover_group_resources(
         &self,
         group: &str,
@@ -664,6 +672,13 @@ impl KubernetesApiClient {
                 ] {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
+            },
+            ("discovery.k8s.io", "v1") => {
+                resources.push(Self::namespaced_resource(
+                    "endpointslices",
+                    "endpointslice",
+                    "EndpointSlice",
+                ));
             },
             _ => {},
         }
