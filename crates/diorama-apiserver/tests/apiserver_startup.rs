@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 use diorama_apiserver::{
     ApiserverAdapter, ApiserverConfig, ApiserverService, COMPONENT_APISERVER, DEFAULT_SECURE_PORT,
-    DEFAULT_SERVICE_CLUSTER_IP_RANGE, KubernetesStorage,
+    DEFAULT_SERVICE_CLUSTER_IP_RANGE, DEFAULT_SERVICE_NODE_PORT_RANGE, KubernetesStorage,
 };
 use diorama_datastore::{DatastoreConfig, DatastoreEngine};
 use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
@@ -47,6 +47,9 @@ fn baseline_configuration_flags_match_kubernetes_v1_35_7_specification() {
     assert!(args.contains(&format!("--secure-port={DEFAULT_SECURE_PORT}")));
     assert!(args.contains(&format!(
         "--service-cluster-ip-range={DEFAULT_SERVICE_CLUSTER_IP_RANGE}"
+    )));
+    assert!(args.contains(&format!(
+        "--service-node-port-range={DEFAULT_SERVICE_NODE_PORT_RANGE}"
     )));
     assert!(args.contains(&"--authorization-mode=Node,RBAC".to_string()));
     assert!(args.contains(&"--anonymous-auth=false".to_string()));
