@@ -121,21 +121,21 @@ impl IptablesDataplane {
                 });
             }
 
-            // Endpoint DNAT rule
+            // Endpoint MASQ rule (must precede terminating DNAT target)
             rules.push(IptablesRule {
                 table: "nat",
                 chain: sep_chain.clone(),
+                rule: "-j KUBE-MARK-MASQ".to_string(),
+            });
+
+            // Endpoint DNAT rule
+            rules.push(IptablesRule {
+                table: "nat",
+                chain: sep_chain,
                 rule: format!(
                     "-p {proto} -m {proto} -j DNAT --to-destination {}:{}",
                     ep.ip, ep.port
                 ),
-            });
-
-            // Endpoint MASQ rule
-            rules.push(IptablesRule {
-                table: "nat",
-                chain: sep_chain,
-                rule: "-j KUBE-MARK-MASQ".to_string(),
             });
         }
     }
