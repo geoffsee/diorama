@@ -1016,6 +1016,57 @@ fn secret_row(secret: &Value, now: u64) -> Value {
     })
 }
 
+fn format_endpoints_str(endpoints: &Value) -> String {
+    let mut eps = Vec::new();
+    let Some(subsets) = endpoints.get("subsets").and_then(Value::as_array) else {
+        return "<none>".to_string();
+    };
+    for subset in subsets {
+        extract_subset_endpoints(subset, &mut eps);
+    }
+    if eps.is_empty() {
+        "<none>".to_string()
+    } else {
+        eps.join(",")
+    }
+}
+
+fn extract_subset_endpoints(subset: &Value, eps: &mut Vec<String>) {
+    let Some(addrs) = subset.get("addresses").and_then(Value::as_array) else {
+        return;
+    };
+    let ports = subset.get("ports").and_then(Value::as_array);
+    for addr in addrs {
+        let Some(ip) = addr.get("ip").and_then(Value::as_str) else {
+            continue;
+        };
+        match ports {
+            Some(ports) => {
+                for port_val in ports {
+                    if let Some(port) = port_val.get("port").and_then(Value::as_i64) {
+                        eps.push(format!("{ip}:{port}"));
+                    }
+                }
+            },
+            None => eps.push(ip.to_string()),
+        }
+    }
+}
+
+fn endpoints_row(endpoints: &Value, now: u64) -> Value {
+    let name = endpoints
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let endpoints_str = format_endpoints_str(endpoints);
+    let age = item_age(endpoints, now);
+
+    json!({
+        "cells": [name, endpoints_str, age],
+        "object": endpoints
+    })
+}
+
 fn col(
     name: &'static str,
     col_type: &'static str,
@@ -1046,6 +1097,11 @@ fn resource_column_definitions(resource: &str) -> Vec<Value> {
             col("Port(s)", "string", "", "Service ports"),
             col("Age", "string", "", "Service age"),
         ],
+        "endpoints" => vec![
+            col("Name", "string", "name", "Resource name"),
+            col("Endpoints", "string", "", "Endpoints"),
+            col("Age", "string", "", "Endpoints age"),
+        ],
         "configmaps" => vec![
             col("Name", "string", "name", "Resource name"),
             col("Data", "string", "", "ConfigMap data"),
@@ -1071,6 +1127,7 @@ fn resource_row(resource: &str, item: &Value, now: u64) -> Value {
     match resource {
         "namespaces" => namespace_row(item, now),
         "services" => service_row(item, now),
+        "endpoints" => endpoints_row(item, now),
         "configmaps" => configmap_row(item, now),
         "secrets" => secret_row(item, now),
         _ => pod_row(item, now),
@@ -1137,7 +1194,7 @@ fn supports_table(path: &ResourcePath) -> bool {
     path.subresource.is_none()
         && matches!(
             path.resource.as_str(),
-            "pods" | "namespaces" | "services" | "configmaps" | "secrets"
+            "pods" | "namespaces" | "services" | "endpoints" | "configmaps" | "secrets"
         )
 }
 

@@ -5,6 +5,7 @@ use diorama_supervisor::{
     FailurePolicy, Registration, StopPhase,
 };
 
+use crate::firewall::DataplaneReconciler;
 use crate::service::ProxyService;
 
 pub const COMPONENT_PROXY: &str = "kube-proxy";
@@ -77,6 +78,12 @@ impl Adapter for ProxyAdapter {
                     code: "proxy-readiness-rejected",
                 });
             }
+
+            // Initial dataplane reconciliation to initialize base chains
+            let _ = self
+                .service
+                .reconcile_dataplane(&DataplaneReconciler::new(), None)
+                .await;
 
             // 5. Await supervisor stop phase
             loop {

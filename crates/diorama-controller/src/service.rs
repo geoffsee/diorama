@@ -6,7 +6,7 @@ use diorama_apiserver::{ApiserverService, KubernetesApiClient};
 use crate::config::ControllerManagerConfig;
 use crate::error::ControllerError;
 use crate::health::ControllerHealthReport;
-use crate::workload::WorkloadManager;
+use crate::workload::{ReconciliationSummary, WorkloadManager};
 
 pub const CONTROLLER_MANAGER_USER: &str = "system:kube-controller-manager";
 
@@ -165,5 +165,39 @@ impl ControllerManagerService {
     /// Stops the controller manager service.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Reconciles workloads and endpoints across all namespaces in the cluster.
+    pub async fn reconcile_all(&self) -> Result<Vec<ReconciliationSummary>, ControllerError> {
+        let client = self.client();
+        let ns_list =
+            client
+                .list_namespaces()
+                .await
+                .map_err(|e| ControllerError::ApiserverUnavailable {
+                    reason: format!("failed to list namespaces for reconciliation: {e}"),
+                })?;
+        let mut namespaces = Vec::new();
+        if let Some(items) = ns_list.get("items").and_then(serde_json::Value::as_array) {
+            for item in items {
+                if let Some(name) = item
+                    .pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    namespaces.push(name.to_string());
+                }
+            }
+        }
+        if namespaces.is_empty() {
+            namespaces.push("default".to_string());
+        }
+
+        let workload_mgr = self.workload_manager();
+        let mut summaries = Vec::new();
+        for ns in &namespaces {
+            let summary = workload_mgr.reconcile_namespace(ns).await?;
+            summaries.push(summary);
+        }
+        Ok(summaries)
     }
 }

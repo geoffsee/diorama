@@ -34,6 +34,10 @@ pub fn v3_core() -> Value {
         ),
         ("Pod", "/api/v1/namespaces/{namespace}/pods/{name}"),
         ("Service", "/api/v1/namespaces/{namespace}/services/{name}"),
+        (
+            "Endpoints",
+            "/api/v1/namespaces/{namespace}/endpoints/{name}",
+        ),
         ("Secret", "/api/v1/namespaces/{namespace}/secrets/{name}"),
     ] {
         let collection = path.trim_end_matches("/{name}");

@@ -13,12 +13,22 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 #[derive(Clone, Debug)]
 pub struct ControllerManagerAdapter {
     service: ControllerManagerService,
+    sync_period: Duration,
 }
 
 impl ControllerManagerAdapter {
     #[must_use]
     pub fn new(service: ControllerManagerService) -> Self {
-        Self { service }
+        Self {
+            service,
+            sync_period: Duration::from_millis(500),
+        }
+    }
+
+    #[must_use]
+    pub fn with_sync_period(mut self, sync_period: Duration) -> Self {
+        self.sync_period = sync_period;
+        self
     }
 
     pub fn registration(
@@ -77,14 +87,27 @@ impl Adapter for ControllerManagerAdapter {
                 });
             }
 
-            // 5. Await supervisor stop phase
+            // Initial reconciliation pass
+            let _ = self.service.reconcile_all().await;
+
+            // 5. Periodic reconciliation loop while monitoring stop phase
+            let mut ticker = tokio::time::interval(self.sync_period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
-                match context.changed().await {
-                    StopPhase::Running => {},
-                    StopPhase::Graceful | StopPhase::Force => {
-                        self.service.stop();
-                        break;
-                    },
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let _ = self.service.reconcile_all().await;
+                    }
+                    phase = context.changed() => {
+                        match phase {
+                            StopPhase::Running => {},
+                            StopPhase::Graceful | StopPhase::Force => {
+                                self.service.stop();
+                                break;
+                            },
+                        }
+                    }
                 }
             }
 
