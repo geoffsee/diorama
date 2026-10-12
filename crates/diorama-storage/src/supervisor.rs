@@ -91,7 +91,7 @@ impl Adapter for LocalPathAdapter {
             }
 
             let volume_manager = self.service.volume_manager();
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
 
             // 5. Await supervisor stop phase while periodically reconciling PVCs and Pods
             loop {
@@ -136,7 +136,15 @@ impl Adapter for LocalPathAdapter {
                                         if let Some(pod_name) = pod.get("metadata").and_then(|m| m.get("name")).and_then(Value::as_str)
                                             && pod.pointer("/spec/nodeName").and_then(Value::as_str).is_some()
                                         {
-                                            let _ = volume_manager.bind_volumes_for_pod(ns, pod_name).await;
+                                            let has_pvc = pod
+                                                .pointer("/spec/volumes")
+                                                .and_then(Value::as_array)
+                                                .is_some_and(|vols| {
+                                                    vols.iter().any(|v| v.get("persistentVolumeClaim").is_some())
+                                                });
+                                            if has_pvc {
+                                                let _ = volume_manager.bind_volumes_for_pod(ns, pod_name).await;
+                                            }
                                         }
                                     }
                                 }
