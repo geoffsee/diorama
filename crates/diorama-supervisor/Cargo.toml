@@ -11,10 +11,10 @@ workspace = true
 
 [dependencies]
 rustix = { version = "=1.1.5", features = ["process", "fs"] }
-tokio = { version = "=1.53.1", features = ["rt", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time", "signal"] }
 
 [dev-dependencies]
-tokio = { version = "=1.53.1", features = ["test-util"] }
+tokio = { version = "=1.53.2", features = ["test-util"] }
 
 [[test]]
 name = "suite"
