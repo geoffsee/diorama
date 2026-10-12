@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
@@ -10,7 +10,7 @@ use crate::admission::{
     AdmissionEngine, AdmissionRequest, GroupVersionKind, GroupVersionResource, UserInfo,
 };
 use crate::aggregation::{APIService, AggregatedRequestContext, AggregationManager};
-use crate::config::ApiserverConfig;
+use crate::config::{ApiserverConfig, parse_ipv4_cidr, parse_port_range};
 use crate::error::ApiserverError;
 use crate::rbac::{
     AuthzRequest, ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding,
@@ -55,6 +55,7 @@ pub struct KubernetesApiClient {
     request_header_ca_file: std::path::PathBuf,
     request_header_allowed_names: Vec<String>,
     service_cluster_ip_range: String,
+    service_node_port_range: String,
 }
 
 impl std::fmt::Debug for KubernetesApiClient {
@@ -91,70 +92,6 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
     }
 }
 
-fn parse_ipv4_cidr(cidr: &str) -> Option<(u32, u32)> {
-    let (ip_str, prefix_str) = cidr.split_once('/')?;
-    let ip: Ipv4Addr = ip_str.parse().ok()?;
-    let prefix_len: u32 = prefix_str.parse().ok()?;
-    if prefix_len > 32 {
-        return None;
-    }
-    let ip_u32 = u32::from(ip);
-    let mask = if prefix_len == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix_len)
-    };
-    let net = ip_u32 & mask;
-    let bcast = net | !mask;
-    Some((net, bcast))
-}
-
-fn extract_service_ips(doc: &Value) -> Vec<u32> {
-    let mut ips = Vec::new();
-    if let Some(addr) = doc
-        .pointer("/spec/clusterIP")
-        .and_then(Value::as_str)
-        .filter(|ip| !ip.is_empty() && *ip != "None")
-        .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
-    {
-        ips.push(u32::from(addr));
-    }
-    if let Some(ip_list) = doc.pointer("/spec/clusterIPs").and_then(Value::as_array) {
-        for ip_val in ip_list {
-            if let Some(addr) = ip_val
-                .as_str()
-                .filter(|ip| !ip.is_empty() && *ip != "None")
-                .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
-            {
-                ips.push(u32::from(addr));
-            }
-        }
-    }
-    ips
-}
-
-fn ensure_service_cluster_ips(spec: &mut serde_json::Map<String, Value>, ip: &str) {
-    if !spec.contains_key("clusterIPs") {
-        spec.insert("clusterIPs".to_string(), json!([ip]));
-    }
-}
-
-fn sync_service_cluster_ips(spec: &mut serde_json::Map<String, Value>, existing: &Value) {
-    let Some(existing_ip) = existing.pointer("/spec/clusterIP").and_then(Value::as_str) else {
-        return;
-    };
-    if !spec.contains_key("clusterIP") {
-        spec.insert("clusterIP".to_string(), json!(existing_ip));
-    }
-    if !spec.contains_key("clusterIPs") {
-        let ips = existing
-            .pointer("/spec/clusterIPs")
-            .cloned()
-            .unwrap_or_else(|| json!([existing_ip]));
-        spec.insert("clusterIPs".to_string(), ips);
-    }
-}
-
 impl KubernetesApiClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -179,6 +116,7 @@ impl KubernetesApiClient {
             request_header_ca_file: config.request_header_ca_file.clone(),
             request_header_allowed_names: vec!["system:auth-proxy".to_string()],
             service_cluster_ip_range: config.service_cluster_ip_range.clone(),
+            service_node_port_range: config.service_node_port_range.clone(),
         }
     }
 
@@ -2730,50 +2668,6 @@ impl KubernetesApiClient {
 
     // --- Service, Endpoints & EndpointSlice CRUD ---
 
-    async fn allocate_cluster_ip(&self) -> Result<String, ApiserverError> {
-        let (net_u32, bcast_u32) =
-            parse_ipv4_cidr(&self.service_cluster_ip_range).ok_or_else(|| {
-                ApiserverError::Internal {
-                    reason: format!(
-                        "invalid service_cluster_ip_range: {}",
-                        self.service_cluster_ip_range
-                    ),
-                }
-            })?;
-
-        let prefix = format!("{}/services/", self.storage.prefix());
-        let kvs = self.storage.list(&prefix).await?;
-        let mut used_ips = std::collections::HashSet::new();
-        for kv in kvs {
-            if let Ok(doc) = serde_json::from_slice::<Value>(&kv.value) {
-                used_ips.extend(extract_service_ips(&doc));
-            }
-        }
-
-        // Allocate next available IP in CIDR range.
-        // Skip network address (net_u32) and broadcast (bcast_u32).
-        // Reserve net_u32 + 1 (kubernetes service default) and net_u32 + 10 (kube-dns default).
-        for candidate in (net_u32 + 1)..bcast_u32 {
-            if candidate == net_u32 + 1 || candidate == net_u32 + 10 {
-                continue;
-            }
-            if !used_ips.contains(&candidate) {
-                return Ok(Ipv4Addr::from(candidate).to_string());
-            }
-        }
-
-        // Fallback if other IPs in range are exhausted
-        for candidate in (net_u32 + 1)..bcast_u32 {
-            if !used_ips.contains(&candidate) {
-                return Ok(Ipv4Addr::from(candidate).to_string());
-            }
-        }
-
-        Err(ApiserverError::Internal {
-            reason: "failed to allocate clusterIP: IP range exhausted".to_string(),
-        })
-    }
-
     pub async fn create_service(
         &self,
         namespace: &str,
@@ -2781,57 +2675,488 @@ impl KubernetesApiClient {
     ) -> Result<Value, ApiserverError> {
         self.create_service_options(namespace, service, false).await
     }
+    fn cidr_bounds(&self) -> Result<(u32, u32), ApiserverError> {
+        let (base_ip, prefix_len) = parse_ipv4_cidr(&self.service_cluster_ip_range)?;
+        let base = u32::from(base_ip);
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            let shift = u32::from(32 - prefix_len);
+            !((1u32.checked_shl(shift).unwrap_or(0)).wrapping_sub(1))
+        };
+        let network = base & mask;
+        let broadcast = network | !mask;
+        Ok((network, broadcast))
+    }
+
+    fn collect_doc_service_resources(
+        doc: &Value,
+        allocated_ips: &mut BTreeSet<Ipv4Addr>,
+        allocated_ports: &mut BTreeSet<u16>,
+    ) {
+        if let Some(ip) = doc
+            .pointer("/spec/clusterIP")
+            .and_then(Value::as_str)
+            .filter(|s| *s != "None" && !s.is_empty())
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        {
+            allocated_ips.insert(ip);
+        }
+
+        if let Some(ips) = doc.pointer("/spec/clusterIPs").and_then(Value::as_array) {
+            for ip_val in ips {
+                if let Some(ip) = ip_val
+                    .as_str()
+                    .filter(|s| *s != "None" && !s.is_empty())
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                {
+                    allocated_ips.insert(ip);
+                }
+            }
+        }
+
+        if let Some(ports) = doc.pointer("/spec/ports").and_then(Value::as_array) {
+            for p in ports {
+                if let Some(np) = p
+                    .get("nodePort")
+                    .and_then(Value::as_u64)
+                    .and_then(|np| u16::try_from(np).ok())
+                    .filter(|&np| np > 0)
+                {
+                    allocated_ports.insert(np);
+                }
+            }
+        }
+    }
+
+    async fn collect_allocated_service_resources(
+        &self,
+        exclude: Option<(&str, &str)>,
+    ) -> Result<(BTreeSet<Ipv4Addr>, BTreeSet<u16>), ApiserverError> {
+        let prefix = format!("{}/services/", self.storage.prefix());
+        let kvs = self.storage.list(&prefix).await?;
+        let mut allocated_ips = BTreeSet::new();
+        let mut allocated_ports = BTreeSet::new();
+
+        for kv in kvs {
+            let doc: Value = serde_json::from_slice(&kv.value)?;
+            let ns = doc
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = doc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if exclude == Some((ns, name)) {
+                continue;
+            }
+
+            Self::collect_doc_service_resources(&doc, &mut allocated_ips, &mut allocated_ports);
+        }
+
+        Ok((allocated_ips, allocated_ports))
+    }
+
+    fn allocate_cluster_ip(
+        &self,
+        namespace: &str,
+        name: &str,
+        allocated_ips: &BTreeSet<Ipv4Addr>,
+    ) -> Result<Ipv4Addr, ApiserverError> {
+        let (network, broadcast) = self.cidr_bounds()?;
+        let is_kubernetes_svc = namespace == "default" && name == "kubernetes";
+        let start = if is_kubernetes_svc {
+            network + 1
+        } else if broadcast > network + 2 {
+            network + 2
+        } else {
+            network
+        };
+        let end = if broadcast > network + 2 {
+            broadcast - 1
+        } else {
+            broadcast
+        };
+
+        for ip_u32 in start..=end {
+            if !is_kubernetes_svc && ip_u32 == network + 1 {
+                // Reserve .1 for default/kubernetes
+                continue;
+            }
+            let ip = Ipv4Addr::from(ip_u32);
+            if !allocated_ips.contains(&ip) {
+                return Ok(ip);
+            }
+        }
+
+        Err(ApiserverError::InvalidInput {
+            field: "spec.clusterIP".to_string(),
+            reason: "service cluster IP range is full".to_string(),
+        })
+    }
+
+    fn validate_specified_cluster_ip(
+        &self,
+        ip_str: &str,
+        allocated_ips: &BTreeSet<Ipv4Addr>,
+    ) -> Result<Ipv4Addr, ApiserverError> {
+        let ip: Ipv4Addr = ip_str.parse().map_err(|_| ApiserverError::InvalidInput {
+            field: "spec.clusterIP".to_string(),
+            reason: format!("invalid cluster IP '{ip_str}'"),
+        })?;
+        let (network, broadcast) = self.cidr_bounds()?;
+        let ip_u32 = u32::from(ip);
+        if ip_u32 < network || ip_u32 > broadcast {
+            return Err(ApiserverError::InvalidInput {
+                field: "spec.clusterIP".to_string(),
+                reason: format!(
+                    "cluster IP {ip} is not within service CIDR {}",
+                    self.service_cluster_ip_range
+                ),
+            });
+        }
+        if allocated_ips.contains(&ip) {
+            return Err(ApiserverError::InvalidInput {
+                field: "spec.clusterIP".to_string(),
+                reason: format!("cluster IP {ip} is already allocated"),
+            });
+        }
+        Ok(ip)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn prepare_service_for_create(
+        &self,
+        namespace: &str,
+        service: &mut Value,
+    ) -> Result<(), ApiserverError> {
+        let name = service
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let (mut allocated_ips, mut allocated_ports) =
+            self.collect_allocated_service_resources(None).await?;
+
+        let spec = service
+            .get_mut("spec")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ApiserverError::InvalidInput {
+                field: "spec".to_string(),
+                reason: "Service requires a spec object".to_string(),
+            })?;
+
+        // 1. Default spec.type
+        if !spec.contains_key("type")
+            || spec
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty)
+        {
+            spec.insert("type".to_string(), json!("ClusterIP"));
+        }
+        let svc_type = spec
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("ClusterIP")
+            .to_string();
+
+        // 2. Default sessionAffinity
+        if !spec.contains_key("sessionAffinity") {
+            spec.insert("sessionAffinity".to_string(), json!("None"));
+        }
+
+        // 3. ClusterIP allocation
+        let specified_cluster_ip = spec
+            .get("clusterIP")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+
+        if svc_type == "ExternalName" {
+            // ExternalName does not allocate clusterIP
+        } else if let Some(ip_str) = specified_cluster_ip {
+            if ip_str == "None" {
+                // Headless service
+            } else {
+                let validated_ip = self.validate_specified_cluster_ip(&ip_str, &allocated_ips)?;
+                allocated_ips.insert(validated_ip);
+                if !spec.contains_key("clusterIPs") {
+                    spec.insert("clusterIPs".to_string(), json!([ip_str]));
+                }
+            }
+        } else {
+            // Allocate clusterIP
+            let allocated = self.allocate_cluster_ip(namespace, &name, &allocated_ips)?;
+            allocated_ips.insert(allocated);
+            let ip_str = allocated.to_string();
+            spec.insert("clusterIP".to_string(), json!(ip_str));
+            if !spec.contains_key("clusterIPs") {
+                spec.insert("clusterIPs".to_string(), json!([ip_str]));
+            }
+        }
+
+        // 4. Default ports and allocate nodePort if NodePort / LoadBalancer
+        let needs_node_port = matches!(svc_type.as_str(), "NodePort" | "LoadBalancer");
+        let (min_port, max_port) = parse_port_range(&self.service_node_port_range)?;
+
+        if let Some(ports) = spec.get_mut("ports").and_then(Value::as_array_mut) {
+            for port in ports.iter_mut() {
+                let Some(port_obj) = port.as_object_mut() else {
+                    continue;
+                };
+
+                if !port_obj.contains_key("protocol") {
+                    port_obj.insert("protocol".to_string(), json!("TCP"));
+                }
+
+                if !needs_node_port {
+                    continue;
+                }
+
+                let requested = port_obj
+                    .get("nodePort")
+                    .and_then(Value::as_u64)
+                    .filter(|&p| p > 0);
+                let requested_u16 = if let Some(np_u64) = requested {
+                    let np = u16::try_from(np_u64).map_err(|_| ApiserverError::InvalidInput {
+                        field: "spec.ports[].nodePort".to_string(),
+                        reason: format!(
+                            "nodePort {np_u64} is outside allowed range {min_port}-{max_port}"
+                        ),
+                    })?;
+                    Some(np)
+                } else {
+                    None
+                };
+
+                Self::allocate_or_validate_node_port(
+                    port_obj,
+                    requested_u16,
+                    min_port,
+                    max_port,
+                    &mut allocated_ports,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn allocate_or_validate_node_port(
+        port_obj: &mut serde_json::Map<String, Value>,
+        requested_port: Option<u16>,
+        min_port: u16,
+        max_port: u16,
+        allocated_ports: &mut BTreeSet<u16>,
+    ) -> Result<(), ApiserverError> {
+        let port = if let Some(np) = requested_port {
+            if np < min_port || np > max_port {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.ports[].nodePort".to_string(),
+                    reason: format!("nodePort {np} is outside allowed range {min_port}-{max_port}"),
+                });
+            }
+            if allocated_ports.contains(&np) {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.ports[].nodePort".to_string(),
+                    reason: format!("nodePort {np} is already allocated"),
+                });
+            }
+            np
+        } else {
+            (min_port..=max_port)
+                .find(|cand| !allocated_ports.contains(cand))
+                .ok_or_else(|| ApiserverError::InvalidInput {
+                    field: "spec.ports[].nodePort".to_string(),
+                    reason: "service node port range is full".to_string(),
+                })?
+        };
+
+        allocated_ports.insert(port);
+        port_obj.insert("nodePort".to_string(), json!(port));
+        Ok(())
+    }
+
+    fn extract_old_node_ports(old_doc: &Value) -> (BTreeMap<i64, u16>, BTreeMap<String, u16>) {
+        let mut by_port = BTreeMap::new();
+        let mut by_name = BTreeMap::new();
+        let Some(old_ports) = old_doc.pointer("/spec/ports").and_then(Value::as_array) else {
+            return (by_port, by_name);
+        };
+        for p in old_ports {
+            let Some(np) = p
+                .get("nodePort")
+                .and_then(Value::as_u64)
+                .and_then(|np| u16::try_from(np).ok())
+                .filter(|&np| np > 0)
+            else {
+                continue;
+            };
+            if let Some(port_num) = p.get("port").and_then(Value::as_i64) {
+                by_port.insert(port_num, np);
+            }
+            if let Some(port_name) = p.get("name").and_then(Value::as_str) {
+                by_name.insert(port_name.to_string(), np);
+            }
+        }
+        (by_port, by_name)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn prepare_service_for_update(
+        &self,
+        namespace: &str,
+        name: &str,
+        service: &mut Value,
+    ) -> Result<(), ApiserverError> {
+        let key = format!("{}/services/{namespace}/{name}", self.storage.prefix());
+        let existing = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: "services".to_string(),
+                name: format!("{namespace}/{name}"),
+            })?;
+        let old_doc: Value = serde_json::from_slice(&existing.value)?;
+
+        let (mut allocated_ips, mut allocated_ports) = self
+            .collect_allocated_service_resources(Some((namespace, name)))
+            .await?;
+
+        let spec = service
+            .get_mut("spec")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| ApiserverError::InvalidInput {
+                field: "spec".to_string(),
+                reason: "Service requires a spec object".to_string(),
+            })?;
+
+        // 1. Default spec.type
+        if !spec.contains_key("type")
+            || spec
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty)
+        {
+            spec.insert("type".to_string(), json!("ClusterIP"));
+        }
+        let svc_type = spec
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("ClusterIP")
+            .to_string();
+
+        // 2. Default sessionAffinity
+        if !spec.contains_key("sessionAffinity") {
+            spec.insert("sessionAffinity".to_string(), json!("None"));
+        }
+
+        // 3. ClusterIP immutability / allocation
+        let old_cluster_ip = old_doc.pointer("/spec/clusterIP").and_then(Value::as_str);
+        let new_cluster_ip = spec.get("clusterIP").and_then(Value::as_str);
+
+        match (old_cluster_ip, new_cluster_ip) {
+            (Some(old_ip), None | Some("")) => {
+                spec.insert("clusterIP".to_string(), json!(old_ip));
+            },
+            (Some(old_ip), Some(new_ip)) if old_ip != new_ip => {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.clusterIP".to_string(),
+                    reason: "field is immutable".to_string(),
+                });
+            },
+            (None, None | Some("")) => {
+                if svc_type != "ExternalName" {
+                    let allocated = self.allocate_cluster_ip(namespace, name, &allocated_ips)?;
+                    allocated_ips.insert(allocated);
+                    spec.insert("clusterIP".to_string(), json!(allocated.to_string()));
+                }
+            },
+            (None, Some(new_ip)) if new_ip != "None" => {
+                let validated_ip = self.validate_specified_cluster_ip(new_ip, &allocated_ips)?;
+                allocated_ips.insert(validated_ip);
+            },
+            _ => {},
+        }
+
+        if let Some(cip) = spec
+            .get("clusterIP")
+            .and_then(Value::as_str)
+            .filter(|cip| *cip != "None" && !cip.is_empty() && !spec.contains_key("clusterIPs"))
+        {
+            spec.insert("clusterIPs".to_string(), json!([cip]));
+        }
+
+        // 4. Ports defaulting & NodePort handling
+        let needs_node_port = matches!(svc_type.as_str(), "NodePort" | "LoadBalancer");
+        let (min_port, max_port) = parse_port_range(&self.service_node_port_range)?;
+
+        let (old_node_ports_by_port, old_node_ports_by_name) =
+            Self::extract_old_node_ports(&old_doc);
+
+        if let Some(ports) = spec.get_mut("ports").and_then(Value::as_array_mut) {
+            for port in ports.iter_mut() {
+                let Some(port_obj) = port.as_object_mut() else {
+                    continue;
+                };
+
+                if !port_obj.contains_key("protocol") {
+                    port_obj.insert("protocol".to_string(), json!("TCP"));
+                }
+
+                if !needs_node_port {
+                    // Deallocate nodePort if changed to ClusterIP or ExternalName
+                    port_obj.remove("nodePort");
+                    continue;
+                }
+
+                let specified_node_port = port_obj
+                    .get("nodePort")
+                    .and_then(Value::as_u64)
+                    .filter(|&p| p > 0)
+                    .and_then(|p| u16::try_from(p).ok());
+
+                let reused_old_node_port = if specified_node_port.is_none() {
+                    let by_name = port_obj
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|n| old_node_ports_by_name.get(n).copied());
+                    let by_port = port_obj
+                        .get("port")
+                        .and_then(Value::as_i64)
+                        .and_then(|p| old_node_ports_by_port.get(&p).copied());
+                    by_name.or(by_port)
+                } else {
+                    None
+                };
+
+                let target_np = specified_node_port.or(reused_old_node_port);
+                Self::allocate_or_validate_node_port(
+                    port_obj,
+                    target_np,
+                    min_port,
+                    max_port,
+                    &mut allocated_ports,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn create_service_options(
         &self,
         namespace: &str,
         mut service: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
-        if !service.get("spec").is_some_and(Value::is_object) {
-            service["spec"] = json!({});
-        }
-
-        let svc_type = service
-            .pointer("/spec/type")
-            .and_then(Value::as_str)
-            .unwrap_or("ClusterIP")
-            .to_string();
-
-        if let Some(spec) = service
-            .get_mut("spec")
-            .and_then(Value::as_object_mut)
-            .filter(|spec| !spec.contains_key("type"))
-        {
-            spec.insert("type".to_string(), json!(svc_type));
-        }
-
-        if svc_type != "ExternalName" {
-            let cluster_ip = service
-                .pointer("/spec/clusterIP")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-
-            match cluster_ip.as_deref() {
-                Some("None") => {
-                    // Headless service: do not allocate an IP
-                },
-                Some(ip) if !ip.is_empty() => {
-                    // Pre-assigned ClusterIP: keep it, and set clusterIPs if missing
-                    if let Some(spec) = service.get_mut("spec").and_then(Value::as_object_mut) {
-                        ensure_service_cluster_ips(spec, ip);
-                    }
-                },
-                _ => {
-                    // Allocate new clusterIP
-                    let allocated = self.allocate_cluster_ip().await?;
-                    if let Some(spec) = service.get_mut("spec").and_then(Value::as_object_mut) {
-                        spec.insert("clusterIP".to_string(), json!(&allocated));
-                        ensure_service_cluster_ips(spec, &allocated);
-                    }
-                },
-            }
-        }
-
+        self.prepare_service_for_create(namespace, &mut service)
+            .await?;
         self.create_workload_options("", "Service", "services", namespace, service, dry_run)
             .await
     }
@@ -2858,12 +3183,8 @@ impl KubernetesApiClient {
         mut service: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
-        if let (Ok(existing), Some(spec)) = (
-            self.get_service(namespace, name).await,
-            service.get_mut("spec").and_then(Value::as_object_mut),
-        ) {
-            sync_service_cluster_ips(spec, &existing);
-        }
+        self.prepare_service_for_update(namespace, name, &mut service)
+            .await?;
         self.update_workload_options("", "Service", "services", namespace, name, service, dry_run)
             .await
     }

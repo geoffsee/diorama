@@ -12,5 +12,7 @@ mod auth_rbac;
 mod https_gateway;
 #[path = "service_account_tokens.rs"]
 mod service_account_tokens;
+#[path = "service_allocation.rs"]
+mod service_allocation;
 #[path = "storage_readiness.rs"]
 mod storage_readiness;

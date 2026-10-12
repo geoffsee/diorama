@@ -29,7 +29,8 @@ pub use client::{
 };
 pub use config::{
     ApiserverConfig, DEFAULT_ETCD_PREFIX, DEFAULT_SA_ISSUER, DEFAULT_SECURE_PORT,
-    DEFAULT_SERVICE_CLUSTER_IP_RANGE,
+    DEFAULT_SERVICE_CLUSTER_IP_RANGE, DEFAULT_SERVICE_NODE_PORT_RANGE, parse_ipv4_cidr,
+    parse_port_range,
 };
 pub use error::ApiserverError;
 pub use health::{HealthReport, check_apiserver_readiness};

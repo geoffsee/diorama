@@ -593,6 +593,37 @@ async fn table_accept_formatting_for_all_supported_resources() {
         "{body}"
     );
 
+    // NodePort service table formatting verifies CLUSTER-IP and port:nodePort/proto display
+    let (status, body) = request(
+        addr,
+        &pki,
+        true,
+        "POST",
+        "/api/v1/namespaces/default/services",
+        r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"webnp"},"spec":{"type":"NodePort","ports":[{"port":80,"targetPort":8080}]}}"#,
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    let (status, body) = request_with_accept(
+        addr,
+        &pki,
+        true,
+        "GET",
+        "/api/v1/namespaces/default/services/webnp",
+        "application/json;as=Table;v=v1;g=meta.k8s.io",
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"kind\":\"Table\""), "{body}");
+    assert!(
+        body.contains(
+            "\"cells\":[\"webnp\",\"NodePort\",\"10.43.0.2\",\"<none>\",\"80:30000/TCP\""
+        ),
+        "{body}"
+    );
+
     // 3. ConfigMaps
     let (status, body) = request(
         addr,

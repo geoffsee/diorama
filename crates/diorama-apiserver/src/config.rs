@@ -6,8 +6,52 @@ use crate::error::ApiserverError;
 
 pub const DEFAULT_SECURE_PORT: u16 = 6443;
 pub const DEFAULT_SERVICE_CLUSTER_IP_RANGE: &str = "10.43.0.0/16";
+pub const DEFAULT_SERVICE_NODE_PORT_RANGE: &str = "30000-32767";
 pub const DEFAULT_ETCD_PREFIX: &str = "/registry";
 pub const DEFAULT_SA_ISSUER: &str = "https://kubernetes.default.svc";
+
+/// Parses an IPv4 CIDR string into a base IP and prefix length.
+pub fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), ApiserverError> {
+    let (ip_str, prefix_str) = cidr.split_once('/').ok_or_else(|| ApiserverError::Config {
+        reason: format!("invalid CIDR format: '{cidr}', expected ip/prefix"),
+    })?;
+    let ip: Ipv4Addr = ip_str.parse().map_err(|e| ApiserverError::Config {
+        reason: format!("invalid CIDR IP '{ip_str}': {e}"),
+    })?;
+    let prefix: u8 = prefix_str.parse().map_err(|e| ApiserverError::Config {
+        reason: format!("invalid CIDR prefix length '{prefix_str}': {e}"),
+    })?;
+    if prefix > 32 {
+        return Err(ApiserverError::Config {
+            reason: format!("CIDR prefix length {prefix} exceeds 32"),
+        });
+    }
+    Ok((ip, prefix))
+}
+
+/// Parses a port range string formatted as `start-end` into `(u16, u16)`.
+pub fn parse_port_range(range_str: &str) -> Result<(u16, u16), ApiserverError> {
+    let (start_str, end_str) = range_str
+        .split_once('-')
+        .ok_or_else(|| ApiserverError::Config {
+            reason: format!("invalid port range format: '{range_str}', expected start-end"),
+        })?;
+    let start: u16 = start_str
+        .trim()
+        .parse()
+        .map_err(|e| ApiserverError::Config {
+            reason: format!("invalid start port in range '{start_str}': {e}"),
+        })?;
+    let end: u16 = end_str.trim().parse().map_err(|e| ApiserverError::Config {
+        reason: format!("invalid end port in range '{end_str}': {e}"),
+    })?;
+    if start == 0 || end == 0 || start > end {
+        return Err(ApiserverError::Config {
+            reason: format!("invalid port range {start}-{end}"),
+        });
+    }
+    Ok((start, end))
+}
 
 /// Official Kubernetes v1.35.7 API Server configuration options.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +60,7 @@ pub struct ApiserverConfig {
     pub secure_port: u16,
     pub advertise_address: IpAddr,
     pub service_cluster_ip_range: String,
+    pub service_node_port_range: String,
     pub pki_dir: PathBuf,
     pub etcd_servers: Vec<String>,
     pub etcd_prefix: String,
@@ -50,6 +95,7 @@ impl ApiserverConfig {
             secure_port: DEFAULT_SECURE_PORT,
             advertise_address: node_ip,
             service_cluster_ip_range: DEFAULT_SERVICE_CLUSTER_IP_RANGE.to_string(),
+            service_node_port_range: DEFAULT_SERVICE_NODE_PORT_RANGE.to_string(),
             pki_dir: pki.to_path_buf(),
             etcd_servers: vec!["http://127.0.0.1:2379".to_string()],
             etcd_prefix: DEFAULT_ETCD_PREFIX.to_string(),
@@ -82,6 +128,15 @@ impl ApiserverConfig {
                 reason: "service_cluster_ip_range must not be empty".to_string(),
             });
         }
+        parse_ipv4_cidr(&self.service_cluster_ip_range)?;
+
+        if self.service_node_port_range.is_empty() {
+            return Err(ApiserverError::Config {
+                reason: "service_node_port_range must not be empty".to_string(),
+            });
+        }
+        parse_port_range(&self.service_node_port_range)?;
+
         if self.etcd_servers.is_empty() {
             return Err(ApiserverError::Config {
                 reason: "at least one etcd server must be configured".to_string(),
@@ -106,6 +161,7 @@ impl ApiserverConfig {
                 "--service-cluster-ip-range={}",
                 self.service_cluster_ip_range
             ),
+            format!("--service-node-port-range={}", self.service_node_port_range),
             format!("--cert-dir={}", self.pki_dir.display()),
             format!("--client-ca-file={}", self.client_ca_file.display()),
             format!("--tls-cert-file={}", self.tls_cert_file.display()),
