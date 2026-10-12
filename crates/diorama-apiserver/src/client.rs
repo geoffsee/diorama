@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
 
-use diorama_datastore::WatchReceiver;
+pub use diorama_datastore::{WatchEvent, WatchEventType, WatchReceiver};
 
 use crate::admission::{
     AdmissionEngine, AdmissionRequest, GroupVersionKind, GroupVersionResource, UserInfo,
@@ -1797,9 +1797,20 @@ impl KubernetesApiClient {
         plural: &str,
         namespace: &str,
     ) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("list", group, plural, Some(namespace), None)?;
+        let authz_ns = if namespace.is_empty() {
+            None
+        } else {
+            Some(namespace)
+        };
+        self.check_auth_detailed("list", group, plural, authz_ns, None)?;
         let prefix = if group.is_empty() {
-            format!("{}/{plural}/{namespace}/", self.storage.prefix())
+            if namespace.is_empty() {
+                format!("{}/{plural}/", self.storage.prefix())
+            } else {
+                format!("{}/{plural}/{namespace}/", self.storage.prefix())
+            }
+        } else if namespace.is_empty() {
+            format!("{}/{group}/{plural}/", self.storage.prefix())
         } else {
             format!("{}/{group}/{plural}/{namespace}/", self.storage.prefix())
         };

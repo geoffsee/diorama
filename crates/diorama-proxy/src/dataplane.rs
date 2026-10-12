@@ -142,14 +142,141 @@ impl IptablesDataplane {
 
     /// Programs the synthesized iptables NAT rules via the command executor, ensuring owned chains exist
     /// and are repopulated without wiping foreign tables.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_rules(
         rules: &[IptablesRule],
         executor: &dyn CommandExecutor,
     ) -> Result<(), ProxyError> {
+        // Probe packet filter availability first
+        let probe = executor
+            .run("iptables", &["-t", "nat", "-S"])
+            .map_err(|e| ProxyError::CommandExecutionFailed {
+                command: "iptables -t nat -S".to_string(),
+                reason: e.to_string(),
+            })?;
+        if !probe.success {
+            return Err(ProxyError::CommandExecutionFailed {
+                command: "iptables -t nat -S".to_string(),
+                reason: probe.stderr,
+            });
+        }
+
         // Ensure base chains exist
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-SERVICES"]);
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-NODEPORTS"]);
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-POSTROUTING"]);
+        let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-MARK-MASQ"]);
+
+        // Program mark rules for KUBE-MARK-MASQ
+        let mark_check = executor.run(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-C",
+                "KUBE-MARK-MASQ",
+                "-j",
+                "MARK",
+                "--set-xmark",
+                "0x4000/0x4000",
+            ],
+        );
+        if !matches!(mark_check, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "KUBE-MARK-MASQ",
+                    "-j",
+                    "MARK",
+                    "--set-xmark",
+                    "0x4000/0x4000",
+                ],
+            );
+        }
+
+        // Program mark and masquerade rules for KUBE-POSTROUTING
+        let post_masq_check = executor.run(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-C",
+                "KUBE-POSTROUTING",
+                "-m",
+                "mark",
+                "!",
+                "--mark",
+                "0x4000/0x4000",
+                "-j",
+                "RETURN",
+            ],
+        );
+        if !matches!(post_masq_check, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "KUBE-POSTROUTING",
+                    "-m",
+                    "mark",
+                    "!",
+                    "--mark",
+                    "0x4000/0x4000",
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+
+        let masq_check = executor.run(
+            "iptables",
+            &["-t", "nat", "-C", "KUBE-POSTROUTING", "-j", "MASQUERADE"],
+        );
+        if !matches!(masq_check, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &["-t", "nat", "-A", "KUBE-POSTROUTING", "-j", "MASQUERADE"],
+            );
+        }
+
+        // Idempotently install jump rules into base chains
+        let prerouting_jump = executor.run(
+            "iptables",
+            &["-t", "nat", "-C", "PREROUTING", "-j", "KUBE-SERVICES"],
+        );
+        if !matches!(prerouting_jump, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &["-t", "nat", "-A", "PREROUTING", "-j", "KUBE-SERVICES"],
+            );
+        }
+
+        let output_jump = executor.run(
+            "iptables",
+            &["-t", "nat", "-C", "OUTPUT", "-j", "KUBE-SERVICES"],
+        );
+        if !matches!(output_jump, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &["-t", "nat", "-A", "OUTPUT", "-j", "KUBE-SERVICES"],
+            );
+        }
+
+        let postrouting_jump = executor.run(
+            "iptables",
+            &["-t", "nat", "-C", "POSTROUTING", "-j", "KUBE-POSTROUTING"],
+        );
+        if !matches!(postrouting_jump, Ok(ref out) if out.success) {
+            let _ = executor.run(
+                "iptables",
+                &["-t", "nat", "-A", "POSTROUTING", "-j", "KUBE-POSTROUTING"],
+            );
+        }
 
         // Flush only owned base chains to clear previous service/nodeport mappings
         let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-SERVICES"]);
@@ -364,10 +491,25 @@ impl NftablesDataplane {
     }
 
     /// Programs the synthesized nftables rules into the dedicated `ip kube-proxy` table via the command executor.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_rules(
         rules: &[NftablesRule],
         executor: &dyn CommandExecutor,
     ) -> Result<(), ProxyError> {
+        // Probe packet filter availability first
+        let probe = executor.run("nft", &["list", "tables"]).map_err(|e| {
+            ProxyError::CommandExecutionFailed {
+                command: "nft list tables".to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        if !probe.success {
+            return Err(ProxyError::CommandExecutionFailed {
+                command: "nft list tables".to_string(),
+                reason: probe.stderr,
+            });
+        }
+
         // Ensure table and base chains exist
         let _ = executor.run("nft", &["add", "table", "ip", "kube-proxy"]);
         let _ = executor.run(

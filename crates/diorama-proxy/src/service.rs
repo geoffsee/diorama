@@ -26,6 +26,7 @@ pub struct ProxyService {
     dataplane_ready: Arc<AtomicBool>,
     verified_generation: Arc<AtomicU64>,
     routing_table: Arc<RwLock<ServiceRoutingTable>>,
+    client: Option<Arc<diorama_apiserver::KubernetesApiClient>>,
 }
 
 impl std::fmt::Debug for ProxyService {
@@ -37,6 +38,7 @@ impl std::fmt::Debug for ProxyService {
             .field("ready", &self.is_ready())
             .field("snat_ready", &self.is_snat_ready())
             .field("dataplane_ready", &self.is_dataplane_ready())
+            .field("has_client", &self.client.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -54,7 +56,24 @@ impl ProxyService {
             dataplane_ready: Arc::new(AtomicBool::new(false)),
             verified_generation: Arc::new(AtomicU64::new(0)),
             routing_table: Arc::new(RwLock::new(ServiceRoutingTable::new())),
+            client: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_client(mut self, client: Arc<diorama_apiserver::KubernetesApiClient>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    #[must_use]
+    pub fn client(&self) -> Option<&Arc<diorama_apiserver::KubernetesApiClient>> {
+        self.client.as_ref()
+    }
+
+    #[must_use]
+    pub fn executor(&self) -> &Arc<dyn CommandExecutor> {
+        &self.executor
     }
 
     #[must_use]
@@ -339,5 +358,67 @@ impl ProxyService {
             self.executor.as_ref(),
             previous_endpoints,
         )
+    }
+
+    /// Synchronizes the routing table from the provided Kubernetes API client and reconciles the dataplane.
+    pub async fn sync_from_client(
+        &self,
+        client: &diorama_apiserver::KubernetesApiClient,
+        reconciler: &DataplaneReconciler,
+    ) -> Result<ReconciliationSummary, ProxyError> {
+        let services_val = client
+            .list_services("")
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Failed to list services: {e}"),
+            })?;
+
+        let slices_val =
+            client
+                .list_endpointslices("")
+                .await
+                .map_err(|e| ProxyError::Internal {
+                    reason: format!("Failed to list endpointslices: {e}"),
+                })?;
+
+        let svcs: Vec<_> = services_val
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| crate::routing::service_from_value(item).ok())
+            .collect();
+        let slices: Vec<_> = slices_val
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| crate::routing::endpoint_slice_from_value(item).ok())
+            .collect();
+
+        {
+            let mut table = self.routing_table.write().await;
+            for svc in svcs {
+                table.apply_service(svc);
+            }
+            for slice in slices {
+                table.apply_endpoint_slice(slice);
+            }
+        }
+        self.dataplane_ready.store(false, Ordering::SeqCst);
+
+        self.reconcile_dataplane(reconciler, None).await
+    }
+
+    /// Synchronizes the routing table from the configured API client (if any) and reconciles the dataplane.
+    pub async fn sync_from_api(
+        &self,
+        reconciler: &DataplaneReconciler,
+    ) -> Result<ReconciliationSummary, ProxyError> {
+        if let Some(client) = self.client.as_ref() {
+            self.sync_from_client(client, reconciler).await
+        } else {
+            self.reconcile_dataplane(reconciler, None).await
+        }
     }
 }

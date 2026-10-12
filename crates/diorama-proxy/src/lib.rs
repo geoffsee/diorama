@@ -41,6 +41,7 @@ pub use prober::{DataplaneProbeReport, DataplaneProber, ProbeResult, WorkloadPro
 pub use routing::{
     EndpointConditions, EndpointItem, EndpointPort, EndpointSliceDefinition, Protocol,
     ServiceDefinition, ServicePort, ServiceRoutingTable, ServiceType, TargetEndpoint,
+    endpoint_slice_from_value, extract_namespace_and_name_from_key, service_from_value,
 };
 pub use service::ProxyService;
 pub use supervisor::{COMPONENT_PROXY, DEFAULT_STARTUP_TIMEOUT, ProxyAdapter};

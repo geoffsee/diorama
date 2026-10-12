@@ -519,6 +519,7 @@ pub fn prepare_node_network(
 pub struct MockCommandExecutor {
     pub iptables_available: bool,
     pub nft_available: bool,
+    pub iptables_chains: Mutex<Vec<String>>,
     pub iptables_rules: Mutex<Vec<String>>,
     pub nft_tables: Mutex<Vec<String>>,
     pub nft_chains: Mutex<Vec<String>>,
@@ -602,6 +603,7 @@ impl MockCommandExecutor {
         self.unrelated_nat_rules.lock().unwrap().len()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_iptables(
         &self,
         args: &[&str],
@@ -624,8 +626,16 @@ impl MockCommandExecutor {
 
         let mut rules = self.iptables_rules.lock().unwrap();
 
-        if args.contains(&"-C") {
-            let present = rules.iter().any(|r| r.contains(MASQUERADE_COMMENT));
+        if let Some(pos) = args.iter().position(|&a| a == "-C") {
+            let check_tokens: Vec<&str> = args[pos + 1..].to_vec();
+            let present = rules.iter().any(|r| {
+                if r.contains(MASQUERADE_COMMENT)
+                    && check_tokens.iter().any(|t| t.contains(MASQUERADE_COMMENT))
+                {
+                    return true;
+                }
+                check_tokens.iter().all(|t| r.contains(t))
+            });
             return Ok(CommandOutput {
                 success: present,
                 stdout: String::new(),
@@ -649,7 +659,25 @@ impl MockCommandExecutor {
             });
         }
 
-        if let Some(pos) = args.iter().position(|&a| a == "-F" || a == "-X") {
+        if let Some(pos) = args.iter().position(|&a| a == "-N") {
+            if let Some(chain) = args.get(pos + 1) {
+                let mut chains = self.iptables_chains.lock().unwrap();
+                if !chains.contains(&chain.to_string()) {
+                    chains.push(chain.to_string());
+                }
+                let entry = format!("-N {chain}");
+                if !rules.contains(&entry) {
+                    rules.push(entry);
+                }
+            }
+            return Ok(CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        if let Some(pos) = args.iter().position(|&a| a == "-F") {
             let chain_opt = args.get(pos + 1).copied();
             if let Some(chain) = chain_opt
                 && !chain.starts_with('-')
@@ -657,7 +685,28 @@ impl MockCommandExecutor {
                 let pattern = format!("-A {chain}");
                 rules.retain(|r| !r.contains(&pattern));
             } else {
+                rules.retain(|r| r.starts_with("-N "));
+                self.unrelated_nat_rules.lock().unwrap().clear();
+            }
+            return Ok(CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        if let Some(pos) = args.iter().position(|&a| a == "-X") {
+            let chain_opt = args.get(pos + 1).copied();
+            if let Some(chain) = chain_opt
+                && !chain.starts_with('-')
+            {
+                let pattern = format!("-A {chain}");
+                let n_pattern = format!("-N {chain}");
+                rules.retain(|r| !r.contains(&pattern) && !r.contains(&n_pattern));
+                self.iptables_chains.lock().unwrap().retain(|c| c != chain);
+            } else {
                 rules.clear();
+                self.iptables_chains.lock().unwrap().clear();
                 self.unrelated_nat_rules.lock().unwrap().clear();
             }
             return Ok(CommandOutput {
@@ -756,7 +805,30 @@ impl MockCommandExecutor {
         }
     }
 
+    #[allow(clippy::excessive_nesting)]
     fn handle_nft_list(&self, args: &[&str]) -> CommandOutput {
+        if args.get(1) == Some(&"ruleset") {
+            let tables = self.nft_tables.lock().unwrap();
+            let chains = self.nft_chains.lock().unwrap();
+            let rules = self.nft_rules.lock().unwrap();
+            let mut out = String::new();
+            for t in tables.iter() {
+                let _ = writeln!(out, "table ip {t} {{");
+                for c in chains.iter() {
+                    let _ = writeln!(out, "    chain {c} {{");
+                    for r in rules.iter() {
+                        let _ = writeln!(out, "        {r}");
+                    }
+                    let _ = writeln!(out, "    }}");
+                }
+                let _ = writeln!(out, "}}");
+            }
+            return CommandOutput {
+                success: true,
+                stdout: out,
+                stderr: String::new(),
+            };
+        }
         if args.get(1) == Some(&"tables") {
             let tables = self.nft_tables.lock().unwrap();
             let mut out = String::new();
@@ -855,6 +927,68 @@ impl MockCommandExecutor {
         }
         CommandOutput::default()
     }
+
+    #[allow(clippy::excessive_nesting)]
+    fn handle_iptables_save(&self) -> Result<CommandOutput, std::io::Error> {
+        if !self.iptables_available {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "iptables-save command not found",
+            ));
+        }
+
+        let rules = self.iptables_rules.lock().unwrap();
+        let chains = self.iptables_chains.lock().unwrap();
+        let mut out = String::from("*nat\n");
+        out.push_str(":PREROUTING ACCEPT [0:0]\n");
+        out.push_str(":INPUT ACCEPT [0:0]\n");
+        out.push_str(":OUTPUT ACCEPT [0:0]\n");
+        out.push_str(":POSTROUTING ACCEPT [0:0]\n");
+        let mut all_chains = Vec::new();
+        for c in chains.iter() {
+            all_chains.push(c.clone());
+        }
+        for r in rules.iter() {
+            if let Some(c) = r.strip_prefix("-N ")
+                && !all_chains.contains(&c.to_string())
+            {
+                all_chains.push(c.to_string());
+            }
+        }
+        for c in all_chains {
+            let _ = writeln!(out, ":{c} - [0:0]");
+        }
+        for r in rules.iter() {
+            if r.starts_with("-N ") {
+                continue;
+            }
+            let line = if let Some(stripped) = r.strip_prefix("iptables ") {
+                let parts: Vec<&str> = stripped.split_whitespace().collect();
+                let mut filtered = Vec::new();
+                let mut i = 0;
+                while i < parts.len() {
+                    if parts[i] == "-w" || parts[i] == "-t" {
+                        i += 2;
+                    } else {
+                        filtered.push(parts[i]);
+                        i += 1;
+                    }
+                }
+                filtered.join(" ")
+            } else {
+                r.clone()
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push_str("COMMIT\n");
+
+        Ok(CommandOutput {
+            success: true,
+            stdout: out,
+            stderr: String::new(),
+        })
+    }
 }
 
 impl CommandExecutor for MockCommandExecutor {
@@ -864,6 +998,7 @@ impl CommandExecutor for MockCommandExecutor {
 
         match program {
             "iptables" => self.handle_iptables(args, &cmd_str),
+            "iptables-save" => self.handle_iptables_save(),
             "nft" => self.handle_nft(args, &cmd_str),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

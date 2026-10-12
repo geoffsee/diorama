@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::ProxyError;
 
@@ -444,5 +445,314 @@ impl ServiceRoutingTable {
 
         // Second try NodePort routing
         self.route_node_port(dst_port, protocol)
+    }
+}
+
+/// Extracts `(namespace, name)` from a datastore key path (e.g. `/registry/services/default/my-svc`).
+#[must_use]
+pub fn extract_namespace_and_name_from_key(key: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2 {
+        let name = parts[parts.len() - 1].to_string();
+        let namespace = parts[parts.len() - 2].to_string();
+        Some((namespace, name))
+    } else {
+        None
+    }
+}
+
+/// Parses a `ServiceDefinition` from a Kubernetes `Service` JSON value.
+#[allow(clippy::cast_possible_truncation)]
+pub fn service_from_value(val: &Value) -> Result<ServiceDefinition, ProxyError> {
+    let metadata = val.get("metadata").ok_or_else(|| ProxyError::Internal {
+        reason: "Service missing metadata".to_string(),
+    })?;
+    let name = metadata
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::Internal {
+            reason: "Service missing metadata.name".to_string(),
+        })?
+        .to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+
+    let spec = val.get("spec").ok_or_else(|| ProxyError::Internal {
+        reason: format!("Service {namespace}/{name} missing spec"),
+    })?;
+
+    let svc_type_str = spec
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("ClusterIP");
+
+    let service_type = match svc_type_str {
+        "NodePort" => ServiceType::NodePort,
+        "LoadBalancer" => ServiceType::LoadBalancer,
+        _ => ServiceType::ClusterIP,
+    };
+
+    let cluster_ip = spec
+        .get("clusterIP")
+        .and_then(Value::as_str)
+        .and_then(|ip| {
+            if ip.is_empty() || ip == "None" {
+                None
+            } else {
+                Some(ip.to_string())
+            }
+        });
+
+    let mut ports = Vec::new();
+    if let Some(ports_arr) = spec.get("ports").and_then(Value::as_array) {
+        for p in ports_arr {
+            let port_num =
+                p.get("port")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ProxyError::Internal {
+                        reason: format!("Service {namespace}/{name} port missing port number"),
+                    })? as u16;
+
+            let protocol = match p.get("protocol").and_then(Value::as_str) {
+                Some("UDP") => Protocol::Udp,
+                _ => Protocol::Tcp,
+            };
+
+            let name = p
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+
+            let target_port = if let Some(tp) = p.get("targetPort") {
+                if let Some(num) = tp.as_u64() {
+                    num as u16
+                } else if let Some(s) = tp.as_str() {
+                    s.parse::<u16>().unwrap_or(port_num)
+                } else {
+                    port_num
+                }
+            } else {
+                port_num
+            };
+
+            let node_port = p
+                .get("nodePort")
+                .and_then(Value::as_u64)
+                .map(|np| np as u16);
+
+            ports.push(ServicePort {
+                name,
+                protocol,
+                port: port_num,
+                target_port,
+                node_port,
+            });
+        }
+    }
+
+    Ok(ServiceDefinition {
+        namespace,
+        name,
+        service_type,
+        cluster_ip,
+        ports,
+    })
+}
+
+/// Parses an `EndpointSliceDefinition` from a Kubernetes `EndpointSlice` JSON value.
+#[allow(clippy::cast_possible_truncation)]
+pub fn endpoint_slice_from_value(val: &Value) -> Result<EndpointSliceDefinition, ProxyError> {
+    let metadata = val.get("metadata").ok_or_else(|| ProxyError::Internal {
+        reason: "EndpointSlice missing metadata".to_string(),
+    })?;
+    let name = metadata
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::Internal {
+            reason: "EndpointSlice missing metadata.name".to_string(),
+        })?
+        .to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+
+    let service_name = metadata
+        .get("labels")
+        .and_then(|l| l.get("kubernetes.io/service-name"))
+        .and_then(Value::as_str)
+        .map_or_else(|| name.clone(), ToString::to_string);
+
+    let address_type = val
+        .get("addressType")
+        .and_then(Value::as_str)
+        .unwrap_or("IPv4")
+        .to_string();
+
+    let mut ports = Vec::new();
+    if let Some(ports_arr) = val.get("ports").and_then(Value::as_array) {
+        for p in ports_arr {
+            let port_name = p
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let port = p.get("port").and_then(Value::as_u64).map(|p| p as u16);
+            let protocol = p.get("protocol").and_then(Value::as_str).map(|pr| {
+                if pr == "UDP" {
+                    Protocol::Udp
+                } else {
+                    Protocol::Tcp
+                }
+            });
+            ports.push(EndpointPort {
+                name: port_name,
+                port,
+                protocol,
+            });
+        }
+    }
+
+    let mut endpoints = Vec::new();
+    if let Some(endpoints_arr) = val.get("endpoints").and_then(Value::as_array) {
+        for ep in endpoints_arr {
+            let addresses = ep
+                .get("addresses")
+                .and_then(Value::as_array)
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let conditions = if let Some(cond) = ep.get("conditions") {
+                let ready = cond.get("ready").and_then(Value::as_bool);
+                let serving = cond.get("serving").and_then(Value::as_bool);
+                let terminating = cond.get("terminating").and_then(Value::as_bool);
+                EndpointConditions {
+                    ready,
+                    serving,
+                    terminating,
+                }
+            } else {
+                EndpointConditions::default()
+            };
+
+            let node_name = ep
+                .get("nodeName")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+
+            endpoints.push(EndpointItem {
+                addresses,
+                conditions,
+                node_name,
+            });
+        }
+    }
+
+    Ok(EndpointSliceDefinition {
+        namespace,
+        name,
+        service_name,
+        address_type,
+        ports,
+        endpoints,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_namespace_and_name() {
+        assert_eq!(
+            extract_namespace_and_name_from_key("/registry/services/default/kubernetes"),
+            Some(("default".to_string(), "kubernetes".to_string()))
+        );
+        assert_eq!(
+            extract_namespace_and_name_from_key(
+                "/registry/discovery.k8s.io/endpointslices/kube-system/coredns-abc"
+            ),
+            Some(("kube-system".to_string(), "coredns-abc".to_string()))
+        );
+        assert_eq!(extract_namespace_and_name_from_key("single"), None);
+    }
+
+    #[test]
+    fn test_service_from_value() {
+        let val = json!({
+            "metadata": {
+                "name": "my-service",
+                "namespace": "test-ns"
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.96.0.100",
+                "ports": [
+                    {
+                        "name": "http",
+                        "port": 80,
+                        "targetPort": 8080,
+                        "protocol": "TCP"
+                    }
+                ]
+            }
+        });
+
+        let svc = service_from_value(&val).expect("parse service");
+        assert_eq!(svc.name, "my-service");
+        assert_eq!(svc.namespace, "test-ns");
+        assert_eq!(svc.service_type, ServiceType::ClusterIP);
+        assert_eq!(svc.cluster_ip.as_deref(), Some("10.96.0.100"));
+        assert_eq!(svc.ports.len(), 1);
+        assert_eq!(svc.ports[0].port, 80);
+        assert_eq!(svc.ports[0].target_port, 8080);
+    }
+
+    #[test]
+    fn test_endpoint_slice_from_value() {
+        let val = json!({
+            "metadata": {
+                "name": "my-service-slice",
+                "namespace": "test-ns",
+                "labels": {
+                    "kubernetes.io/service-name": "my-service"
+                }
+            },
+            "addressType": "IPv4",
+            "ports": [
+                {
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "TCP"
+                }
+            ],
+            "endpoints": [
+                {
+                    "addresses": ["10.244.0.5"],
+                    "conditions": {
+                        "ready": true
+                    },
+                    "nodeName": "node-1"
+                }
+            ]
+        });
+
+        let slice = endpoint_slice_from_value(&val).expect("parse slice");
+        assert_eq!(slice.name, "my-service-slice");
+        assert_eq!(slice.service_name, "my-service");
+        assert_eq!(slice.namespace, "test-ns");
+        assert_eq!(slice.endpoints.len(), 1);
+        assert_eq!(slice.endpoints[0].addresses, vec!["10.244.0.5"]);
+        assert!(slice.endpoints[0].conditions.is_ready());
     }
 }

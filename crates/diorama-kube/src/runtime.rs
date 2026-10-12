@@ -332,7 +332,10 @@ impl RuntimeBuilder {
 
     /// Registers the kube-proxy component under supervision.
     #[must_use]
-    pub fn register_proxy(self, proxy: ProxyService) -> Self {
+    pub fn register_proxy(self, mut proxy: ProxyService) -> Self {
+        if let (None, Some(client)) = (proxy.client(), self.client.clone()) {
+            proxy = proxy.with_client(Arc::new(client));
+        }
         let timeout = self.policy.startup_timeout();
         let reg = ProxyAdapter::registration(
             COMPONENT_PROXY,
@@ -967,7 +970,8 @@ fn register_workload_path(
         let proxy_mode =
             diorama_proxy::detect_proxy_backend(None, &executor).unwrap_or(ProxyMode::IpTables);
         let proxy_opts = KubeProxyOptions::new(proxy_kubeconfig, is_container, proxy_mode);
-        let proxy_service = ProxyService::new(proxy_opts);
+        let proxy_service = ProxyService::new(proxy_opts)
+            .with_client(Arc::new(ctx.apiserver_service.admin_client()));
         builder = builder.register_proxy(proxy_service);
 
         let kubelet_dir = ctx.state_dir.join("kubelet");
