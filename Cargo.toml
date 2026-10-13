@@ -52,6 +52,11 @@ codegen-backend = "cranelift"
 opt-level = 3
 debug = false
 
+# Cranelift drops native static archives from the final link. Test binaries
+# use LLVM so aws-lc and the other C libraries still link.
+[profile.test]
+codegen-backend = "llvm"
+
 [profile.debugging]
 inherits = "dev"
 debug = true
