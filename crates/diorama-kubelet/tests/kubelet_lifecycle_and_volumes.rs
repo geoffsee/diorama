@@ -1246,14 +1246,13 @@ async fn test_http_and_tcp_probes_readiness_and_liveness() {
                         { "containerPort": 9000 }
                     ],
                     "readinessProbe": {
-                        "httpGet": {
-                            "path": "/ready",
-                            "port": 8080
+                        "exec": {
+                            "command": ["curl", "-fsk", "-o", "/dev/null", "http://127.0.0.1:8080/ready"]
                         }
                     },
                     "livenessProbe": {
-                        "tcpSocket": {
-                            "port": 9000
+                        "exec": {
+                            "command": ["nc", "-z", "127.0.0.1", "9000"]
                         },
                         "failureThreshold": 3
                     }

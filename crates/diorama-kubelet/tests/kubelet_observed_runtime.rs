@@ -183,7 +183,8 @@ async fn unbound_pod_is_bound_started_and_reported_running() {
     let report = kubelet.reconcile_once().await.unwrap();
     assert_eq!(report.bound, 0);
     let elsewhere = admin.get_pod("default", "elsewhere").await.unwrap();
-    assert!(elsewhere.get("status").is_none());
+    assert_eq!(elsewhere["status"]["phase"], "Pending");
+    assert_eq!(elsewhere["spec"]["nodeName"], "other-node");
 }
 
 #[tokio::test]

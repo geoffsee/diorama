@@ -208,8 +208,10 @@ async fn test_unassigned_or_differently_assigned_pod_is_ignored() {
     assert_eq!(count, 0);
 
     let pod1 = client.get_pod("default", "unscheduled-pod").await.unwrap();
-    assert!(pod1.get("status").is_none() || pod1["status"].get("phase").is_none());
+    assert_eq!(pod1["status"]["phase"], "Pending");
+    assert!(pod1["spec"].get("nodeName").is_none());
 
     let pod2 = client.get_pod("default", "other-node-pod").await.unwrap();
-    assert!(pod2.get("status").is_none() || pod2["status"].get("phase").is_none());
+    assert_eq!(pod2["status"]["phase"], "Pending");
+    assert_eq!(pod2["spec"]["nodeName"], "other-worker-node");
 }
