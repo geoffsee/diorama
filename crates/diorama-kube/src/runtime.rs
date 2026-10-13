@@ -786,17 +786,36 @@ fn register_operational_metrics(
         .register_component(metrics_reg)
 }
 
+/// Node address for PKI, the kubelet, and pod hostIP.
+///
+/// An empty or non-IPv4 `network.nodeIP` is auto-detected from `candidates`.
+/// A valid explicit IPv4, including `127.0.0.1`, is kept. Detection with no
+/// usable address falls back to loopback.
+pub(crate) fn node_ip_for_config(
+    configured: &str,
+    candidates: &[diorama_network::InterfaceCandidate],
+) -> IpAddr {
+    match diorama_network::resolve_node_ip(Some(configured), candidates) {
+        Ok((ip, _)) => IpAddr::V4(ip),
+        Err(err) => {
+            let reason = serde_json::to_string(&err.to_string())
+                .unwrap_or_else(|_| "\"no usable IPv4 address\"".to_string());
+            let _ = writeln!(
+                io::stderr(),
+                "{{\"schema\":1,\"level\":\"warn\",\"event\":\"node_ip_fallback\",\"detail_code\":\"{}\",\"reason\":{reason}}}",
+                err.diagnostic_code()
+            );
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        },
+    }
+}
+
 fn initialize_pki(
     state_dir: &std::path::Path,
     config: &ValidatedConfig,
 ) -> Result<(IpAddr, PathBuf, String), RuntimeError> {
-    let node_ip: IpAddr = if config.config().network.node_ip.is_empty() {
-        "127.0.0.1".parse().unwrap()
-    } else {
-        config.config().network.node_ip.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid node IP: {e}"))
-        })?
-    };
+    let candidates = diorama_network::discover_host_interfaces();
+    let node_ip = node_ip_for_config(&config.config().network.node_ip, &candidates);
 
     let node_name = if config.config().kubernetes.node_name.is_empty() {
         "diorama-node".to_string()
@@ -1025,5 +1044,52 @@ mod exit_code_tests {
             })),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod node_ip_for_config_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use diorama_network::InterfaceCandidate;
+
+    use super::node_ip_for_config;
+
+    fn eth0(addr: Ipv4Addr) -> InterfaceCandidate {
+        InterfaceCandidate::new("eth0", 1500, vec![IpAddr::V4(addr)])
+    }
+
+    fn loopback() -> InterfaceCandidate {
+        InterfaceCandidate::new("lo", 65536, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    }
+
+    #[test]
+    fn empty_config_uses_private_interface_address() {
+        let ip = node_ip_for_config("", &[eth0(Ipv4Addr::new(10, 0, 2, 15)), loopback()]);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)));
+    }
+
+    #[test]
+    fn explicit_config_wins_over_detected_address() {
+        let ip = node_ip_for_config(
+            "192.0.2.10",
+            &[eth0(Ipv4Addr::new(10, 0, 2, 15)), loopback()],
+        );
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+    }
+
+    #[test]
+    fn explicit_loopback_stays_loopback() {
+        let ip = node_ip_for_config(
+            "127.0.0.1",
+            &[eth0(Ipv4Addr::new(10, 0, 2, 15)), loopback()],
+        );
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn empty_config_with_only_loopback_stays_loopback() {
+        let ip = node_ip_for_config("", &[loopback()]);
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }
