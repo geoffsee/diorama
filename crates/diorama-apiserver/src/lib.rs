@@ -1,3 +1,7 @@
+/// Kubernetes release reported by `/version` and the node `kubeletVersion`.
+/// Sonobuoy selects `registry.k8s.io/conformance:<version>` from that value.
+pub const KUBERNETES_VERSION: &str = "v1.37.1";
+
 pub mod admission;
 pub mod aggregation;
 pub mod client;

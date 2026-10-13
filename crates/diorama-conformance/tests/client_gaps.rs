@@ -886,6 +886,8 @@ fn sig_of(codename: &str) -> String {
     rest[..end].to_string()
 }
 
+/// Vendored from Kubernetes v1.37.1 `test/conformance/testdata/conformance.yaml`.
+/// A certified run uses `registry.k8s.io/conformance:v1.37.1`.
 #[test]
 #[ignore = "prints every v1.37 conformance test as not covered"]
 fn upstream_conformance_catalog() {

@@ -651,12 +651,21 @@ fn object_key(object: &Value) -> String {
 }
 
 fn version() -> Value {
+    let (major, minor) = split_kubernetes_version(crate::KUBERNETES_VERSION);
     json!({
-        "major": "1",
-        "minor": "35",
-        "gitVersion": "v1.35.7",
+        "major": major,
+        "minor": minor,
+        "gitVersion": crate::KUBERNETES_VERSION,
         "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
     })
+}
+
+/// `v1.37.1` splits into major `1` and minor `37`.
+fn split_kubernetes_version(version: &str) -> (&str, &str) {
+    let rest = version.strip_prefix('v').unwrap_or(version);
+    let (major, rest) = rest.split_once('.').unwrap_or((rest, "0"));
+    let minor = rest.split_once('.').map(|(minor, _)| minor).unwrap_or(rest);
+    (major, minor)
 }
 
 /// Serves a static document to any client that may read core discovery.
@@ -1358,6 +1367,16 @@ fn response(status: StatusCode, content_type: &'static str, bytes: Bytes) -> Res
 mod tests {
     use super::group_item;
     use serde_json::json;
+
+    #[test]
+    fn version_advertises_the_conformance_release() {
+        let body = super::version();
+        assert_eq!(body["major"], "1");
+        assert_eq!(body["minor"], "37");
+        assert_eq!(body["gitVersion"], "v1.37.1");
+        let spec = crate::openapi::v3_group("apps", "v1");
+        assert_eq!(spec["info"]["version"], "v1.37.1");
+    }
 
     #[test]
     fn aggregated_discovery_uses_aggregated_media_type() {

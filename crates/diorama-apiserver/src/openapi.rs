@@ -82,7 +82,7 @@ pub fn v3_core() -> Value {
     }
     json!({
         "openapi": "3.0.0",
-        "info": { "title": "Kubernetes", "version": "v1.35.7" },
+        "info": { "title": "Kubernetes", "version": crate::KUBERNETES_VERSION },
         "paths": paths,
         "components": { "schemas": {} }
     })
@@ -98,7 +98,7 @@ pub fn v3_storage_v1() -> Value {
     );
     json!({
         "openapi": "3.0.0",
-        "info": { "title": "Kubernetes", "version": "v1.35.7" },
+        "info": { "title": "Kubernetes", "version": crate::KUBERNETES_VERSION },
         "paths": paths,
         "components": { "schemas": {} }
     })
@@ -121,7 +121,7 @@ pub fn v3_group(group: &str, version: &str) -> Value {
     }
     json!({
         "openapi": "3.0.0",
-        "info": { "title": "Kubernetes", "version": "v1.35.7" },
+        "info": { "title": "Kubernetes", "version": crate::KUBERNETES_VERSION },
         "paths": paths,
         "components": { "schemas": {} }
     })
