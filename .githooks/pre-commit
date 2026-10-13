@@ -5,6 +5,9 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Honor rust-toolchain.toml. A stable cargo earlier on PATH cannot parse nightly profile keys.
+export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${PATH}"
+
 run() {
     printf 'pre-commit: %s\n' "$*"
     "$@"

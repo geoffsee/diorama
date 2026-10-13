@@ -1,7 +1,8 @@
 //! HTTPS front end for the in-process Kubernetes API.
 
 mod dispatch;
-mod query;
+mod protojson;
+pub(crate) mod query;
 mod route;
 mod server;
 mod tls;

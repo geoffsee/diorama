@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 
 /// Parses `a=b&c=d%3De` into a map; later keys win. Keys and values are decoded.
 pub(crate) fn parse(query: Option<&str>) -> BTreeMap<String, String> {
+    parse_pairs(query).into_iter().collect()
+}
+
+/// Parses the query into decoded pairs, preserving repeated keys in order.
+/// `exec` passes one `command` parameter per argv element, which a map would collapse.
+pub(crate) fn parse_pairs(query: Option<&str>) -> Vec<(String, String)> {
     query
         .unwrap_or_default()
         .split('&')

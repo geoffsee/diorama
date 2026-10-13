@@ -1,4 +1,5 @@
 [toolchain]
-channel = "1.97.1"
-components = ["clippy", "rustfmt", "rust-src"]
+channel = "nightly-2026-10-12"
+components = ["clippy", "rustfmt", "rust-src", "rustc-codegen-cranelift"]
+targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
 profile = "minimal"

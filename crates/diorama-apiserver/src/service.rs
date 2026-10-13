@@ -13,6 +13,7 @@ use crate::aggregation::AggregationManager;
 use crate::client::{ClientIdentity, KubernetesApiClient};
 use crate::config::ApiserverConfig;
 use crate::error::ApiserverError;
+use crate::exec::PodExec;
 use crate::health::{HealthReport, check_apiserver_readiness};
 use crate::logs::PodLogReader;
 use crate::pki::validate_pki_prerequisites;
@@ -32,6 +33,7 @@ pub struct ApiserverService {
     crd_registry: Arc<RwLock<BTreeMap<String, Value>>>,
     bound_addr: Arc<Mutex<Option<SocketAddr>>>,
     pod_log_reader: Arc<RwLock<Option<Arc<dyn PodLogReader>>>>,
+    pod_exec: Arc<RwLock<Option<Arc<dyn PodExec>>>>,
 }
 
 impl ApiserverService {
@@ -66,6 +68,7 @@ impl ApiserverService {
             crd_registry,
             bound_addr: Arc::new(Mutex::new(None)),
             pod_log_reader: Arc::new(RwLock::new(None)),
+            pod_exec: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -157,6 +160,15 @@ impl ApiserverService {
                     admin.create_namespace(ns).await?;
                 },
                 Err(e) => return Err(e),
+            }
+        }
+        let listed = admin.list_namespaces().await?;
+        if let Some(items) = listed.get("items").and_then(Value::as_array) {
+            for item in items {
+                if let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) {
+                    admin.ensure_default_service_account(name).await?;
+                    admin.ensure_kube_root_ca_configmap(name).await?;
+                }
             }
         }
         Ok(())
@@ -335,6 +347,33 @@ impl ApiserverService {
             self.rbac.add_role_binding(rb);
         }
 
+        // HTTP creates store Kubernetes objects under the API group, not the
+        // internal struct layout restored above.
+        for plural in [
+            "clusterroles",
+            "clusterrolebindings",
+            "roles",
+            "rolebindings",
+        ] {
+            let prefix = format!(
+                "{}/rbac.authorization.k8s.io/{plural}/",
+                self.storage.prefix()
+            );
+            for kv in self.storage.list(&prefix).await? {
+                let doc: Value = serde_json::from_slice(&kv.value).map_err(|e| {
+                    ApiserverError::StorageUnusable {
+                        reason: format!("failed to read {plural} at {}: {e}", kv.key),
+                    }
+                })?;
+                let namespace = doc.pointer("/metadata/namespace").and_then(Value::as_str);
+                self.rbac
+                    .apply_api_object(plural, namespace, &doc)
+                    .map_err(|reason| ApiserverError::StorageUnusable {
+                        reason: format!("failed to load {plural} at {}: {reason}", kv.key),
+                    })?;
+            }
+        }
+
         Ok(())
     }
 
@@ -367,6 +406,17 @@ impl ApiserverService {
     #[must_use]
     pub fn pod_log_reader(&self) -> Option<Arc<dyn PodLogReader>> {
         self.pod_log_reader.read().unwrap().clone()
+    }
+
+    /// Registers the in-process kubelet as the target for the pod exec subresource.
+    pub fn set_pod_exec(&self, exec: Arc<dyn PodExec>) {
+        *self.pod_exec.write().unwrap() = Some(exec);
+    }
+
+    /// The pod exec target, if a kubelet has registered one.
+    #[must_use]
+    pub fn pod_exec(&self) -> Option<Arc<dyn PodExec>> {
+        self.pod_exec.read().unwrap().clone()
     }
 
     pub fn stop(&self) {

@@ -243,8 +243,12 @@ impl ContainerEnvironment {
     /// In cgroup v2, a cgroup cannot simultaneously host processes and delegate controllers
     /// to child cgroups (the "no internal processes" constraint). To avoid this conflict:
     /// - If not cgroup v2 (e.g. cgroup v1), skips setup cleanly.
-    /// - If cgroup v2, creates `<cgroup_root>/init`, moves `pid` into it via `cgroup.procs`,
-    ///   and enables available controllers on `<cgroup_root>/cgroup.subtree_control`.
+    /// - If cgroup v2, creates `<cgroup_root>/init`, moves **every** process listed in
+    ///   `<cgroup_root>/cgroup.procs` (plus `pid`) into it, and enables available
+    ///   controllers on `<cgroup_root>/cgroup.subtree_control`.
+    ///
+    /// Moving only the caller leaves siblings behind (entrypoint shell, supervisor
+    /// children), so the subtree write fails with `EBUSY` and pods can never start.
     pub fn prepare_cgroups(&self, pid: u32) -> Result<CgroupSetupStatus, KubeletError> {
         if !self.allow_host_mutations {
             return Ok(CgroupSetupStatus::Simulated {
@@ -279,8 +283,10 @@ impl ContainerEnvironment {
             return Err(KubeletError::Io(e));
         }
 
-        let procs_file = init_cgroup.join("cgroup.procs");
-        if let Err(e) = fs::write(&procs_file, format!("{pid}\n")) {
+        // Drain the root cgroup so subtree delegation is legal. Processes that
+        // exit mid-migration (ESRCH / InvalidInput) are skipped; a permission
+        // failure degrades to SkippedPermissionDenied.
+        if let Err(e) = migrate_all_procs(&self.cgroup_root, &init_cgroup, pid) {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 return Ok(CgroupSetupStatus::SkippedPermissionDenied);
             }
@@ -288,10 +294,24 @@ impl ContainerEnvironment {
         }
 
         let subtree_control = self.cgroup_root.join("cgroup.subtree_control");
-        let enabled_controllers = match enable_subtree_controllers(&subtree_control, &controllers) {
-            Ok(c) => c,
-            Err(status) => return Ok(status),
-        };
+        let mut enabled_controllers =
+            match enable_subtree_controllers(&subtree_control, &controllers) {
+                Ok(c) => c,
+                Err(status) => return Ok(status),
+            };
+        if enabled_controllers.len() != controllers.len() {
+            // A process may have forked into the root between migration and the
+            // write; drain once more and retry the missing controllers.
+            let _ = migrate_all_procs(&self.cgroup_root, &init_cgroup, pid);
+            let missing: Vec<String> = controllers
+                .iter()
+                .filter(|c| !enabled_controllers.contains(c))
+                .cloned()
+                .collect();
+            if let Ok(retried) = enable_subtree_controllers(&subtree_control, &missing) {
+                enabled_controllers.extend(retried);
+            }
+        }
 
         if self.simulated {
             Ok(CgroupSetupStatus::Simulated {
@@ -363,6 +383,32 @@ impl ContainerEnvironment {
             Ok(Ipv6DisableStatus::SkippedNotFound)
         }
     }
+}
+
+/// Moves every process in `root/cgroup.procs` plus `pid` into `init/cgroup.procs`.
+fn migrate_all_procs(root: &Path, init: &Path, pid: u32) -> Result<(), std::io::Error> {
+    use std::collections::BTreeSet;
+
+    let mut pids: BTreeSet<String> = BTreeSet::new();
+    pids.insert(pid.to_string());
+    if let Ok(listing) = fs::read_to_string(root.join("cgroup.procs")) {
+        for token in listing.split_whitespace() {
+            pids.insert(token.to_string());
+        }
+    }
+    let target = init.join("cgroup.procs");
+    for entry in pids {
+        match fs::write(&target, format!("{entry}\n")) {
+            Ok(()) => {},
+            // The process exited between listing and migration.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::InvalidInput => {},
+            Err(e) if e.raw_os_error() == Some(3) => {},
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn enable_subtree_controllers(

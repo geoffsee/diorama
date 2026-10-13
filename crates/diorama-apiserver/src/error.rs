@@ -41,6 +41,11 @@ pub enum ApiserverError {
     #[error("bad request: {message}")]
     BadRequest { message: String },
 
+    /// A list `continue` token is older than the server keeps. `continue_token`
+    /// is the inconsistent token the client should retry with.
+    #[error("continue token expired")]
+    Expired { continue_token: String },
+
     #[error("invalid input for {field}: {reason}")]
     InvalidInput { field: String, reason: String },
 
@@ -72,7 +77,9 @@ impl ApiserverError {
             Self::AggregatedApiError { .. } => "apiserver-aggregated-api-error",
             Self::NotFound { .. } => "apiserver-not-found",
             Self::Conflict { .. } => "apiserver-conflict",
-            Self::BadRequest { .. } | Self::InvalidInput { .. } => "apiserver-bad-request",
+            Self::BadRequest { .. } | Self::InvalidInput { .. } | Self::Expired { .. } => {
+                "apiserver-bad-request"
+            },
             Self::Internal { .. } => "apiserver-internal-error",
             Self::Io(_) => "apiserver-io-error",
             Self::Serialization(_) => "apiserver-serialization-error",

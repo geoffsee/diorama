@@ -220,3 +220,72 @@ async fn rbac_cluster_roles_and_cluster_role_bindings() {
         "Auditor cannot create configmaps"
     );
 }
+
+#[tokio::test]
+async fn http_rbac_objects_reach_the_authorizer_and_survive_restart() {
+    let temp = TempDir::new().unwrap();
+    let service = setup_service(&temp);
+    service.check_prerequisites().await.unwrap();
+    let admin = service.admin_client();
+    admin.create_namespace("gaps").await.unwrap();
+
+    let reader = service.service_account_client("gaps", "reader");
+    let before = reader.list_configmaps("gaps").await;
+    assert!(
+        matches!(before, Err(ApiserverError::Unauthorized { .. })),
+        "service account starts with no grant"
+    );
+
+    admin
+        .create_cluster_object(
+            "rbac.authorization.k8s.io",
+            "ClusterRole",
+            "clusterroles",
+            serde_json::json!({
+                "metadata": {"name": "reader"},
+                "rules": [{"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list"]}]
+            }),
+        )
+        .await
+        .expect("create clusterrole");
+    admin
+        .create_cluster_object(
+            "rbac.authorization.k8s.io",
+            "ClusterRoleBinding",
+            "clusterrolebindings",
+            serde_json::json!({
+                "metadata": {"name": "reader-binding"},
+                "roleRef": {"kind": "ClusterRole", "name": "reader"},
+                "subjects": [{"kind": "ServiceAccount", "name": "reader", "namespace": "gaps"}]
+            }),
+        )
+        .await
+        .expect("create binding");
+
+    reader
+        .list_configmaps("gaps")
+        .await
+        .expect("binding grants list");
+
+    let restarted = ApiserverService::new(service.config().clone(), service.storage().clone());
+    restarted.check_prerequisites().await.unwrap();
+    restarted
+        .service_account_client("gaps", "reader")
+        .list_configmaps("gaps")
+        .await
+        .expect("restart reloads the stored binding");
+
+    admin
+        .delete_cluster_object(
+            "rbac.authorization.k8s.io",
+            "clusterrolebindings",
+            "reader-binding",
+        )
+        .await
+        .unwrap();
+    let after = reader.list_configmaps("gaps").await;
+    assert!(
+        matches!(after, Err(ApiserverError::Unauthorized { .. })),
+        "deleting the binding revokes the grant"
+    );
+}

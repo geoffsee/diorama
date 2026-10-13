@@ -32,35 +32,60 @@ pub(crate) async fn dispatch(
     body: &[u8],
 ) -> Result<Outcome, ApiserverError> {
     if let Some(subresource) = &path.subresource {
-        return subresource_read(service, client, method, path, subresource, query).await;
-    }
-    if !matches!(*method, Method::GET | Method::POST | Method::DELETE) {
-        return Ok(status_outcome(
-            http::StatusCode::METHOD_NOT_ALLOWED,
-            "MethodNotAllowed",
-            "method is not supported",
-        ));
+        return subresource_dispatch(
+            service,
+            client,
+            method,
+            path,
+            subresource,
+            query,
+            content_type,
+            body,
+        )
+        .await;
     }
     if method == Method::GET {
-        return read(client, path).await.map(ok_json);
+        return read(client, path, query).await.map(ok_json);
     }
     if method == Method::DELETE {
         return delete(client, path, query, body).await;
     }
-    let doc = decode_body(content_type, body, path)?;
-    create(client, path, doc).await.map(created_json)
+    if method == Method::PUT {
+        let doc = decode_body(content_type, body, path)?;
+        return replace(client, path, query, doc).await.map(ok_json);
+    }
+    if method == Method::PATCH {
+        return patch(client, path, content_type, query, body)
+            .await
+            .map(ok_json);
+    }
+    if method == Method::POST {
+        let doc = decode_body(content_type, body, path)?;
+        return create(client, path, doc).await.map(created_json);
+    }
+    Ok(status_outcome(
+        http::StatusCode::METHOD_NOT_ALLOWED,
+        "MethodNotAllowed",
+        "method is not supported",
+    ))
 }
 
-async fn read(client: &KubernetesApiClient, path: &ResourcePath) -> Result<Value, ApiserverError> {
+async fn read(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    query: Option<&str>,
+) -> Result<Value, ApiserverError> {
     if is_namespaced(&path.resource) {
         if let Some(namespace) = &path.namespace {
             if let Some(name) = &path.name {
                 get_namespaced(client, &path.group, &path.resource, namespace, name).await
             } else {
-                list_namespaced(client, &path.group, &path.resource, namespace).await
+                let list = list_namespaced(client, &path.group, &path.resource, namespace).await?;
+                page_list(filter_list(list, query), query)
             }
         } else if path.name.is_none() {
-            list_all_namespaces(client, &path.group, &path.resource).await
+            let list = list_all_namespaces(client, &path.group, &path.resource).await?;
+            page_list(filter_list(list, query), query)
         } else {
             Err(ApiserverError::BadRequest {
                 message: format!("{} requires a namespace", path.resource),
@@ -72,10 +97,168 @@ async fn read(client: &KubernetesApiClient, path: &ResourcePath) -> Result<Value
             name: path.name.clone().unwrap_or_default(),
         })
     } else if let Some(name) = &path.name {
-        get_cluster(client, &path.resource, name).await
+        get_cluster(client, &path.group, &path.resource, name).await
     } else {
-        list_cluster(client, &path.resource).await
+        let list = list_cluster(client, &path.group, &path.resource).await?;
+        page_list(filter_list(list, query), query)
     }
+}
+
+/// Pages a filtered list. `continue` is `c.<issued>.<rv>.<lastName>` and stays
+/// consistent for 30 seconds. After that the server returns 410 with an
+/// inconsistent token so clients can resume without the original resourceVersion.
+fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverError> {
+    let params = query::parse(query);
+    let Some(limit) = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return Ok(list);
+    };
+    if limit == 0 {
+        return Ok(list);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let token = params.get("continue").cloned().unwrap_or_default();
+    let (start_after, response_rv, inconsistent) = if token.is_empty() {
+        (String::new(), None, false)
+    } else {
+        let mut parts = token.split('.');
+        let mode = parts.next().unwrap_or("");
+        let issued = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let rv = parts.next().unwrap_or("").to_string();
+        let name = parts.collect::<Vec<_>>().join(".");
+        if !matches!(mode, "c" | "i") || issued.is_none() || rv.is_empty() {
+            return Err(ApiserverError::BadRequest {
+                message: "continue token is invalid".to_string(),
+            });
+        }
+        let issued = issued.unwrap_or(0);
+        if mode == "c" && now.saturating_sub(issued) >= 30 {
+            let next = format!("i.{now}.{rv}i.{name}");
+            return Err(ApiserverError::Expired {
+                continue_token: next,
+            });
+        }
+        (name, Some(rv), mode == "i")
+    };
+    let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
+        return Ok(list);
+    };
+    items.sort_by(|left, right| {
+        let left = left
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let right = right
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        left.cmp(right)
+    });
+    let start = if start_after.is_empty() {
+        0
+    } else {
+        items
+            .iter()
+            .position(|item| {
+                item.pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    > start_after.as_str()
+            })
+            .unwrap_or(items.len())
+    };
+    let end = (start + limit).min(items.len());
+    let page = items[start..end].to_vec();
+    let remaining = items.len().saturating_sub(end);
+    let last_name = page
+        .last()
+        .and_then(|item| item.pointer("/metadata/name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    *items = page;
+    let current_rv = list
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("0")
+        .to_string();
+    let rv = if inconsistent {
+        response_rv.unwrap_or(current_rv)
+    } else {
+        response_rv.unwrap_or(current_rv)
+    };
+    if let Some(meta) = list.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.insert("resourceVersion".to_string(), json!(rv));
+        if remaining > 0 {
+            let mode = if inconsistent { "i" } else { "c" };
+            meta.insert(
+                "continue".to_string(),
+                json!(format!("{mode}.{now}.{rv}.{last_name}")),
+            );
+            meta.insert("remainingItemCount".to_string(), json!(remaining));
+        } else {
+            meta.remove("continue");
+            meta.remove("remainingItemCount");
+        }
+    }
+    Ok(list)
+}
+
+/// Applies `labelSelector` (`key=value,key2=value2`) and `fieldSelector`
+/// (`metadata.name=x`) to a list response. Selectors kubectl always sends
+/// (`spec.nodeName`, `status.phase`) that we do not index are ignored rather
+/// than rejected so list calls succeed.
+fn filter_list(mut list: Value, query: Option<&str>) -> Value {
+    let params = query::parse(query);
+    let label_selector = params.get("labelSelector").cloned().unwrap_or_default();
+    let field_selector = params.get("fieldSelector").cloned().unwrap_or_default();
+    if label_selector.is_empty() && field_selector.is_empty() {
+        return list;
+    }
+    let labels = parse_label_selector(&label_selector);
+    let fields = parse_label_selector(&field_selector);
+    let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
+        return list;
+    };
+    items.retain(|item| {
+        labels.iter().all(|(key, want)| {
+            item.pointer("/metadata/labels")
+                .and_then(|v| v.get(key))
+                .and_then(Value::as_str)
+                == Some(want.as_str())
+        }) && fields.iter().all(|(key, want)| match key.as_str() {
+            "metadata.name" => {
+                item.pointer("/metadata/name").and_then(Value::as_str) == Some(want.as_str())
+            },
+            "metadata.namespace" => {
+                item.pointer("/metadata/namespace").and_then(Value::as_str) == Some(want.as_str())
+            },
+            // Unindexed selectors (spec.nodeName, status.phase, ...) match
+            // everything so controllers can list without field indexing.
+            _ => true,
+        })
+    });
+    list
+}
+
+fn parse_label_selector(selector: &str) -> Vec<(String, String)> {
+    selector
+        .split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || key.contains('!') || value.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 async fn delete(
@@ -85,9 +268,8 @@ async fn delete(
     body: &[u8],
 ) -> Result<Outcome, ApiserverError> {
     let Some(name) = &path.name else {
-        return Err(ApiserverError::BadRequest {
-            message: "delete requires a resource name".to_string(),
-        });
+        // Collection delete: remove every selected object, like upstream.
+        return delete_collection(client, path, query).await;
     };
     let deleted = status_outcome(http::StatusCode::OK, "Success", "deleted");
     if is_namespaced(&path.resource) {
@@ -106,9 +288,254 @@ async fn delete(
         }
         delete_namespaced(client, &path.group, &path.resource, namespace, name).await?;
     } else {
-        delete_cluster(client, &path.resource, name).await?;
+        delete_cluster(client, &path.group, &path.resource, name).await?;
     }
     Ok(deleted)
+}
+
+/// Deletes every object selected by a collection `DELETE`, honouring
+/// `labelSelector`/`fieldSelector` like `GET`. Missing objects are skipped so
+/// clients can clean up by label without knowing exact names.
+async fn delete_collection(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    query: Option<&str>,
+) -> Result<Outcome, ApiserverError> {
+    let list = read(client, path, query).await?;
+    let items = list
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in items {
+        let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let deleted = if is_namespaced(&path.resource) {
+            let namespace = item
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .or(path.namespace.as_deref());
+            let Some(namespace) = namespace else {
+                continue;
+            };
+            if path.group.is_empty() && path.resource == "pods" {
+                // Best effort; the kubelet owns graceful pod removal.
+                client
+                    .delete_pod_options(namespace, name, None)
+                    .await
+                    .map(|_| ())
+            } else {
+                delete_namespaced(client, &path.group, &path.resource, namespace, name).await
+            }
+        } else {
+            delete_cluster(client, &path.group, &path.resource, name).await
+        };
+        // An object deleted concurrently is already at the desired state.
+        if let Err(ApiserverError::NotFound { .. }) = deleted {
+            continue;
+        }
+        deleted?;
+    }
+    Ok(status_outcome(http::StatusCode::OK, "Success", "deleted"))
+}
+
+async fn replace(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    query: Option<&str>,
+    doc: Value,
+) -> Result<Value, ApiserverError> {
+    let Some(name) = &path.name else {
+        return Err(ApiserverError::BadRequest {
+            message: "replace requires a resource name".to_string(),
+        });
+    };
+    if is_dry_run(query) {
+        // Validate the object exists, then echo the replacement without storing.
+        let _ = read_single(client, path, name).await?;
+        return Ok(stamp_replacement(doc, path, name));
+    }
+    if is_namespaced(&path.resource) {
+        let Some(namespace) = &path.namespace else {
+            return Err(ApiserverError::BadRequest {
+                message: format!("{} requires a namespace", path.resource),
+            });
+        };
+        update_namespaced(client, &path.group, &path.resource, namespace, name, doc).await
+    } else {
+        update_cluster(client, &path.group, &path.resource, name, doc).await
+    }
+}
+
+fn stamp_replacement(mut doc: Value, path: &ResourcePath, name: &str) -> Value {
+    if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.insert("name".to_string(), json!(name));
+        if let Some(namespace) = &path.namespace {
+            meta.insert("namespace".to_string(), json!(namespace));
+        }
+    }
+    doc
+}
+
+async fn read_single(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    name: &str,
+) -> Result<Value, ApiserverError> {
+    if is_namespaced(&path.resource) {
+        let Some(namespace) = &path.namespace else {
+            return Err(ApiserverError::BadRequest {
+                message: format!("{} requires a namespace", path.resource),
+            });
+        };
+        get_namespaced(client, &path.group, &path.resource, namespace, name).await
+    } else {
+        get_cluster(client, &path.group, &path.resource, name).await
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchType {
+    Json,
+    Merge,
+    Apply,
+}
+
+fn patch_type(content_type: Option<&str>) -> PatchType {
+    let content = content_type.unwrap_or_default().to_ascii_lowercase();
+    if content.contains("json-patch") {
+        PatchType::Json
+    } else if content.contains("apply-patch") {
+        PatchType::Apply
+    } else {
+        // merge-patch, strategic-merge-patch and plain JSON all merge objects.
+        PatchType::Merge
+    }
+}
+
+fn is_dry_run(query: Option<&str>) -> bool {
+    query::parse(query).contains_key("dryRun")
+}
+
+async fn patch(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    content_type: Option<&str>,
+    query: Option<&str>,
+    body: &[u8],
+) -> Result<Value, ApiserverError> {
+    let Some(name) = &path.name else {
+        return Err(ApiserverError::BadRequest {
+            message: "patch requires a resource name".to_string(),
+        });
+    };
+    let kind = patch_type(content_type);
+    let existing = read_single(client, path, name).await;
+    if kind == PatchType::Apply {
+        return apply_patch(client, path, query, name, body, existing).await;
+    }
+    let mut target = match existing {
+        Ok(doc) => doc,
+        Err(err) => return Err(err),
+    };
+    match kind {
+        PatchType::Json => {
+            crate::admission::apply_json_patch(&mut target, body)?;
+        },
+        PatchType::Merge => {
+            let merge: Value =
+                serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
+                    message: format!("patch body is not JSON: {err}"),
+                })?;
+            crate::client::json_merge_patch(&mut target, merge);
+        },
+        PatchType::Apply => unreachable!("handled above"),
+    }
+    if is_dry_run(query) {
+        return Ok(target);
+    }
+    if is_namespaced(&path.resource) {
+        let Some(namespace) = &path.namespace else {
+            return Err(ApiserverError::BadRequest {
+                message: format!("{} requires a namespace", path.resource),
+            });
+        };
+        update_namespaced(client, &path.group, &path.resource, namespace, name, target).await
+    } else {
+        update_cluster(client, &path.group, &path.resource, name, target).await
+    }
+}
+
+/// Server-side apply: creates the object when absent, otherwise merges the
+/// applied manifest onto the stored object. Field ownership tracking is
+/// simplified to a full merge; `force` and `fieldManager` are accepted.
+async fn apply_patch(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    query: Option<&str>,
+    name: &str,
+    body: &[u8],
+    existing: Result<Value, ApiserverError>,
+) -> Result<Value, ApiserverError> {
+    let mut applied: Value =
+        serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
+            message: format!("apply body is not JSON: {err}"),
+        })?;
+    // The applied manifest wins for its fields; strip server-assigned metadata
+    // that must never be taken from the client.
+    if let Some(meta) = applied.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.remove("resourceVersion");
+        meta.remove("uid");
+        meta.remove("creationTimestamp");
+        meta.insert("name".to_string(), json!(name));
+        if let Some(namespace) = &path.namespace {
+            meta.insert("namespace".to_string(), json!(namespace));
+        }
+    }
+    let dry_run = is_dry_run(query);
+    match existing {
+        Err(ApiserverError::NotFound { .. }) => {
+            if dry_run {
+                return Ok(applied);
+            }
+            if is_namespaced(&path.resource) {
+                let Some(namespace) = &path.namespace else {
+                    return Err(ApiserverError::BadRequest {
+                        message: format!("{} requires a namespace", path.resource),
+                    });
+                };
+                create_namespaced(client, &path.group, &path.resource, namespace, applied).await
+            } else {
+                create_cluster(client, &path.group, &path.resource, applied).await
+            }
+        },
+        Err(err) => Err(err),
+        Ok(mut current) => {
+            crate::client::json_merge_patch(&mut current, applied);
+            if dry_run {
+                return Ok(current);
+            }
+            if is_namespaced(&path.resource) {
+                let Some(namespace) = &path.namespace else {
+                    return Err(ApiserverError::BadRequest {
+                        message: format!("{} requires a namespace", path.resource),
+                    });
+                };
+                update_namespaced(
+                    client,
+                    &path.group,
+                    &path.resource,
+                    namespace,
+                    name,
+                    current,
+                )
+                .await
+            } else {
+                update_cluster(client, &path.group, &path.resource, name, current).await
+            }
+        },
+    }
 }
 
 /// `gracePeriodSeconds` from the query or a `DeleteOptions` body, whichever is given.
@@ -143,14 +570,23 @@ async fn create(
         };
         create_namespaced(client, &path.group, &path.resource, namespace, doc).await
     } else {
-        create_cluster(client, &path.resource, doc).await
+        create_cluster(client, &path.group, &path.resource, doc).await
     }
 }
 
 fn is_namespaced(resource: &str) -> bool {
     !matches!(
         resource,
-        "namespaces" | "nodes" | "persistentvolumes" | "storageclasses"
+        "namespaces"
+            | "nodes"
+            | "persistentvolumes"
+            | "storageclasses"
+            | "clusterroles"
+            | "clusterrolebindings"
+            | "customresourcedefinitions"
+            | "validatingwebhookconfigurations"
+            | "mutatingwebhookconfigurations"
+            | "apiservices"
     )
 }
 
@@ -209,12 +645,49 @@ async fn list_namespaced(
         ("", "endpoints") => client.list_endpoints(namespace).await,
         ("", "serviceaccounts") => client.list_service_accounts(namespace).await,
         ("", "persistentvolumeclaims") => client.list_pvcs(namespace).await,
+        ("", "events") => {
+            client
+                .list_namespaced_objects("", "EventList", "events", namespace)
+                .await
+        },
         ("discovery.k8s.io", "endpointslices") => client.list_endpointslices(namespace).await,
         ("apps", "deployments") => client.list_deployments(namespace).await,
         ("apps", "replicasets") => client.list_replicasets(namespace).await,
         ("apps", "statefulsets") => client.list_statefulsets(namespace).await,
         ("apps", "daemonsets") => client.list_daemonsets(namespace).await,
-        _ => Err(unknown(resource)),
+        ("batch", "jobs") => client.list_jobs(namespace).await,
+        ("batch", "cronjobs") => client.list_cronjobs(namespace).await,
+        ("coordination.k8s.io", "leases") => client.list_leases(namespace).await,
+        ("events.k8s.io", "events") => {
+            client
+                .list_namespaced_objects("events.k8s.io", "EventList", "events", namespace)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "roles") => {
+            client
+                .list_namespaced_objects(
+                    "rbac.authorization.k8s.io",
+                    "RoleList",
+                    "roles",
+                    namespace,
+                )
+                .await
+        },
+        ("rbac.authorization.k8s.io", "rolebindings") => {
+            client
+                .list_namespaced_objects(
+                    "rbac.authorization.k8s.io",
+                    "RoleBindingList",
+                    "rolebindings",
+                    namespace,
+                )
+                .await
+        },
+        _ => {
+            client
+                .list_namespaced_objects(group, list_kind(resource), resource, namespace)
+                .await
+        },
     }
 }
 
@@ -233,12 +706,39 @@ async fn get_namespaced(
         ("", "endpoints") => client.get_endpoints(namespace, name).await,
         ("", "serviceaccounts") => client.get_service_account(namespace, name).await,
         ("", "persistentvolumeclaims") => client.get_pvc(namespace, name).await,
+        ("", "events") => {
+            client
+                .get_namespaced_object("", "events", namespace, name)
+                .await
+        },
         ("discovery.k8s.io", "endpointslices") => client.get_endpointslice(namespace, name).await,
         ("apps", "deployments") => client.get_deployment(namespace, name).await,
         ("apps", "replicasets") => client.get_replicaset(namespace, name).await,
         ("apps", "statefulsets") => client.get_statefulset(namespace, name).await,
         ("apps", "daemonsets") => client.get_daemonset(namespace, name).await,
-        _ => Err(unknown(resource)),
+        ("batch", "jobs") => client.get_job(namespace, name).await,
+        ("batch", "cronjobs") => client.get_cronjob(namespace, name).await,
+        ("coordination.k8s.io", "leases") => client.get_lease(namespace, name).await,
+        ("events.k8s.io", "events") => {
+            client
+                .get_namespaced_object("events.k8s.io", "events", namespace, name)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "roles") => {
+            client
+                .get_namespaced_object("rbac.authorization.k8s.io", "roles", namespace, name)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "rolebindings") => {
+            client
+                .get_namespaced_object("rbac.authorization.k8s.io", "rolebindings", namespace, name)
+                .await
+        },
+        _ => {
+            client
+                .get_namespaced_object(group, resource, namespace, name)
+                .await
+        },
     }
 }
 
@@ -256,6 +756,11 @@ async fn delete_namespaced(
         ("", "endpoints") => client.delete_endpoints(namespace, name).await,
         ("", "serviceaccounts") => client.delete_service_account(namespace, name).await,
         ("", "persistentvolumeclaims") => client.delete_pvc(namespace, name).await,
+        ("", "events") => {
+            client
+                .delete_namespaced_object("", "events", namespace, name)
+                .await
+        },
         ("discovery.k8s.io", "endpointslices") => {
             client.delete_endpointslice(namespace, name).await
         },
@@ -263,7 +768,34 @@ async fn delete_namespaced(
         ("apps", "replicasets") => client.delete_replicaset(namespace, name).await,
         ("apps", "statefulsets") => client.delete_statefulset(namespace, name).await,
         ("apps", "daemonsets") => client.delete_daemonset(namespace, name).await,
-        _ => Err(unknown(resource)),
+        ("batch", "jobs") => client.delete_job(namespace, name).await,
+        ("batch", "cronjobs") => client.delete_cronjob(namespace, name).await,
+        ("coordination.k8s.io", "leases") => client.delete_lease(namespace, name).await,
+        ("events.k8s.io", "events") => {
+            client
+                .delete_namespaced_object("events.k8s.io", "events", namespace, name)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "roles") => {
+            client
+                .delete_namespaced_object("rbac.authorization.k8s.io", "roles", namespace, name)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "rolebindings") => {
+            client
+                .delete_namespaced_object(
+                    "rbac.authorization.k8s.io",
+                    "rolebindings",
+                    namespace,
+                    name,
+                )
+                .await
+        },
+        _ => {
+            client
+                .delete_namespaced_object(group, resource, namespace, name)
+                .await
+        },
     }
 }
 
@@ -282,68 +814,271 @@ async fn create_namespaced(
         ("", "endpoints") => client.create_endpoints(namespace, doc).await,
         ("", "serviceaccounts") => client.create_service_account(namespace, doc).await,
         ("", "persistentvolumeclaims") => client.create_pvc(namespace, doc).await,
+        ("", "events") => {
+            client
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await
+        },
         ("discovery.k8s.io", "endpointslices") => client.create_endpointslice(namespace, doc).await,
         ("apps", "deployments") => client.create_deployment(namespace, doc).await,
         ("apps", "replicasets") => client.create_replicaset(namespace, doc).await,
         ("apps", "statefulsets") => client.create_statefulset(namespace, doc).await,
         ("apps", "daemonsets") => client.create_daemonset(namespace, doc).await,
-        _ => Err(unknown(resource)),
+        ("batch", "jobs") => client.create_job(namespace, doc).await,
+        ("batch", "cronjobs") => client.create_cronjob(namespace, doc).await,
+        ("coordination.k8s.io", "leases") => client.create_lease(namespace, doc).await,
+        ("events.k8s.io", "events") => {
+            client
+                .create_namespaced_object("events.k8s.io", "Event", "events", namespace, doc)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "roles") => {
+            client
+                .create_namespaced_object(
+                    "rbac.authorization.k8s.io",
+                    "Role",
+                    "roles",
+                    namespace,
+                    doc,
+                )
+                .await
+        },
+        ("rbac.authorization.k8s.io", "rolebindings") => {
+            client
+                .create_namespaced_object(
+                    "rbac.authorization.k8s.io",
+                    "RoleBinding",
+                    "rolebindings",
+                    namespace,
+                    doc,
+                )
+                .await
+        },
+        _ => {
+            let kind = kind_name(resource).unwrap_or("Object");
+            client
+                .create_namespaced_object(group, kind, resource, namespace, doc)
+                .await
+        },
+    }
+}
+
+async fn update_namespaced(
+    client: &KubernetesApiClient,
+    group: &str,
+    resource: &str,
+    namespace: &str,
+    name: &str,
+    doc: Value,
+) -> Result<Value, ApiserverError> {
+    match (group, resource) {
+        ("", "pods") => client.update_pod(namespace, name, doc).await,
+        ("", "services") => client.update_service(namespace, name, doc).await,
+        ("", "endpoints") => client.update_endpoints(namespace, name, doc).await,
+        ("", "persistentvolumeclaims") => client.update_pvc(namespace, name, doc).await,
+        ("discovery.k8s.io", "endpointslices") => {
+            client.update_endpointslice(namespace, name, doc).await
+        },
+        ("apps", "deployments") => client.update_deployment(namespace, name, doc).await,
+        ("apps", "replicasets") => client.update_replicaset(namespace, name, doc).await,
+        ("apps", "statefulsets") => client.update_statefulset(namespace, name, doc).await,
+        ("apps", "daemonsets") => client.update_daemonset(namespace, name, doc).await,
+        ("batch", "jobs") => client.update_job(namespace, name, doc).await,
+        ("batch", "cronjobs") => client.update_cronjob(namespace, name, doc).await,
+        ("coordination.k8s.io", "leases") => client.update_lease(namespace, name, doc).await,
+        _ => {
+            let kind = kind_name(resource).unwrap_or("Object");
+            client
+                .replace_namespaced_object(group, kind, resource, namespace, name, doc)
+                .await
+        },
     }
 }
 
 async fn list_cluster(
     client: &KubernetesApiClient,
+    group: &str,
     resource: &str,
 ) -> Result<Value, ApiserverError> {
-    match resource {
-        "namespaces" => client.list_namespaces().await,
-        "nodes" => client.list_nodes().await,
-        "persistentvolumes" => client.list_pvs().await,
-        "storageclasses" => client.list_storage_classes().await,
-        _ => Err(unknown(resource)),
+    match (group, resource) {
+        ("", "namespaces") => client.list_namespaces().await,
+        ("", "nodes") => client.list_nodes().await,
+        ("", "persistentvolumes") => client.list_pvs().await,
+        ("storage.k8s.io" | "", "storageclasses") => client.list_storage_classes().await,
+        ("rbac.authorization.k8s.io", "clusterroles") => {
+            client
+                .list_cluster_objects(
+                    "rbac.authorization.k8s.io",
+                    "ClusterRoleList",
+                    "clusterroles",
+                )
+                .await
+        },
+        ("rbac.authorization.k8s.io", "clusterrolebindings") => {
+            client
+                .list_cluster_objects(
+                    "rbac.authorization.k8s.io",
+                    "ClusterRoleBindingList",
+                    "clusterrolebindings",
+                )
+                .await
+        },
+        ("apiextensions.k8s.io", "customresourcedefinitions") => client.list_crds().await,
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            client.list_validating_webhook_configurations().await
+        },
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            client.list_mutating_webhook_configurations().await
+        },
+        ("apiregistration.k8s.io", "apiservices") => client.list_api_services().await,
+        _ => {
+            client
+                .list_cluster_objects(group, list_kind(resource), resource)
+                .await
+        },
     }
 }
 
 async fn get_cluster(
     client: &KubernetesApiClient,
+    group: &str,
     resource: &str,
     name: &str,
 ) -> Result<Value, ApiserverError> {
-    match resource {
-        "namespaces" => client.get_namespace(name).await,
-        "nodes" => client.get_node(name).await,
-        "persistentvolumes" => client.get_pv(name).await,
-        "storageclasses" => client.get_storage_class(name).await,
-        _ => Err(unknown(resource)),
+    match (group, resource) {
+        ("", "namespaces") => client.get_namespace(name).await,
+        ("", "nodes") => client.get_node(name).await,
+        ("", "persistentvolumes") => client.get_pv(name).await,
+        ("storage.k8s.io" | "", "storageclasses") => client.get_storage_class(name).await,
+        ("rbac.authorization.k8s.io", "clusterroles") => cluster_role_to_json(
+            client
+                .get_cluster_object("rbac.authorization.k8s.io", "clusterroles", name)
+                .await,
+        ),
+        ("rbac.authorization.k8s.io", "clusterrolebindings") => {
+            client
+                .get_cluster_object("rbac.authorization.k8s.io", "clusterrolebindings", name)
+                .await
+        },
+        ("apiextensions.k8s.io", "customresourcedefinitions") => client.get_crd(name).await,
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            client.get_validating_webhook_configuration(name).await
+        },
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            client.get_mutating_webhook_configuration(name).await
+        },
+        ("apiregistration.k8s.io", "apiservices") => client.get_api_service(name).await,
+        _ => client.get_cluster_object(group, resource, name).await,
     }
+}
+
+/// Stored cluster roles are already standard objects; passthrough helper keeps
+/// the match arms symmetric while leaving room for bootstrap-role fallback.
+fn cluster_role_to_json(result: Result<Value, ApiserverError>) -> Result<Value, ApiserverError> {
+    result
 }
 
 async fn delete_cluster(
     client: &KubernetesApiClient,
+    group: &str,
     resource: &str,
     name: &str,
 ) -> Result<(), ApiserverError> {
-    match resource {
-        "namespaces" => client.delete_namespace(name).await,
-        "nodes" => client.delete_node(name).await,
-        "persistentvolumes" => client.delete_pv(name).await,
-        "storageclasses" => client.delete_storage_class(name).await,
-        _ => Err(unknown(resource)),
+    match (group, resource) {
+        ("", "namespaces") => client.delete_namespace(name).await,
+        ("", "nodes") => client.delete_node(name).await,
+        ("", "persistentvolumes") => client.delete_pv(name).await,
+        ("storage.k8s.io" | "", "storageclasses") => client.delete_storage_class(name).await,
+        ("rbac.authorization.k8s.io", "clusterroles") => {
+            client
+                .delete_cluster_object("rbac.authorization.k8s.io", "clusterroles", name)
+                .await
+        },
+        ("rbac.authorization.k8s.io", "clusterrolebindings") => {
+            client
+                .delete_cluster_object("rbac.authorization.k8s.io", "clusterrolebindings", name)
+                .await
+        },
+        ("apiextensions.k8s.io", "customresourcedefinitions") => client.delete_crd(name).await,
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            client.delete_validating_webhook_configuration(name).await
+        },
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            client.delete_mutating_webhook_configuration(name).await
+        },
+        ("apiregistration.k8s.io", "apiservices") => client.delete_api_service(name).await,
+        _ => client.delete_cluster_object(group, resource, name).await,
     }
 }
 
 async fn create_cluster(
     client: &KubernetesApiClient,
+    group: &str,
     resource: &str,
     doc: Value,
 ) -> Result<Value, ApiserverError> {
-    let name = object_name(&doc)?;
-    match resource {
-        "namespaces" => client.create_namespace(&name).await,
-        "nodes" => client.create_node(doc).await,
-        "persistentvolumes" => client.create_pv(doc).await,
-        "storageclasses" => client.create_storage_class(doc).await,
-        _ => Err(unknown(resource)),
+    match (group, resource) {
+        ("", "namespaces") => {
+            let name = object_name(&doc)?;
+            client.create_namespace(&name).await
+        },
+        ("", "nodes") => client.create_node(doc).await,
+        ("", "persistentvolumes") => client.create_pv(doc).await,
+        ("storage.k8s.io" | "", "storageclasses") => client.create_storage_class(doc).await,
+        ("rbac.authorization.k8s.io", "clusterroles") => {
+            client
+                .create_cluster_object(
+                    "rbac.authorization.k8s.io",
+                    "ClusterRole",
+                    "clusterroles",
+                    doc,
+                )
+                .await
+        },
+        ("rbac.authorization.k8s.io", "clusterrolebindings") => {
+            client
+                .create_cluster_object(
+                    "rbac.authorization.k8s.io",
+                    "ClusterRoleBinding",
+                    "clusterrolebindings",
+                    doc,
+                )
+                .await
+        },
+        ("apiextensions.k8s.io", "customresourcedefinitions") => client.create_crd(doc).await,
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            client.create_validating_webhook_configuration(doc).await
+        },
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            client.create_mutating_webhook_configuration(doc).await
+        },
+        ("apiregistration.k8s.io", "apiservices") => client.create_api_service(doc).await,
+        _ => {
+            let kind = kind_name(resource).unwrap_or("Object");
+            client
+                .create_cluster_object(group, kind, resource, doc)
+                .await
+        },
+    }
+}
+
+async fn update_cluster(
+    client: &KubernetesApiClient,
+    group: &str,
+    resource: &str,
+    name: &str,
+    doc: Value,
+) -> Result<Value, ApiserverError> {
+    match (group, resource) {
+        ("", "nodes") => client.update_node(name, doc).await,
+        ("", "persistentvolumes") => client.update_pv(name, doc).await,
+        ("storage.k8s.io" | "", "storageclasses") => client.update_storage_class(name, doc).await,
+        _ => {
+            let kind = kind_name(resource).unwrap_or("Object");
+            client
+                .replace_cluster_object(group, kind, resource, name, doc)
+                .await
+        },
     }
 }
 
@@ -356,6 +1091,11 @@ fn decode_body(
         return Ok(Value::Null);
     }
     if content_type.is_some_and(|value| value.contains("protobuf")) {
+        if let Some(mut value) = crate::http::protojson::decode_k8s_protobuf(body, &path.resource)?
+        {
+            stamp_type_meta(&mut value, path);
+            return Ok(value);
+        }
         let mut value = decode_protobuf_body(body, &path.resource)?;
         stamp_type_meta(&mut value, path);
         return Ok(value);
@@ -408,6 +1148,11 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "configmaps" => "ConfigMap",
         "secrets" => "Secret",
         "pods" => "Pod",
+        "podtemplates" => "PodTemplate",
+        "limitranges" => "LimitRange",
+        "resourcequotas" => "ResourceQuota",
+        "replicationcontrollers" => "ReplicationController",
+        "bindings" => "Binding",
         "services" => "Service",
         "endpoints" => "Endpoints",
         "endpointslices" => "EndpointSlice",
@@ -419,6 +1164,19 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "replicasets" => "ReplicaSet",
         "statefulsets" => "StatefulSet",
         "daemonsets" => "DaemonSet",
+        "jobs" => "Job",
+        "cronjobs" => "CronJob",
+        "leases" => "Lease",
+        "events" => "Event",
+        "roles" => "Role",
+        "rolebindings" => "RoleBinding",
+        "clusterroles" => "ClusterRole",
+        "clusterrolebindings" => "ClusterRoleBinding",
+        "storageclasses" => "StorageClass",
+        "customresourcedefinitions" => "CustomResourceDefinition",
+        "validatingwebhookconfigurations" => "ValidatingWebhookConfiguration",
+        "mutatingwebhookconfigurations" => "MutatingWebhookConfiguration",
+        "apiservices" => "APIService",
         _ => return None,
     })
 }
@@ -653,16 +1411,13 @@ fn object_name(doc: &Value) -> Result<String, ApiserverError> {
         })
 }
 
-fn unknown(resource: &str) -> ApiserverError {
-    ApiserverError::NotFound {
-        resource: resource.to_string(),
-        name: resource.to_string(),
-    }
-}
-
 fn list_kind(resource: &str) -> &'static str {
     match resource {
         "pods" => "PodList",
+        "podtemplates" => "PodTemplateList",
+        "limitranges" => "LimitRangeList",
+        "resourcequotas" => "ResourceQuotaList",
+        "replicationcontrollers" => "ReplicationControllerList",
         "configmaps" => "ConfigMapList",
         "secrets" => "SecretList",
         "services" => "ServiceList",
@@ -674,6 +1429,15 @@ fn list_kind(resource: &str) -> &'static str {
         "replicasets" => "ReplicaSetList",
         "statefulsets" => "StatefulSetList",
         "daemonsets" => "DaemonSetList",
+        "jobs" => "JobList",
+        "cronjobs" => "CronJobList",
+        "leases" => "LeaseList",
+        "events" => "EventList",
+        "roles" => "RoleList",
+        "rolebindings" => "RoleBindingList",
+        "clusterroles" => "ClusterRoleList",
+        "clusterrolebindings" => "ClusterRoleBindingList",
+        "storageclasses" => "StorageClassList",
         _ => "List",
     }
 }
@@ -707,37 +1471,110 @@ fn status_outcome(status: http::StatusCode, reason: &str, message: &str) -> Outc
     }
 }
 
-/// Serves the read-only subresources kubectl needs: `status` echoes the stored
-/// object and `log` streams captured container output from the kubelet.
-async fn subresource_read(
+/// Serves the subresources kubectl needs: `status` echoes or replaces the stored
+/// object, `scale` reports or sets replicas, and `log` streams captured
+/// container output from the kubelet.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn subresource_dispatch(
     service: &ApiserverService,
     client: &KubernetesApiClient,
     method: &Method,
     path: &ResourcePath,
     subresource: &str,
     query: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
 ) -> Result<Outcome, ApiserverError> {
-    if method != Method::GET {
-        return Ok(status_outcome(
-            http::StatusCode::METHOD_NOT_ALLOWED,
-            "MethodNotAllowed",
-            "method is not supported",
-        ));
-    }
     if path.name.is_none() {
         return Err(ApiserverError::BadRequest {
             message: format!("{subresource} requires a resource name"),
         });
     }
     match (path.group.as_str(), path.resource.as_str(), subresource) {
-        (_, _, "status") => {
-            let object = ResourcePath {
-                subresource: None,
-                ..path.clone()
-            };
-            read(client, &object).await.map(ok_json)
+        (_, _, "status") => match *method {
+            Method::GET => {
+                let object = ResourcePath {
+                    subresource: None,
+                    ..path.clone()
+                };
+                read(client, &object, query).await.map(ok_json)
+            },
+            Method::PUT | Method::PATCH => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "status requires a resource name".to_string(),
+                    });
+                };
+                let mut current = read_single(client, &strip_subresource(path), name).await?;
+                if method == Method::PUT {
+                    let doc = decode_body(content_type, body, path)?;
+                    if let Some(status) = doc.get("status") {
+                        current["status"] = status.clone();
+                    }
+                } else {
+                    apply_body_patch(&mut current, content_type, body)?;
+                }
+                persist_object(client, path, name, current)
+                    .await
+                    .map(ok_json)
+            },
+            _ => Ok(status_outcome(
+                http::StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "method is not supported",
+            )),
+        },
+        (_, "deployments" | "replicasets" | "statefulsets", "scale") => match *method {
+            Method::GET => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "scale requires a resource name".to_string(),
+                    });
+                };
+                let current = read_single(client, &strip_subresource(path), name).await?;
+                Ok(ok_json(scale_from(&current, path)))
+            },
+            Method::PUT | Method::PATCH => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "scale requires a resource name".to_string(),
+                    });
+                };
+                let mut current = read_single(client, &strip_subresource(path), name).await?;
+                let replicas = if method == Method::PUT {
+                    let doc = decode_body(content_type, body, path)?;
+                    scale_replicas(&doc)
+                } else {
+                    let mut scale = scale_from(&current, path);
+                    apply_body_patch(&mut scale, content_type, body)?;
+                    scale_replicas(&scale)
+                };
+                let Some(replicas) = replicas else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "scale requires spec.replicas".to_string(),
+                    });
+                };
+                if current.get("spec").is_none_or(|v| !v.is_object()) {
+                    current["spec"] = json!({});
+                }
+                current["spec"]["replicas"] = json!(replicas);
+                let updated = persist_object(client, path, name, current).await?;
+                Ok(ok_json(scale_from(&updated, path)))
+            },
+            _ => Ok(status_outcome(
+                http::StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "method is not supported",
+            )),
         },
         ("", "pods", "log") => {
+            if method != Method::GET {
+                return Ok(status_outcome(
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "method is not supported",
+                ));
+            }
             let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
                 return Err(ApiserverError::BadRequest {
                     message: "pods requires a namespace".to_string(),
@@ -762,9 +1599,111 @@ async fn subresource_read(
                 body,
             })
         },
+        (_, "pods", "exec" | "attach" | "portforward") => Err(ApiserverError::BadRequest {
+            message: format!("{subresource} requires a websocket upgrade"),
+        }),
         _ => Err(ApiserverError::NotFound {
             resource: format!("{}/{subresource}", path.resource),
             name: path.name.clone().unwrap_or_default(),
         }),
     }
+}
+
+fn strip_subresource(path: &ResourcePath) -> ResourcePath {
+    ResourcePath {
+        subresource: None,
+        ..path.clone()
+    }
+}
+
+fn apply_body_patch(
+    target: &mut Value,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<(), ApiserverError> {
+    match patch_type(content_type) {
+        PatchType::Json => crate::admission::apply_json_patch(target, body),
+        PatchType::Merge | PatchType::Apply => {
+            let patch: Value =
+                serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
+                    message: format!("patch body is not JSON: {err}"),
+                })?;
+            crate::client::json_merge_patch(target, patch);
+            Ok(())
+        },
+    }
+}
+
+async fn persist_object(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    name: &str,
+    doc: Value,
+) -> Result<Value, ApiserverError> {
+    if is_namespaced(&path.resource) {
+        let Some(namespace) = &path.namespace else {
+            return Err(ApiserverError::BadRequest {
+                message: format!("{} requires a namespace", path.resource),
+            });
+        };
+        update_namespaced(client, &path.group, &path.resource, namespace, name, doc).await
+    } else {
+        update_cluster(client, &path.group, &path.resource, name, doc).await
+    }
+}
+
+fn scale_replicas(doc: &Value) -> Option<i64> {
+    doc.pointer("/spec/replicas")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            doc.pointer("/spec/replicas")
+                .and_then(Value::as_u64)
+                .and_then(|v| i64::try_from(v).ok())
+        })
+}
+
+/// Minimal `autoscaling/v1` Scale view backed by `spec.replicas` / `status.replicas`.
+fn scale_from(current: &Value, path: &ResourcePath) -> Value {
+    let replicas = current
+        .pointer("/spec/replicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let status_replicas = current
+        .pointer("/status/replicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let selector = current
+        .pointer("/spec/selector/matchLabels")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let name = current
+        .pointer("/metadata/name")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let namespace = current
+        .pointer("/metadata/namespace")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let resource_version = current
+        .pointer("/metadata/resourceVersion")
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "kind": "Scale",
+        "apiVersion": "autoscaling/v1",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "resourceVersion": resource_version,
+        },
+        "spec": { "replicas": replicas },
+        "status": {
+            "replicas": status_replicas,
+            "selector": selector,
+        },
+        "_target": {
+            "group": path.group,
+            "resource": path.resource,
+        }
+    })
 }

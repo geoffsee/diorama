@@ -800,6 +800,82 @@ pub(crate) fn write_volume_file(path: &Path, content: &[u8]) -> std::io::Result<
     std::fs::write(path, content)
 }
 
+/// Applies a Kubernetes file `mode` (decimal, e.g. `420` for `0644`) to a staged file.
+pub(crate) fn chmod_volume_file(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777));
+}
+
+/// Effective mode for one staged file: per-item `mode`, else the volume
+/// `defaultMode`, else the Kubernetes default (`0644` for config/secret data).
+pub(crate) fn volume_file_mode(item: Option<&Value>, vol_spec: &Value) -> u32 {
+    item.and_then(|item| item.get("mode"))
+        .or_else(|| vol_spec.get("defaultMode"))
+        .and_then(Value::as_u64)
+        .and_then(|mode| u32::try_from(mode).ok())
+        .map_or(0o644, |mode| mode & 0o777)
+}
+
+/// Reads `pod.spec.securityContext.fsGroup` as a gid, if valid.
+pub(crate) fn pod_fs_group(pod: &Value) -> Option<u32> {
+    let group = pod.pointer("/spec/securityContext/fsGroup")?.as_u64()?;
+    u32::try_from(group).ok()
+}
+
+/// Gives a staged volume directory to a pod `fsGroup`, like upstream's
+/// `SetVolumeOwnership`: every entry is group-chowned (without following
+/// symlinks) and group read/write is added so non-root containers can use
+/// `emptyDir` and projected volumes. Skips the walk when the root already
+/// carries the group (`OnRootMismatch` behaviour).
+pub(crate) fn apply_fs_group_ownership(vol_dir: &Path, fs_group: u32) -> Result<(), KubeletError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root_meta = std::fs::symlink_metadata(vol_dir).map_err(KubeletError::Io)?;
+    if root_meta.gid() == fs_group {
+        return Ok(());
+    }
+    let mut stack = vec![vol_dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        chown_group(&path, fs_group)?;
+        let mut mode = meta.permissions().mode();
+        if meta.is_dir() {
+            mode |= 0o070;
+        } else {
+            mode |= 0o060;
+            if mode & 0o100 != 0 {
+                mode |= 0o010;
+            }
+        }
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        if meta.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_group(path: &Path, gid: u32) -> Result<(), KubeletError> {
+    rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))
+        .map_err(|errno| KubeletError::Io(std::io::Error::from(errno)))
+}
+
+#[cfg(not(unix))]
+fn chown_group(_path: &Path, _gid: u32) -> Result<(), KubeletError> {
+    Ok(())
+}
+
 pub(crate) fn stage_secret_files(
     vol_dir: &Path,
     vol_spec: &Value,
@@ -813,18 +889,22 @@ pub(crate) fn stage_secret_files(
             let key = item.get("key").and_then(Value::as_str).unwrap_or("");
             let path = item.get("path").and_then(Value::as_str).unwrap_or(key);
             let file_path = safe_volume_path(vol_dir, path)?;
+            let mode = volume_file_mode(Some(item), vol_spec);
             if let Some(val) = data_map.and_then(|m| m.get(key)).and_then(Value::as_str) {
                 let bytes = diorama_pki::base64_decode(val.trim())
                     .unwrap_or_else(|_| val.as_bytes().to_vec());
                 write_volume_file(&file_path, &bytes)?;
+                chmod_volume_file(&file_path, mode);
             } else if let Some(val) = string_data_map
                 .and_then(|m| m.get(key))
                 .and_then(Value::as_str)
             {
                 write_volume_file(&file_path, val.as_bytes())?;
+                chmod_volume_file(&file_path, mode);
             }
         }
     } else {
+        let mode = volume_file_mode(None, vol_spec);
         if let Some(data) = data_map {
             for (key, val_v) in data {
                 if let Some(val_str) = val_v.as_str() {
@@ -832,6 +912,7 @@ pub(crate) fn stage_secret_files(
                     let bytes = diorama_pki::base64_decode(val_str.trim())
                         .unwrap_or_else(|_| val_str.as_bytes().to_vec());
                     write_volume_file(&file_path, &bytes)?;
+                    chmod_volume_file(&file_path, mode);
                 }
             }
         }
@@ -840,6 +921,7 @@ pub(crate) fn stage_secret_files(
                 if let Some(val_str) = val_v.as_str() {
                     let file_path = safe_volume_path(vol_dir, key)?;
                     write_volume_file(&file_path, val_str.as_bytes())?;
+                    chmod_volume_file(&file_path, mode);
                 }
             }
         }
@@ -860,8 +942,10 @@ pub(crate) fn stage_configmap_files(
             let key = item.get("key").and_then(Value::as_str).unwrap_or("");
             let path = item.get("path").and_then(Value::as_str).unwrap_or(key);
             let file_path = safe_volume_path(vol_dir, path)?;
+            let mode = volume_file_mode(Some(item), vol_spec);
             if let Some(val) = data_map.and_then(|m| m.get(key)).and_then(Value::as_str) {
                 write_volume_file(&file_path, val.as_bytes())?;
+                chmod_volume_file(&file_path, mode);
             } else if let Some(val) = binary_data_map
                 .and_then(|m| m.get(key))
                 .and_then(Value::as_str)
@@ -869,14 +953,17 @@ pub(crate) fn stage_configmap_files(
                 let bytes = diorama_pki::base64_decode(val.trim())
                     .unwrap_or_else(|_| val.as_bytes().to_vec());
                 write_volume_file(&file_path, &bytes)?;
+                chmod_volume_file(&file_path, mode);
             }
         }
     } else {
+        let mode = volume_file_mode(None, vol_spec);
         if let Some(data) = data_map {
             for (key, val_v) in data {
                 if let Some(val_str) = val_v.as_str() {
                     let file_path = safe_volume_path(vol_dir, key)?;
                     write_volume_file(&file_path, val_str.as_bytes())?;
+                    chmod_volume_file(&file_path, mode);
                 }
             }
         }
@@ -887,6 +974,7 @@ pub(crate) fn stage_configmap_files(
                     let bytes = diorama_pki::base64_decode(val_str.trim())
                         .unwrap_or_else(|_| val_str.as_bytes().to_vec());
                     write_volume_file(&file_path, &bytes)?;
+                    chmod_volume_file(&file_path, mode);
                 }
             }
         }
@@ -1066,4 +1154,48 @@ pub(crate) fn check_pod_restart_need(
     }
 
     reports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_fs_group_ownership, pod_fs_group, volume_file_mode};
+    use serde_json::json;
+
+    #[test]
+    fn file_mode_prefers_item_over_default() {
+        let vol = json!({ "defaultMode": 420 });
+        assert_eq!(volume_file_mode(None, &vol), 0o644);
+        assert_eq!(volume_file_mode(Some(&json!({ "mode": 256 })), &vol), 0o400);
+        assert_eq!(volume_file_mode(None, &json!({})), 0o644);
+        // Out-of-range bits are masked to permission bits.
+        assert_eq!(
+            volume_file_mode(None, &json!({ "defaultMode": 0o100_644 })),
+            0o644
+        );
+    }
+
+    #[test]
+    fn fs_group_parses_valid_gids_only() {
+        assert_eq!(
+            pod_fs_group(&json!({ "spec": { "securityContext": { "fsGroup": 2000 } } })),
+            Some(2000)
+        );
+        assert_eq!(pod_fs_group(&json!({ "spec": {} })), None);
+        assert_eq!(
+            pod_fs_group(&json!({ "spec": { "securityContext": { "fsGroup": -1 } } })),
+            None
+        );
+    }
+
+    #[test]
+    fn fs_group_ownership_skips_matching_root() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("diorama-fsgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gid = std::fs::symlink_metadata(&dir).unwrap().gid();
+        // The root already carries the group, so no chown walk runs.
+        apply_fs_group_ownership(&dir, gid).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

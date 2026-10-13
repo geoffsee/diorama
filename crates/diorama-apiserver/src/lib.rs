@@ -3,6 +3,7 @@ pub mod aggregation;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod exec;
 pub mod health;
 mod http;
 pub mod logs;
@@ -33,6 +34,7 @@ pub use config::{
     parse_port_range,
 };
 pub use error::ApiserverError;
+pub use exec::{PodExec, PodExecOptions, PodExecResult};
 pub use health::{HealthReport, check_apiserver_readiness};
 pub use logs::{PodLogOptions, PodLogReader};
 pub use pki::validate_pki_prerequisites;

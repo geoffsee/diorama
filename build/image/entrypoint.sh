@@ -41,4 +41,30 @@ for plugin in bridge host-local portmap loopback; do
     ln -sfn "$src" "$state/cni/bin/$plugin"
 done
 
+# cgroup v2: a cgroup with processes cannot delegate controllers to children
+# ("no internal processes"). Drain this container's root cgroup into /init so
+# crun can create pod cgroups. The kubelet repeats this in Rust (see
+# ContainerEnvironment::prepare_cgroups); doing it here covers the window
+# before the kubelet starts.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    mkdir -p /sys/fs/cgroup/init || true
+    if [ -f /sys/fs/cgroup/cgroup.procs ]; then
+        for pid in $(cat /sys/fs/cgroup/cgroup.procs 2>/dev/null || true) $$; do
+            echo "$pid" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+        done
+    fi
+    controllers=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)
+    if [ -n "$controllers" ]; then
+        enable=""
+        for c in $controllers; do
+            enable="$enable +$c"
+        done
+        echo "$enable" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || {
+            for c in $controllers; do
+                echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+            done
+        }
+    fi
+fi
+
 exec /usr/local/bin/diorama "$@"

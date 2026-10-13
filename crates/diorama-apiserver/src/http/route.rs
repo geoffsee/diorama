@@ -11,6 +11,7 @@ pub(crate) enum Route {
     OpenApiV3Index,
     OpenApiV3Core,
     OpenApiV3StorageV1,
+    OpenApiV3Group { group: String, version: String },
     Resource(ResourcePath),
     NotFound,
 }
@@ -33,6 +34,10 @@ pub(crate) fn parse(path: &str) -> Route {
         ["openapi", "v3"] => Route::OpenApiV3Index,
         ["openapi", "v3", "api", "v1"] => Route::OpenApiV3Core,
         ["openapi", "v3", "apis", "storage.k8s.io", "v1"] => Route::OpenApiV3StorageV1,
+        ["openapi", "v3", "apis", group, version] => Route::OpenApiV3Group {
+            group: (*group).to_string(),
+            version: (*version).to_string(),
+        },
         ["api"] => Route::ApiVersions,
         ["api", "v1"] => Route::CoreDiscovery,
         ["api", "v1", rest @ ..] => parse_resource("", rest),
@@ -78,13 +83,32 @@ fn parse_resource(group: &str, parts: &[&str]) -> Route {
     })
 }
 
+/// Whether the client offers `v2` aggregated discovery (`apidiscovery.k8s.io`).
+///
+/// Only `v2` is served. Clients that offer solely `v2beta1` (client-go older
+/// than 1.28, as vendored by Sonobuoy) fail to parse a `v2` response, so they
+/// receive legacy discovery, which is also in their `Accept` list.
 pub(crate) fn wants_aggregated_discovery(accept: Option<&str>) -> bool {
-    accept.is_some_and(|value| value.contains("apidiscovery.k8s.io"))
+    let Some(accept) = accept else {
+        return false;
+    };
+    accept.split(',').any(|entry| {
+        let mut group_ok = false;
+        let mut version_v2 = false;
+        for param in entry.split(';').skip(1) {
+            match param.trim() {
+                "g=apidiscovery.k8s.io" => group_ok = true,
+                "v=v2" => version_v2 = true,
+                _ => {},
+            }
+        }
+        group_ok && version_v2
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, parse};
+    use super::{Route, parse, wants_aggregated_discovery};
 
     #[test]
     fn parses_core_namespace_and_namespaced_pod() {
@@ -129,7 +153,33 @@ mod tests {
             parse("/openapi/v3/apis/storage.k8s.io/v1"),
             Route::OpenApiV3StorageV1
         ));
+        assert!(matches!(
+            parse("/openapi/v3/apis/apps/v1"),
+            Route::OpenApiV3Group { group, version }
+                if group == "apps" && version == "v1"
+        ));
         assert!(matches!(parse("/openapi/v2"), Route::NotFound));
+    }
+
+    #[test]
+    fn aggregated_discovery_requires_explicit_v2() {
+        // Modern kubectl/client-go and kube offer v2.
+        assert!(wants_aggregated_discovery(Some(
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json"
+        )));
+        assert!(wants_aggregated_discovery(Some(
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json"
+        )));
+        // Extra parameters (profiling peers) do not opt out.
+        assert!(wants_aggregated_discovery(Some(
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList;profile=nopeer"
+        )));
+        // Plain JSON and v2beta1-only clients (Sonobuoy's client-go) get legacy.
+        assert!(!wants_aggregated_discovery(None));
+        assert!(!wants_aggregated_discovery(Some("application/json")));
+        assert!(!wants_aggregated_discovery(Some(
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json"
+        )));
     }
 
     #[test]

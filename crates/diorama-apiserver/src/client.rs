@@ -14,6 +14,7 @@ use crate::config::{ApiserverConfig, parse_ipv4_cidr, parse_port_range};
 use crate::error::ApiserverError;
 use crate::rbac::{
     AuthzRequest, ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding,
+    cluster_role_binding_from_api, cluster_role_from_api, role_binding_from_api, role_from_api,
 };
 use crate::storage::KubernetesStorage;
 use crate::token::TokenService;
@@ -52,6 +53,7 @@ pub struct KubernetesApiClient {
     aggregation: Arc<AggregationManager>,
     crd_registry: Arc<RwLock<BTreeMap<String, Value>>>,
     anonymous_auth_allowed: bool,
+    client_ca_file: std::path::PathBuf,
     request_header_ca_file: std::path::PathBuf,
     request_header_allowed_names: Vec<String>,
     service_cluster_ip_range: String,
@@ -64,6 +66,105 @@ impl std::fmt::Debug for KubernetesApiClient {
             .field("identity", &self.identity)
             .field("anonymous_auth_allowed", &self.anonymous_auth_allowed)
             .finish_non_exhaustive()
+    }
+}
+
+/// Storage key for a cluster-scoped object (`/<prefix>[/<group>]/<plural>/<name>`).
+fn cluster_key(prefix: &str, group: &str, plural: &str, name: &str) -> String {
+    if group.is_empty() {
+        format!("{prefix}/{plural}/{name}")
+    } else {
+        format!("{prefix}/{group}/{plural}/{name}")
+    }
+}
+
+/// Storage prefix for listing cluster-scoped objects.
+fn cluster_prefix(prefix: &str, group: &str, plural: &str) -> String {
+    if group.is_empty() {
+        format!("{prefix}/{plural}/")
+    } else {
+        format!("{prefix}/{group}/{plural}/")
+    }
+}
+
+fn invalid_rbac(reason: String) -> ApiserverError {
+    ApiserverError::InvalidInput {
+        field: "rbac".to_string(),
+        reason,
+    }
+}
+
+fn rbac_namespace<'a>(
+    namespace: Option<&'a str>,
+    doc: &'a Value,
+) -> Result<&'a str, ApiserverError> {
+    namespace
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            doc.pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| invalid_rbac("metadata.namespace is required".to_string()))
+}
+
+const KUBE_ROOT_CA_DESCRIPTION: &str = "Contains a CA bundle that can be used to verify the kube-apiserver when using internal endpoints such as the internal service IP or kubernetes.default.svc. No other usage is guaranteed across distributions of Kubernetes clusters.";
+
+fn root_ca_configmap_current(doc: Option<&Value>, ca_pem: &str) -> bool {
+    let Some(doc) = doc else {
+        return false;
+    };
+    let data = doc.get("data").and_then(Value::as_object);
+    let ca_matches = data
+        .and_then(|data| data.get("ca.crt"))
+        .and_then(Value::as_str)
+        == Some(ca_pem);
+    let only_ca = data.is_some_and(|data| data.len() == 1);
+    let described = doc
+        .pointer("/metadata/annotations/kubernetes.io/description")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty());
+    ca_matches && only_ca && described
+}
+
+fn kube_root_ca_configmap(namespace: &str, ca_pem: &str, existing: Option<&Value>) -> Value {
+    let mut doc = existing.cloned().unwrap_or_else(|| {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": KubernetesApiClient::KUBE_ROOT_CA_CONFIGMAP,
+                "namespace": namespace,
+                "creationTimestamp": crate::time::now_rfc3339()
+            }
+        })
+    });
+    if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.insert(
+            "name".to_string(),
+            json!(KubernetesApiClient::KUBE_ROOT_CA_CONFIGMAP),
+        );
+        meta.insert("namespace".to_string(), json!(namespace));
+        let annotations = meta
+            .entry("annotations")
+            .or_insert_with(|| json!({}))
+            .as_object_mut();
+        if let Some(annotations) = annotations {
+            annotations.insert(
+                "kubernetes.io/description".to_string(),
+                json!(KUBE_ROOT_CA_DESCRIPTION),
+            );
+        }
+    }
+    doc["data"] = json!({ "ca.crt": ca_pem });
+    doc
+}
+
+fn group_version(group: &str) -> String {
+    if group.is_empty() {
+        "v1".to_string()
+    } else {
+        format!("{group}/v1")
     }
 }
 
@@ -113,6 +214,7 @@ impl KubernetesApiClient {
             aggregation,
             crd_registry,
             anonymous_auth_allowed: config.anonymous_auth,
+            client_ca_file: config.client_ca_file.clone(),
             request_header_ca_file: config.request_header_ca_file.clone(),
             request_header_allowed_names: vec!["system:auth-proxy".to_string()],
             service_cluster_ip_range: config.service_cluster_ip_range.clone(),
@@ -356,6 +458,7 @@ impl KubernetesApiClient {
 
     // --- Discovery API ---
 
+    #[allow(clippy::too_many_lines)]
     pub fn discover_core(&self) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("get", "", "discovery", None, None)?;
         Ok(json!({
@@ -369,7 +472,7 @@ impl KubernetesApiClient {
                     "namespaced": false,
                     "kind": "Namespace",
                     "shortNames": ["ns"],
-                    "verbs": ["create", "delete", "get", "list", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "configmaps",
@@ -377,14 +480,14 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "ConfigMap",
                     "shortNames": ["cm"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "secrets",
                     "singularName": "secret",
                     "namespaced": true,
                     "kind": "Secret",
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "pods",
@@ -392,7 +495,43 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "Pod",
                     "shortNames": ["po"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "pods/log",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "verbs": ["get"]
+                },
+                {
+                    "name": "podtemplates",
+                    "singularName": "podtemplate",
+                    "namespaced": true,
+                    "kind": "PodTemplate",
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "limitranges",
+                    "singularName": "limitrange",
+                    "namespaced": true,
+                    "kind": "LimitRange",
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "resourcequotas",
+                    "singularName": "resourcequota",
+                    "namespaced": true,
+                    "kind": "ResourceQuota",
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "replicationcontrollers",
+                    "singularName": "replicationcontroller",
+                    "namespaced": true,
+                    "kind": "ReplicationController",
+                    "shortNames": ["rc"],
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "services",
@@ -400,7 +539,7 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "Service",
                     "shortNames": ["svc"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "endpoints",
@@ -408,21 +547,21 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "Endpoints",
                     "shortNames": ["ep"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "serviceaccounts",
                     "singularName": "serviceaccount",
                     "namespaced": true,
                     "kind": "ServiceAccount",
-                    "verbs": ["create", "delete", "get", "list", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "nodes",
                     "singularName": "node",
                     "namespaced": false,
                     "kind": "Node",
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "persistentvolumeclaims",
@@ -430,7 +569,7 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "PersistentVolumeClaim",
                     "shortNames": ["pvc"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "persistentvolumes",
@@ -438,12 +577,35 @@ impl KubernetesApiClient {
                     "namespaced": false,
                     "kind": "PersistentVolume",
                     "shortNames": ["pv"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "events",
+                    "singularName": "event",
+                    "namespaced": true,
+                    "kind": "Event",
+                    "shortNames": ["ev"],
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "pods/log",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "verbs": ["get"]
+                },
+                {
+                    "name": "pods/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "verbs": ["get", "patch", "update"]
                 }
             ]
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn discover_apis(&self) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("get", "", "discovery", None, None)?;
         let mut groups = vec![
@@ -453,6 +615,27 @@ impl KubernetesApiClient {
                     { "groupVersion": "apps/v1", "version": "v1" }
                 ],
                 "preferredVersion": { "groupVersion": "apps/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "batch",
+                "versions": [
+                    { "groupVersion": "batch/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "batch/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "coordination.k8s.io",
+                "versions": [
+                    { "groupVersion": "coordination.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "coordination.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "events.k8s.io",
+                "versions": [
+                    { "groupVersion": "events.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "events.k8s.io/v1", "version": "v1" }
             }),
             json!({
                 "name": "apiextensions.k8s.io",
@@ -554,6 +737,8 @@ impl KubernetesApiClient {
             "daemonsets" => &["ds"],
             "endpoints" => &["ep"],
             "endpointslices" => &["es"],
+            "jobs" => &["job"],
+            "cronjobs" => &["cj"],
             _ => &[],
         };
         json!({
@@ -562,7 +747,17 @@ impl KubernetesApiClient {
             "namespaced": true,
             "kind": kind,
             "shortNames": short_names,
-            "verbs": ["create", "delete", "get", "list", "update", "watch"]
+            "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+        })
+    }
+
+    fn cluster_resource(name: &str, singular: &str, kind: &str) -> Value {
+        json!({
+            "name": name,
+            "singularName": singular,
+            "namespaced": false,
+            "kind": kind,
+            "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
         })
     }
 
@@ -621,6 +816,73 @@ impl KubernetesApiClient {
                 ] {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
+                for scalable in [
+                    "deployments/scale",
+                    "replicasets/scale",
+                    "statefulsets/scale",
+                ] {
+                    resources.push(json!({
+                        "name": scalable,
+                        "singularName": "",
+                        "namespaced": true,
+                        "kind": "Scale",
+                        "verbs": ["get", "patch", "update"]
+                    }));
+                }
+                for status in [
+                    "deployments/status",
+                    "replicasets/status",
+                    "statefulsets/status",
+                    "daemonsets/status",
+                ] {
+                    resources.push(json!({
+                        "name": status,
+                        "singularName": "",
+                        "namespaced": true,
+                        "kind": status.split('/').next().unwrap_or(""),
+                        "verbs": ["get", "patch", "update"]
+                    }));
+                }
+            },
+            ("batch", "v1") => {
+                for (name, singular, kind) in
+                    [("jobs", "job", "Job"), ("cronjobs", "cronjob", "CronJob")]
+                {
+                    resources.push(Self::namespaced_resource(name, singular, kind));
+                }
+                for status in ["jobs/status", "cronjobs/status"] {
+                    resources.push(json!({
+                        "name": status,
+                        "singularName": "",
+                        "namespaced": true,
+                        "kind": status.split('/').next().unwrap_or(""),
+                        "verbs": ["get", "patch", "update"]
+                    }));
+                }
+            },
+            ("coordination.k8s.io", "v1") => {
+                resources.push(Self::namespaced_resource("leases", "lease", "Lease"));
+            },
+            ("events.k8s.io", "v1") => {
+                resources.push(Self::namespaced_resource("events", "event", "Event"));
+            },
+            ("rbac.authorization.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "clusterroles",
+                    "clusterrole",
+                    "ClusterRole",
+                ));
+                resources.push(Self::cluster_resource(
+                    "clusterrolebindings",
+                    "clusterrolebinding",
+                    "ClusterRoleBinding",
+                ));
+                resources.push(Self::namespaced_resource("roles", "role", "Role"));
+                resources.push(Self::namespaced_resource(
+                    "rolebindings",
+                    "rolebinding",
+                    "RoleBinding",
+                ));
             },
             ("discovery.k8s.io", "v1") => {
                 resources.push(Self::namespaced_resource(
@@ -636,7 +898,7 @@ impl KubernetesApiClient {
                     "namespaced": false,
                     "kind": "StorageClass",
                     "shortNames": ["sc"],
-                    "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 }));
             },
             _ => {},
@@ -721,7 +983,98 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        // The service-account controller creates this before namespace creation
+        // is visible. Do it here so a new namespace already has `default`.
+        if let Err(err) = self.ensure_default_service_account(name).await {
+            let _ = self.storage.delete(&key, None).await;
+            return Err(err);
+        }
+        if let Err(err) = self.ensure_kube_root_ca_configmap(name).await {
+            let sa_key = format!("{}/serviceaccounts/{name}/default", self.storage.prefix());
+            let _ = self.storage.delete(&sa_key, None).await;
+            let _ = self.storage.delete(&key, None).await;
+            return Err(err);
+        }
         Ok(result)
+    }
+
+    /// Name of the ConfigMap the root-ca cert publisher maintains in every namespace.
+    pub const KUBE_ROOT_CA_CONFIGMAP: &'static str = "kube-root-ca.crt";
+
+    /// Publishes `kube-root-ca.crt` the way the kube-controller-manager publisher does.
+    ///
+    /// Creates the ConfigMap when it is missing, puts it back after a delete, and
+    /// replaces `data` when `ca.crt` or the description annotation drifts. The
+    /// caller's RBAC is not consulted: namespace creation and the publisher both
+    /// have to install it for users who cannot create ConfigMaps.
+    pub async fn ensure_kube_root_ca_configmap(
+        &self,
+        namespace: &str,
+    ) -> Result<(), ApiserverError> {
+        let ca_pem = std::fs::read_to_string(&self.client_ca_file)?;
+        if ca_pem.trim().is_empty() {
+            return Err(ApiserverError::Config {
+                reason: format!("cluster CA file {} is empty", self.client_ca_file.display()),
+            });
+        }
+        let key = format!(
+            "{}/configmaps/{namespace}/{}",
+            self.storage.prefix(),
+            Self::KUBE_ROOT_CA_CONFIGMAP
+        );
+        let existing = self.storage.get(&key).await?;
+        let current = existing
+            .as_ref()
+            .and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok());
+        if root_ca_configmap_current(current.as_ref(), &ca_pem) {
+            return Ok(());
+        }
+        let doc = kube_root_ca_configmap(namespace, &ca_pem, current.as_ref());
+        let bytes = serde_json::to_vec(&doc)?;
+        match existing {
+            None => match self.storage.create(&key, bytes).await {
+                Ok(_) => Ok(()),
+                Err(ApiserverError::Conflict { .. }) => Ok(()),
+                Err(err) => Err(err),
+            },
+            Some(_) => {
+                self.storage.update(&key, bytes, None).await?;
+                Ok(())
+            },
+        }
+    }
+
+    /// Creates the `default` service account when a namespace does not have one.
+    ///
+    /// This is the service-account controller's job upstream. It does not use the
+    /// caller's permissions: namespace creation grants the account even when the
+    /// caller cannot create service accounts.
+    pub(crate) async fn ensure_default_service_account(
+        &self,
+        namespace: &str,
+    ) -> Result<(), ApiserverError> {
+        let key = format!(
+            "{}/serviceaccounts/{namespace}/default",
+            self.storage.prefix()
+        );
+        if self.storage.get(&key).await?.is_some() {
+            return Ok(());
+        }
+        let doc = json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": "default",
+                "namespace": namespace,
+                "creationTimestamp": crate::time::now_rfc3339()
+            }
+        });
+        let bytes = serde_json::to_vec(&doc)?;
+        match self.storage.create(&key, bytes).await {
+            Ok(_) => Ok(()),
+            Err(ApiserverError::Conflict { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn get_namespace(&self, name: &str) -> Result<Value, ApiserverError> {
@@ -774,14 +1127,51 @@ impl KubernetesApiClient {
     pub async fn delete_namespace(&self, name: &str) -> Result<(), ApiserverError> {
         self.check_auth_detailed("delete", "", "namespaces", None, Some(name))?;
         let key = format!("{}/namespaces/{name}", self.storage.prefix());
-        let res = self.storage.delete(&key, None).await?;
-        if res.is_none() {
+        if self.storage.get(&key).await?.is_none() {
             return Err(ApiserverError::NotFound {
                 resource: "namespaces".to_string(),
                 name: name.to_string(),
             });
         }
+        // Upstream deletes every namespaced object with the namespace instead
+        // of orphaning them; do the same synchronously across all collections.
+        for (group, plural) in Self::namespaced_collections() {
+            let prefix = if group.is_empty() {
+                format!("{}/{plural}/{name}/", self.storage.prefix())
+            } else {
+                format!("{}/{group}/{plural}/{name}/", self.storage.prefix())
+            };
+            for kv in self.storage.list(&prefix).await? {
+                let _ = self.storage.delete(&kv.key, None).await;
+            }
+        }
+        let _ = self.storage.delete(&key, None).await;
         Ok(())
+    }
+
+    /// Every `(group, plural)` holding namespaced objects, for cascade delete.
+    fn namespaced_collections() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("", "pods"),
+            ("", "configmaps"),
+            ("", "secrets"),
+            ("", "services"),
+            ("", "endpoints"),
+            ("", "serviceaccounts"),
+            ("", "persistentvolumeclaims"),
+            ("", "events"),
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+            ("apps", "statefulsets"),
+            ("apps", "daemonsets"),
+            ("batch", "jobs"),
+            ("batch", "cronjobs"),
+            ("coordination.k8s.io", "leases"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("events.k8s.io", "events"),
+            ("rbac.authorization.k8s.io", "roles"),
+            ("rbac.authorization.k8s.io", "rolebindings"),
+        ]
     }
 
     // --- ConfigMap CRUD ---
@@ -1390,6 +1780,21 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object {
             pod = obj;
         }
+        // The kubelet reports Pending once it accepts the pod. Tests read the
+        // create response immediately, before that patch lands.
+        if pod
+            .pointer("/status/phase")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            if let Some(status) = pod.as_object_mut().and_then(|pod| {
+                pod.entry("status")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+            }) {
+                status.insert("phase".to_string(), json!("Pending"));
+            }
+        }
 
         if dry_run {
             return Ok(pod);
@@ -1742,6 +2147,7 @@ impl KubernetesApiClient {
             .to_string();
 
         self.check_auth_detailed("create", group, plural, Some(namespace), Some(&name))?;
+        self.authorize_rbac_write(group, plural, Some(namespace), &doc)?;
 
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -1807,6 +2213,7 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        self.install_rbac_object(group, plural, Some(namespace), &result)?;
         Ok(result)
     }
 
@@ -2001,6 +2408,7 @@ impl KubernetesApiClient {
             doc = obj;
         }
 
+        self.authorize_rbac_write(group, plural, Some(namespace), &doc)?;
         if dry_run {
             return Ok(doc);
         }
@@ -2014,6 +2422,7 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        self.install_rbac_object(group, plural, Some(namespace), &result)?;
         Ok(result)
     }
 
@@ -2040,7 +2449,304 @@ impl KubernetesApiClient {
                 name: format!("{namespace}/{name}"),
             });
         }
+        self.rbac.forget_api_object(plural, Some(namespace), name);
         Ok(())
+    }
+
+    /// Generic replace for namespaced objects served over HTTP (`PUT`/`PATCH`).
+    ///
+    /// Delegates to the workload store so `ConfigMaps`, `Secrets`, `ServiceAccounts`,
+    /// `Jobs` and other declarative objects share admission, uid preservation and
+    /// `resourceVersion` handling without per-kind boilerplate.
+    pub async fn replace_namespaced_object(
+        &self,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        namespace: &str,
+        name: &str,
+        doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.update_workload(group, kind, plural, namespace, name, doc)
+            .await
+    }
+
+    /// Generic replace for cluster-scoped objects served over HTTP.
+    pub async fn replace_cluster_object(
+        &self,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        name: &str,
+        mut doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("update", group, plural, None, Some(name))?;
+        let key = cluster_key(self.storage.prefix(), group, plural, name);
+        let existing = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: plural.to_string(),
+                name: name.to_string(),
+            })?;
+        let old_doc: Value = serde_json::from_slice(&existing.value)?;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            if let Some(old_uid) = old_doc.get("metadata").and_then(|m| m.get("uid")) {
+                meta.insert("uid".to_string(), old_uid.clone());
+            }
+            if meta.get("creationTimestamp").is_none()
+                && let Some(created) = old_doc.pointer("/metadata/creationTimestamp").cloned()
+            {
+                meta.insert("creationTimestamp".to_string(), created);
+            }
+        }
+        if let (true, Some(old_status)) = (
+            doc.get("status").is_none_or(Value::is_null),
+            old_doc.get("status").filter(|s| !s.is_null()),
+        ) {
+            doc["status"] = old_status.clone();
+        }
+        let expected_version = doc
+            .pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            .and_then(|v| v.parse::<u64>().ok());
+        self.authorize_rbac_write(group, plural, None, &doc)?;
+        let bytes = serde_json::to_vec(&doc)?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        let mut result = doc;
+        if result.get("kind").is_none() {
+            result["kind"] = json!(kind);
+        }
+        if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        self.install_rbac_object(group, plural, None, &result)?;
+        Ok(result)
+    }
+
+    /// Generic create for cluster-scoped objects served over HTTP.
+    pub async fn create_cluster_object(
+        &self,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        mut doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        let name = doc
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiserverError::InvalidInput {
+                field: "metadata.name".to_string(),
+                reason: format!("{kind} requires metadata.name"),
+            })?
+            .to_string();
+        self.check_auth_detailed("create", group, plural, None, Some(&name))?;
+        self.authorize_rbac_write(group, plural, None, &doc)?;
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            if !meta.contains_key("creationTimestamp") {
+                meta.insert(
+                    "creationTimestamp".to_string(),
+                    json!(crate::time::now_rfc3339()),
+                );
+            }
+            if !meta.contains_key("uid") {
+                meta.insert(
+                    "uid".to_string(),
+                    json!(format!("uid-{plural}-{name}-{cur_rev}")),
+                );
+            }
+        }
+        doc["kind"] = json!(kind);
+        doc["apiVersion"] = json!(group_version(group));
+        let key = cluster_key(self.storage.prefix(), group, plural, &name);
+        let bytes = serde_json::to_vec(&doc)?;
+        let kv = self.storage.create(&key, bytes).await?;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        self.install_rbac_object(group, plural, None, &doc)?;
+        Ok(doc)
+    }
+
+    /// Generic get for cluster-scoped objects served over HTTP.
+    pub async fn get_cluster_object(
+        &self,
+        group: &str,
+        plural: &str,
+        name: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("get", group, plural, None, Some(name))?;
+        let key = cluster_key(self.storage.prefix(), group, plural, name);
+        let kv = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: plural.to_string(),
+                name: name.to_string(),
+            })?;
+        let mut doc: Value = serde_json::from_slice(&kv.value)?;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        Ok(doc)
+    }
+
+    /// Generic list for cluster-scoped objects served over HTTP.
+    pub async fn list_cluster_objects(
+        &self,
+        group: &str,
+        kind_list: &str,
+        plural: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("list", group, plural, None, None)?;
+        let prefix = cluster_prefix(self.storage.prefix(), group, plural);
+        let kvs = self.storage.list(&prefix).await?;
+        let mut items = Vec::new();
+        for kv in kvs {
+            let mut doc: Value = serde_json::from_slice(&kv.value)?;
+            if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.insert(
+                    "resourceVersion".to_string(),
+                    json!(kv.mod_revision.to_string()),
+                );
+            }
+            items.push(doc);
+        }
+        let cur_rev = self.storage.current_revision().await;
+        Ok(json!({
+            "apiVersion": group_version(group),
+            "kind": kind_list,
+            "metadata": { "resourceVersion": cur_rev.to_string() },
+            "items": items
+        }))
+    }
+
+    /// Generic delete for cluster-scoped objects served over HTTP.
+    pub async fn delete_cluster_object(
+        &self,
+        group: &str,
+        plural: &str,
+        name: &str,
+    ) -> Result<(), ApiserverError> {
+        self.check_auth_detailed("delete", group, plural, None, Some(name))?;
+        let key = cluster_key(self.storage.prefix(), group, plural, name);
+        let res = self.storage.delete(&key, None).await?;
+        if res.is_none() {
+            return Err(ApiserverError::NotFound {
+                resource: plural.to_string(),
+                name: name.to_string(),
+            });
+        }
+        self.rbac.forget_api_object(plural, None, name);
+        Ok(())
+    }
+
+    fn authorize_rbac_write(
+        &self,
+        group: &str,
+        plural: &str,
+        namespace: Option<&str>,
+        doc: &Value,
+    ) -> Result<(), ApiserverError> {
+        if group != "rbac.authorization.k8s.io" {
+            return Ok(());
+        }
+        match plural {
+            "clusterroles" => {
+                let role = cluster_role_from_api(doc).map_err(invalid_rbac)?;
+                self.verify_cluster_role_creation_privileges(&role)
+            },
+            "clusterrolebindings" => {
+                let binding = cluster_role_binding_from_api(doc).map_err(invalid_rbac)?;
+                self.verify_cluster_role_binding_privileges(&binding.role_ref)
+            },
+            "roles" => {
+                let namespace = rbac_namespace(namespace, doc)?;
+                let role = role_from_api(namespace, doc).map_err(invalid_rbac)?;
+                self.verify_role_creation_privileges(namespace, &role)
+            },
+            "rolebindings" => {
+                let namespace = rbac_namespace(namespace, doc)?;
+                let binding = role_binding_from_api(namespace, doc).map_err(invalid_rbac)?;
+                self.verify_role_binding_privileges(namespace, &binding.role_ref)
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn install_rbac_object(
+        &self,
+        group: &str,
+        plural: &str,
+        namespace: Option<&str>,
+        doc: &Value,
+    ) -> Result<(), ApiserverError> {
+        if group != "rbac.authorization.k8s.io" {
+            return Ok(());
+        }
+        self.rbac
+            .apply_api_object(plural, namespace, doc)
+            .map_err(invalid_rbac)
+    }
+
+    /// Generic create for namespaced objects served over HTTP.
+    pub async fn create_namespaced_object(
+        &self,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        namespace: &str,
+        doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.create_workload(group, kind, plural, namespace, doc)
+            .await
+    }
+
+    /// Generic get for namespaced objects served over HTTP.
+    pub async fn get_namespaced_object(
+        &self,
+        group: &str,
+        plural: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.get_workload(group, plural, namespace, name).await
+    }
+
+    /// Generic list for namespaced objects served over HTTP.
+    pub async fn list_namespaced_objects(
+        &self,
+        group: &str,
+        kind_list: &str,
+        plural: &str,
+        namespace: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.list_workload(group, kind_list, plural, namespace)
+            .await
+    }
+
+    /// Generic delete for namespaced objects served over HTTP.
+    pub async fn delete_namespaced_object(
+        &self,
+        group: &str,
+        plural: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), ApiserverError> {
+        self.delete_workload(group, plural, namespace, name).await
     }
 
     // Deployments
