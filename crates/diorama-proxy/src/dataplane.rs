@@ -346,7 +346,7 @@ impl IptablesDataplane {
     ///
     /// Prefers the upstream `-m addrtype --dst-type LOCAL` match. Falls back to an
     /// unconditional jump when `xt_addrtype` is unavailable so single-node boots still
-    /// serve NodePorts on the loopback address.
+    /// serve `NodePorts` on the loopback address.
     fn ensure_kube_services_nodeports_jump(
         executor: &dyn CommandExecutor,
     ) -> Result<(), ProxyError> {
@@ -445,6 +445,16 @@ impl IptablesDataplane {
         Self::verify_rules_output(table, &output.stdout)
     }
 
+    fn require_nat_rule(present: bool, rule: String) -> Result<(), ProxyError> {
+        if present {
+            return Ok(());
+        }
+        Err(ProxyError::RoutingVerificationFailed {
+            rule,
+            reason: "matching rule missing from iptables nat table".to_string(),
+        })
+    }
+
     fn verify_rules_output(
         table: &ServiceRoutingTable,
         existing_rules: &str,
@@ -458,25 +468,18 @@ impl IptablesDataplane {
                         "-d {cluster_ip}/32 -p {proto} -m {proto} --dport {} ",
                         port.port
                     );
-                    if !existing_rules.lines().any(|l| l.contains(&needle)) {
-                        return Err(ProxyError::RoutingVerificationFailed {
-                            rule: format!("ClusterIP {cluster_ip}:{}", port.port),
-                            reason: "matching rule missing from iptables nat table".to_string(),
-                        });
-                    }
+                    Self::require_nat_rule(
+                        existing_rules.lines().any(|line| line.contains(&needle)),
+                        format!("ClusterIP {cluster_ip}:{}", port.port),
+                    )?;
                 }
                 if let Some(node_port) = port.node_port {
                     expects_nodeport = true;
                     let needle = format!("-p {proto} -m {proto} --dport {node_port} ");
                     let has_nodeport = existing_rules
                         .lines()
-                        .any(|l| l.contains("KUBE-NODEPORTS") && l.contains(&needle));
-                    if !has_nodeport {
-                        return Err(ProxyError::RoutingVerificationFailed {
-                            rule: format!("NodePort {node_port}/{proto}"),
-                            reason: "matching rule missing from iptables nat table".to_string(),
-                        });
-                    }
+                        .any(|line| line.contains("KUBE-NODEPORTS") && line.contains(&needle));
+                    Self::require_nat_rule(has_nodeport, format!("NodePort {node_port}/{proto}"))?;
                 }
             }
         }
