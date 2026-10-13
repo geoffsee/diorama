@@ -15,6 +15,8 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// Summary report of paths cleaned and preserved during restart preparation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -275,4 +277,184 @@ pub fn clean_stale_runtime_state(
     record_preserved_assets(paths, &mut report);
 
     Ok(report)
+}
+
+/// Mount points at or inside `roots`, deepest path first.
+///
+/// `mountinfo` is the text of `/proc/self/mountinfo`. Mount points use the
+/// kernel's octal escapes (`\040` for a space). Paths outside `roots` are omitted.
+pub fn mounts_under(mountinfo: &str, roots: &[&Path]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for line in mountinfo.lines() {
+        let Some(point) = mountinfo_mount_point(line) else {
+            continue;
+        };
+        if roots.iter().any(|root| path_is_within(&point, root)) {
+            found.push(point);
+        }
+    }
+    found.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    found
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn mountinfo_mount_point(line: &str) -> Option<PathBuf> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let separator = fields.iter().position(|field| *field == "-")?;
+    if separator < 5 {
+        return None;
+    }
+    Some(PathBuf::from(unescape_mount_field(fields[4])))
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = String::with_capacity(field.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            let octal = &field[index + 1..index + 4];
+            if octal.bytes().all(|byte| byte.is_ascii_digit())
+                && let Ok(value) = u8::from_str_radix(octal, 8)
+            {
+                out.push(char::from(value));
+                index += 4;
+                continue;
+            }
+        }
+        out.push(char::from(bytes[index]));
+        index += 1;
+    }
+    out
+}
+
+fn managed_pid_file(paths: &ContainerdPaths) -> Option<PathBuf> {
+    paths
+        .root_dir
+        .parent()
+        .map(|dir| dir.join("containerd.pid"))
+}
+
+fn process_comm(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let comm = comm.trim();
+        if comm.is_empty() {
+            None
+        } else {
+            Some(comm.to_string())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let line = text.lines().next()?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        Path::new(line)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn signal_pid(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status();
+}
+
+fn wait_until_dead(pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if !process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Stops a leftover managed containerd recorded in `{containerd_dir}/containerd.pid`
+/// when that pid's command is `containerd`, then detaches mounts under the
+/// disposable root and state directories on Linux.
+pub fn reclaim_managed_runtime(paths: &ContainerdPaths) {
+    stop_recorded_containerd(paths);
+    detach_managed_mounts(paths);
+}
+
+fn stop_recorded_containerd(paths: &ContainerdPaths) {
+    let Some(pid_file) = managed_pid_file(paths) else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string(&pid_file) else {
+        return;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return;
+    };
+    if pid <= 1 || process_comm(pid).as_deref() != Some("containerd") {
+        return;
+    }
+    signal_pid(pid, "-TERM");
+    if wait_until_dead(pid, Duration::from_secs(2)) {
+        return;
+    }
+    signal_pid(pid, "-KILL");
+    let _ = wait_until_dead(pid, Duration::from_secs(1));
+}
+
+fn managed_mounts(mountinfo: &str, paths: &ContainerdPaths) -> Vec<PathBuf> {
+    let roots: [&Path; 2] = [paths.root_dir.as_path(), paths.state_dir.as_path()];
+    mounts_under(mountinfo, &roots)
+}
+
+fn detach_managed_mounts(paths: &ContainerdPaths) {
+    #[cfg(target_os = "linux")]
+    {
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        for mount in managed_mounts(&mountinfo, paths) {
+            let _ = Command::new("umount").arg("-l").arg(&mount).status();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = managed_mounts("", paths);
+    }
+}
+
+pub(crate) fn cleanup_is_busy(err: &CleanupError) -> bool {
+    let CleanupError::Io { source, .. } = err else {
+        return false;
+    };
+    matches!(
+        source.kind(),
+        io::ErrorKind::ResourceBusy | io::ErrorKind::DirectoryNotEmpty
+    )
 }
