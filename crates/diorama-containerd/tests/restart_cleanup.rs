@@ -9,14 +9,18 @@
 //! - Arbitrary pulled images stored within disposable `root/` are evicted as expected.
 
 use diorama_config::Config;
-use diorama_containerd::cleanup::{clean_stale_runtime_state, validate_cleanup_path};
+use diorama_containerd::cleanup::{clean_stale_runtime_state, mounts_under, validate_cleanup_path};
 use diorama_containerd::image::ImageImportConfig;
 use diorama_containerd::registry::{RegistryHostFile, write_registry_hosts_toml};
 use diorama_containerd::service::{ContainerdPaths, ContainerdService, ContainerdServiceOptions};
+use diorama_containerd::{clear_prepare_failure, last_prepare_failure};
+use diorama_supervisor::{Registration, Supervisor, stop_channel};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn populate_disposable_state(paths: &ContainerdPaths) -> (PathBuf, PathBuf) {
@@ -251,4 +255,190 @@ fn test_clean_crash_restart_recovers_pod_synchronization() {
             .exists()
     );
     assert!(paths.config_path.exists(), "config.toml freshly generated");
+}
+
+fn service_for(paths: ContainerdPaths) -> ContainerdService {
+    let image_config = ImageImportConfig::from_config(&Config::default(), &paths.images_dir);
+    ContainerdService::new(ContainerdServiceOptions::new(paths, image_config))
+}
+
+#[tokio::test]
+async fn adapter_prepare_failure_records_io_reason() {
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("state");
+    let paths = ContainerdPaths::from_base(&base);
+    fs::create_dir_all(paths.root_dir.parent().unwrap()).unwrap();
+    fs::write(&paths.root_dir, b"not-a-directory").unwrap();
+    let cni = base.join("containerd").join("cni").join("conf");
+    fs::create_dir_all(&cni).unwrap();
+    let conflist = cni.join("10-bridge.conflist");
+    let conflist_bytes = b"{\"cniVersion\":\"1.0.0\",\"name\":\"bridge\"}";
+    fs::write(&conflist, conflist_bytes).unwrap();
+
+    clear_prepare_failure();
+    let service = service_for(paths.clone());
+    let spec = ContainerdService::component_spec(Duration::from_secs(2));
+    let supervisor = Supervisor::new(vec![Registration::new(spec, service)]).unwrap();
+    let (_stop, receiver) = stop_channel();
+    let _report = supervisor.run(receiver).await;
+
+    let line = last_prepare_failure().expect("prepare failure must be recorded");
+    assert!(
+        line.contains("\"event\":\"containerd_prepare_failed\""),
+        "{line}"
+    );
+    assert!(
+        line.contains("\"detail_code\":\"containerd_prepare_failed\""),
+        "{line}"
+    );
+    assert!(
+        line.contains(&paths.root_dir.display().to_string()),
+        "{line}"
+    );
+    let reason = line.to_ascii_lowercase();
+    assert!(
+        reason.contains("not a directory") || reason.contains("os error"),
+        "{line}"
+    );
+    assert_eq!(fs::read(&conflist).unwrap(), conflist_bytes);
+}
+
+// The caller reaps the child after prepare signals it.
+#[allow(clippy::zombie_processes)]
+fn spawn_containerd_holder(socket: &Path, pid_file: &Path) -> std::process::Child {
+    let dir = tempfile::tempdir().expect("holder dir");
+    let source = dir.path().join("holder.rs");
+    fs::write(
+        &source,
+        r#"fn main() {
+    let sock = std::env::args().nth(1).expect("socket");
+    let pid_file = std::env::args().nth(2).expect("pid file");
+    std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+"#,
+    )
+    .unwrap();
+    let bin = dir.path().join("containerd");
+    let status = Command::new("rustc")
+        .args(["--edition", "2021", "-O", "-o"])
+        .arg(&bin)
+        .arg(&source)
+        .status()
+        .expect("rustc");
+    assert!(status.success(), "holder failed to compile");
+    // Keep the temp dir alive for the child binary.
+    let bin = bin.canonicalize().unwrap();
+    std::mem::forget(dir);
+    let mut child = Command::new(&bin)
+        .arg(socket)
+        .arg(pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn holder");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if pid_file.is_file() && socket.exists() {
+            return child;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    panic!("holder did not bind the managed socket");
+}
+
+#[test]
+fn prepare_stops_managed_leftover_and_keeps_cni() {
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("state");
+    let paths = ContainerdPaths::from_base(&base);
+    fs::create_dir_all(&paths.root_dir).unwrap();
+    fs::create_dir_all(&paths.state_dir).unwrap();
+    fs::create_dir_all(&paths.registry_hosts_dir).unwrap();
+    fs::create_dir_all(&paths.images_dir).unwrap();
+    fs::create_dir_all(paths.binary_path.parent().unwrap()).unwrap();
+    fs::write(paths.root_dir.join("meta.db"), b"stale").unwrap();
+
+    let cni = base.join("containerd").join("cni").join("conf");
+    fs::create_dir_all(&cni).unwrap();
+    let conflist = cni.join("10-bridge.conflist");
+    let conflist_bytes = b"{\"cniVersion\":\"1.0.0\"}";
+    fs::write(&conflist, conflist_bytes).unwrap();
+    let (hosts_toml, coredns, _pause) = populate_preserved_inputs(&paths);
+    let hosts_bytes = fs::read(&hosts_toml).unwrap();
+    let coredns_bytes = fs::read(&coredns).unwrap();
+
+    let containerd_dir = paths.root_dir.parent().unwrap();
+    let foreign_pid = containerd_dir.join("containerd.pid");
+    fs::write(&foreign_pid, std::process::id().to_string()).unwrap();
+    service_for(paths.clone()).prepare().unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-0", &std::process::id().to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "a pid whose command is not containerd must stay alive"
+    );
+    assert_eq!(fs::read(&conflist).unwrap(), conflist_bytes);
+
+    fs::create_dir_all(&paths.state_dir).unwrap();
+    let socket = paths.socket_path.clone();
+    let pid_file = containerd_dir.join("containerd.pid");
+    let mut holder = spawn_containerd_holder(&socket, &pid_file);
+    let holder_pid = fs::read_to_string(&pid_file).unwrap();
+    service_for(paths.clone())
+        .prepare()
+        .expect("prepare reclaims a managed leftover containerd");
+    let reaped = holder.try_wait().expect("wait holder").is_some()
+        || Command::new("kill")
+            .args(["-0", holder_pid.trim()])
+            .status()
+            .map_or(true, |status| !status.success());
+    assert!(reaped, "managed containerd holder must be stopped");
+    assert!(paths.root_dir.is_dir());
+    assert!(paths.state_dir.is_dir());
+    assert!(paths.config_path.is_file());
+    assert_eq!(fs::read(&conflist).unwrap(), conflist_bytes);
+    assert_eq!(fs::read(&hosts_toml).unwrap(), hosts_bytes);
+    assert_eq!(fs::read(&coredns).unwrap(), coredns_bytes);
+    let _ = holder.wait();
+}
+
+#[test]
+fn mounts_under_returns_nested_paths_deepest_first() {
+    let root = Path::new("/build/state/containerd/root");
+    let state = Path::new("/build/state/containerd/state");
+    let mountinfo = "\
+22 1 0:21 / / rw - overlay overlay rw
+33 22 0:22 / /build/state/containerd/root/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs rw - overlay overlay rw
+34 33 0:23 / /build/state/containerd/root/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs/nested rw - tmpfs tmpfs rw
+41 22 0:25 / /build/state/containerd/state/io.containerd.runtime.v2.task/k8s.io/abc/rootfs rw - overlay overlay rw
+40 22 0:24 / /build/state/containerd/cni rw - tmpfs tmpfs rw
+42 22 0:26 / /build/state/containerd/root/has\\040space rw - tmpfs tmpfs rw
+";
+    let mounts = mounts_under(mountinfo, &[root, state]);
+    assert_eq!(
+        mounts,
+        vec![
+            PathBuf::from(
+                "/build/state/containerd/root/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs/nested"
+            ),
+            PathBuf::from(
+                "/build/state/containerd/root/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs"
+            ),
+            PathBuf::from(
+                "/build/state/containerd/state/io.containerd.runtime.v2.task/k8s.io/abc/rootfs"
+            ),
+            PathBuf::from("/build/state/containerd/root/has space"),
+        ]
+    );
 }

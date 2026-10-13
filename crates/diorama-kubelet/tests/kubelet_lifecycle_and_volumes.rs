@@ -1679,3 +1679,137 @@ async fn test_persistent_volume_claim_mount_and_recreate_persistence() {
     assert_eq!(res2.exit_code, 0);
     assert_eq!(res2.stdout, "hello alpine local-path");
 }
+
+fn container_env_map(
+    runtime: &MockRuntimeProvider,
+    pod_uid: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let configs = runtime.container_configs(pod_uid);
+    let config = configs
+        .first()
+        .unwrap_or_else(|| panic!("container config for {pod_uid}"));
+    config
+        .envs
+        .iter()
+        .map(|env| {
+            (
+                env.key.clone(),
+                String::from_utf8_lossy(&env.value).into_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn service_links_publish_kubernetes_even_when_disabled_and_skip_headless() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let admin = apiserver_arc.admin_client();
+    admin
+        .create_service(
+            "default",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": "plainhead", "namespace": "default" },
+                "spec": {
+                    "clusterIP": "None",
+                    "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let web = admin
+        .create_service(
+            "default",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": "web", "namespace": "default" },
+                "spec": {
+                    "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let web_ip = web["spec"]["clusterIP"].as_str().unwrap().to_string();
+
+    let client = kubelet.client();
+    client
+        .create_pod(
+            "default",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "links-off", "namespace": "default" },
+                "spec": {
+                    "nodeName": "test-node",
+                    "enableServiceLinks": false,
+                    "containers": [{ "name": "main", "image": "docker.io/library/busybox:1.36" }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .create_pod(
+            "default",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "links-on", "namespace": "default" },
+                "spec": {
+                    "nodeName": "test-node",
+                    "containers": [{ "name": "main", "image": "docker.io/library/busybox:1.36" }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let off = client.get_pod("default", "links-off").await.unwrap();
+    let on = client.get_pod("default", "links-on").await.unwrap();
+    let off_env = container_env_map(&runtime, off["metadata"]["uid"].as_str().unwrap());
+    let on_env = container_env_map(&runtime, on["metadata"]["uid"].as_str().unwrap());
+
+    assert_eq!(
+        off_env.get("KUBERNETES_SERVICE_HOST").map(String::as_str),
+        Some("10.43.0.1")
+    );
+    assert_eq!(
+        off_env.get("KUBERNETES_SERVICE_PORT").map(String::as_str),
+        Some("443")
+    );
+    assert!(!off_env.contains_key("PLAINHEAD_SERVICE_HOST"));
+    assert!(!off_env.contains_key("WEB_SERVICE_HOST"));
+
+    assert_eq!(
+        on_env.get("KUBERNETES_SERVICE_HOST").map(String::as_str),
+        Some("10.43.0.1")
+    );
+    assert_eq!(
+        on_env.get("WEB_SERVICE_HOST").map(String::as_str),
+        Some(web_ip.as_str())
+    );
+    assert_eq!(
+        on_env.get("WEB_SERVICE_PORT").map(String::as_str),
+        Some("8080")
+    );
+    assert!(!on_env.contains_key("PLAINHEAD_SERVICE_HOST"));
+}

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::Duration;
 
 use diorama_apiserver::WatchEventType;
@@ -80,6 +81,21 @@ impl Adapter for ProxyAdapter {
             // 4. Initial dataplane reconciliation / API synchronization
             let reconciler = DataplaneReconciler::new();
             if let Err(err) = self.service.sync_from_api(&reconciler).await {
+                tracing::error!(
+                    target: "kubeproxy::dataplane",
+                    error = %err,
+                    detail_code = err.diagnostic_code(),
+                    "initial dataplane sync from API failed"
+                );
+                // Lifecycle JSON only carries the static detail_code; mirror the
+                // actionable reason onto stderr so Alpine evidence captures it.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{{\"schema\":1,\"level\":\"error\",\"event\":\"proxy_sync_failed\",\"detail_code\":\"{}\",\"reason\":{}}}",
+                    err.diagnostic_code(),
+                    serde_json::to_string(&err.to_string())
+                        .unwrap_or_else(|_| "\"unknown\"".to_string())
+                );
                 return Err(AdapterError {
                     code: err.diagnostic_code(),
                 });
@@ -131,8 +147,15 @@ impl Adapter for ProxyAdapter {
                                                     tracing::warn!(
                                                         target: "kubeproxy::dataplane",
                                                         error = %err,
-                                                        "failed to reconcile dataplane after service update"
+                                                        "failed to reconcile dataplane after service update; resyncing from API"
                                                     );
+                                                    if let Err(sync_err) = self.service.sync_from_api(&reconciler).await {
+                                                        tracing::warn!(
+                                                            target: "kubeproxy::dataplane",
+                                                            error = %sync_err,
+                                                            "dataplane resync after service update failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -143,8 +166,15 @@ impl Adapter for ProxyAdapter {
                                                     tracing::warn!(
                                                         target: "kubeproxy::dataplane",
                                                         error = %err,
-                                                        "failed to reconcile dataplane after service delete"
+                                                        "failed to reconcile dataplane after service delete; resyncing from API"
                                                     );
+                                                    if let Err(sync_err) = self.service.sync_from_api(&reconciler).await {
+                                                        tracing::warn!(
+                                                            target: "kubeproxy::dataplane",
+                                                            error = %sync_err,
+                                                            "dataplane resync after service delete failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -178,8 +208,15 @@ impl Adapter for ProxyAdapter {
                                                     tracing::warn!(
                                                         target: "kubeproxy::dataplane",
                                                         error = %err,
-                                                        "failed to reconcile dataplane after endpointslice update"
+                                                        "failed to reconcile dataplane after endpointslice update; resyncing from API"
                                                     );
+                                                    if let Err(sync_err) = self.service.sync_from_api(&reconciler).await {
+                                                        tracing::warn!(
+                                                            target: "kubeproxy::dataplane",
+                                                            error = %sync_err,
+                                                            "dataplane resync after endpointslice update failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -190,8 +227,15 @@ impl Adapter for ProxyAdapter {
                                                     tracing::warn!(
                                                         target: "kubeproxy::dataplane",
                                                         error = %err,
-                                                        "failed to reconcile dataplane after endpointslice delete"
+                                                        "failed to reconcile dataplane after endpointslice delete; resyncing from API"
                                                     );
+                                                    if let Err(sync_err) = self.service.sync_from_api(&reconciler).await {
+                                                        tracing::warn!(
+                                                            target: "kubeproxy::dataplane",
+                                                            error = %sync_err,
+                                                            "dataplane resync after endpointslice delete failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }

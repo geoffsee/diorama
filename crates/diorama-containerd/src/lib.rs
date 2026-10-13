@@ -18,7 +18,10 @@ pub mod snapshotter;
 pub mod symlink;
 
 pub use cgroup::{evaluate_systemd_cgroup, is_cgroup_v2, is_systemd_running, use_systemd_cgroup};
-pub use cleanup::{CleanupError, CleanupReport, clean_stale_runtime_state, validate_cleanup_path};
+pub use cleanup::{
+    CleanupError, CleanupReport, clean_stale_runtime_state, reclaim_managed_runtime,
+    validate_cleanup_path,
+};
 pub use client::connect_unix;
 pub use config::{
     CONTAINERD_CONFIG_VERSION, ContainerdConfigFile, ContainerdConfigOptions,
@@ -42,6 +45,7 @@ pub use registry::{
 };
 pub use service::{
     COMPONENT_CONTAINERD, ContainerdPaths, ContainerdService, ContainerdServiceOptions,
+    clear_prepare_failure, last_prepare_failure,
 };
 pub use shim::{
     DEFAULT_SHIM_BINARY_NAME, RUNTIME_RUNC_V2, ShimError, build_containerd_path, find_shim_in_path,

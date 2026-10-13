@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::admission::AdmissionEngine;
 use crate::aggregation::AggregationManager;
@@ -143,6 +143,7 @@ impl ApiserverService {
         self.admission.restore_from_storage(&self.storage).await?;
         self.aggregation.restore_from_storage(&self.storage).await?;
         self.bootstrap_default_namespaces().await?;
+        self.bootstrap_kubernetes_service().await?;
 
         Ok(())
     }
@@ -159,6 +160,108 @@ impl ApiserverService {
             }
         }
         Ok(())
+    }
+
+    /// Creates `default/kubernetes` through the normal Service path when it is absent.
+    ///
+    /// The first address of the service CIDR and TCP 443 match the upstream apiserver.
+    /// An `EndpointSlice` publishes the address the apiserver actually listens on.
+    pub async fn bootstrap_kubernetes_service(&self) -> Result<(), ApiserverError> {
+        let admin = self.admin_client();
+        let service = match admin.get_service("default", "kubernetes").await {
+            Ok(service) => service,
+            Err(ApiserverError::NotFound { .. }) => {
+                admin
+                    .create_service(
+                        "default",
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Service",
+                            "metadata": {
+                                "name": "kubernetes",
+                                "labels": {
+                                    "component": "apiserver",
+                                    "provider": "kubernetes"
+                                }
+                            },
+                            "spec": {
+                                "type": "ClusterIP",
+                                "sessionAffinity": "None",
+                                "ports": [{
+                                    "name": "https",
+                                    "port": 443,
+                                    "protocol": "TCP",
+                                    "targetPort": self.config.secure_port
+                                }]
+                            }
+                        }),
+                    )
+                    .await?
+            },
+            Err(err) => return Err(err),
+        };
+        self.ensure_kubernetes_endpoint_slice(&admin, &service)
+            .await
+    }
+
+    async fn ensure_kubernetes_endpoint_slice(
+        &self,
+        admin: &KubernetesApiClient,
+        service: &Value,
+    ) -> Result<(), ApiserverError> {
+        match admin.get_endpointslice("default", "kubernetes").await {
+            Ok(_) => return Ok(()),
+            Err(ApiserverError::NotFound { .. }) => {},
+            Err(err) => return Err(err),
+        }
+
+        let port_name = service
+            .pointer("/spec/ports/0/name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("https");
+        let uid = service
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let endpoint_ip = kubernetes_endpoint_ip(&self.config);
+        admin
+            .create_endpointslice(
+                "default",
+                json!({
+                    "apiVersion": "discovery.k8s.io/v1",
+                    "kind": "EndpointSlice",
+                    "metadata": {
+                        "name": "kubernetes",
+                        "labels": {
+                            "kubernetes.io/service-name": "kubernetes"
+                        },
+                        "ownerReferences": [{
+                            "apiVersion": "v1",
+                            "kind": "Service",
+                            "name": "kubernetes",
+                            "uid": uid,
+                            "controller": true
+                        }]
+                    },
+                    "addressType": "IPv4",
+                    "ports": [{
+                        "name": port_name,
+                        "port": self.config.secure_port,
+                        "protocol": "TCP"
+                    }],
+                    "endpoints": [{
+                        "addresses": [endpoint_ip],
+                        "conditions": {
+                            "ready": true,
+                            "serving": true,
+                            "terminating": false
+                        }
+                    }]
+                }),
+            )
+            .await
+            .map(drop)
     }
 
     pub async fn restore_crds_from_storage(&self) -> Result<(), ApiserverError> {
@@ -414,5 +517,14 @@ impl ApiserverService {
             username: username.into(),
             groups,
         })
+    }
+}
+
+/// Address where in-cluster clients can open a connection to this apiserver.
+fn kubernetes_endpoint_ip(config: &ApiserverConfig) -> String {
+    match config.bind_address {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => ip.to_string(),
+        std::net::IpAddr::V6(ip) if !ip.is_unspecified() => ip.to_string(),
+        _ => config.advertise_address.to_string(),
     }
 }

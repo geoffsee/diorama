@@ -498,9 +498,10 @@ pub fn prepare_node_network(
         crate::ipv6::disable_ipv6_sysctls_in_root(root)?;
     }
 
-    // 2. IP forwarding
+    // 2. IP forwarding and loopback DNAT for the in-cluster apiserver.
     let root = sysctl_root.unwrap_or_else(|| Path::new("/proc/sys"));
     crate::sysctl::ensure_ip_forward_in_root(root)?;
+    crate::sysctl::ensure_route_localnet_in_root(root)?;
 
     // 3. Masquerade
     let backend = detect_backend(sysctl_root, executor)?;

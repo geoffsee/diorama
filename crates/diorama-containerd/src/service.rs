@@ -1,7 +1,10 @@
 //! Supervised containerd runtime service adapter.
 
 use crate::cgroup::use_systemd_cgroup;
-use crate::cleanup::{CleanupError, CleanupReport, clean_stale_runtime_state};
+use crate::cleanup::{
+    CleanupError, CleanupReport, clean_stale_runtime_state, cleanup_is_busy,
+    reclaim_managed_runtime,
+};
 use crate::config::{
     ContainerdConfigOptions, ContainerdServicePaths, write_containerd_config_file,
 };
@@ -22,8 +25,42 @@ use diorama_supervisor::{
     FailurePolicy,
 };
 use std::fmt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
+
+static PREPARE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Clears the last recorded prepare failure. Tests call this before a run.
+pub fn clear_prepare_failure() {
+    *PREPARE_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// The stderr line recorded for the most recent prepare failure, if any.
+pub fn last_prepare_failure() -> Option<String> {
+    PREPARE_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub fn prepare_failure_line(err: &io::Error) -> String {
+    format!(
+        "{{\"schema\":1,\"level\":\"error\",\"event\":\"containerd_prepare_failed\",\"detail_code\":\"containerd_prepare_failed\",\"reason\":{}}}",
+        serde_json::to_string(&err.to_string()).unwrap_or_else(|_| "\"unknown\"".to_string())
+    )
+}
+
+fn record_prepare_failure(err: &io::Error) {
+    let line = prepare_failure_line(err);
+    *PREPARE_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(line.clone());
+    let _ = writeln!(io::stderr(), "{line}");
+}
 
 pub const COMPONENT_CONTAINERD: &str = "containerd";
 
@@ -130,9 +167,7 @@ impl ContainerdService {
     /// ensures directories exist, and renders config.toml.
     pub fn prepare(&self) -> Result<(), std::io::Error> {
         if self.options.clean_stale_state_on_startup {
-            let _ = self
-                .cleanup(None)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            reclaim_and_clean(&self.options.paths)?;
         }
 
         let paths = &self.options.paths;
@@ -262,15 +297,36 @@ impl ContainerdService {
     }
 }
 
+fn cleanup_to_io(err: &CleanupError) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
+fn reclaim_and_clean(paths: &ContainerdPaths) -> io::Result<()> {
+    reclaim_managed_runtime(paths);
+    match clean_stale_runtime_state(paths, None) {
+        Ok(_) => Ok(()),
+        Err(err) if cleanup_is_busy(&err) => {
+            reclaim_managed_runtime(paths);
+            clean_stale_runtime_state(paths, None)
+                .map(|_| ())
+                .map_err(|err| cleanup_to_io(&err))
+        },
+        Err(err) => Err(cleanup_to_io(&err)),
+    }
+}
+
 impl Adapter for ContainerdService {
     fn run(self: Box<Self>, context: AdapterContext) -> AdapterFuture {
         match self.into_process_adapter() {
             Ok((adapter, _cleanup)) => Box::new(adapter).run(context),
-            Err(_) => Box::pin(async move {
-                Err(AdapterError {
-                    code: "containerd_prepare_failed",
+            Err(err) => {
+                record_prepare_failure(&err);
+                Box::pin(async move {
+                    Err(AdapterError {
+                        code: "containerd_prepare_failed",
+                    })
                 })
-            }),
+            },
         }
     }
 }

@@ -398,6 +398,10 @@ impl ProxyService {
 
         {
             let mut table = self.routing_table.write().await;
+            // Replace the in-memory table with the API listing so deleted Services
+            // and EndpointSlices cannot keep programming stale DNAT rules after a
+            // restart or watch lag resync.
+            *table = crate::routing::ServiceRoutingTable::new();
             for svc in svcs {
                 table.apply_service(svc);
             }

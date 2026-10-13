@@ -199,3 +199,71 @@ async fn default_namespaces_bootstrapped_on_startup() {
 
     service.stop();
 }
+
+#[tokio::test]
+async fn kubernetes_service_created_at_first_cluster_ip_when_absent() {
+    let temp = TempDir::new().unwrap();
+    let node_ip: IpAddr = "192.0.2.30".parse().unwrap();
+    let config = setup_fixture_pki(&temp, node_ip);
+    let (_engine, storage) = setup_fixture_datastore(&temp);
+
+    let service = ApiserverService::new(config, storage);
+    service.check_prerequisites().await.unwrap();
+    let client = service.admin_client();
+
+    let svc = client
+        .get_service("default", "kubernetes")
+        .await
+        .expect("default/kubernetes is created before pods start");
+    assert_eq!(svc["spec"]["clusterIP"], "10.43.0.1");
+    assert_eq!(svc["spec"]["ports"][0]["port"], 443);
+    assert_eq!(svc["spec"]["ports"][0]["protocol"], "TCP");
+
+    let slice = client
+        .get_endpointslice("default", "kubernetes")
+        .await
+        .expect("default/kubernetes endpoint slice publishes the apiserver");
+    assert_eq!(slice["endpoints"][0]["addresses"][0], "127.0.0.1");
+    assert_eq!(slice["ports"][0]["name"], "https");
+    assert_eq!(slice["ports"][0]["port"], 6443);
+    assert_eq!(slice["ports"][0]["protocol"], "TCP");
+
+    service.check_prerequisites().await.unwrap();
+    let again = client.get_service("default", "kubernetes").await.unwrap();
+    assert_eq!(again["metadata"]["uid"], svc["metadata"]["uid"]);
+    assert_eq!(again["spec"]["clusterIP"], "10.43.0.1");
+
+    service.stop();
+}
+
+#[tokio::test]
+async fn existing_kubernetes_service_is_left_in_place() {
+    let temp = TempDir::new().unwrap();
+    let node_ip: IpAddr = "192.0.2.30".parse().unwrap();
+    let config = setup_fixture_pki(&temp, node_ip);
+    let (_engine, storage) = setup_fixture_datastore(&temp);
+
+    let service = ApiserverService::new(config, storage);
+    service.start().unwrap();
+    let client = service.admin_client();
+    client
+        .create_service(
+            "default",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": "kubernetes" },
+                "spec": {
+                    "clusterIP": "10.43.0.9",
+                    "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    service.check_prerequisites().await.unwrap();
+    let svc = client.get_service("default", "kubernetes").await.unwrap();
+    assert_eq!(svc["spec"]["clusterIP"], "10.43.0.9");
+    service.stop();
+}
