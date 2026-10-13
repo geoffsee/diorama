@@ -42,6 +42,6 @@ pub use resolver::{
     sanitize_resolv_conf,
 };
 pub use sysctl::{
-    IP_FORWARD_SYSCTL_REL_PATH, ensure_ip_forward, ensure_ip_forward_in_root, ensure_sysctl_value,
-    read_sysctl,
+    IP_FORWARD_SYSCTL_REL_PATH, ensure_ip_forward, ensure_ip_forward_in_root,
+    ensure_route_localnet, ensure_route_localnet_in_root, ensure_sysctl_value, read_sysctl,
 };

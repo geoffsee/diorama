@@ -543,7 +543,7 @@ async fn table_accept_formatting_for_all_supported_resources() {
         true,
         "POST",
         "/api/v1/namespaces/default/services",
-        r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"web"},"spec":{"type":"ClusterIP","clusterIP":"10.43.0.1","ports":[{"port":80,"protocol":"TCP"}]}}"#,
+        r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"web"},"spec":{"type":"ClusterIP","clusterIP":"10.43.0.2","ports":[{"port":80,"protocol":"TCP"}]}}"#,
     )
     .await;
     assert_eq!(status, 201, "{body}");
@@ -571,7 +571,7 @@ async fn table_accept_formatting_for_all_supported_resources() {
     assert!(body.contains("\"name\":\"Port(s)\""), "{body}");
     assert!(body.contains("\"name\":\"Age\""), "{body}");
     assert!(
-        body.contains("\"cells\":[\"web\",\"ClusterIP\",\"10.43.0.1\",\"<none>\",\"80/TCP\""),
+        body.contains("\"cells\":[\"web\",\"ClusterIP\",\"10.43.0.2\",\"<none>\",\"80/TCP\""),
         "{body}"
     );
 
@@ -589,7 +589,7 @@ async fn table_accept_formatting_for_all_supported_resources() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("\"kind\":\"Table\""), "{body}");
     assert!(
-        body.contains("\"cells\":[\"web\",\"ClusterIP\",\"10.43.0.1\",\"<none>\",\"80/TCP\""),
+        body.contains("\"cells\":[\"web\",\"ClusterIP\",\"10.43.0.2\",\"<none>\",\"80/TCP\""),
         "{body}"
     );
 
@@ -619,7 +619,7 @@ async fn table_accept_formatting_for_all_supported_resources() {
     assert!(body.contains("\"kind\":\"Table\""), "{body}");
     assert!(
         body.contains(
-            "\"cells\":[\"webnp\",\"NodePort\",\"10.43.0.2\",\"<none>\",\"80:30000/TCP\""
+            "\"cells\":[\"webnp\",\"NodePort\",\"10.43.0.3\",\"<none>\",\"80:30000/TCP\""
         ),
         "{body}"
     );

@@ -132,6 +132,33 @@ pub fn ensure_ip_forward_in_root(root: &Path) -> Result<(), NetworkError> {
     ensure_sysctl_value(root, IP_FORWARD_SYSCTL_REL_PATH, "1")
 }
 
+/// Allows DNAT toward `127.0.0.0/8` on the host.
+///
+/// The apiserver listens on loopback. Pod traffic to the `kubernetes` Service is
+/// rewritten to that address, and the kernel drops those packets unless
+/// `route_localnet` is set on the arriving interface.
+pub fn ensure_route_localnet() -> Result<(), NetworkError> {
+    ensure_route_localnet_in_root(Path::new("/proc/sys"))
+}
+
+/// Sets `route_localnet=1` for `all` and every interface present under `root`.
+pub fn ensure_route_localnet_in_root(root: &Path) -> Result<(), NetworkError> {
+    let conf = root.join("net/ipv4/conf");
+    if let Ok(entries) = fs::read_dir(&conf) {
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !entry.path().join("route_localnet").exists() && name != "all" {
+                continue;
+            }
+            let rel = format!("net/ipv4/conf/{name}/route_localnet");
+            ensure_sysctl_value(root, &rel, "1")?;
+        }
+    }
+    ensure_sysctl_value(root, "net/ipv4/conf/all/route_localnet", "1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +180,22 @@ mod tests {
 
         // Should succeed without writing!
         assert!(ensure_ip_forward_in_root(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn route_localnet_is_enabled_for_all_and_existing_interfaces() {
+        let dir = tempdir().expect("tempdir");
+        let all = dir.path().join("net/ipv4/conf/all/route_localnet");
+        let cni0 = dir.path().join("net/ipv4/conf/cni0/route_localnet");
+        fs::create_dir_all(all.parent().unwrap()).unwrap();
+        fs::create_dir_all(cni0.parent().unwrap()).unwrap();
+        fs::write(&all, b"0\n").unwrap();
+        fs::write(&cni0, b"0\n").unwrap();
+
+        ensure_route_localnet_in_root(dir.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&all).unwrap().trim(), "1");
+        assert_eq!(fs::read_to_string(&cni0).unwrap().trim(), "1");
     }
 
     #[test]

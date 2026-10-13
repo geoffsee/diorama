@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use diorama_apiserver::WatchReceiver;
 use diorama_supervisor::{
     Adapter, AdapterContext, AdapterError, AdapterFuture, ComponentKind, ComponentSpec,
     FailurePolicy, Registration, StopPhase,
@@ -104,6 +105,12 @@ impl Adapter for ControllerManagerAdapter {
                 tracing::warn!(error = %err, "initial controller reconciliation pass failed");
             }
 
+            // Watches publish Endpoints before the one-second poll, so a headless
+            // name is resolvable as soon as the backing pod is Ready.
+            let client = self.service.client();
+            let mut service_watch = client.watch_resource("", "services", None).await.ok();
+            let mut pod_watch = client.watch_resource("", "pods", None).await.ok();
+
             // 5. Periodic reconciliation until supervisor stops us
             let mut ticker = tokio::time::interval(self.reconcile_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -118,14 +125,35 @@ impl Adapter for ControllerManagerAdapter {
                         }
                     }
                     _ = ticker.tick() => {
-                        if let Err(err) = self.service.reconcile_all().await {
-                            tracing::warn!(error = %err, "periodic controller reconciliation pass failed");
-                        }
+                        reconcile_quietly(&self.service).await;
+                    }
+                    () = recv_watch(service_watch.as_mut()) => {
+                        reconcile_quietly(&self.service).await;
+                    }
+                    () = recv_watch(pod_watch.as_mut()) => {
+                        reconcile_quietly(&self.service).await;
                     }
                 }
             }
 
             Ok(())
         })
+    }
+}
+
+async fn reconcile_quietly(service: &ControllerManagerService) {
+    if let Err(err) = service.reconcile_all().await {
+        tracing::warn!(error = %err, "controller reconciliation pass failed");
+    }
+}
+
+async fn recv_watch(watch: Option<&mut WatchReceiver>) {
+    match watch {
+        Some(watch) => {
+            if watch.recv().await.is_err() {
+                tokio::time::sleep(Duration::from_hours(1)).await;
+            }
+        },
+        None => std::future::pending().await,
     }
 }

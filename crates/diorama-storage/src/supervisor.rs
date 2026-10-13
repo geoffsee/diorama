@@ -1,15 +1,28 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use diorama_supervisor::{
     Adapter, AdapterContext, AdapterError, AdapterFuture, ComponentKind, ComponentSpec,
     FailurePolicy, Registration, StopPhase,
 };
-use serde_json::Value;
 
-use crate::config::LOCAL_PATH_STORAGE_CLASS_NAME;
 use crate::service::LocalPathService;
 
 pub const COMPONENT_LOCAL_PATH: &str = "local-path-provisioner";
+
+fn spawn_volume_binder(service: LocalPathService, stop: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            service.bind_pending_volumes().await;
+        }
+    });
+}
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Supervisor adapter for the local-path storage provisioner.
@@ -75,6 +88,11 @@ impl Adapter for LocalPathAdapter {
                 });
             }
 
+            // Volume binding is independent of the provisioner pod becoming Ready.
+            // A readiness timeout still degrades the addon, and binding continues.
+            let stop = Arc::new(AtomicBool::new(false));
+            spawn_volume_binder(self.service.clone(), Arc::clone(&stop));
+
             // 3. Wait for readiness
             let timeout = self.service.config().readiness_timeout;
             if let Err(err) = self.service.wait_for_readiness(timeout).await {
@@ -85,109 +103,21 @@ impl Adapter for LocalPathAdapter {
 
             // 4. Signal readiness to supervisor coordinator
             if !context.ready() {
+                stop.store(true, Ordering::Relaxed);
                 return Err(AdapterError {
                     code: "storage-readiness-rejected",
                 });
             }
 
-            let volume_manager = self.service.volume_manager();
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
-
-            // 5. Await supervisor stop phase while periodically reconciling PVCs and Pods
+            // 5. Await supervisor stop while the binder keeps running.
             loop {
-                tokio::select! {
-                    phase = context.changed() => {
-                        match phase {
-                            StopPhase::Running => {},
-                            StopPhase::Graceful | StopPhase::Force => {
-                                self.service.stop();
-                                break;
-                            },
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Ok(ns_list) = self.service.client().list_namespaces().await {
-                            let mut namespaces = Vec::new();
-                            if let Some(items) = ns_list.get("items").and_then(Value::as_array) {
-                                for item in items {
-                                    if let Some(name) = item.get("metadata").and_then(|m| m.get("name")).and_then(Value::as_str) {
-                                        namespaces.push(name.to_string());
-                                    }
-                                }
-                            }
-                            if !namespaces.iter().any(|n| n == "default") {
-                                namespaces.push("default".to_string());
-                            }
-
-                            let default_node = match self.service.client().list_nodes().await {
-                                Ok(nodes) => nodes
-                                    .pointer("/items/0/metadata/name")
-                                    .and_then(Value::as_str)
-                                    .map(std::string::ToString::to_string),
-                                Err(_) => None,
-                            };
-
-                            for ns in &namespaces {
-                                // 1. Reconcile Pod volume bindings
-                                if let Ok(pod_list) = self.service.client().list_pods(ns).await
-                                    && let Some(pods) = pod_list.get("items").and_then(Value::as_array)
-                                {
-                                    for pod in pods {
-                                        if let Some(pod_name) = pod.get("metadata").and_then(|m| m.get("name")).and_then(Value::as_str)
-                                            && pod.pointer("/spec/nodeName").and_then(Value::as_str).is_some()
-                                        {
-                                            let has_pvc = pod
-                                                .pointer("/spec/volumes")
-                                                .and_then(Value::as_array)
-                                                .is_some_and(|vols| {
-                                                    vols.iter().any(|v| v.get("persistentVolumeClaim").is_some())
-                                                });
-                                            if has_pvc {
-                                                let _ = volume_manager.bind_volumes_for_pod(ns, pod_name).await;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 2. Reconcile PVCs
-                                if let Ok(pvc_list) = self.service.client().list_pvcs(ns).await
-                                    && let Some(pvcs) = pvc_list.get("items").and_then(Value::as_array)
-                                {
-                                    for pvc in pvcs {
-                                        // In standard Kubernetes, omitting storageClassName defaults to the default
-                                        // StorageClass (local-path), whereas storageClassName: "" explicitly disables
-                                        // dynamic provisioning.
-                                        let sc_opt = pvc.pointer("/spec/storageClassName").and_then(Value::as_str);
-                                        let is_local_path = match sc_opt {
-                                            None => true,
-                                            Some(s) if s == LOCAL_PATH_STORAGE_CLASS_NAME => true,
-                                            _ => false,
-                                        };
-                                        if is_local_path {
-                                            let phase = pvc.pointer("/status/phase").and_then(Value::as_str);
-                                            let vol_name = pvc.pointer("/spec/volumeName").and_then(Value::as_str);
-                                            if phase != Some("Bound") || vol_name.is_none() {
-                                                let selected_node = pvc
-                                                    .pointer("/metadata/annotations/volume.kubernetes.io~1selected-node")
-                                                    .and_then(Value::as_str)
-                                                    .map(std::string::ToString::to_string);
-                                                // For standalone PVC provisioning before pod scheduling, defaulting to
-                                                // default_node allows single-node local environments to bind volumes.
-                                                // Note: In multi-node topologies, this would bind before scheduler assignment.
-                                                let node_to_use = selected_node.or_else(|| default_node.clone());
-                                                if let (Some(pvc_name), Some(node)) = (
-                                                    pvc.pointer("/metadata/name").and_then(Value::as_str),
-                                                    node_to_use,
-                                                ) {
-                                                    let _ = volume_manager.provision_volume_for_pvc(ns, pvc_name, &node).await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                match context.changed().await {
+                    StopPhase::Running => {},
+                    StopPhase::Graceful | StopPhase::Force => {
+                        stop.store(true, Ordering::Relaxed);
+                        self.service.stop();
+                        break;
+                    },
                 }
             }
 

@@ -282,6 +282,13 @@ impl RbacAuthorizer {
                     non_resource_urls: Vec::new(),
                 },
                 PolicyRule {
+                    verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+                    api_groups: vec![String::new()],
+                    resources: vec!["services".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
                     verbs: vec!["get".to_string()],
                     api_groups: vec![String::new()],
                     resources: vec![

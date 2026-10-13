@@ -387,6 +387,231 @@ pub fn sandbox_config(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
     )
 }
 
+const SERVICE_ACCOUNT_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+const SERVICE_ACCOUNT_VOLUME_NAME: &str = "kube-api-access-diorama";
+const KUBERNETES_API_AUDIENCE: &str = "https://kubernetes.default.svc";
+
+/// Stock kubelet service-link variables.
+///
+/// `enableServiceLinks` defaults to true. `default/kubernetes` is always published.
+/// Services with an empty `ClusterIP`, or `ClusterIP` `None`, add no variables.
+fn service_link_envs(pod: &Value, services: &[Value]) -> Vec<cri::KeyValue> {
+    let pod_namespace = pod
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let links_enabled = pod
+        .pointer("/spec/enableServiceLinks")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut selected: Vec<&Value> = Vec::new();
+    for service in services {
+        if routable_cluster_ip(service).is_none() {
+            continue;
+        }
+        let name = service
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let namespace = service
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let kubernetes_api = namespace == "default" && name == "kubernetes";
+        let same_namespace = links_enabled && namespace == pod_namespace;
+        if !kubernetes_api && !same_namespace {
+            continue;
+        }
+        if let Some(slot) = selected.iter_mut().find(|existing| {
+            existing.pointer("/metadata/name").and_then(Value::as_str) == Some(name)
+        }) {
+            *slot = service;
+        } else {
+            selected.push(service);
+        }
+    }
+
+    let mut envs = Vec::new();
+    for service in selected {
+        push_service_link_envs(&mut envs, service);
+    }
+    envs
+}
+
+fn routable_cluster_ip(service: &Value) -> Option<&str> {
+    let ip = service.pointer("/spec/clusterIP").and_then(Value::as_str)?;
+    if ip.is_empty() || ip == "None" {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+fn push_service_link_envs(envs: &mut Vec<cri::KeyValue>, service: &Value) {
+    let Some(cluster_ip) = routable_cluster_ip(service) else {
+        return;
+    };
+    let Some(ports) = service.pointer("/spec/ports").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(first) = ports.first() else {
+        return;
+    };
+    let Some(first_port) = json_port(first) else {
+        return;
+    };
+    let service_name = env_var_token(
+        service
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    if service_name.is_empty() {
+        return;
+    }
+
+    push_env(
+        envs,
+        format!("{service_name}_SERVICE_HOST"),
+        cluster_ip.to_string(),
+    );
+    let port_key = format!("{service_name}_SERVICE_PORT");
+    push_env(envs, port_key.clone(), first_port.to_string());
+    for port in ports {
+        let Some(number) = json_port(port) else {
+            continue;
+        };
+        if let Some(name) = port
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            push_env(
+                envs,
+                format!("{port_key}_{}", env_var_token(name)),
+                number.to_string(),
+            );
+        }
+    }
+    for (index, port) in ports.iter().enumerate() {
+        let Some(number) = json_port(port) else {
+            continue;
+        };
+        let protocol = port
+            .get("protocol")
+            .and_then(Value::as_str)
+            .filter(|protocol| !protocol.is_empty())
+            .unwrap_or("TCP");
+        let host_port = join_host_port(cluster_ip, number);
+        if index == 0 {
+            push_env(
+                envs,
+                format!("{service_name}_PORT"),
+                format!("{}://{host_port}", protocol.to_ascii_lowercase()),
+            );
+        }
+        let prefix = format!(
+            "{service_name}_PORT_{number}_{}",
+            protocol.to_ascii_uppercase()
+        );
+        push_env(
+            envs,
+            prefix.clone(),
+            format!("{}://{host_port}", protocol.to_ascii_lowercase()),
+        );
+        push_env(
+            envs,
+            format!("{prefix}_PROTO"),
+            protocol.to_ascii_lowercase(),
+        );
+        push_env(envs, format!("{prefix}_PORT"), number.to_string());
+        push_env(envs, format!("{prefix}_ADDR"), cluster_ip.to_string());
+    }
+}
+
+fn apply_service_links(envs: &mut Vec<cri::KeyValue>, pod: &Value, services: &[Value]) {
+    let links = service_link_envs(pod, services);
+    if links.is_empty() {
+        return;
+    }
+    let explicit = std::mem::take(envs);
+    *envs = links;
+    for env in explicit {
+        push_env_kv(envs, env);
+    }
+}
+
+fn push_env(envs: &mut Vec<cri::KeyValue>, key: String, value: String) {
+    push_env_kv(
+        envs,
+        cri::KeyValue {
+            key,
+            value: value.into_bytes(),
+        },
+    );
+}
+
+fn push_env_kv(envs: &mut Vec<cri::KeyValue>, env: cri::KeyValue) {
+    if let Some(existing) = envs.iter_mut().find(|item| item.key == env.key) {
+        existing.value = env.value;
+    } else {
+        envs.push(env);
+    }
+}
+
+fn env_var_token(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch == '-' {
+                '_'
+            } else {
+                ch.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+fn json_port(port: &Value) -> Option<u16> {
+    port.get("port")
+        .and_then(Value::as_u64)
+        .and_then(|number| u16::try_from(number).ok())
+}
+
+fn join_host_port(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+fn automount_service_account_token(pod: &Value) -> bool {
+    pod.pointer("/spec/automountServiceAccountToken")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn pod_has_service_account_token(pod: &Value) -> bool {
+    pod.pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .is_some_and(|volumes| {
+            volumes.iter().any(|volume| {
+                volume
+                    .pointer("/projected/sources")
+                    .and_then(Value::as_array)
+                    .is_some_and(|sources| {
+                        sources
+                            .iter()
+                            .any(|source| source.get("serviceAccountToken").is_some())
+                    })
+            })
+        })
+}
+
 /// Builds the CRI container configuration for one attempt of a spec container,
 /// optionally resolving volume mounts against the given root directory.
 pub fn container_config_with_root(
@@ -1242,6 +1467,20 @@ impl PodReconciler {
                 reason: "CreateContainerConfigError",
                 message: e.to_string(),
             })?;
+        let service_list = self
+            .client
+            .list_services("")
+            .await
+            .map_err(|err| StartFailure {
+                reason: "CreateContainerConfigError",
+                message: format!("failed to list services for service links: {err}"),
+            })?;
+        let services = service_list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        apply_service_links(&mut config.envs, pod, &services);
         let namespace = pod
             .pointer("/metadata/namespace")
             .and_then(Value::as_str)
@@ -1346,6 +1585,8 @@ impl PodReconciler {
         ) {
             return Ok(());
         }
+        let enriched = self.pod_with_service_account_volume(pod);
+        let pod = &enriched;
         self.prepare_pod_volumes(namespace, pod).await?;
         let (sandbox_id, sandbox_config) = match self.ensure_sandbox(namespace, pod).await {
             Ok(sandbox) => sandbox,
@@ -2221,6 +2462,60 @@ impl PodReconciler {
     }
 
     /// Prepares and populates volume mounts (Secrets, `ConfigMaps`, Projected) on the host filesystem.
+    fn pod_with_service_account_volume(&self, pod: &Value) -> Value {
+        if self.apiserver.is_none()
+            || !automount_service_account_token(pod)
+            || pod_has_service_account_token(pod)
+        {
+            return pod.clone();
+        }
+        let mut enriched = pod.clone();
+        let Some(spec) = enriched.get_mut("spec").and_then(Value::as_object_mut) else {
+            return enriched;
+        };
+        if let Some(volumes) = spec
+            .entry("volumes".to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        {
+            volumes.push(json!({
+                "name": SERVICE_ACCOUNT_VOLUME_NAME,
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [{
+                        "serviceAccountToken": {
+                            "path": "token",
+                            "audience": KUBERNETES_API_AUDIENCE,
+                            "expirationSeconds": 7200
+                        }
+                    }]
+                }
+            }));
+        }
+        for key in ["containers", "initContainers"] {
+            let Some(containers) = spec.get_mut(key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for container in containers {
+                let Some(container) = container.as_object_mut() else {
+                    continue;
+                };
+                if let Some(mounts) = container
+                    .entry("volumeMounts".to_string())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                {
+                    mounts.push(json!({
+                        "name": SERVICE_ACCOUNT_VOLUME_NAME,
+                        "mountPath": SERVICE_ACCOUNT_MOUNT_PATH,
+                        "readOnly": true
+                    }));
+                }
+            }
+        }
+        enriched
+    }
+
     pub async fn prepare_pod_volumes(
         &self,
         namespace: &str,
@@ -2308,6 +2603,84 @@ fn dead_container_views<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(envs: &[cri::KeyValue], key: &str) -> Option<String> {
+        envs.iter()
+            .find(|env| env.key == key)
+            .map(|env| String::from_utf8_lossy(&env.value).into_owned())
+    }
+
+    #[test]
+    fn service_links_skip_empty_and_headless_cluster_ips() {
+        let pod = json!({
+            "metadata": { "name": "app", "namespace": "default" },
+            "spec": { "containers": [{ "name": "main" }] }
+        });
+        let services = vec![
+            json!({
+                "metadata": { "name": "kubernetes", "namespace": "default" },
+                "spec": {
+                    "clusterIP": "10.43.0.1",
+                    "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
+                }
+            }),
+            json!({
+                "metadata": { "name": "blank", "namespace": "default" },
+                "spec": {
+                    "clusterIP": "",
+                    "ports": [{ "name": "http", "port": 80, "protocol": "TCP" }]
+                }
+            }),
+            json!({
+                "metadata": { "name": "headless", "namespace": "default" },
+                "spec": {
+                    "clusterIP": "None",
+                    "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }]
+                }
+            }),
+            json!({
+                "metadata": { "name": "web", "namespace": "default" },
+                "spec": {
+                    "clusterIP": "10.43.0.2",
+                    "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }]
+                }
+            }),
+        ];
+
+        let disabled = json!({
+            "metadata": { "name": "app", "namespace": "default" },
+            "spec": { "enableServiceLinks": false, "containers": [{ "name": "main" }] }
+        });
+        let off = service_link_envs(&disabled, &services);
+        assert_eq!(
+            env_of(&off, "KUBERNETES_SERVICE_HOST").as_deref(),
+            Some("10.43.0.1")
+        );
+        assert_eq!(
+            env_of(&off, "KUBERNETES_SERVICE_PORT").as_deref(),
+            Some("443")
+        );
+        assert_eq!(
+            env_of(&off, "KUBERNETES_SERVICE_PORT_HTTPS").as_deref(),
+            Some("443")
+        );
+        assert!(env_of(&off, "WEB_SERVICE_HOST").is_none());
+        assert!(env_of(&off, "HEADLESS_SERVICE_HOST").is_none());
+        assert!(env_of(&off, "BLANK_SERVICE_HOST").is_none());
+
+        let on = service_link_envs(&pod, &services);
+        assert_eq!(
+            env_of(&on, "WEB_SERVICE_HOST").as_deref(),
+            Some("10.43.0.2")
+        );
+        assert_eq!(env_of(&on, "WEB_SERVICE_PORT").as_deref(), Some("8080"));
+        assert_eq!(
+            env_of(&on, "WEB_PORT").as_deref(),
+            Some("tcp://10.43.0.2:8080")
+        );
+        assert!(env_of(&on, "HEADLESS_SERVICE_HOST").is_none());
+        assert!(env_of(&on, "BLANK_SERVICE_HOST").is_none());
+    }
 
     #[test]
     fn test_build_dns_config_cluster_first_default() {

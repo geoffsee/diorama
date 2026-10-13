@@ -147,6 +147,9 @@ impl IptablesDataplane {
         rules: &[IptablesRule],
         executor: &dyn CommandExecutor,
     ) -> Result<(), ProxyError> {
+        // Pod traffic DNATed to the loopback apiserver is otherwise dropped.
+        let _ = diorama_network::ensure_route_localnet();
+
         // Probe packet filter availability first
         let probe = executor
             .run("iptables", &["-t", "nat", "-S"])
