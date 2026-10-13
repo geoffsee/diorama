@@ -3,11 +3,12 @@
 use std::fs;
 use std::sync::Arc;
 
-use diorama_network::MockCommandExecutor;
+use diorama_network::{CommandExecutor, MockCommandExecutor};
 use diorama_proxy::{
-    DataplaneProber, EndpointConditions, EndpointItem, EndpointPort, EndpointSliceDefinition,
-    IptablesDataplane, KubeProxyOptions, NftablesDataplane, Protocol, ProxyError, ProxyMode,
-    ProxyService, ServiceDefinition, ServicePort, ServiceRoutingTable, ServiceType,
+    DataplaneProber, DataplaneReconciler, EndpointConditions, EndpointItem, EndpointPort,
+    EndpointSliceDefinition, IptablesDataplane, KubeProxyOptions, NftablesDataplane, Protocol,
+    ProxyError, ProxyMode, ProxyService, ServiceDefinition, ServicePort, ServiceRoutingTable,
+    ServiceType,
 };
 use tempfile::TempDir;
 
@@ -967,4 +968,352 @@ fn test_live_udp_socket_probe_verification() {
     assert_eq!(result.reached_endpoint.unwrap().port, port);
 
     echo_server.join().unwrap();
+}
+
+#[test]
+fn reconcile_installs_clusterip_and_nodeport_rules_and_second_reconcile_verifies() {
+    let mut table = ServiceRoutingTable::new();
+    table.apply_service(ServiceDefinition::new(
+        "default",
+        "webnp",
+        ServiceType::NodePort,
+        Some("10.43.0.3".to_string()),
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 8080,
+            target_port: 8080,
+            node_port: Some(30000),
+        }],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "webnp-slice",
+        "webnp",
+        vec![EndpointPort {
+            name: Some("http".to_string()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(vec!["10.42.0.5".to_string()], true, None)],
+    ));
+
+    let mock = MockCommandExecutor::new_iptables_host();
+    // Seed the E15 masquerade rule so foreign-firewall preservation stays green.
+    let _ = mock.run(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            "10.42.0.0/16",
+            "!",
+            "-d",
+            "10.42.0.0/16",
+            "-m",
+            "comment",
+            "--comment",
+            "kubesolo: pod masquerade",
+            "-j",
+            "MASQUERADE",
+        ],
+    );
+
+    let reconciler = DataplaneReconciler::new();
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("first reconcile must succeed");
+
+    let save = mock.run("iptables", &["-t", "nat", "-S"]).unwrap();
+    assert!(
+        save.stdout
+            .contains("-d 10.43.0.3/32 -p tcp -m tcp --dport 8080"),
+        "KUBE-SERVICES must program ClusterIP DNAT dispatch: {}",
+        save.stdout
+    );
+    assert!(
+        save.stdout
+            .contains("-A KUBE-NODEPORTS -p tcp -m tcp --dport 30000")
+            || save
+                .stdout
+                .contains("iptables -t nat -A KUBE-NODEPORTS -p tcp -m tcp --dport 30000"),
+        "KUBE-NODEPORTS must program NodePort dispatch: {}",
+        save.stdout
+    );
+    assert!(
+        save.stdout.contains("KUBE-NODEPORTS")
+            && (save.stdout.contains("-j KUBE-NODEPORTS")
+                || save.stdout.contains("jump KUBE-NODEPORTS")),
+        "KUBE-SERVICES (or an equivalent hook) must jump to KUBE-NODEPORTS so localhost NodePort works: {}",
+        save.stdout
+    );
+    assert!(
+        save.stdout.contains("DNAT --to-destination 10.42.0.5:8080")
+            || save.stdout.contains("--to-destination 10.42.0.5:8080"),
+        "ready endpoint must receive DNAT: {}",
+        save.stdout
+    );
+
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("second reconcile must still verify");
+
+    let save2 = mock.run("iptables", &["-t", "nat", "-S"]).unwrap();
+    assert!(
+        save2
+            .stdout
+            .contains("-d 10.43.0.3/32 -p tcp -m tcp --dport 8080"),
+        "ClusterIP rule must survive second reconcile: {}",
+        save2.stdout
+    );
+    assert!(
+        save2.stdout.contains("--dport 30000"),
+        "NodePort rule must survive second reconcile: {}",
+        save2.stdout
+    );
+    assert!(
+        save2.stdout.contains("-j KUBE-NODEPORTS") || save2.stdout.contains("jump KUBE-NODEPORTS"),
+        "NodePort jump must survive second reconcile: {}",
+        save2.stdout
+    );
+}
+
+#[test]
+fn reconcile_with_leftover_rules_and_full_service_set_still_verifies() {
+    let mut table = ServiceRoutingTable::new();
+    // Mimic the Alpine guest service set after the probe creates workloads.
+    table.apply_service(ServiceDefinition::new(
+        "default",
+        "kubernetes",
+        ServiceType::ClusterIP,
+        Some("10.43.0.1".to_string()),
+        vec![ServicePort {
+            name: Some("https".to_string()),
+            protocol: Protocol::Tcp,
+            port: 443,
+            target_port: 6443,
+            node_port: None,
+        }],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "kubernetes",
+        "kubernetes",
+        vec![EndpointPort {
+            name: Some("https".to_string()),
+            port: Some(6443),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(vec!["127.0.0.1".to_string()], true, None)],
+    ));
+    table.apply_service(ServiceDefinition::new(
+        "kube-system",
+        "kube-dns",
+        ServiceType::ClusterIP,
+        Some("10.43.0.10".to_string()),
+        vec![
+            ServicePort {
+                name: Some("dns".to_string()),
+                protocol: Protocol::Udp,
+                port: 53,
+                target_port: 53,
+                node_port: None,
+            },
+            ServicePort {
+                name: Some("dns-tcp".to_string()),
+                protocol: Protocol::Tcp,
+                port: 53,
+                target_port: 53,
+                node_port: None,
+            },
+        ],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "kube-system",
+        "kube-dns",
+        "kube-dns",
+        vec![
+            EndpointPort {
+                name: Some("dns".to_string()),
+                port: Some(53),
+                protocol: Some(Protocol::Udp),
+            },
+            EndpointPort {
+                name: Some("dns-tcp".to_string()),
+                port: Some(53),
+                protocol: Some(Protocol::Tcp),
+            },
+        ],
+        vec![EndpointItem::new(vec!["10.42.0.3".to_string()], true, None)],
+    ));
+    table.apply_service(ServiceDefinition::new(
+        "default",
+        "web",
+        ServiceType::ClusterIP,
+        Some("10.43.0.2".to_string()),
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 8080,
+            target_port: 8080,
+            node_port: None,
+        }],
+    ));
+    table.apply_service(ServiceDefinition::new(
+        "default",
+        "webnp",
+        ServiceType::NodePort,
+        Some("10.43.0.3".to_string()),
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 8080,
+            target_port: 8080,
+            node_port: Some(30000),
+        }],
+    ));
+    table.apply_service(ServiceDefinition::new(
+        "default",
+        "webhead",
+        ServiceType::ClusterIP,
+        None,
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 8080,
+            target_port: 8080,
+            node_port: None,
+        }],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "web-slice",
+        "web",
+        vec![EndpointPort {
+            name: Some("http".to_string()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(vec!["10.42.0.5".to_string()], true, None)],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "webnp-slice",
+        "webnp",
+        vec![EndpointPort {
+            name: Some("http".to_string()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(vec!["10.42.0.5".to_string()], true, None)],
+    ));
+    table.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "webhead",
+        "webhead",
+        vec![EndpointPort {
+            name: Some("http".to_string()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(vec!["10.42.0.5".to_string()], true, None)],
+    ));
+
+    let mock = MockCommandExecutor::new_iptables_host();
+    let _ = mock.run(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            "10.42.0.0/16",
+            "!",
+            "-d",
+            "10.42.0.0/16",
+            "-m",
+            "comment",
+            "--comment",
+            "kubesolo: pod masquerade",
+            "-j",
+            "MASQUERADE",
+        ],
+    );
+
+    let reconciler = DataplaneReconciler::new();
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("first full-set reconcile");
+    // Second reconcile simulates a process restart that inherits leftover nat rules.
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("second full-set reconcile with leftover rules must verify");
+}
+
+#[test]
+fn reconcile_creates_service_chain_for_clusterip_without_ready_endpoints() {
+    let mut table = ServiceRoutingTable::new();
+    table.apply_service(ServiceDefinition::new(
+        "kube-system",
+        "kube-dns",
+        ServiceType::ClusterIP,
+        Some("10.43.0.10".to_string()),
+        vec![ServicePort {
+            name: Some("dns".to_string()),
+            protocol: Protocol::Udp,
+            port: 53,
+            target_port: 53,
+            node_port: None,
+        }],
+    ));
+    // No EndpointSlice on purpose: second-start can list the Service before
+    // EndpointSlices are ready or while backends are empty.
+
+    let mock = MockCommandExecutor::new_iptables_host();
+    let _ = mock.run(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            "10.42.0.0/16",
+            "!",
+            "-d",
+            "10.42.0.0/16",
+            "-m",
+            "comment",
+            "--comment",
+            "kubesolo: pod masquerade",
+            "-j",
+            "MASQUERADE",
+        ],
+    );
+
+    let reconciler = DataplaneReconciler::new();
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("ClusterIP with no endpoints must still program a jump target chain");
+
+    let save = mock.run("iptables", &["-t", "nat", "-S"]).unwrap();
+    assert!(
+        save.stdout
+            .contains("-d 10.43.0.10/32 -p udp -m udp --dport 53"),
+        "ClusterIP jump must be installed: {}",
+        save.stdout
+    );
+    assert!(
+        save.stdout.contains("-N KUBE-SVC-") || save.stdout.contains("KUBE-SVC-"),
+        "KUBE-SVC chain for the ClusterIP jump must exist: {}",
+        save.stdout
+    );
+
+    // A second reconcile with leftover rules must keep verifying.
+    reconciler
+        .reconcile(&table, ProxyMode::IpTables, &mock, None)
+        .expect("second reconcile without endpoints must still verify");
 }

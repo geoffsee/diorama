@@ -63,6 +63,11 @@ impl IptablesDataplane {
         let svc_hash = service_chain_hash(&svc_key);
         let svc_chain = format!("KUBE-SVC-{svc_hash}");
 
+        // Headless Services are not DNAT targets.
+        if cluster_ip.is_none() && port.node_port.is_none() {
+            return;
+        }
+
         // ClusterIP rule
         if let Some(cip) = cluster_ip {
             rules.push(IptablesRule {
@@ -119,6 +124,12 @@ impl IptablesDataplane {
                     chain: svc_chain.to_string(),
                     rule: format!("-j {sep_chain}"),
                 });
+            }
+
+            // Share identical backend addresses across Services without duplicating SEP body.
+            let sep_body_exists = rules.iter().any(|r| r.chain == sep_chain);
+            if sep_body_exists {
+                continue;
             }
 
             // Endpoint MASQ rule (must precede terminating DNAT target)
@@ -290,6 +301,14 @@ impl IptablesDataplane {
             if rule.chain.starts_with("KUBE-SVC-") || rule.chain.starts_with("KUBE-SEP-") {
                 custom_chains.insert(rule.chain.clone());
             }
+            // ClusterIP/NodePort jumps are emitted even when a Service has no ready
+            // endpoints. Those target chains must still exist or iptables-nft rejects
+            // the jump (seen on second start for kube-dns before EndpointSlices recover).
+            for token in rule.rule.split_whitespace() {
+                if token.starts_with("KUBE-SVC-") || token.starts_with("KUBE-SEP-") {
+                    custom_chains.insert(token.to_string());
+                }
+            }
         }
 
         Self::purge_stale_chains(executor, &custom_chains);
@@ -315,6 +334,68 @@ impl IptablesDataplane {
                     reason: out.stderr,
                 });
             }
+        }
+
+        // ClusterIP matches must stay ahead of this jump. Localhost NodePort traffic
+        // (OUTPUT to 127.0.0.1:nodePort) only reaches KUBE-NODEPORTS through it.
+        Self::ensure_kube_services_nodeports_jump(executor)?;
+        Ok(())
+    }
+
+    /// Appends the kube-proxy dispatch from `KUBE-SERVICES` into `KUBE-NODEPORTS`.
+    ///
+    /// Prefers the upstream `-m addrtype --dst-type LOCAL` match. Falls back to an
+    /// unconditional jump when `xt_addrtype` is unavailable so single-node boots still
+    /// serve NodePorts on the loopback address.
+    fn ensure_kube_services_nodeports_jump(
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), ProxyError> {
+        let local_jump = executor.run(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "KUBE-SERVICES",
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-j",
+                "KUBE-NODEPORTS",
+            ],
+        );
+        if matches!(local_jump, Ok(ref out) if out.success) {
+            return Ok(());
+        }
+
+        let fallback = executor
+            .run(
+                "iptables",
+                &["-t", "nat", "-A", "KUBE-SERVICES", "-j", "KUBE-NODEPORTS"],
+            )
+            .map_err(|e| ProxyError::CommandExecutionFailed {
+                command: "iptables -t nat -A KUBE-SERVICES -j KUBE-NODEPORTS".to_string(),
+                reason: e.to_string(),
+            })?;
+        if !fallback.success {
+            let addrtype_reason = local_jump.map_or_else(
+                |e| e.to_string(),
+                |out| {
+                    if out.stderr.is_empty() {
+                        out.stdout
+                    } else {
+                        out.stderr
+                    }
+                },
+            );
+            return Err(ProxyError::RoutingVerificationFailed {
+                rule: "KUBE-SERVICES -> KUBE-NODEPORTS".to_string(),
+                reason: format!(
+                    "failed to install NodePort dispatch jump (addrtype: {addrtype_reason}; fallback: {})",
+                    fallback.stderr
+                ),
+            });
         }
         Ok(())
     }
@@ -368,23 +449,46 @@ impl IptablesDataplane {
         table: &ServiceRoutingTable,
         existing_rules: &str,
     ) -> Result<(), ProxyError> {
+        let mut expects_nodeport = false;
         for svc in table.services().values() {
-            let Some(ref cluster_ip) = svc.cluster_ip else {
-                continue;
-            };
             for port in &svc.ports {
                 let proto = port.protocol.as_str().to_lowercase();
-                let needle = format!(
-                    "-d {cluster_ip}/32 -p {proto} -m {proto} --dport {} ",
-                    port.port
-                );
-                if !existing_rules.lines().any(|l| l.contains(&needle)) {
-                    return Err(ProxyError::RoutingVerificationFailed {
-                        rule: format!("ClusterIP {cluster_ip}:{}", port.port),
-                        reason: "matching rule missing from iptables nat table".to_string(),
-                    });
+                if let Some(ref cluster_ip) = svc.cluster_ip {
+                    let needle = format!(
+                        "-d {cluster_ip}/32 -p {proto} -m {proto} --dport {} ",
+                        port.port
+                    );
+                    if !existing_rules.lines().any(|l| l.contains(&needle)) {
+                        return Err(ProxyError::RoutingVerificationFailed {
+                            rule: format!("ClusterIP {cluster_ip}:{}", port.port),
+                            reason: "matching rule missing from iptables nat table".to_string(),
+                        });
+                    }
+                }
+                if let Some(node_port) = port.node_port {
+                    expects_nodeport = true;
+                    let needle = format!("-p {proto} -m {proto} --dport {node_port} ");
+                    let has_nodeport = existing_rules
+                        .lines()
+                        .any(|l| l.contains("KUBE-NODEPORTS") && l.contains(&needle));
+                    if !has_nodeport {
+                        return Err(ProxyError::RoutingVerificationFailed {
+                            rule: format!("NodePort {node_port}/{proto}"),
+                            reason: "matching rule missing from iptables nat table".to_string(),
+                        });
+                    }
                 }
             }
+        }
+        if expects_nodeport
+            && !existing_rules
+                .lines()
+                .any(|l| l.contains("KUBE-SERVICES") && l.contains("-j KUBE-NODEPORTS"))
+        {
+            return Err(ProxyError::RoutingVerificationFailed {
+                rule: "KUBE-SERVICES -> KUBE-NODEPORTS".to_string(),
+                reason: "NodePort dispatch jump missing from iptables nat table".to_string(),
+            });
         }
         Ok(())
     }
