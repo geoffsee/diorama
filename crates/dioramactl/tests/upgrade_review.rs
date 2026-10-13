@@ -428,7 +428,7 @@ fn live_lock_and_interrupted_receipt_refuse_new_mutations() {
         calls: vec![],
     };
     assert!(run_upgrade(&mut backend, dir.path(), None, "v1.3.0", 1, &mut Vec::new()).is_err());
-    assert!(backend.calls.is_empty());
+    assert_eq!(backend.calls, <[&str; 0]>::default());
     drop(lock);
     fs::write(
         dir.path().join(".upgrade-pending"),
@@ -436,7 +436,7 @@ fn live_lock_and_interrupted_receipt_refuse_new_mutations() {
     )
     .unwrap();
     assert!(run_upgrade(&mut backend, dir.path(), None, "v1.3.0", 1, &mut Vec::new()).is_err());
-    assert!(backend.calls.is_empty());
+    assert_eq!(backend.calls, <[&str; 0]>::default());
 }
 
 #[derive(Clone, Copy)]
@@ -1299,7 +1299,7 @@ fn recovery_rejects_foreign_backup_before_backend_calls() {
             .contains("outside the owned backup directory")
     );
     drop(backend);
-    assert!(runner.calls.is_empty());
+    assert_eq!(runner.calls, <[std::string::String; 0]>::default());
     assert!(dir.path().join(".upgrade-pending").exists());
 }
 

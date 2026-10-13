@@ -291,7 +291,7 @@ fn unknown_read_errors_and_unprobed_ports_never_claim_success() {
     );
     let report = evaluate_preflight(&e, &input);
     assert_eq!(report.findings[5].status, CheckStatus::Unknown);
-    assert!(report.findings[5].plans.is_empty());
+    assert_eq!(report.findings[5].plans, []);
 }
 #[test]
 fn module_indexes_are_not_proof_of_comment_capability() {

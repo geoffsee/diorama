@@ -140,7 +140,10 @@ async fn real_layer_override_reaches_exact_component_deadline_and_cleans_partial
     assert_eq!(report.failures[0].kind, FailureKind::StartupTimeout);
     assert_eq!(report.cause, StopCause::Fatal(report.failures[0].clone()));
     assert!(cleanup.await.is_ok());
-    assert!(report.cleanup_failures.is_empty());
+    assert_eq!(
+        report.cleanup_failures,
+        <[diorama_supervisor::CleanupFailure; 0]>::default()
+    );
     assert!(
         !report
             .transitions
@@ -185,8 +188,14 @@ async fn dependency_wait_does_not_spend_configured_child_budget() {
     assert_eq!(started.elapsed(), Duration::from_secs(3));
     stop.stop();
     let report = task.await.unwrap();
-    assert!(report.failures.is_empty());
-    assert!(report.cleanup_failures.is_empty());
+    assert_eq!(
+        report.failures,
+        <[diorama_supervisor::ComponentFailure; 0]>::default()
+    );
+    assert_eq!(
+        report.cleanup_failures,
+        <[diorama_supervisor::CleanupFailure; 0]>::default()
+    );
 }
 #[test]
 fn unrepresentable_effective_deadline_is_not_silently_clamped() {

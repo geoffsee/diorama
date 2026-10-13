@@ -664,7 +664,7 @@ fn version() -> Value {
 fn split_kubernetes_version(version: &str) -> (&str, &str) {
     let rest = version.strip_prefix('v').unwrap_or(version);
     let (major, rest) = rest.split_once('.').unwrap_or((rest, "0"));
-    let minor = rest.split_once('.').map(|(minor, _)| minor).unwrap_or(rest);
+    let minor = rest.split_once('.').map_or(rest, |(minor, _)| minor);
     (major, minor)
 }
 

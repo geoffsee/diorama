@@ -128,7 +128,10 @@ fn assert_combined_report(report: &diorama_supervisor::SupervisorReport, collisi
     if collision {
         metrics_startup::assert_retryable_bind_failure(report);
     } else {
-        assert!(report.failures.is_empty());
+        assert_eq!(
+            report.failures,
+            <[diorama_supervisor::ComponentFailure; 0]>::default()
+        );
     }
 }
 
@@ -737,7 +740,7 @@ async fn validation_redacts_keys_and_optional_map_edits_reach_all_handlers() {
                 .unwrap()
                 .unwrap()
                 .config;
-            assert!(stored.portainer.edge_key.is_empty());
+            assert_eq!(stored.portainer.edge_key, "");
             assert!(stored.kubernetes.kubelet.system_reserved.is_none());
         } else {
             request_json(&harness.socket_path, "DELETE", "/api/v1/config", "", &[]).await;

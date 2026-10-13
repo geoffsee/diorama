@@ -120,8 +120,7 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs());
     let token = params.get("continue").cloned().unwrap_or_default();
     let (start_after, response_rv, inconsistent) = if token.is_empty() {
         (String::new(), None, false)
@@ -187,11 +186,7 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
         .and_then(Value::as_str)
         .unwrap_or("0")
         .to_string();
-    let rv = if inconsistent {
-        response_rv.unwrap_or(current_rv)
-    } else {
-        response_rv.unwrap_or(current_rv)
-    };
+    let rv = response_rv.unwrap_or(current_rv);
     if let Some(meta) = list.get_mut("metadata").and_then(Value::as_object_mut) {
         meta.insert("resourceVersion".to_string(), json!(rv));
         if remaining > 0 {

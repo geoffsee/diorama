@@ -998,15 +998,15 @@ impl KubernetesApiClient {
         Ok(result)
     }
 
-    /// Name of the ConfigMap the root-ca cert publisher maintains in every namespace.
+    /// Name of the `ConfigMap` the root-ca cert publisher maintains in every namespace.
     pub const KUBE_ROOT_CA_CONFIGMAP: &'static str = "kube-root-ca.crt";
 
     /// Publishes `kube-root-ca.crt` the way the kube-controller-manager publisher does.
     ///
-    /// Creates the ConfigMap when it is missing, puts it back after a delete, and
+    /// Creates the `ConfigMap` when it is missing, puts it back after a delete, and
     /// replaces `data` when `ca.crt` or the description annotation drifts. The
     /// caller's RBAC is not consulted: namespace creation and the publisher both
-    /// have to install it for users who cannot create ConfigMaps.
+    /// have to install it for users who cannot create `ConfigMaps`.
     pub async fn ensure_kube_root_ca_configmap(
         &self,
         namespace: &str,
@@ -1031,16 +1031,14 @@ impl KubernetesApiClient {
         }
         let doc = kube_root_ca_configmap(namespace, &ca_pem, current.as_ref());
         let bytes = serde_json::to_vec(&doc)?;
-        match existing {
-            None => match self.storage.create(&key, bytes).await {
-                Ok(_) => Ok(()),
-                Err(ApiserverError::Conflict { .. }) => Ok(()),
+        if existing.is_none() {
+            match self.storage.create(&key, bytes).await {
+                Ok(_) | Err(ApiserverError::Conflict { .. }) => Ok(()),
                 Err(err) => Err(err),
-            },
-            Some(_) => {
-                self.storage.update(&key, bytes, None).await?;
-                Ok(())
-            },
+            }
+        } else {
+            self.storage.update(&key, bytes, None).await?;
+            Ok(())
         }
     }
 
@@ -1071,8 +1069,7 @@ impl KubernetesApiClient {
         });
         let bytes = serde_json::to_vec(&doc)?;
         match self.storage.create(&key, bytes).await {
-            Ok(_) => Ok(()),
-            Err(ApiserverError::Conflict { .. }) => Ok(()),
+            Ok(_) | Err(ApiserverError::Conflict { .. }) => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -1786,14 +1783,13 @@ impl KubernetesApiClient {
             .pointer("/status/phase")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
-        {
-            if let Some(status) = pod.as_object_mut().and_then(|pod| {
+            && let Some(status) = pod.as_object_mut().and_then(|pod| {
                 pod.entry("status")
                     .or_insert_with(|| json!({}))
                     .as_object_mut()
-            }) {
-                status.insert("phase".to_string(), json!("Pending"));
-            }
+            })
+        {
+            status.insert("phase".to_string(), json!("Pending"));
         }
 
         if dry_run {

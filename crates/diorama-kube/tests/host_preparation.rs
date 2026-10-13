@@ -174,13 +174,14 @@ impl AssessmentInputs for Fake {
     fn ports(&mut self, _: bool) -> Result<[Observation<PortAvailability>; 4], PlatformError> {
         Ok([Observation::Present(PortAvailability::Available); 4])
     }
-    async fn version(&mut self, _: StopReceiver) -> VersionProbe {
-        VersionProbe {
+    fn version(&mut self, _: StopReceiver) -> impl std::future::Future<Output = VersionProbe> {
+        let probe = VersionProbe {
             family: self.family,
             failure: None,
             cleanup: cleanup(true),
             observer: None,
-        }
+        };
+        std::future::ready(probe)
     }
 }
 impl NetworkPreparationInputs for Fake {
@@ -353,7 +354,10 @@ async fn fresh_backend_guard_failure_prevents_all_effects() {
     let report =
         prepare_node_host_with(&config(false, true), std::future::pending(), &mut fake).await;
     assert_eq!(report.status, HostPreparationStatus::GuardStopped);
-    assert!(fake.modules.is_empty());
+    assert_eq!(
+        fake.modules,
+        <[diorama::host_network::ModuleId; 0]>::default()
+    );
     assert!(fake.container_calls.lock().unwrap().is_empty());
     assert!(!report.shared_effects_possible);
 }
@@ -388,7 +392,10 @@ async fn initially_cancelled_combined_operation_never_performs_effects() {
     let mut fake = Fake::default();
     let report = prepare_node_host_with(&config(false, true), async {}, &mut fake).await;
     assert_eq!(report.status, HostPreparationStatus::Cancelled);
-    assert!(fake.modules.is_empty());
+    assert_eq!(
+        fake.modules,
+        <[diorama::host_network::ModuleId; 0]>::default()
+    );
     assert!(fake.container_calls.lock().unwrap().is_empty());
     assert!(!report.shared_effects_possible);
 }

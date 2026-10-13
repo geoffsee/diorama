@@ -271,7 +271,7 @@ fn ordinary_uninstall_retains_datastore_volumes_and_runtime_inputs() {
         &mut Vec::new(),
     )
     .unwrap();
-    assert!(result.removed.is_empty());
+    assert_eq!(result.removed, <[std::path::PathBuf; 0]>::default());
     for path in [
         "kine/db/record",
         "local-path-storage/record",
@@ -304,7 +304,7 @@ fn symlinked_parent_is_refused_before_service_stop_or_foreign_deletion() {
         )
         .is_err()
     );
-    assert!(host.calls.is_empty());
+    assert_eq!(host.calls, <[std::string::String; 0]>::default());
     assert_eq!(
         fs::read_to_string(foreign.path().join("db/important")).unwrap(),
         "private"

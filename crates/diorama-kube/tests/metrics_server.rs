@@ -242,7 +242,10 @@ async fn test_node_runtime_disabled_mode_opens_no_listener() {
 
     stop_handle.stop();
     let (report, _, _) = run_handle.await.expect("runtime run");
-    assert!(report.failures.is_empty());
+    assert_eq!(
+        report.failures,
+        <[diorama_supervisor::ComponentFailure; 0]>::default()
+    );
     assert!(
         report
             .outcomes
@@ -422,7 +425,10 @@ async fn metrics_serving_attempt(reclaim_before_bind: bool) -> bool {
     // 3. Graceful shutdown
     stop_handle.stop();
     let (report, _, _) = run_handle.await.expect("runtime join");
-    assert!(report.failures.is_empty());
+    assert_eq!(
+        report.failures,
+        <[diorama_supervisor::ComponentFailure; 0]>::default()
+    );
 
     // Verify endpoint is closed
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -676,7 +682,7 @@ async fn incomplete_metrics_headers_expire() {
         .await
         .expect("partial request must expire");
     assert!(result.is_ok() || result.unwrap_err().kind() == io::ErrorKind::ConnectionReset);
-    assert!(buf.is_empty());
+    assert_eq!(buf, <[u8; 0]>::default());
     tx.send(true).unwrap();
     server.await.unwrap().unwrap();
 }

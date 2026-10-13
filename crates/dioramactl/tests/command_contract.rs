@@ -396,7 +396,7 @@ fn test_completion_generation_for_all_shells() {
         let mut out = Vec::new();
         dioramactl::generate_completion(shell, &mut out).unwrap();
         let script = String::from_utf8(out).unwrap();
-        assert!(!script.is_empty());
+        assert_ne!(script, "");
         assert!(script.contains("dioramactl"));
         assert!(script.contains("check"));
         assert!(script.contains("download"));
@@ -1080,7 +1080,7 @@ fn kubeconfig_remove_is_selective_and_requires_name() {
     )
     .unwrap();
     assert_eq!(code, 0);
-    assert!(engine.calls.is_empty());
+    assert_eq!(engine.calls, <[(std::string::String, u16); 0]>::default());
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(!written.contains("name: dev") && !written.contains("\"name\": \"dev\""));
     assert!(written.contains("name: other") || written.contains("\"name\": \"other\""));

@@ -152,6 +152,7 @@ impl Collector for DatastoreCollector {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod datastore_tests {
     use super::*;
 

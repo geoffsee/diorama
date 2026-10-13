@@ -310,7 +310,7 @@ mod tests {
             panic!("terminal output");
         };
         assert_eq!(result.status, OutputStatus::OwnerFailed);
-        assert!(result.bytes().is_empty());
+        assert_eq!(result.bytes(), []);
         let cleanup = output.0.snapshot();
         assert!(cleanup.thread_joined);
         assert_eq!(cleanup.error, Some("process_owner_panicked"));

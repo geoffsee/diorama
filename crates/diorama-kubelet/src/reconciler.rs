@@ -3247,7 +3247,7 @@ mod tests {
             }
         });
         let config = sandbox_config(&pod, 0);
-        assert!(config.hostname.is_empty());
+        assert_eq!(config.hostname, "");
         let security = config
             .linux
             .as_ref()
@@ -3524,7 +3524,7 @@ mod tests {
         let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local").unwrap();
         assert_eq!(dns.servers, vec!["1.1.1.1"]);
         assert_eq!(dns.searches, vec!["foo.bar"]);
-        assert!(dns.options.is_empty());
+        assert_eq!(dns.options, <[String; 0]>::default());
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn checked_in_example_is_exact_unresolved_default_render_and_roundtrips() {
     let defaults = Config::default();
     assert_eq!(render_effective_yaml(&defaults).unwrap(), example);
     let decoded = decode(example).unwrap();
-    assert!(decoded.warnings.is_empty());
+    assert_eq!(decoded.warnings, []);
     assert_eq!(decoded.config, defaults);
     assert_eq!(render_effective_yaml(&decoded.config).unwrap(), example);
 }

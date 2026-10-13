@@ -69,7 +69,7 @@ async fn optional_failure_is_visible_while_healthy_worker_remains_responsive() {
             move |mut context| async move {
                 context.ready();
                 failed.await.unwrap();
-                assert!(!secret.is_empty());
+                assert_ne!(secret, "");
                 Err(AdapterError {
                     code: "optional_failed",
                 })

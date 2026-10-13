@@ -89,7 +89,7 @@ fn custom_portainer_edge_image_uses_custom_reference_and_is_non_fatal() {
         "registry.internal.corp/portainer/custom-agent:2.19"
     );
     // Custom edge image is not embedded in standard release archive
-    assert!(agent_target.filename.is_empty());
+    assert_eq!(agent_target.filename, "");
     // Pull failure for custom edge image is non-fatal warm cache
     assert!(!agent_target.required);
 }

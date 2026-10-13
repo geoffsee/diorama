@@ -60,11 +60,11 @@ async fn projected_service_account_token_volume_and_authentication() {
         ca_crt.contains("BEGIN CERTIFICATE"),
         "kube-root-ca.crt must carry the cluster CA"
     );
-    assert!(
-        !root_ca["metadata"]["annotations"]["kubernetes.io/description"]
+    assert_ne!(
+        root_ca["metadata"]["annotations"]["kubernetes.io/description"]
             .as_str()
-            .unwrap_or("")
-            .is_empty()
+            .unwrap_or(""),
+        ""
     );
 
     // 1. Grant RBAC permissions to ServiceAccount 'production:app-service'

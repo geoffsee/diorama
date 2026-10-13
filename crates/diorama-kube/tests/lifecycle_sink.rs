@@ -281,7 +281,7 @@ async fn optional_failure_reaches_the_sink_while_the_healthy_worker_answers() {
     let (supervisor, observer) = Supervisor::new(vec![
         registration("optional", FailurePolicy::Degrade, move |_| async move {
             failed.await.expect("failure signal");
-            assert!(!secret.is_empty());
+            assert_ne!(secret, "");
             Err(AdapterError {
                 code: "optional_failed",
             })

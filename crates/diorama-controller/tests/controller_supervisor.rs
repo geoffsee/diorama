@@ -94,11 +94,11 @@ async fn root_ca_publisher_repairs_deleted_and_edited_configmaps() {
         .expect("publisher repairs an edited kube-root-ca.crt");
     assert_eq!(repaired["data"]["ca.crt"], original);
     assert!(repaired["data"].get("extra").is_none());
-    assert!(
-        !repaired["metadata"]["annotations"]["kubernetes.io/description"]
+    assert_ne!(
+        repaired["metadata"]["annotations"]["kubernetes.io/description"]
             .as_str()
-            .unwrap_or("")
-            .is_empty()
+            .unwrap_or(""),
+        ""
     );
 }
 
@@ -146,7 +146,7 @@ async fn test_controller_manager_startup_and_authenticated_identity() {
     assert!(health.is_healthy);
     assert!(health.authenticated);
     assert!(health.apiserver_connected);
-    assert!(!health.configured_controllers.is_empty());
+    assert_ne!(health.configured_controllers, <[String; 0]>::default());
     assert_eq!(
         health.active_controllers,
         vec![
@@ -208,7 +208,7 @@ async fn test_controller_manager_supervision_lifecycle() {
     let report = controller_svc.check_readiness().await.unwrap();
     assert!(report.is_healthy);
     assert!(report.authenticated);
-    assert!(!report.configured_controllers.is_empty());
+    assert_ne!(report.configured_controllers, <[String; 0]>::default());
     assert_eq!(
         report.active_controllers,
         vec![

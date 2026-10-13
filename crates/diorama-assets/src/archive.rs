@@ -647,7 +647,7 @@ fn digest_hex(bytes: &[u8]) -> Result<[u8; 32], ArchivePolicyError> {
         return Err(ArchivePolicyError::Name);
     }
     let mut result = [0; 32];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let nibble = |b| match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),
@@ -785,7 +785,7 @@ mod tests {
                 .members
                 .get(&format!("{}.tar.gz", vectors::hex(&layer)))
                 .unwrap();
-            assert!(member.data.is_empty());
+            assert_eq!(member.data, Vec::<u8>::new());
             assert_eq!(member.size, 20001);
             assert_eq!(member.digest.as_slice(), Sha256::digest(&layer).as_slice());
         }

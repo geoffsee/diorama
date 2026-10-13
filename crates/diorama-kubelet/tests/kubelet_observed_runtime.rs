@@ -245,7 +245,10 @@ async fn never_policy_pods_become_terminal_and_keep_transition_times() {
     let report = kubelet.reconcile_once().await.unwrap();
     assert_eq!(report.orphans_stopped, 1);
     assert_eq!(runtime.sandbox_count(&uid), 0);
-    assert!(runtime.container_ids(&uid).is_empty());
+    assert_eq!(
+        runtime.container_ids(&uid),
+        <[std::string::String; 0]>::default()
+    );
     assert_eq!(runtime.sandbox_count(&bad_uid), 1);
 }
 

@@ -603,7 +603,7 @@ async fn test_external_runtime_workload_restart_diagnostics() {
         .report_workload_restart_needs("default")
         .await
         .unwrap();
-    assert!(reports.is_empty());
+    assert_eq!(reports, <[dioramalet::WorkloadRestartReport; 0]>::default());
 
     // 2. Simulate Kubelet restart with changed CPU manager settings (e.g. reserved CPUs changed from 0 to 1)
     let mut updated_options = kubelet_options.clone();

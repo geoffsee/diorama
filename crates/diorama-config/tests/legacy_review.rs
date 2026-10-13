@@ -38,7 +38,7 @@ fn extraction_preserves_separate_and_explicit_empty_values() {
     assert_eq!(flags.flags["path"], "/var/lib/custom path");
     assert_eq!(flags.flags["portainer-edge-key"], "");
     assert_eq!(flags.flags["debug"], "true");
-    assert!(flags.missing_values.is_empty());
+    assert_eq!(flags.missing_values, Vec::<String>::new());
     assert!(flags_to_config(&extract_service_flags("--node-ip --debug"), None).is_err());
 }
 

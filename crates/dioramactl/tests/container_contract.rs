@@ -402,9 +402,18 @@ fn test_rollback_on_network_creation_failure() {
     assert!(result.is_err());
 
     // Nothing was created, nothing to remove
-    assert!(engine.removed_containers.is_empty());
-    assert!(engine.removed_networks.is_empty());
-    assert!(engine.removed_volumes.is_empty());
+    assert_eq!(
+        engine.removed_containers,
+        <[std::string::String; 0]>::default()
+    );
+    assert_eq!(
+        engine.removed_networks,
+        <[std::string::String; 0]>::default()
+    );
+    assert_eq!(
+        engine.removed_volumes,
+        <[std::string::String; 0]>::default()
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -513,12 +522,18 @@ fn reinstall_pull_failure_preserves_instance_and_later_failure_reports_removal()
     engine.fail_pull_image = true;
     assert!(install_container(&mut engine, &params).is_err());
     assert!(engine.containers[&cname].1);
-    assert!(engine.removed_containers.is_empty());
+    assert_eq!(
+        engine.removed_containers,
+        <[std::string::String; 0]>::default()
+    );
     engine.fail_pull_image = false;
     engine.fail_create_container = true;
     let error = install_container(&mut engine, &params).unwrap_err();
     assert!(error.to_string().contains("previous container was removed"));
-    assert!(engine.removed_volumes.is_empty());
+    assert_eq!(
+        engine.removed_volumes,
+        <[std::string::String; 0]>::default()
+    );
 }
 
 #[test]
@@ -547,7 +562,10 @@ fn reinstall_replaces_running_or_stopped_instance_and_reconciles_mtu() {
             "1400"
         );
         assert_eq!(engine.created_volumes.len(), 1);
-        assert!(engine.removed_volumes.is_empty());
+        assert_eq!(
+            engine.removed_volumes,
+            <[std::string::String; 0]>::default()
+        );
         let payload: serde_json::Value =
             serde_json::from_str(&serialize_container_create_request(config)).unwrap();
         assert_eq!(payload["Env"], serde_json::json!(config.env));
@@ -569,9 +587,18 @@ fn reserved_port_conflicts_fail_before_engine_mutation() {
         params.d2k_host_port = Some(d2k);
         params.container_ports = mapping.map(String::from);
         assert!(install_container(&mut engine, &params).is_err());
-        assert!(engine.created_networks.is_empty());
-        assert!(engine.created_volumes.is_empty());
-        assert!(engine.created_containers.is_empty());
+        assert_eq!(
+            engine.created_networks,
+            <[std::string::String; 0]>::default()
+        );
+        assert_eq!(
+            engine.created_volumes,
+            <[std::string::String; 0]>::default()
+        );
+        assert_eq!(
+            engine.created_containers,
+            <[std::string::String; 0]>::default()
+        );
     }
 }
 

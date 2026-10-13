@@ -447,7 +447,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(docker.copies.is_empty());
+        assert_eq!(docker.copies, Vec::<(String, String)>::new());
         assert_eq!(
             fs::read(options.output.unwrap().join("cert.pem")).unwrap(),
             b"d2k-client.crt"
@@ -469,7 +469,8 @@ mod tests {
                 )
                 .is_err()
             );
-            assert!(docker.copies.is_empty() && docker.contexts.is_empty());
+            assert_eq!(docker.copies, Vec::<(String, String)>::new());
+            assert_eq!(docker.contexts, Vec::<(String, String)>::new());
             assert!(!options.output.unwrap().exists());
         }
     }
@@ -492,7 +493,7 @@ mod tests {
                 1
             );
             assert!(!options.output.unwrap().exists());
-            assert!(docker.copies.is_empty());
+            assert_eq!(docker.copies, Vec::<(String, String)>::new());
         }
     }
     #[test]

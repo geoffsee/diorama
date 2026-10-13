@@ -49,8 +49,8 @@ fn replacement_backs_up_exact_bytes_and_fills_metadata_without_mutating_input() 
     config.kind.clear();
     let outcome = write_document(&path, &config).unwrap();
     assert!(outcome.backup_created);
-    assert!(config.api_version.is_empty());
-    assert!(config.kind.is_empty());
+    assert_eq!(config.api_version, "");
+    assert_eq!(config.kind, "");
     assert_eq!(fs::read(root.0.join("config.yaml.bak")).unwrap(), old);
     let loaded = read_file(&path).unwrap().unwrap();
     assert_eq!(loaded.config.api_version, API_VERSION);

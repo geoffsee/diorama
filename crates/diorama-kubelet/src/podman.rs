@@ -821,8 +821,8 @@ mod tests {
             entries[2].clone().into_summary().state,
             ContainerState::Idle("created".to_string())
         );
-        assert!(parse_ps_output("").unwrap().is_empty());
-        assert!(parse_ps_output("[]").unwrap().is_empty());
+        assert_eq!(parse_ps_output("").unwrap(), <[PsEntry; 0]>::default());
+        assert_eq!(parse_ps_output("[]").unwrap(), <[PsEntry; 0]>::default());
         assert!(parse_ps_output("not json").is_err());
     }
 

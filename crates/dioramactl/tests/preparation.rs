@@ -198,7 +198,10 @@ async fn earlier_nonroot_or_unknown_blocks_all_preparation() {
             ..State::default()
         }));
         assert_eq!(run(state.clone(), true, false, false).await.0, 1);
-        assert!(state.borrow().actions.is_empty());
+        assert_eq!(
+            state.borrow().actions,
+            <[diorama_platform::preflight::PreparationAction; 0]>::default()
+        );
         assert_eq!(state.borrow().ports, 0);
     }
 }

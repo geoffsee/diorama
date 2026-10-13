@@ -6,6 +6,17 @@
 //! generated protobuf for that kind. Field names come from the vendored
 //! Kubernetes 1.35 `generated.proto` files.
 
+// Field numbers and zig-zag values are fixed-width protobuf integers.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::excessive_nesting,
+    clippy::type_complexity,
+    clippy::unnecessary_wraps,
+    clippy::verbose_bit_mask
+)]
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -110,13 +121,13 @@ pub(crate) fn decode_k8s_protobuf(
 }
 
 fn message_for(type_meta: Option<&(String, String)>, resource: &str) -> Option<String> {
-    if let Some((api_version, kind)) = type_meta {
-        if let Some(name) = message_for_gvk(api_version, kind) {
-            return Some(name);
-        }
+    if let Some((api_version, kind)) = type_meta
+        && let Some(name) = message_for_gvk(api_version, kind)
+    {
+        return Some(name);
     }
     let kind = super::dispatch::kind_name(resource)?;
-    message_for_gvk("v1", kind).or_else(|| message_for_gvk(&format!("apps/v1"), kind))
+    message_for_gvk("v1", kind).or_else(|| message_for_gvk("apps/v1", kind))
 }
 
 fn message_for_gvk(api_version: &str, kind: &str) -> Option<String> {
@@ -301,10 +312,10 @@ fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverEr
         },
         "k8s.io.apimachinery.pkg.util.intstr.IntOrString" => {
             let text = string_field(bytes, 3);
-            if let Some(Value::String(value)) = text {
-                if !value.is_empty() {
-                    return Ok(Some(Value::String(value)));
-                }
+            if let Some(Value::String(value)) = text
+                && !value.is_empty()
+            {
+                return Ok(Some(Value::String(value)));
             }
             let int_val = varint_field(bytes, 2).unwrap_or(0) as i32;
             Ok(Some(json!(int_val)))
@@ -776,22 +787,19 @@ fn parse_proto(
         }
         if let Some(message) = stack.iter().rev().find_map(|scope| match scope {
             Scope::Message(message) => Some(message.clone()),
-            Scope::Enum(_) => None,
-            Scope::Oneof => None,
+            Scope::Enum(_) | Scope::Oneof => None,
         }) {
-            if matches!(stack.last(), Some(Scope::Enum(_))) {
-                if let Some(Scope::Enum(name)) = stack.last() {
-                    if let Some((label, number)) = parse_enum_value(stmt) {
-                        enums.entry(name.clone()).or_default().insert(number, label);
-                    }
+            if let Some(Scope::Enum(name)) = stack.last() {
+                if let Some((label, number)) = parse_enum_value(stmt) {
+                    enums.entry(name.clone()).or_default().insert(number, label);
                 }
             } else if let Some(field) = parse_field(stmt) {
                 messages.entry(message).or_default().push(field);
             }
-        } else if let Some(Scope::Enum(name)) = stack.last() {
-            if let Some((label, number)) = parse_enum_value(stmt) {
-                enums.entry(name.clone()).or_default().insert(number, label);
-            }
+        } else if let Some(Scope::Enum(name)) = stack.last()
+            && let Some((label, number)) = parse_enum_value(stmt)
+        {
+            enums.entry(name.clone()).or_default().insert(number, label);
         }
     }
 }
@@ -954,7 +962,7 @@ mod tests {
         let metadata = string_field(1, "test");
         let mut spec = string_field(3, "None");
         let mut port = string_field(1, "http");
-        port.extend(varint((3 << 3) | 0));
+        port.extend(varint(3 << 3));
         port.extend(varint(80));
         spec.extend(length_delimited(1, &port));
         let mut service = length_delimited(1, &metadata);
@@ -972,7 +980,7 @@ mod tests {
     fn protobuf_cronjob_keeps_suspend() {
         let metadata = string_field(1, "suspended");
         let mut spec = string_field(1, "* * * * *");
-        spec.extend(varint((4 << 3) | 0));
+        spec.extend(varint(4 << 3));
         spec.extend(varint(1));
         let mut cronjob = length_delimited(1, &metadata);
         cronjob.extend(length_delimited(2, &spec));

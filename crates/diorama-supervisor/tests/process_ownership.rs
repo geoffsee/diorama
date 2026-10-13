@@ -206,7 +206,7 @@ async fn disposable_process_cases() {
     );
     tokio::time::sleep(Duration::from_millis(30)).await;
     stop.stop();
-    assert!(task.await.expect("external join").failures.is_empty());
+    assert_eq!(task.await.expect("external join").failures, []);
     let before = std::fs::read_to_string(sentinel.join("heartbeat")).expect("sentinel heartbeat");
     tokio::time::sleep(Duration::from_millis(80)).await;
     let after =
@@ -271,9 +271,9 @@ async fn failure_cases(base: &Path) {
                 .expect("case bounded")
                 .expect("supervisor join");
             if mode == "oneshot" {
-                assert!(report.failures.is_empty());
+                assert_eq!(report.failures, []);
             } else {
-                assert!(!report.failures.is_empty());
+                assert_ne!(report.failures, []);
             }
             if matches!(mode, "early" | "leader-exits-first") {
                 assert!(

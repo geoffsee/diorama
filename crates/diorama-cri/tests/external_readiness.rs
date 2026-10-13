@@ -350,7 +350,7 @@ fn external_cri_component_spec() {
     assert_eq!(spec.kind, ComponentKind::LongRunning);
     assert_eq!(spec.failure_policy, FailurePolicy::Fatal);
     assert_eq!(spec.startup_timeout, timeout);
-    assert!(spec.prerequisites.is_empty());
+    assert_eq!(spec.prerequisites, Vec::<String>::new());
 }
 
 #[tokio::test]

@@ -138,7 +138,7 @@ fn explicit_false_zero_empty_and_no_parser_defaults_override_file() {
     let config = resolve(input, &BTreeMap::new(), &flags).unwrap();
     assert_eq!(config.network.mtu, 0);
     assert!(!config.logging.debug);
-    assert!(config.portainer.edge_id.is_empty());
+    assert_eq!(config.portainer.edge_id, "");
     assert_eq!(
         resolve(input, &BTreeMap::new(), &ExplicitFlags::default())
             .unwrap()

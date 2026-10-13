@@ -98,7 +98,7 @@ fn signal_child() {
         started.load(Ordering::SeqCst),
         if mode == "partial" { 1 } else { 2 }
     );
-    assert!(report.supervisor.cleanup_failures.is_empty());
+    assert_eq!(report.supervisor.cleanup_failures, []);
     assert_eq!(report.listener_closed, None);
     if mode == "fatal" {
         assert_eq!(report.first_signal, None);
@@ -120,7 +120,7 @@ fn signal_child() {
                 ShutdownSignal::Terminate
             })
         );
-        assert!(report.supervisor.failures.is_empty());
+        assert_eq!(report.supervisor.failures, []);
     }
     println!(
         "diorama_RESULT mode={mode} first={:?} active=0 cleanup=clean",

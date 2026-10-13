@@ -172,7 +172,7 @@ fn corrupt_payload_import_failure_and_missing_imported_tag_never_pull_or_create(
         )
         .is_err()
     );
-    assert!(engine.calls.is_empty());
+    assert_eq!(engine.calls, <[&str; 0]>::default());
     for (import_error, tag_missing) in [(true, false), (false, true)] {
         let mut session = inventory.decoding_session(DecodeLimits::default()).unwrap();
         let mut engine = Engine {
@@ -214,6 +214,6 @@ fn multiple_or_missing_tags_fail_before_any_engine_effect() {
             )
             .is_err()
         );
-        assert!(engine.calls.is_empty());
+        assert_eq!(engine.calls, <[&str; 0]>::default());
     }
 }

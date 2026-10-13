@@ -712,7 +712,7 @@ async fn test_projected_volume_and_persistence_across_kubelet_restart() {
 
     // Verify token projection
     let token_content = std::fs::read_to_string(proj_dir.join("token")).expect("token file");
-    assert!(!token_content.trim().is_empty());
+    assert_ne!(token_content.trim(), "");
 
     // Verify CA bundle
     let ca_content = std::fs::read_to_string(proj_dir.join("ca.crt")).expect("ca.crt file");

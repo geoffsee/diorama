@@ -123,7 +123,7 @@ fn shared_upgrade_lock_refuses_host_and_container_cleanup_before_effects() {
         )
         .is_err()
     );
-    assert!(runner.calls.is_empty());
+    assert_eq!(runner.calls, <[std::string::String; 0]>::default());
     assert!(data.join("kine/db/state.db").exists());
     assert!(artifacts.iter().all(|path| path.exists()));
 }
@@ -191,7 +191,7 @@ fn active_recovery_receipts_block_reset_and_uninstall_but_explicit_purge_can_dis
                             .to_string()
                             .contains("interrupted upgrade")
                     );
-                    assert!(runner.calls.is_empty());
+                    assert_eq!(runner.calls, <[std::string::String; 0]>::default());
                     assert!(data.join("kine/db/state.db").exists());
                     assert!(data.join(receipt).exists());
                 }
@@ -331,7 +331,7 @@ fn unsupported_backend_fails_before_any_cleanup_effect() {
         fail_at: None,
     };
     assert!(ServiceHost::new(&mut runner, config).is_err());
-    assert!(runner.calls.is_empty());
+    assert_eq!(runner.calls, <[std::string::String; 0]>::default());
 }
 
 #[test]

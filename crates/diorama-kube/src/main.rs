@@ -35,7 +35,7 @@ fn affinity_count(status: &str) -> Option<usize> {
     let mut count = 0usize;
     let mut previous = None;
     for part in list.trim().split(',') {
-        let (start, end) = part.split_once('-').map_or((part, part), |pair| pair);
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
         let start = start.parse::<usize>().ok()?;
         let end = end.parse::<usize>().ok()?;
         if start > end || previous.is_some_and(|last| start <= last) {

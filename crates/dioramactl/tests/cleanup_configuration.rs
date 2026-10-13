@@ -266,6 +266,6 @@ fn symlinked_configuration_parent_is_rejected_before_side_effects() {
         )
         .is_err()
     );
-    assert!(host.calls.is_empty());
+    assert_eq!(host.calls, <[&str; 0]>::default());
     assert!(configuration.join("config.yaml").exists());
 }
