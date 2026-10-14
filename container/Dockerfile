@@ -1,10 +1,10 @@
 # diorama runtime image. The binary is built on the host so a code change
-# does not recompile inside Podman. See build/image/dev-image.sh.
+# does not recompile inside Podman. See container/dev-image.sh.
 #
-#   build/image/dev-image.sh
+#   container/dev-image.sh
 #
 # A machine with no Rust toolchain can still compile in the image:
-#   podman build -f Dockerfile.source -t diorama .
+#   podman build --ignorefile container/.dockerignore -f container/Dockerfile.source -t diorama .
 #
 # Run:
 #   podman run -d --privileged \
@@ -53,7 +53,7 @@ RUN printf '%s\n' \
     done
 
 COPY --chmod=755 dist/diorama /usr/local/bin/diorama
-COPY --chmod=755 build/image/entrypoint.sh /usr/local/bin/diorama-entrypoint
+COPY --chmod=755 container/entrypoint.sh /usr/local/bin/diorama-entrypoint
 
 VOLUME ["/var/lib/diorama"]
 

@@ -5,7 +5,7 @@
 //! ```
 //!
 //! The image defaults to `localhost/diorama:latest`. Build it with
-//! `build/image/dev-image.sh`. Every probe runs. The test fails with the full list.
+//! `container/dev-image.sh`. Every probe runs. The test fails with the full list.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -73,7 +73,7 @@ impl Cluster {
             .map_err(|err| format!("podman image inspect: {err}"))?;
         if !inspect.status.success() {
             return Err(format!(
-                "image {image} is missing; run build/image/dev-image.sh"
+                "image {image} is missing; run container/dev-image.sh"
             ));
         }
         let name = format!("diorama-conformance-{}", std::process::id());

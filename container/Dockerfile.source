@@ -1,5 +1,5 @@
 # Full image build that compiles diorama inside the build container.
-# The everyday loop is Dockerfile plus build/image/dev-image.sh, which
+# The everyday loop is container/Dockerfile plus container/dev-image.sh, which
 # copies a host incremental binary and skips this compile.
 
 FROM rust:1.97.1-bookworm AS build
@@ -57,7 +57,7 @@ RUN printf '%s\n' \
     done
 
 COPY --from=build --chmod=755 /out/diorama /usr/local/bin/diorama
-COPY --chmod=755 build/image/entrypoint.sh /usr/local/bin/diorama-entrypoint
+COPY --chmod=755 container/entrypoint.sh /usr/local/bin/diorama-entrypoint
 
 VOLUME ["/var/lib/diorama"]
 

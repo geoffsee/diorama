@@ -3,7 +3,7 @@
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-root=$(CDPATH= cd -- "$here/../.." && pwd)
+root=$(CDPATH= cd -- "$here/.." && pwd)
 
 case "$(uname -m)" in
     arm64|aarch64) target=aarch64-unknown-linux-musl ;;
@@ -22,4 +22,4 @@ mkdir -p "$root/dist"
 cp "$root/target/$target/debug/diorama" "$root/dist/diorama"
 chmod +x "$root/dist/diorama"
 
-exec podman build -t diorama -f "$root/Dockerfile" "$root"
+exec podman build --ignorefile "$root/container/.dockerignore" -t diorama -f "$root/container/Dockerfile" "$root"
