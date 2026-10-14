@@ -1,10 +1,11 @@
 //! Decode Kubernetes protobuf request bodies into the JSON objects the rest of
 //! the apiserver already stores.
 //!
-//! client-go sends built-in types as `application/vnd.kubernetes.protobuf`.
+//! `client-go` sends built-in types as `application/vnd.kubernetes.protobuf`.
 //! The payload is `k8s\0` plus a `runtime.Unknown` whose `raw` field is the
-//! generated protobuf for that kind. Field names come from the vendored
-//! Kubernetes 1.35 `generated.proto` files.
+//! generated protobuf for that kind. Field definitions come from the static
+//! Kubernetes v1.37.1 schema table in `generated/k8s_proto_schema.rs`,
+//! regenerated offline with `diorama-proto-schema`.
 
 // Field numbers and zig-zag values are fixed-width protobuf integers.
 #![allow(
@@ -17,44 +18,12 @@
     clippy::verbose_bit_mask
 )]
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiserverError;
 
-const SOURCES: &[&str] = &[
-    include_str!("../../proto/staging_src_k8s.io_apimachinery_pkg_apis_meta_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_apimachinery_pkg_runtime_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_apimachinery_pkg_runtime_schema_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_apimachinery_pkg_util_intstr_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_apimachinery_pkg_api_resource_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_core_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_apps_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_batch_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_discovery_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_coordination_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_rbac_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_networking_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_storage_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_policy_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_autoscaling_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_autoscaling_v2_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_certificates_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_admissionregistration_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_events_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_node_v1_generated.proto"),
-    include_str!("../../proto/staging_src_k8s.io_api_scheduling_v1_generated.proto"),
-    include_str!(
-        "../../proto/staging_src_k8s.io_apiextensions-apiserver_pkg_apis_apiextensions_v1_generated.proto"
-    ),
-    include_str!(
-        "../../proto/staging_src_k8s.io_kube-aggregator_pkg_apis_apiregistration_v1_generated.proto"
-    ),
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum WireKind {
     String,
     Bytes,
@@ -71,26 +40,119 @@ enum WireKind {
     Enum,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct FieldDef {
     number: u32,
-    name: String,
+    name: &'static str,
     kind: WireKind,
-    type_name: String,
+    type_name: &'static str,
     repeated: bool,
     map_value: Option<WireKind>,
-    map_value_type: String,
+    map_value_type: &'static str,
 }
 
-#[derive(Debug, Default)]
-struct Schema {
-    messages: HashMap<String, Vec<FieldDef>>,
-    enums: HashMap<String, HashMap<i64, String>>,
+impl FieldDef {
+    const fn scalar(number: u32, name: &'static str, kind: WireKind) -> Self {
+        Self {
+            number,
+            name,
+            kind,
+            type_name: "",
+            repeated: false,
+            map_value: None,
+            map_value_type: "",
+        }
+    }
+
+    const fn repeated_scalar(number: u32, name: &'static str, kind: WireKind) -> Self {
+        Self {
+            number,
+            name,
+            kind,
+            type_name: "",
+            repeated: true,
+            map_value: None,
+            map_value_type: "",
+        }
+    }
+
+    const fn typed(
+        number: u32,
+        name: &'static str,
+        kind: WireKind,
+        type_name: &'static str,
+    ) -> Self {
+        Self {
+            number,
+            name,
+            kind,
+            type_name,
+            repeated: false,
+            map_value: None,
+            map_value_type: "",
+        }
+    }
+
+    const fn repeated_typed(
+        number: u32,
+        name: &'static str,
+        kind: WireKind,
+        type_name: &'static str,
+    ) -> Self {
+        Self {
+            number,
+            name,
+            kind,
+            type_name,
+            repeated: true,
+            map_value: None,
+            map_value_type: "",
+        }
+    }
+
+    const fn map(
+        number: u32,
+        name: &'static str,
+        value_kind: WireKind,
+        value_type: &'static str,
+    ) -> Self {
+        Self {
+            number,
+            name,
+            kind: WireKind::Message,
+            type_name: "",
+            repeated: true,
+            map_value: Some(value_kind),
+            map_value_type: value_type,
+        }
+    }
 }
 
-fn schema() -> &'static Schema {
-    static SCHEMA: OnceLock<Schema> = OnceLock::new();
-    SCHEMA.get_or_init(load_schema)
+include!("generated/k8s_proto_schema.rs");
+
+fn lookup_message(name: &str) -> Option<&'static [FieldDef]> {
+    MESSAGES
+        .binary_search_by_key(&name, |(message, _)| *message)
+        .ok()
+        .map(|index| MESSAGES[index].1)
+}
+
+fn lookup_field(fields: &'static [FieldDef], number: u32) -> Option<&'static FieldDef> {
+    fields
+        .binary_search_by_key(&number, |field| field.number)
+        .ok()
+        .map(|index| &fields[index])
+}
+
+fn lookup_enum(type_name: &str, value: i64) -> Option<&'static str> {
+    let variants = ENUMS
+        .binary_search_by_key(&type_name, |(name, _)| *name)
+        .ok()
+        .map(|index| ENUMS[index].1)?;
+    variants
+        .binary_search_by_key(&value, |(number, _)| *number)
+        .ok()
+        .map(|index| variants[index].1)
 }
 
 pub(crate) fn decode_k8s_protobuf(
@@ -114,7 +176,7 @@ pub(crate) fn decode_k8s_protobuf(
     let Some(message) = message_for(type_meta.as_ref(), resource) else {
         return Ok(None);
     };
-    if !schema().messages.contains_key(&message) {
+    if lookup_message(&message).is_none() {
         return Ok(None);
     }
     decode_message(&message, &raw).map(Some)
@@ -236,11 +298,7 @@ fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
     if let Some(value) = decode_special(name, bytes)? {
         return Ok(value);
     }
-    let fields = schema().messages.get(name).cloned().unwrap_or_default();
-    let by_number: HashMap<u32, FieldDef> = fields
-        .into_iter()
-        .map(|field| (field.number, field))
-        .collect();
+    let fields = lookup_message(name).unwrap_or(&[]);
     let mut object = Map::new();
     let mut input = bytes;
     while !input.is_empty() {
@@ -248,7 +306,7 @@ fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
         input = rest;
         let number = u32::try_from(key >> 3).unwrap_or(0);
         let wire = key & 0x07;
-        let Some(field) = by_number.get(&number) else {
+        let Some(field) = lookup_field(fields, number) else {
             input = skip_wire(input, wire)?;
             continue;
         };
@@ -338,14 +396,10 @@ fn decode_varint(field: &FieldDef, raw: u64) -> Value {
             json!(raw as i64)
         },
         WireKind::Sint32 | WireKind::Sint64 => json!(zigzag(raw)),
-        WireKind::Enum => {
-            let name = schema()
-                .enums
-                .get(&field.type_name)
-                .and_then(|values| values.get(&(raw as i64)))
-                .cloned();
-            name.map_or_else(|| json!(raw as i64), Value::String)
-        },
+        WireKind::Enum => lookup_enum(field.type_name, raw as i64).map_or_else(
+            || json!(raw as i64),
+            |label| Value::String(label.to_string()),
+        ),
         _ => json!(raw as i64),
     }
 }
@@ -357,7 +411,7 @@ fn decode_length(field: &FieldDef, chunk: &[u8]) -> Result<Value, ApiserverError
     match field.kind {
         WireKind::String => Ok(Value::String(String::from_utf8_lossy(chunk).into_owned())),
         WireKind::Bytes => Ok(Value::String(base64(chunk))),
-        WireKind::Message => decode_message(&field.type_name, chunk),
+        WireKind::Message => decode_message(field.type_name, chunk),
         _ => Ok(json!(String::from_utf8_lossy(chunk))),
     }
 }
@@ -386,7 +440,7 @@ fn decode_map_entry(field: &FieldDef, chunk: &[u8]) -> Result<Value, ApiserverEr
                         },
                         Some(WireKind::Bytes) => Value::String(base64(bytes)),
                         Some(WireKind::Message) | None => {
-                            decode_message(&field.map_value_type, bytes)?
+                            decode_message(field.map_value_type, bytes)?
                         },
                         Some(_) => json!(String::from_utf8_lossy(bytes)),
                     }
@@ -420,7 +474,7 @@ fn store_field(object: &mut Map<String, Value>, field: &FieldDef, value: Value) 
             .to_string();
         let mapped = entry.get("value").cloned().unwrap_or(Value::Null);
         let map = object
-            .entry(field.name.clone())
+            .entry(field.name.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(map) = map.as_object_mut() {
             map.insert(key, mapped);
@@ -429,14 +483,14 @@ fn store_field(object: &mut Map<String, Value>, field: &FieldDef, value: Value) 
     }
     if field.repeated {
         let list = object
-            .entry(field.name.clone())
+            .entry(field.name.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Some(list) = list.as_array_mut() {
             list.push(value);
         }
         return;
     }
-    object.insert(field.name.clone(), value);
+    object.insert(field.name.to_string(), value);
 }
 
 fn string_field(bytes: &[u8], number: u64) -> Option<Value> {
@@ -607,315 +661,6 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-#[derive(Clone, Debug)]
-struct RawField {
-    number: u32,
-    name: String,
-    type_name: String,
-    repeated: bool,
-    map_value: String,
-}
-
-fn load_schema() -> Schema {
-    let mut packages = Vec::new();
-    let mut raw_messages: HashMap<String, Vec<RawField>> = HashMap::new();
-    let mut enum_names = Vec::new();
-    let mut enums: HashMap<String, HashMap<i64, String>> = HashMap::new();
-    for source in SOURCES {
-        parse_proto(
-            source,
-            &mut packages,
-            &mut raw_messages,
-            &mut enum_names,
-            &mut enums,
-        );
-    }
-    let mut schema = Schema {
-        messages: HashMap::new(),
-        enums,
-    };
-    let known: std::collections::HashSet<String> = raw_messages.keys().cloned().collect();
-    for (message, fields) in raw_messages {
-        let package = package_of(&message);
-        let resolved = fields
-            .into_iter()
-            .map(|field| resolve_field(&message, package, field, &known, &schema.enums))
-            .collect();
-        schema.messages.insert(message, resolved);
-    }
-    let _ = packages;
-    let _ = enum_names;
-    schema
-}
-
-fn package_of(message: &str) -> &str {
-    message.rsplit_once('.').map_or("", |(package, _)| package)
-}
-
-fn resolve_field(
-    message: &str,
-    package: &str,
-    field: RawField,
-    messages: &std::collections::HashSet<String>,
-    enums: &HashMap<String, HashMap<i64, String>>,
-) -> FieldDef {
-    let map = !field.map_value.is_empty();
-    let type_token = if map {
-        field.map_value.as_str()
-    } else {
-        field.type_name.as_str()
-    };
-    let resolved = resolve_type(message, package, type_token, messages, enums);
-    let kind = scalar_kind(type_token, &resolved, messages, enums);
-    let map_value = if map {
-        Some(scalar_kind(&field.map_value, &resolved, messages, enums))
-    } else {
-        None
-    };
-    FieldDef {
-        number: field.number,
-        name: field.name,
-        kind: if map { WireKind::Message } else { kind },
-        type_name: if map { String::new() } else { resolved.clone() },
-        repeated: field.repeated || map,
-        map_value,
-        map_value_type: if map { resolved } else { String::new() },
-    }
-}
-
-fn resolve_type(
-    message: &str,
-    package: &str,
-    type_name: &str,
-    messages: &std::collections::HashSet<String>,
-    enums: &HashMap<String, HashMap<i64, String>>,
-) -> String {
-    let type_name = type_name.trim_start_matches('.');
-    if type_name.contains('.') {
-        return type_name.to_string();
-    }
-    for candidate in [
-        format!("{message}.{type_name}"),
-        format!("{package}.{type_name}"),
-    ] {
-        if messages.contains(&candidate) || enums.contains_key(&candidate) {
-            return candidate;
-        }
-    }
-    type_name.to_string()
-}
-
-fn scalar_kind(
-    type_token: &str,
-    resolved: &str,
-    messages: &std::collections::HashSet<String>,
-    enums: &HashMap<String, HashMap<i64, String>>,
-) -> WireKind {
-    match type_token.trim_start_matches('.') {
-        "string" => WireKind::String,
-        "bytes" => WireKind::Bytes,
-        "bool" => WireKind::Bool,
-        "int32" | "fixed32" | "sfixed32" => WireKind::Int32,
-        "int64" | "fixed64" | "sfixed64" => WireKind::Int64,
-        "uint32" => WireKind::Uint32,
-        "uint64" => WireKind::Uint64,
-        "sint32" => WireKind::Sint32,
-        "sint64" => WireKind::Sint64,
-        "float" => WireKind::Float,
-        "double" => WireKind::Double,
-        _ if enums.contains_key(resolved) => WireKind::Enum,
-        _ if messages.contains(resolved) => WireKind::Message,
-        _ => WireKind::Message,
-    }
-}
-
-fn parse_proto(
-    source: &str,
-    _packages: &mut Vec<String>,
-    messages: &mut HashMap<String, Vec<RawField>>,
-    _enum_names: &mut Vec<String>,
-    enums: &mut HashMap<String, HashMap<i64, String>>,
-) {
-    let text = strip_comments(source);
-    let mut package = String::new();
-    let mut stack: Vec<Scope> = Vec::new();
-    let mut buf = String::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        buf.push(' ');
-        buf.push_str(line);
-        if !buf.contains('{') && !buf.contains('}') && !buf.contains(';') {
-            continue;
-        }
-        let stmt = std::mem::take(&mut buf);
-        let stmt = stmt.trim();
-        if let Some(rest) = stmt.strip_prefix("package ") {
-            package = rest.trim().trim_end_matches(';').trim().to_string();
-            continue;
-        }
-        if stmt.starts_with("import ") || stmt.starts_with("option ") || stmt.starts_with("syntax ")
-        {
-            continue;
-        }
-        if stmt.starts_with('}')
-            || stmt.ends_with('}')
-                && !stmt.contains("message ")
-                && !stmt.contains("enum ")
-                && !stmt.contains("oneof ")
-        {
-            stack.pop();
-            continue;
-        }
-        if let Some(name) = decl_name(stmt, "message ") {
-            let full = qualify(&package, &stack, &name);
-            stack.push(Scope::Message(full.clone()));
-            messages.entry(full).or_default();
-            continue;
-        }
-        if let Some(name) = decl_name(stmt, "enum ") {
-            let full = qualify(&package, &stack, &name);
-            stack.push(Scope::Enum(full.clone()));
-            enums.entry(full).or_default();
-            continue;
-        }
-        if decl_name(stmt, "oneof ").is_some() {
-            stack.push(Scope::Oneof);
-            continue;
-        }
-        if let Some(message) = stack.iter().rev().find_map(|scope| match scope {
-            Scope::Message(message) => Some(message.clone()),
-            Scope::Enum(_) | Scope::Oneof => None,
-        }) {
-            if let Some(Scope::Enum(name)) = stack.last() {
-                if let Some((label, number)) = parse_enum_value(stmt) {
-                    enums.entry(name.clone()).or_default().insert(number, label);
-                }
-            } else if let Some(field) = parse_field(stmt) {
-                messages.entry(message).or_default().push(field);
-            }
-        } else if let Some(Scope::Enum(name)) = stack.last()
-            && let Some((label, number)) = parse_enum_value(stmt)
-        {
-            enums.entry(name.clone()).or_default().insert(number, label);
-        }
-    }
-}
-
-enum Scope {
-    Message(String),
-    Enum(String),
-    Oneof,
-}
-
-fn qualify(package: &str, stack: &[Scope], name: &str) -> String {
-    let mut parts = Vec::new();
-    if !package.is_empty() {
-        parts.push(package.to_string());
-    }
-    for scope in stack {
-        if let Scope::Message(message) = scope {
-            let short = message.rsplit('.').next().unwrap_or(message);
-            parts.push(short.to_string());
-        }
-    }
-    parts.push(name.to_string());
-    parts.join(".")
-}
-
-fn decl_name(stmt: &str, prefix: &str) -> Option<String> {
-    let rest = stmt.trim().strip_prefix(prefix)?;
-    let name = rest
-        .split(|ch: char| ch == '{' || ch.is_whitespace())
-        .next()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-fn parse_field(stmt: &str) -> Option<RawField> {
-    let stmt = stmt.trim().trim_end_matches(';').trim();
-    let stmt = stmt.split('[').next()?.trim();
-    if stmt.is_empty() || stmt.starts_with("reserved") || stmt.starts_with("extensions") {
-        return None;
-    }
-    let (head, number) = stmt.rsplit_once('=')?;
-    let number = number.trim().parse().ok()?;
-    let mut head = head.trim();
-    let mut repeated = false;
-    for keyword in ["optional ", "required ", "repeated "] {
-        if let Some(rest) = head.strip_prefix(keyword) {
-            repeated = keyword.starts_with("repeated");
-            head = rest.trim();
-            break;
-        }
-    }
-    let (type_token, name) = head.rsplit_once(char::is_whitespace)?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let mut type_name = type_token.trim().to_string();
-    let mut map_value = String::new();
-    if let Some(inner) = type_name
-        .strip_prefix("map<")
-        .and_then(|value| value.strip_suffix('>'))
-    {
-        let (_, value) = inner.split_once(',')?;
-        map_value = value.trim().to_string();
-        type_name.clear();
-        repeated = true;
-    }
-    Some(RawField {
-        number,
-        name: name.to_string(),
-        type_name,
-        repeated,
-        map_value,
-    })
-}
-
-fn parse_enum_value(stmt: &str) -> Option<(String, i64)> {
-    let stmt = stmt.trim().trim_end_matches(';').trim();
-    let stmt = stmt.split('[').next()?.trim();
-    let (name, number) = stmt.split_once('=')?;
-    let name = name.trim();
-    if name.is_empty() || name.contains(' ') {
-        return None;
-    }
-    Some((name.to_string(), number.trim().parse().ok()?))
-}
-
-fn strip_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            continue;
-        }
-        if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
-            index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        out.push(bytes[index] as char);
-        index += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::decode_k8s_protobuf;
@@ -995,5 +740,29 @@ mod tests {
             .expect("cronjob schema");
         assert_eq!(decoded["spec"]["suspend"], true);
         assert_eq!(decoded["spec"]["schedule"], "* * * * *");
+    }
+
+    #[test]
+    fn protobuf_cluster_trust_bundle_decodes_v1_37_fields() {
+        let metadata = string_field(1, "example-bundle");
+        let mut spec = string_field(1, "example.com/signer");
+        spec.extend(string_field(2, "-----BEGIN CERTIFICATE-----\n"));
+        let mut bundle = length_delimited(1, &metadata);
+        bundle.extend(length_delimited(2, &spec));
+        let mut type_meta = string_field(1, "certificates.k8s.io/v1");
+        type_meta.extend(string_field(2, "ClusterTrustBundle"));
+        let mut unknown = length_delimited(1, &type_meta);
+        unknown.extend(length_delimited(2, &bundle));
+        let mut body = b"k8s\x00".to_vec();
+        body.extend(unknown);
+        let decoded = decode_k8s_protobuf(&body, "clustertrustbundles")
+            .expect("decode")
+            .expect("clustertrustbundle schema");
+        assert_eq!(decoded["metadata"]["name"], "example-bundle");
+        assert_eq!(decoded["spec"]["signerName"], "example.com/signer");
+        assert_eq!(
+            decoded["spec"]["trustBundle"],
+            "-----BEGIN CERTIFICATE-----\n"
+        );
     }
 }

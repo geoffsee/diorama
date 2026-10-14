@@ -13,7 +13,6 @@ http = "=1.5.0"
 http-body-util = { version = "=0.1.5", features = ["channel"] }
 hyper = { version = "=1.11.1", features = ["http1", "server", "client"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server", "client", "http1"] }
-k8s-openapi = { version = "=0.28.0", default-features = false, features = ["v1_35"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-datastore = { version = "=0.1.0", path = "../diorama-datastore" }
