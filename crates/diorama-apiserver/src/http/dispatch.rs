@@ -104,7 +104,23 @@ async fn read(
     }
 }
 
-/// Pages a filtered list. `continue` is `c.<issued>.<rv>.<lastName>` and stays
+fn item_pagination_key(item: &Value) -> String {
+    let name = item
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let namespace = item
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
+/// Pages a filtered list. `continue` is `c.<issued>.<rv>.<lastKey>` and stays
 /// consistent for 30 seconds. After that the server returns 410 with an
 /// inconsistent token so clients can resume without the original resourceVersion.
 fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverError> {
@@ -137,7 +153,10 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
         }
         let issued = issued.unwrap_or(0);
         if mode == "c" && now.saturating_sub(issued) >= 30 {
-            let next = format!("i.{now}.{rv}i.{name}");
+            let next_rv = rv
+                .parse::<u64>()
+                .map_or_else(|_| "1".to_string(), |n| (n + 1).to_string());
+            let next = format!("i.{now}.{next_rv}.{name}");
             return Err(ApiserverError::Expired {
                 continue_token: next,
             });
@@ -147,39 +166,19 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
     let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
         return Ok(list);
     };
-    items.sort_by(|left, right| {
-        let left = left
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let right = right
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        left.cmp(right)
-    });
+    items.sort_by_key(item_pagination_key);
     let start = if start_after.is_empty() {
         0
     } else {
         items
             .iter()
-            .position(|item| {
-                item.pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    > start_after.as_str()
-            })
+            .position(|item| item_pagination_key(item) > start_after)
             .unwrap_or(items.len())
     };
     let end = (start + limit).min(items.len());
     let page = items[start..end].to_vec();
     let remaining = items.len().saturating_sub(end);
-    let last_name = page
-        .last()
-        .and_then(|item| item.pointer("/metadata/name"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let last_key = page.last().map(item_pagination_key).unwrap_or_default();
     *items = page;
     let current_rv = list
         .pointer("/metadata/resourceVersion")
@@ -193,7 +192,7 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
             let mode = if inconsistent { "i" } else { "c" };
             meta.insert(
                 "continue".to_string(),
-                json!(format!("{mode}.{now}.{rv}.{last_name}")),
+                json!(format!("{mode}.{now}.{rv}.{last_key}")),
             );
             meta.insert("remainingItemCount".to_string(), json!(remaining));
         } else {
@@ -582,6 +581,11 @@ fn is_namespaced(resource: &str) -> bool {
             | "validatingwebhookconfigurations"
             | "mutatingwebhookconfigurations"
             | "apiservices"
+            | "clustertrustbundles"
+            | "certificatesigningrequests"
+            | "ingressclasses"
+            | "runtimeclasses"
+            | "priorityclasses"
     )
 }
 
@@ -1086,36 +1090,17 @@ fn decode_body(
         return Ok(Value::Null);
     }
     if content_type.is_some_and(|value| value.contains("protobuf")) {
-        if let Some(mut value) = crate::http::protojson::decode_k8s_protobuf(body, &path.resource)?
-        {
-            stamp_type_meta(&mut value, path);
-            return Ok(value);
-        }
-        let mut value = decode_protobuf_body(body, &path.resource)?;
+        let mut value =
+            crate::http::protojson::decode_k8s_protobuf(body, &path.group, &path.resource)?
+                .ok_or_else(|| ApiserverError::BadRequest {
+                    message: format!("unsupported kubernetes protobuf resource {}", path.resource),
+                })?;
         stamp_type_meta(&mut value, path);
         return Ok(value);
     }
     serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
         message: format!("request body is not JSON: {err}"),
     })
-}
-
-fn decode_protobuf_body(body: &[u8], resource: &str) -> Result<Value, ApiserverError> {
-    let payload = body
-        .strip_prefix(b"k8s\x00")
-        .ok_or_else(|| ApiserverError::BadRequest {
-            message: "kubernetes protobuf body is missing the k8s prefix".to_string(),
-        })?;
-    let raw = protobuf_unknown_raw(payload)?;
-    if raw.is_empty() {
-        return Err(ApiserverError::BadRequest {
-            message: "kubernetes protobuf body did not contain an object".to_string(),
-        });
-    }
-    if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
-        return Ok(value);
-    }
-    protobuf_object_to_json(&raw, resource)
 }
 
 fn stamp_type_meta(doc: &mut Value, path: &ResourcePath) {
@@ -1172,228 +1157,17 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "validatingwebhookconfigurations" => "ValidatingWebhookConfiguration",
         "mutatingwebhookconfigurations" => "MutatingWebhookConfiguration",
         "apiservices" => "APIService",
+        "clustertrustbundles" => "ClusterTrustBundle",
+        "certificatesigningrequests" => "CertificateSigningRequest",
+        "horizontalpodautoscalers" => "HorizontalPodAutoscaler",
+        "poddisruptionbudgets" => "PodDisruptionBudget",
+        "networkpolicies" => "NetworkPolicy",
+        "ingresses" => "Ingress",
+        "ingressclasses" => "IngressClass",
+        "runtimeclasses" => "RuntimeClass",
+        "priorityclasses" => "PriorityClass",
         _ => return None,
     })
-}
-
-/// Reads field 2 (`raw`) from a `runtime.Unknown` protobuf message.
-fn protobuf_unknown_raw(payload: &[u8]) -> Result<Vec<u8>, ApiserverError> {
-    let mut input = payload;
-    while !input.is_empty() {
-        let (key, rest) = read_varint(input)?;
-        input = rest;
-        let field = key >> 3;
-        let wire = key & 0x07;
-        match wire {
-            2 => {
-                let (len, rest) = read_varint(input)?;
-                let len = usize::try_from(len).map_err(|_| ApiserverError::BadRequest {
-                    message: "kubernetes protobuf length is invalid".to_string(),
-                })?;
-                if rest.len() < len {
-                    return Err(ApiserverError::BadRequest {
-                        message: "kubernetes protobuf body is truncated".to_string(),
-                    });
-                }
-                let (chunk, rest) = rest.split_at(len);
-                input = rest;
-                if field == 2 {
-                    return Ok(chunk.to_vec());
-                }
-            },
-            0 => {
-                let (_, rest) = read_varint(input)?;
-                input = rest;
-            },
-            _ => {
-                return Err(ApiserverError::BadRequest {
-                    message: format!("unsupported kubernetes protobuf wire type {wire}"),
-                });
-            },
-        }
-    }
-    Err(ApiserverError::BadRequest {
-        message: "kubernetes protobuf body has no raw object".to_string(),
-    })
-}
-
-fn read_varint(input: &[u8]) -> Result<(u64, &[u8]), ApiserverError> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    for (index, byte) in input.iter().enumerate() {
-        if shift >= 64 {
-            break;
-        }
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value, &input[index + 1..]));
-        }
-        shift += 7;
-    }
-    Err(ApiserverError::BadRequest {
-        message: "kubernetes protobuf varint is truncated".to_string(),
-    })
-}
-
-/// Best-effort decode of a Kubernetes protobuf object into JSON.
-///
-/// kubectl sends built-in objects as `runtime.Unknown.raw`. That payload is
-/// itself protobuf. The fields we need for create are `metadata.name` and a
-/// few nested strings; everything else is preserved when it is length-delimited
-/// UTF-8. This is enough for `kubectl create` and `kubectl apply`-style JSON
-/// fallbacks are handled separately.
-fn protobuf_object_to_json(raw: &[u8], resource: &str) -> Result<Value, ApiserverError> {
-    let mut metadata = serde_json::Map::new();
-    let mut data = serde_json::Map::new();
-    let mut object = serde_json::Map::new();
-    let mut input = raw;
-    while !input.is_empty() {
-        let (key, rest) = read_varint(input)?;
-        input = rest;
-        let field = key >> 3;
-        let wire = key & 0x07;
-        match wire {
-            2 => {
-                let (len, rest) = read_varint(input)?;
-                let len = usize::try_from(len).unwrap_or(0);
-                if rest.len() < len {
-                    return Err(ApiserverError::BadRequest {
-                        message: "kubernetes protobuf object is truncated".to_string(),
-                    });
-                }
-                let (chunk, rest) = rest.split_at(len);
-                input = rest;
-                if field == 2 && resource == "configmaps" {
-                    if let Some((key, value)) = protobuf_map_entry(chunk) {
-                        data.insert(key, Value::String(value));
-                    }
-                    continue;
-                }
-                if let Some((name, value)) = protobuf_string_field(field, chunk) {
-                    store_decoded_field(&mut object, &mut metadata, name, value);
-                }
-            },
-            0 => {
-                let (_, rest) = read_varint(input)?;
-                input = rest;
-            },
-            _ => {
-                return Err(ApiserverError::BadRequest {
-                    message: format!("unsupported kubernetes object wire type {wire}"),
-                });
-            },
-        }
-    }
-    if !metadata.is_empty() {
-        object.insert("metadata".to_string(), Value::Object(metadata));
-    }
-    if !data.is_empty() {
-        object.insert("data".to_string(), Value::Object(data));
-    }
-    if object.is_empty() {
-        return Err(ApiserverError::BadRequest {
-            message: "kubernetes protobuf object had no recognized fields".to_string(),
-        });
-    }
-    Ok(Value::Object(object))
-}
-
-fn store_decoded_field(
-    object: &mut serde_json::Map<String, Value>,
-    metadata: &mut serde_json::Map<String, Value>,
-    name: &str,
-    value: Value,
-) {
-    if name == "metadata" {
-        if let Value::Object(meta) = value {
-            *metadata = meta;
-        }
-        return;
-    }
-    object.insert(name.to_string(), value);
-}
-
-fn protobuf_string_field(field: u64, chunk: &[u8]) -> Option<(&'static str, Value)> {
-    // Kubernetes core `ObjectMeta` is field 1 on most objects. Nested strings
-    // use the standard ObjectMeta field numbers: name=1, namespace=3.
-    if field == 1 && !chunk.is_empty() && chunk[0] != b'{' {
-        let mut meta = serde_json::Map::new();
-        let mut input = chunk;
-        while !input.is_empty() {
-            let Ok((key, rest)) = read_varint(input) else {
-                return None;
-            };
-            input = rest;
-            let inner = key >> 3;
-            let wire = key & 0x07;
-            if wire == 0 {
-                let Ok((_, rest)) = read_varint(input) else {
-                    return None;
-                };
-                input = rest;
-                continue;
-            }
-            if wire != 2 {
-                return None;
-            }
-            let Ok((len, rest)) = read_varint(input) else {
-                return None;
-            };
-            let Ok(len) = usize::try_from(len) else {
-                return None;
-            };
-            if rest.len() < len {
-                return None;
-            }
-            let (value, rest) = rest.split_at(len);
-            input = rest;
-            let Ok(text) = std::str::from_utf8(value) else {
-                continue;
-            };
-            if text.is_empty() {
-                continue;
-            }
-            let key_name = match inner {
-                1 => "name",
-                3 => "namespace",
-                4 => "selfLink",
-                _ => continue,
-            };
-            meta.insert(key_name.to_string(), Value::String(text.to_string()));
-        }
-        if meta.is_empty() {
-            return None;
-        }
-        return Some(("metadata", Value::Object(meta)));
-    }
-    None
-}
-
-fn protobuf_map_entry(chunk: &[u8]) -> Option<(String, String)> {
-    let mut key = None;
-    let mut value = None;
-    let mut input = chunk;
-    while !input.is_empty() {
-        let (tag, rest) = read_varint(input).ok()?;
-        input = rest;
-        if tag & 0x07 != 2 {
-            return None;
-        }
-        let (len, rest) = read_varint(input).ok()?;
-        let len = usize::try_from(len).ok()?;
-        if rest.len() < len {
-            return None;
-        }
-        let (bytes, rest) = rest.split_at(len);
-        input = rest;
-        let text = std::str::from_utf8(bytes).ok()?.to_string();
-        match tag >> 3 {
-            1 => key = Some(text),
-            2 => value = Some(text),
-            _ => {},
-        }
-    }
-    Some((key?, value?))
 }
 
 fn object_name(doc: &Value) -> Result<String, ApiserverError> {
@@ -1433,6 +1207,15 @@ fn list_kind(resource: &str) -> &'static str {
         "clusterroles" => "ClusterRoleList",
         "clusterrolebindings" => "ClusterRoleBindingList",
         "storageclasses" => "StorageClassList",
+        "clustertrustbundles" => "ClusterTrustBundleList",
+        "certificatesigningrequests" => "CertificateSigningRequestList",
+        "horizontalpodautoscalers" => "HorizontalPodAutoscalerList",
+        "poddisruptionbudgets" => "PodDisruptionBudgetList",
+        "networkpolicies" => "NetworkPolicyList",
+        "ingresses" => "IngressList",
+        "ingressclasses" => "IngressClassList",
+        "runtimeclasses" => "RuntimeClassList",
+        "priorityclasses" => "PriorityClassList",
         _ => "List",
     }
 }

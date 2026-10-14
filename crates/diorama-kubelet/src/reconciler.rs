@@ -3007,7 +3007,7 @@ async fn http_probe(
         .unwrap_or("HTTP")
         .to_ascii_lowercase();
     if scheme == "https" {
-        return curl_probe(runtime, container_id, http).await;
+        return curl_probe(runtime, container, container_id, http).await;
     }
     let Some(port) = resolve_probe_port(container, http.get("port")) else {
         return false;
@@ -3023,8 +3023,23 @@ async fn http_probe(
     } else {
         format!("/{raw_path}")
     };
-    let mut request = format!("GET {path} HTTP/1.0\r\nHost: {target}\r\nConnection: close\r\n");
-    if let Some(headers) = http.get("httpHeaders").and_then(Value::as_array) {
+    let headers = http.get("httpHeaders").and_then(Value::as_array);
+    let has_custom_host = headers.is_some_and(|items| {
+        items.iter().any(|header| {
+            header
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("host"))
+        })
+    });
+    let mut request = format!("GET {path} HTTP/1.0\r\n");
+    if !has_custom_host {
+        request.push_str("Host: ");
+        request.push_str(&target);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n");
+    if let Some(headers) = headers {
         for header in headers {
             let name = header.get("name").and_then(Value::as_str).unwrap_or("");
             let value = header.get("value").and_then(Value::as_str).unwrap_or("");
@@ -3078,12 +3093,13 @@ async fn http_probe(
 
 /// Best-effort `https` probe through `curl` inside the container, for images
 /// that ship it. Failure (including a missing binary) fails the probe.
-async fn curl_probe(runtime: &Arc<dyn RuntimeProvider>, container_id: &str, http: &Value) -> bool {
-    let port = http
-        .get("port")
-        .and_then(Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())
-        .unwrap_or(443);
+async fn curl_probe(
+    runtime: &Arc<dyn RuntimeProvider>,
+    container: &Value,
+    container_id: &str,
+    http: &Value,
+) -> bool {
+    let port = resolve_probe_port(container, http.get("port")).unwrap_or(443);
     let raw_path = http.get("path").and_then(Value::as_str).unwrap_or("/");
     let path = if raw_path.starts_with('/') {
         raw_path.to_string()

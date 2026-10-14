@@ -998,6 +998,14 @@ impl KubernetesApiClient {
         Ok(result)
     }
 
+    /// Authorizes `pods/exec` (`create` or `get`) before upgrading a WebSocket exec connection.
+    pub fn authorize_pod_exec(&self, namespace: &str, name: &str) -> Result<(), ApiserverError> {
+        self.check_auth_detailed("create", "", "pods/exec", Some(namespace), Some(name))
+            .or_else(|_| {
+                self.check_auth_detailed("get", "", "pods/exec", Some(namespace), Some(name))
+            })
+    }
+
     /// Name of the `ConfigMap` the root-ca cert publisher maintains in every namespace.
     pub const KUBE_ROOT_CA_CONFIGMAP: &'static str = "kube-root-ca.crt";
 
@@ -1011,7 +1019,7 @@ impl KubernetesApiClient {
         &self,
         namespace: &str,
     ) -> Result<(), ApiserverError> {
-        let ca_pem = std::fs::read_to_string(&self.client_ca_file)?;
+        let ca_pem = tokio::fs::read_to_string(&self.client_ca_file).await?;
         if ca_pem.trim().is_empty() {
             return Err(ApiserverError::Config {
                 reason: format!("cluster CA file {} is empty", self.client_ca_file.display()),
@@ -2508,6 +2516,32 @@ impl KubernetesApiClient {
             .pointer("/metadata/resourceVersion")
             .and_then(Value::as_str)
             .and_then(|v| v.parse::<u64>().ok());
+        let cur_rev = self.storage.current_revision().await + 1;
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                kind: kind.to_string(),
+            },
+            resource: GroupVersionResource {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                resource: plural.to_string(),
+            },
+            name: Some(name.to_string()),
+            namespace: None,
+            operation: "UPDATE".to_string(),
+            user_info: self.current_user_info(),
+            object: Some(doc.clone()),
+            old_object: Some(old_doc),
+            dry_run: None,
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+        if let Some(obj) = adm_req.object {
+            doc = obj;
+        }
         self.authorize_rbac_write(group, plural, None, &doc)?;
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.update(&key, bytes, expected_version).await?;
@@ -2542,7 +2576,6 @@ impl KubernetesApiClient {
             })?
             .to_string();
         self.check_auth_detailed("create", group, plural, None, Some(&name))?;
-        self.authorize_rbac_write(group, plural, None, &doc)?;
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             if !meta.contains_key("creationTimestamp") {
@@ -2560,6 +2593,32 @@ impl KubernetesApiClient {
         }
         doc["kind"] = json!(kind);
         doc["apiVersion"] = json!(group_version(group));
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                kind: kind.to_string(),
+            },
+            resource: GroupVersionResource {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                resource: plural.to_string(),
+            },
+            name: Some(name.clone()),
+            namespace: None,
+            operation: "CREATE".to_string(),
+            user_info: self.current_user_info(),
+            object: Some(doc.clone()),
+            old_object: None,
+            dry_run: None,
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+        if let Some(obj) = adm_req.object {
+            doc = obj;
+        }
+        self.authorize_rbac_write(group, plural, None, &doc)?;
         let key = cluster_key(self.storage.prefix(), group, plural, &name);
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.create(&key, bytes).await?;

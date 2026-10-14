@@ -8,6 +8,8 @@ IMAGE ?= localhost/diorama:latest
 CONTAINER_NAME ?= diorama
 CONTAINER_VOLUME ?= diorama-data
 KUBECONFIG_OUT ?= kubeconfig.yaml
+IGNOREFILE_FLAG := $(if $(findstring podman,$(CONTAINER_ENGINE)),--ignorefile container/.dockerignore,)
+MODULES_MOUNT := $(if $(wildcard /lib/modules),-v /lib/modules:/lib/modules:ro,)
 
 .PHONY: help build fmt fmt-check lint test test-doc policy deny check \
 	image dev-image image-source container-run container-stop kubeconfig \
@@ -64,17 +66,17 @@ deny:
 check: fmt-check lint test test-doc policy deny
 
 image dev-image:
-	./container/dev-image.sh
+	CONTAINER_ENGINE=$(CONTAINER_ENGINE) IMAGE=$(IMAGE) ./container/dev-image.sh
 
 image-source:
-	$(CONTAINER_ENGINE) build --ignorefile container/.dockerignore -f container/Dockerfile.source -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build $(IGNOREFILE_FLAG) -f container/Dockerfile.source -t $(IMAGE) .
 
 container-run:
 	$(CONTAINER_ENGINE) run -d --privileged \
 		--hostname diorama \
 		--security-opt seccomp=unconfined \
 		--tmpfs /tmp --tmpfs /run \
-		-v /lib/modules:/lib/modules:ro \
+		$(MODULES_MOUNT) \
 		-v $(CONTAINER_VOLUME):/var/lib/diorama \
 		-p 6443:6443 \
 		--name $(CONTAINER_NAME) \

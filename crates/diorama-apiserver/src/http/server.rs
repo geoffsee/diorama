@@ -270,6 +270,9 @@ async fn exec_upgrade(
             "exec requires a namespaced pod",
         );
     };
+    if let Err(err) = client.authorize_pod_exec(namespace, name) {
+        return error_response(&err);
+    }
     let pod = match client.get_pod(namespace, name).await {
         Ok(pod) => pod,
         Err(err) => return error_response(&err),

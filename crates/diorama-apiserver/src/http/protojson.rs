@@ -155,8 +155,11 @@ fn lookup_enum(type_name: &str, value: i64) -> Option<&'static str> {
         .map(|index| variants[index].1)
 }
 
+const MAX_RECURSION_DEPTH: usize = 64;
+
 pub(crate) fn decode_k8s_protobuf(
     body: &[u8],
+    group: &str,
     resource: &str,
 ) -> Result<Option<Value>, ApiserverError> {
     let payload = body
@@ -173,23 +176,34 @@ pub(crate) fn decode_k8s_protobuf(
     if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
         return Ok(Some(value));
     }
-    let Some(message) = message_for(type_meta.as_ref(), resource) else {
+    let Some(message) = message_for(type_meta.as_ref(), group, resource) else {
         return Ok(None);
     };
     if lookup_message(&message).is_none() {
         return Ok(None);
     }
-    decode_message(&message, &raw).map(Some)
+    decode_message(&message, &raw, 0).map(Some)
 }
 
-fn message_for(type_meta: Option<&(String, String)>, resource: &str) -> Option<String> {
+fn message_for(
+    type_meta: Option<&(String, String)>,
+    group: &str,
+    resource: &str,
+) -> Option<String> {
     if let Some((api_version, kind)) = type_meta
         && let Some(name) = message_for_gvk(api_version, kind)
     {
         return Some(name);
     }
     let kind = super::dispatch::kind_name(resource)?;
-    message_for_gvk("v1", kind).or_else(|| message_for_gvk("apps/v1", kind))
+    let api_version = if group.is_empty() {
+        "v1".to_string()
+    } else {
+        format!("{group}/v1")
+    };
+    message_for_gvk(&api_version, kind)
+        .or_else(|| message_for_gvk("v1", kind))
+        .or_else(|| message_for_gvk("apps/v1", kind))
 }
 
 fn message_for_gvk(api_version: &str, kind: &str) -> Option<String> {
@@ -294,7 +308,12 @@ fn decode_type_meta(bytes: &[u8]) -> Option<(String, String)> {
     Some((api_version?, kind?))
 }
 
-fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
+fn decode_message(name: &str, bytes: &[u8], depth: usize) -> Result<Value, ApiserverError> {
+    if depth > MAX_RECURSION_DEPTH {
+        return Err(ApiserverError::BadRequest {
+            message: "kubernetes protobuf exceeds maximum nesting depth".to_string(),
+        });
+    }
     if let Some(value) = decode_special(name, bytes)? {
         return Ok(value);
     }
@@ -310,6 +329,15 @@ fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
             input = skip_wire(input, wire)?;
             continue;
         };
+        if wire == 2 && field.repeated && field.map_value.is_none() && is_packed_scalar(field.kind)
+        {
+            let (chunk, rest) = read_len(input)?;
+            input = rest;
+            for item in decode_packed(field, chunk)? {
+                store_field(&mut object, field, item);
+            }
+            continue;
+        }
         let value = match wire {
             0 => {
                 let (raw, rest) = read_varint(input)?;
@@ -343,7 +371,7 @@ fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
             2 => {
                 let (chunk, rest) = read_len(input)?;
                 input = rest;
-                decode_length(field, chunk)?
+                decode_length(field, chunk, depth + 1)?
             },
             _ => {
                 input = skip_wire(input, wire)?;
@@ -353,6 +381,53 @@ fn decode_message(name: &str, bytes: &[u8]) -> Result<Value, ApiserverError> {
         store_field(&mut object, field, value);
     }
     Ok(Value::Object(object))
+}
+
+const fn is_packed_scalar(kind: WireKind) -> bool {
+    matches!(
+        kind,
+        WireKind::Bool
+            | WireKind::Int32
+            | WireKind::Int64
+            | WireKind::Uint32
+            | WireKind::Uint64
+            | WireKind::Sint32
+            | WireKind::Sint64
+            | WireKind::Float
+            | WireKind::Double
+            | WireKind::Enum
+    )
+}
+
+fn decode_packed(field: &FieldDef, mut input: &[u8]) -> Result<Vec<Value>, ApiserverError> {
+    let mut values = Vec::new();
+    while !input.is_empty() {
+        let value = match field.kind {
+            WireKind::Double => {
+                if input.len() < 8 {
+                    return Err(truncated());
+                }
+                let raw = u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8]));
+                input = &input[8..];
+                json!(f64::from_bits(raw))
+            },
+            WireKind::Float => {
+                if input.len() < 4 {
+                    return Err(truncated());
+                }
+                let raw = u32::from_le_bytes(input[..4].try_into().unwrap_or([0; 4]));
+                input = &input[4..];
+                json!(f32::from_bits(raw))
+            },
+            _ => {
+                let (raw, rest) = read_varint(input)?;
+                input = rest;
+                decode_varint(field, raw)
+            },
+        };
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverError> {
@@ -369,7 +444,11 @@ fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverEr
             Ok(Some(json!(rfc3339(seconds, nanos))))
         },
         "k8s.io.apimachinery.pkg.util.intstr.IntOrString" => {
+            let kind = varint_field(bytes, 1);
             let text = string_field(bytes, 3);
+            if kind == Some(1) {
+                return Ok(Some(text.unwrap_or_else(|| json!(""))));
+            }
             if let Some(Value::String(value)) = text
                 && !value.is_empty()
             {
@@ -404,19 +483,19 @@ fn decode_varint(field: &FieldDef, raw: u64) -> Value {
     }
 }
 
-fn decode_length(field: &FieldDef, chunk: &[u8]) -> Result<Value, ApiserverError> {
+fn decode_length(field: &FieldDef, chunk: &[u8], depth: usize) -> Result<Value, ApiserverError> {
     if field.map_value.is_some() {
-        return decode_map_entry(field, chunk);
+        return decode_map_entry(field, chunk, depth);
     }
     match field.kind {
         WireKind::String => Ok(Value::String(String::from_utf8_lossy(chunk).into_owned())),
         WireKind::Bytes => Ok(Value::String(base64(chunk))),
-        WireKind::Message => decode_message(field.type_name, chunk),
+        WireKind::Message => decode_message(field.type_name, chunk, depth),
         _ => Ok(json!(String::from_utf8_lossy(chunk))),
     }
 }
 
-fn decode_map_entry(field: &FieldDef, chunk: &[u8]) -> Result<Value, ApiserverError> {
+fn decode_map_entry(field: &FieldDef, chunk: &[u8], depth: usize) -> Result<Value, ApiserverError> {
     let mut input = chunk;
     let mut key = String::new();
     let mut value = Value::Null;
@@ -440,7 +519,7 @@ fn decode_map_entry(field: &FieldDef, chunk: &[u8]) -> Result<Value, ApiserverEr
                         },
                         Some(WireKind::Bytes) => Value::String(base64(bytes)),
                         Some(WireKind::Message) | None => {
-                            decode_message(field.map_value_type, bytes)?
+                            decode_message(field.map_value_type, bytes, depth)?
                         },
                         Some(_) => json!(String::from_utf8_lossy(bytes)),
                     }
@@ -663,7 +742,7 @@ fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_k8s_protobuf;
+    use super::{MAX_RECURSION_DEPTH, decode_k8s_protobuf, decode_message};
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -712,7 +791,7 @@ mod tests {
         spec.extend(length_delimited(1, &port));
         let mut service = length_delimited(1, &metadata);
         service.extend(length_delimited(2, &spec));
-        let decoded = decode_k8s_protobuf(&wrap("Service", &service), "services")
+        let decoded = decode_k8s_protobuf(&wrap("Service", &service), "", "services")
             .expect("decode")
             .expect("service schema");
         assert_eq!(decoded["metadata"]["name"], "test");
@@ -735,7 +814,7 @@ mod tests {
         unknown.extend(length_delimited(2, &cronjob));
         let mut body = b"k8s\x00".to_vec();
         body.extend(unknown);
-        let decoded = decode_k8s_protobuf(&body, "cronjobs")
+        let decoded = decode_k8s_protobuf(&body, "batch", "cronjobs")
             .expect("decode")
             .expect("cronjob schema");
         assert_eq!(decoded["spec"]["suspend"], true);
@@ -755,7 +834,7 @@ mod tests {
         unknown.extend(length_delimited(2, &bundle));
         let mut body = b"k8s\x00".to_vec();
         body.extend(unknown);
-        let decoded = decode_k8s_protobuf(&body, "clustertrustbundles")
+        let decoded = decode_k8s_protobuf(&body, "certificates.k8s.io", "clustertrustbundles")
             .expect("decode")
             .expect("clustertrustbundle schema");
         assert_eq!(decoded["metadata"]["name"], "example-bundle");
@@ -764,5 +843,56 @@ mod tests {
             decoded["spec"]["trustBundle"],
             "-----BEGIN CERTIFICATE-----\n"
         );
+    }
+
+    #[test]
+    fn protobuf_int_or_string_preserves_empty_string_when_type_is_string() {
+        let metadata = string_field(1, "test-svc");
+        let mut target_port = varint(1 << 3);
+        target_port.extend(varint(1)); // type = 1 (string)
+        let mut port = string_field(1, "http");
+        port.extend(varint(3 << 3));
+        port.extend(varint(80));
+        port.extend(length_delimited(4, &target_port));
+        let spec = length_delimited(1, &port);
+        let mut service = length_delimited(1, &metadata);
+        service.extend(length_delimited(2, &spec));
+        let decoded = decode_k8s_protobuf(&wrap("Service", &service), "", "services")
+            .expect("decode")
+            .expect("service schema");
+        assert_eq!(decoded["spec"]["ports"][0]["targetPort"], "");
+    }
+
+    #[test]
+    fn protobuf_packed_repeated_scalars_decode() {
+        let mut packed = varint(1000);
+        packed.extend(varint(2000));
+        let security_context = length_delimited(4, &packed); // PodSecurityContext.supplementalGroups = field 4
+        let spec = length_delimited(14, &security_context); // PodSpec.securityContext = field 14
+        let mut pod = length_delimited(1, &string_field(1, "packed-pod"));
+        pod.extend(length_delimited(2, &spec));
+        let decoded = decode_k8s_protobuf(&wrap("Pod", &pod), "", "pods")
+            .expect("decode")
+            .expect("pod schema");
+        assert_eq!(
+            decoded["spec"]["securityContext"]["supplementalGroups"],
+            serde_json::json!([1000, 2000])
+        );
+    }
+
+    #[test]
+    fn protobuf_rejects_excessive_nesting_depth() {
+        // JSONSchemaProps.not (field 28) is self-referential.
+        let mut nested = string_field(1, "leaf");
+        for _ in 0..(MAX_RECURSION_DEPTH + 4) {
+            nested = length_delimited(28, &nested);
+        }
+        let err = decode_message(
+            "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+            &nested,
+            0,
+        )
+        .expect_err("deep nesting must be rejected");
+        assert!(err.to_string().contains("maximum nesting depth"));
     }
 }

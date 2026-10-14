@@ -92,13 +92,14 @@ impl Cluster {
             "/tmp",
             "--tmpfs",
             "/run",
-            "-v",
-            "/lib/modules:/lib/modules:ro",
             "-p",
             "127.0.0.1::6443",
             "--entrypoint",
             "/bin/sh",
         ]);
+        if std::path::Path::new("/lib/modules").exists() {
+            run.args(["-v", "/lib/modules:/lib/modules:ro"]);
+        }
         if !cfg!(target_os = "macos") {
             run.args(["--security-opt", "apparmor=unconfined"]);
         }
@@ -191,19 +192,26 @@ impl Cluster {
 }
 
 fn find_podman() -> Result<PathBuf, String> {
+    let engine = std::env::var("CONTAINER_ENGINE").unwrap_or_else(|_| "podman".to_string());
+    let engine_path = PathBuf::from(&engine);
+    if engine_path.components().count() > 1 && engine_path.is_file() {
+        return Ok(engine_path);
+    }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("podman");
+            let candidate = dir.join(&engine);
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
     }
     let fallback = PathBuf::from("/opt/podman/bin/podman");
-    if fallback.is_file() {
+    if engine == "podman" && fallback.is_file() {
         return Ok(fallback);
     }
-    Err("podman is not on PATH or at /opt/podman/bin/podman".into())
+    Err(format!(
+        "{engine} is not on PATH or at /opt/podman/bin/podman"
+    ))
 }
 
 fn rewrite_server(yaml: &str, port: u16) -> String {

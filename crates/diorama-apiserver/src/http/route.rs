@@ -46,9 +46,16 @@ pub(crate) fn parse(path: &str) -> Route {
             group: (*group).to_string(),
             version: (*version).to_string(),
         },
-        ["apis", group, "v1", rest @ ..] => parse_resource(group, rest),
+        ["apis", group, version, rest @ ..] if is_api_version(version) => {
+            parse_resource(group, rest)
+        },
         _ => Route::NotFound,
     }
+}
+
+fn is_api_version(version: &str) -> bool {
+    let mut chars = version.chars();
+    matches!(chars.next(), Some('v')) && chars.next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
 fn parse_resource(group: &str, parts: &[&str]) -> Route {

@@ -14,12 +14,27 @@ case "$(uname -m)" in
         ;;
 esac
 
+engine=${CONTAINER_ENGINE:-podman}
+image=${IMAGE:-localhost/diorama:latest}
+
 export PATH="${HOME}/.cargo/bin:${PATH}"
 cd "$root"
-cargo build --locked --target "$target" -p diorama
+if ! cargo build --locked --target "$target" -p diorama; then
+    if [ "$(uname -s)" != "Linux" ]; then
+        printf 'host musl build failed on %s; run "make image-source" to compile inside the container\n' "$(uname -s)" >&2
+    fi
+    exit 1
+fi
 
 mkdir -p "$root/dist"
 cp "$root/target/$target/debug/diorama" "$root/dist/diorama"
 chmod +x "$root/dist/diorama"
 
-exec podman build --ignorefile "$root/container/.dockerignore" -t diorama -f "$root/container/Dockerfile" "$root"
+case "$engine" in
+    *podman*)
+        exec "$engine" build --ignorefile "$root/container/.dockerignore" -t "$image" -f "$root/container/Dockerfile" "$root"
+        ;;
+    *)
+        exec "$engine" build -t "$image" -f "$root/container/Dockerfile" "$root"
+        ;;
+esac
