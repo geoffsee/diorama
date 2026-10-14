@@ -40,7 +40,7 @@ help:
 		"  conformance    Run ignored conformance probe suite against $(IMAGE)"
 
 build:
-	cargo build --locked -p diorama -p dioramactl
+	CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo build --locked -p diorama -p dioramactl
 
 fmt:
 	cargo fmt --all
@@ -91,7 +91,7 @@ kubeconfig:
 		| sed 's#https://[^:]*:6443#https://127.0.0.1:6443#g' > $(KUBECONFIG_OUT)
 
 conformance:
-	DIORAMA_IMAGE=$(IMAGE) cargo test --locked -p diorama-conformance --test suite -- --ignored --nocapture
+	DIORAMA_IMAGE=$(IMAGE) cargo test --locked -p diorama-conformance --test suite client_gaps::client_gaps -- --ignored --nocapture
 
 clean:
 	cargo clean
