@@ -470,10 +470,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "diorama-config",
  "diorama-datastore",
  "diorama-pki",
- "diorama-platform",
  "diorama-supervisor",
  "futures-util",
  "http",
@@ -540,7 +538,6 @@ dependencies = [
  "diorama-config",
  "diorama-containerd-api",
  "diorama-cri",
- "diorama-network",
  "diorama-platform",
  "diorama-supervisor",
  "hyper-util",
@@ -571,7 +568,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "diorama-apiserver",
- "diorama-config",
  "diorama-datastore",
  "diorama-pki",
  "diorama-supervisor",
@@ -579,7 +575,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "k8s-openapi",
  "serde",
  "serde_json",
  "tempfile",
@@ -635,7 +630,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "diorama-apiserver",
- "diorama-config",
  "diorama-datastore",
  "diorama-pki",
  "diorama-supervisor",
@@ -704,13 +698,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "diorama-apiserver",
- "diorama-config",
  "diorama-datastore",
  "diorama-network",
  "diorama-pki",
  "diorama-supervisor",
  "http",
- "k8s-openapi",
  "serde",
  "serde_json",
  "tempfile",
@@ -773,7 +765,6 @@ dependencies = [
  "diorama-network",
  "diorama-pki",
  "diorama-supervisor",
- "k8s-openapi",
  "rustix",
  "serde",
  "serde_json",
@@ -1927,9 +1918,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
