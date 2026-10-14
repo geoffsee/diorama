@@ -426,7 +426,10 @@ fn smoke_check_layout_all_16_node_cells() {
         .expect("smoke check layout");
 
         // Verify assets materialized
-        assert!(!outcome.assets.is_empty());
+        assert_ne!(
+            outcome.assets,
+            Vec::<diorama_assets::MaterializedAsset>::new()
+        );
         for asset in outcome.assets {
             assert!(asset.path.exists());
             if asset.path.to_str().unwrap().contains("bin/")

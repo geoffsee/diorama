@@ -1131,7 +1131,7 @@ mod tests {
                 .to_string()
                 .contains("another upgrade or cleanup owns")
         );
-        assert!(host.log.is_empty());
+        assert_eq!(host.log, Vec::<String>::new());
         assert!(exists(data.path(), "kine/db"));
         drop(retained);
         reset_after_test_child_releases_lock(data.path()).unwrap();

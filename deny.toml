@@ -23,7 +23,17 @@ deny = [
     { crate = "native-tls", use-instead = "rustls" },
     { crate = "git2", use-instead = "gix" },
 ]
-skip = [{ name = "base64" }, { name = "syn" }, { name = "untrusted" }]
+skip = [
+    { name = "base64" },
+    { name = "syn" },
+    { name = "untrusted" },
+    # kube 4.2 pulls ring, sha1, and tungstenite beside the workspace sha2 0.11 stack.
+    { name = "block-buffer" },
+    { name = "cpufeatures" },
+    { name = "crypto-common" },
+    { name = "digest" },
+    { name = "getrandom" },
+]
 skip-tree = []
 
 [bans.std-replacements]

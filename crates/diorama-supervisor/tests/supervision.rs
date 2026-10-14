@@ -112,8 +112,8 @@ async fn dependencies_wait_for_usable_readiness_and_timeout_starts_at_launch() {
         .run(receiver)
         .await;
     assert_eq!(*observations.lock().unwrap(), [Duration::from_secs(10)]);
-    assert!(report.failures.is_empty());
-    assert!(report.cleanup_failures.is_empty());
+    assert_eq!(report.failures, []);
+    assert_eq!(report.cleanup_failures, []);
     assert_eq!(report.cause, StopCause::Requested);
 }
 #[tokio::test(start_paused = true)]
@@ -235,7 +235,7 @@ async fn readiness_just_before_deadline_succeeds() {
         cooperative(context).await
     });
     let report = Supervisor::new(vec![adapter]).unwrap().run(receiver).await;
-    assert!(report.failures.is_empty());
+    assert_eq!(report.failures, []);
 }
 #[tokio::test(start_paused = true)]
 async fn worker_failure_has_no_self_wait_and_preserves_primary_over_cleanup_error() {
@@ -305,7 +305,7 @@ async fn optional_failure_leaves_unrelated_ready_component_running() {
     assert_eq!(report.cause, StopCause::Requested);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].component, "optional");
-    assert!(report.cleanup_failures.is_empty());
+    assert_eq!(report.cleanup_failures, []);
 }
 #[tokio::test(start_paused = true)]
 async fn preexisting_and_repeated_stop_never_start_adapters() {
@@ -354,7 +354,7 @@ async fn partial_startup_stops_active_adapter_and_blocks_waiting_dependent() {
         .await;
     request.await.unwrap();
     assert_eq!(*observed.lock().unwrap(), ["started", "stopped"]);
-    assert!(report.failures.is_empty());
+    assert_eq!(report.failures, []);
 }
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_transitive_dependents_before_provider() {
@@ -398,7 +398,7 @@ async fn shutdown_waits_for_transitive_dependents_before_provider() {
         .run(receiver)
         .await;
     assert_eq!(*log.lock().unwrap(), ["consumer", "provider"]);
-    assert!(report.cleanup_failures.is_empty());
+    assert_eq!(report.cleanup_failures, []);
 }
 #[tokio::test(start_paused = true)]
 async fn stalled_shutdown_uses_one_global_budget_and_joins_aborted_futures() {

@@ -777,7 +777,7 @@ fn malformed_successful_api_document_is_not_echoed_in_diagnostics() {
     let diagnostic = String::from_utf8(stderr).unwrap();
     assert!(diagnostic.contains("invalid configuration document"));
     assert!(!diagnostic.contains("private-review-marker"));
-    assert!(stdout.is_empty());
+    assert_eq!(stdout, <[u8; 0]>::default());
     server.join().unwrap();
 }
 

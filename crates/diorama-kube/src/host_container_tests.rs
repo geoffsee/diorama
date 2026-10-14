@@ -131,7 +131,10 @@ fn controller_tokens_reject_operations_duplicates_and_bounds() {
         parse_controllers(names.as_bytes()),
         Err(ContainerError::TooLarge)
     );
-    assert!(parse_controllers(b" \n").unwrap().is_empty());
+    assert_eq!(
+        parse_controllers(b" \n").unwrap(),
+        <[ControllerName; 0]>::default()
+    );
 }
 #[tokio::test]
 async fn ordered_effects_use_independent_controller_readback() {
@@ -140,7 +143,7 @@ async fn ordered_effects_use_independent_controller_readback() {
     let report = run(fake).await;
     assert_eq!(report.status, ContainerStatus::Completed);
     assert!(report.shared_effects_possible);
-    assert!(report.missing_after.is_empty());
+    assert_eq!(report.missing_after, <[ControllerName; 0]>::default());
     assert_eq!(
         trace.lock().unwrap().calls,
         [
@@ -230,7 +233,10 @@ async fn migration_requires_observed_membership_before_delegation() {
         }
     );
     assert_eq!(trace.lock().unwrap().calls.last(), Some(&"migrate"));
-    assert!(report.controller_attempts.is_empty());
+    assert_eq!(
+        report.controller_attempts,
+        <[ControllerAttempt; 0]>::default()
+    );
 }
 #[tokio::test]
 async fn bulk_and_individual_failures_continue_with_truthful_partial_readback() {
@@ -385,7 +391,7 @@ async fn initially_ready_cancellation_never_acquires_a_session() {
     )
     .await;
     assert_eq!(report.status, ContainerStatus::Cancelled);
-    assert!(trace.lock().unwrap().calls.is_empty());
+    assert_eq!(trace.lock().unwrap().calls, <[&str; 0]>::default());
     assert!(!report.shared_effects_possible);
 }
 

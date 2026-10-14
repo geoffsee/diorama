@@ -68,7 +68,10 @@ async fn test_endpointslice_addition_and_latency_bound() {
         .get("endpoints")
         .and_then(Value::as_array)
         .unwrap();
-    assert!(endpoints.is_empty());
+    assert_eq!(
+        endpoints.as_slice(),
+        <[serde_json::Value; 0]>::default().as_slice()
+    );
 
     // Add Pod 1 and measure latency bound (< 500ms << historical 5s batch delay)
     let pod1 = json!({
@@ -175,12 +178,13 @@ async fn test_endpointslice_readiness_churn_and_cascading_gc() {
     wm.reconcile_namespace(ns).await.unwrap();
 
     let slice = client.get_endpointslice(ns, "web-svc-1").await.unwrap();
-    assert!(
+    assert_eq!(
         slice
             .get("endpoints")
             .and_then(Value::as_array)
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        <[serde_json::Value; 0]>::default().as_slice()
     );
 
     // Delete Service: cascading garbage collection removes EndpointSlice and Endpoints
@@ -309,7 +313,7 @@ async fn test_service_without_selector_is_skipped() {
     let summary = wm.reconcile_namespace(ns).await.unwrap();
     assert_eq!(summary.endpointslices_reconciled, 0);
     assert_eq!(summary.endpoints_reconciled, 0);
-    assert!(summary.errors.is_empty());
+    assert_eq!(summary.errors, <[String; 0]>::default());
 
     assert!(
         client

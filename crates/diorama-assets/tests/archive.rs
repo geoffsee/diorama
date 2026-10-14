@@ -128,7 +128,8 @@ fn manifest_may_precede_members_and_null_or_empty_tags_are_metadata_only() {
         tar.extend(entry(&format!("{}.tar.gz", hex(b"abc")), b"abc"));
         tar.extend(entry(&format!("sha256:{}", hex(&c)), &c));
         tar.extend([0; 1024]);
-        assert!(inspect_tar(&tar).unwrap().repo_tags().is_empty());
+        let empty: &[String] = &[];
+        assert_eq!(inspect_tar(&tar).unwrap().repo_tags(), empty);
     }
 }
 #[test]

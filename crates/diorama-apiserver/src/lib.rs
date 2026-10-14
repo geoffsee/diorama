@@ -1,8 +1,13 @@
+/// Kubernetes release reported by `/version` and the node `kubeletVersion`.
+/// Sonobuoy selects `registry.k8s.io/conformance:<version>` from that value.
+pub const KUBERNETES_VERSION: &str = "v1.37.1";
+
 pub mod admission;
 pub mod aggregation;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod exec;
 pub mod health;
 mod http;
 pub mod logs;
@@ -33,6 +38,7 @@ pub use config::{
     parse_port_range,
 };
 pub use error::ApiserverError;
+pub use exec::{PodExec, PodExecOptions, PodExecResult};
 pub use health::{HealthReport, check_apiserver_readiness};
 pub use logs::{PodLogOptions, PodLogReader};
 pub use pki::validate_pki_prerequisites;

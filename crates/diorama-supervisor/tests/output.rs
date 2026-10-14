@@ -50,7 +50,7 @@ fn assert_capture(mode: &str, captured: &diorama_supervisor::process::CapturedOu
     assert!(captured.bytes().len() <= if mode == "simultaneous" { 2000 } else { 64 });
     match mode {
         "merged" => assert_eq!(captured.bytes(), b"out\xfferr\x00"),
-        "empty" | "missing" => assert!(captured.bytes().is_empty()),
+        "empty" | "missing" => assert_eq!(captured.bytes(), []),
         "exact" | "overflow" | "flood" => assert_eq!(captured.bytes(), &[b'x'; 64]),
         "simultaneous" => {
             let mut sorted = captured.bytes().to_vec();

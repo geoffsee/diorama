@@ -26,7 +26,7 @@ provide an end-to-end node startup or general installer.
 ## Getting started
 
 For development, use Git and a Rust installation that honors
-[rust-toolchain.toml](rust-toolchain.toml): Rust 1.97.1 with Clippy and rustfmt.
+[rust-toolchain.toml](rust-toolchain.toml): nightly 2026-10-12 with Clippy, rustfmt, and the Cranelift codegen backend.
 The workspace uses edition 2024 and a committed dependency lockfile.
 
 ```sh

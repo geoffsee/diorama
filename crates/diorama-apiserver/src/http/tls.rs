@@ -19,6 +19,8 @@ pub(crate) struct PeerIdentity {
 }
 
 pub(crate) fn server_config(config: &ApiserverConfig) -> Result<Arc<ServerConfig>, ApiserverError> {
+    // `--all-features` enables both rustls crypto providers. Pick aws-lc once.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client_ca = load_certs(&config.client_ca_file, "client CA")?;
     let mut roots = RootCertStore::empty();
     for cert in client_ca {

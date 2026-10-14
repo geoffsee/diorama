@@ -352,7 +352,10 @@ fn test_iptables_and_nftables_dataplane_rule_synthesis() {
 
     // 1. Test Iptables rule generation
     let iptables_rules = IptablesDataplane::generate_rules(&table);
-    assert!(!iptables_rules.is_empty());
+    assert_ne!(
+        iptables_rules,
+        <[diorama_proxy::IptablesRule; 0]>::default()
+    );
 
     let has_clusterip_rule = iptables_rules.iter().any(|r| {
         r.chain == "KUBE-SERVICES"
@@ -374,7 +377,10 @@ fn test_iptables_and_nftables_dataplane_rule_synthesis() {
 
     // 2. Test Nftables rule generation
     let nftables_rules = NftablesDataplane::generate_rules(&table);
-    assert!(!nftables_rules.is_empty());
+    assert_ne!(
+        nftables_rules,
+        <[diorama_proxy::NftablesRule; 0]>::default()
+    );
 
     let has_nft_clusterip = nftables_rules.iter().any(|r| {
         r.chain == "services"

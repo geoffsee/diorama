@@ -10,6 +10,8 @@ mod apiserver_startup;
 mod auth_rbac;
 #[path = "https_gateway.rs"]
 mod https_gateway;
+#[path = "patch_put_scale.rs"]
+mod patch_put_scale;
 #[path = "service_account_tokens.rs"]
 mod service_account_tokens;
 #[path = "service_allocation.rs"]

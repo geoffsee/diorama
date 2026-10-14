@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Subject {
@@ -167,6 +168,8 @@ impl RbacAuthorizer {
                     "configmaps".to_string(),
                     "namespaces".to_string(),
                     "pods".to_string(),
+                    "pods/log".to_string(),
+                    "pods/status".to_string(),
                     "services".to_string(),
                 ],
                 resource_names: Vec::new(),
@@ -191,6 +194,9 @@ impl RbacAuthorizer {
                     "configmaps".to_string(),
                     "secrets".to_string(),
                     "pods".to_string(),
+                    "pods/exec".to_string(),
+                    "pods/log".to_string(),
+                    "pods/status".to_string(),
                     "services".to_string(),
                 ],
                 resource_names: Vec::new(),
@@ -364,6 +370,10 @@ impl RbacAuthorizer {
         map.insert(role.name.clone(), role);
     }
 
+    pub fn remove_cluster_role(&self, name: &str) {
+        self.cluster_roles.write().unwrap().remove(name);
+    }
+
     #[must_use]
     pub fn get_cluster_role(&self, name: &str) -> Option<ClusterRole> {
         let map = self.cluster_roles.read().unwrap();
@@ -373,6 +383,10 @@ impl RbacAuthorizer {
     pub fn add_cluster_role_binding(&self, binding: ClusterRoleBinding) {
         let mut map = self.cluster_role_bindings.write().unwrap();
         map.insert(binding.name.clone(), binding);
+    }
+
+    pub fn remove_cluster_role_binding(&self, name: &str) {
+        self.cluster_role_bindings.write().unwrap().remove(name);
     }
 
     #[must_use]
@@ -386,6 +400,13 @@ impl RbacAuthorizer {
         map.insert((role.namespace.clone(), role.name.clone()), role);
     }
 
+    pub fn remove_role(&self, namespace: &str, name: &str) {
+        self.roles
+            .write()
+            .unwrap()
+            .remove(&(namespace.to_string(), name.to_string()));
+    }
+
     #[must_use]
     pub fn get_role(&self, namespace: &str, name: &str) -> Option<Role> {
         let map = self.roles.read().unwrap();
@@ -395,6 +416,57 @@ impl RbacAuthorizer {
     pub fn add_role_binding(&self, binding: RoleBinding) {
         let mut map = self.role_bindings.write().unwrap();
         map.insert((binding.namespace.clone(), binding.name.clone()), binding);
+    }
+
+    pub fn remove_role_binding(&self, namespace: &str, name: &str) {
+        self.role_bindings
+            .write()
+            .unwrap()
+            .remove(&(namespace.to_string(), name.to_string()));
+    }
+
+    /// Installs one Kubernetes RBAC object, as stored by the HTTP API, into the authorizer.
+    pub fn apply_api_object(
+        &self,
+        plural: &str,
+        namespace: Option<&str>,
+        doc: &Value,
+    ) -> Result<(), String> {
+        match plural {
+            "clusterroles" => self.add_cluster_role(cluster_role_from_api(doc)?),
+            "clusterrolebindings" => {
+                self.add_cluster_role_binding(cluster_role_binding_from_api(doc)?);
+            },
+            "roles" => {
+                let namespace = object_namespace(namespace, doc)?;
+                self.add_role(role_from_api(namespace, doc)?);
+            },
+            "rolebindings" => {
+                let namespace = object_namespace(namespace, doc)?;
+                self.add_role_binding(role_binding_from_api(namespace, doc)?);
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// Drops one Kubernetes RBAC object from the authorizer after it is deleted.
+    pub fn forget_api_object(&self, plural: &str, namespace: Option<&str>, name: &str) {
+        match plural {
+            "clusterroles" => self.remove_cluster_role(name),
+            "clusterrolebindings" => self.remove_cluster_role_binding(name),
+            "roles" => {
+                if let Some(namespace) = namespace {
+                    self.remove_role(namespace, name);
+                }
+            },
+            "rolebindings" => {
+                if let Some(namespace) = namespace {
+                    self.remove_role_binding(namespace, name);
+                }
+            },
+            _ => {},
+        }
     }
 
     #[must_use]
@@ -433,6 +505,138 @@ impl RbacAuthorizer {
 
         false
     }
+}
+
+fn object_name(doc: &Value) -> Result<&str, String> {
+    doc.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "metadata.name is required".to_string())
+}
+
+fn object_namespace<'a>(namespace: Option<&'a str>, doc: &'a Value) -> Result<&'a str, String> {
+    namespace
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            doc.pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| "metadata.namespace is required".to_string())
+}
+
+fn string_list(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn rules_from_api(doc: &Value) -> Result<Vec<PolicyRule>, String> {
+    let Some(rules) = doc.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = rules
+        .as_array()
+        .ok_or_else(|| "rules must be an array".to_string())?;
+    Ok(rules
+        .iter()
+        .map(|rule| PolicyRule {
+            verbs: string_list(rule, "verbs"),
+            api_groups: string_list(rule, "apiGroups"),
+            resources: string_list(rule, "resources"),
+            resource_names: string_list(rule, "resourceNames"),
+            non_resource_urls: string_list(rule, "nonResourceURLs"),
+        })
+        .collect())
+}
+
+fn subjects_from_api(doc: &Value) -> Result<Vec<Subject>, String> {
+    let Some(subjects) = doc.get("subjects") else {
+        return Ok(Vec::new());
+    };
+    let subjects = subjects
+        .as_array()
+        .ok_or_else(|| "subjects must be an array".to_string())?;
+    let mut parsed = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        let kind = subject.get("kind").and_then(Value::as_str).unwrap_or("");
+        let name = subject
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "subject name is required".to_string())?;
+        match kind {
+            "User" => parsed.push(Subject::User {
+                name: name.to_string(),
+            }),
+            "Group" => parsed.push(Subject::Group {
+                name: name.to_string(),
+            }),
+            "ServiceAccount" => {
+                let namespace = subject
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|namespace| !namespace.is_empty())
+                    .ok_or_else(|| "ServiceAccount subject requires a namespace".to_string())?;
+                parsed.push(Subject::ServiceAccount {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                });
+            },
+            other => {
+                return Err(format!("unsupported subject kind '{other}'"));
+            },
+        }
+    }
+    Ok(parsed)
+}
+
+fn role_ref_name(doc: &Value) -> Result<String, String> {
+    doc.pointer("/roleRef/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "roleRef.name is required".to_string())
+}
+
+pub(crate) fn cluster_role_from_api(doc: &Value) -> Result<ClusterRole, String> {
+    Ok(ClusterRole {
+        name: object_name(doc)?.to_string(),
+        rules: rules_from_api(doc)?,
+    })
+}
+
+pub(crate) fn cluster_role_binding_from_api(doc: &Value) -> Result<ClusterRoleBinding, String> {
+    Ok(ClusterRoleBinding {
+        name: object_name(doc)?.to_string(),
+        role_ref: role_ref_name(doc)?,
+        subjects: subjects_from_api(doc)?,
+    })
+}
+
+pub(crate) fn role_from_api(namespace: &str, doc: &Value) -> Result<Role, String> {
+    Ok(Role {
+        namespace: namespace.to_string(),
+        name: object_name(doc)?.to_string(),
+        rules: rules_from_api(doc)?,
+    })
+}
+
+pub(crate) fn role_binding_from_api(namespace: &str, doc: &Value) -> Result<RoleBinding, String> {
+    Ok(RoleBinding {
+        namespace: namespace.to_string(),
+        name: object_name(doc)?.to_string(),
+        role_ref: role_ref_name(doc)?,
+        subjects: subjects_from_api(doc)?,
+    })
 }
 
 fn evaluate_cluster_role_binding(
@@ -482,6 +686,8 @@ fn rule_allows(rules: &[PolicyRule], req: &AuthzRequest<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{AuthzRequest, RbacAuthorizer};
 
     fn request<'a>(verb: &'a str, api_group: &'a str, resource: &'a str) -> AuthzRequest<'a> {
@@ -502,5 +708,54 @@ mod tests {
         assert!(authorizer.authorize(&request("list", "", "services")));
         assert!(authorizer.authorize(&request("watch", "discovery.k8s.io", "endpointslices")));
         assert!(!authorizer.authorize(&request("list", "", "secrets")));
+    }
+
+    #[test]
+    fn api_cluster_role_binding_grants_a_service_account() {
+        let authorizer = RbacAuthorizer::new();
+        let role = json!({
+            "metadata": {"name": "sonobuoy-serviceaccount-sonobuoy"},
+            "rules": [
+                {"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]},
+                {"nonResourceURLs": ["/metrics"], "verbs": ["get"]}
+            ]
+        });
+        let binding = json!({
+            "metadata": {"name": "sonobuoy-serviceaccount-sonobuoy"},
+            "roleRef": {"kind": "ClusterRole", "name": "sonobuoy-serviceaccount-sonobuoy"},
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": "sonobuoy-serviceaccount",
+                "namespace": "sonobuoy"
+            }]
+        });
+        authorizer
+            .apply_api_object("clusterroles", None, &role)
+            .expect("role");
+        authorizer
+            .apply_api_object("clusterrolebindings", None, &binding)
+            .expect("binding");
+
+        let groups = [
+            "system:serviceaccounts".to_string(),
+            "system:serviceaccounts:sonobuoy".to_string(),
+        ];
+        let allowed = AuthzRequest {
+            username: "system:serviceaccount:sonobuoy:sonobuoy-serviceaccount",
+            groups: &groups,
+            verb: "list",
+            api_group: "",
+            resource: "pods",
+            namespace: Some("sonobuoy"),
+            resource_name: None,
+        };
+        assert!(authorizer.authorize(&allowed));
+
+        authorizer.forget_api_object(
+            "clusterrolebindings",
+            None,
+            "sonobuoy-serviceaccount-sonobuoy",
+        );
+        assert!(!authorizer.authorize(&allowed));
     }
 }

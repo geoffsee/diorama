@@ -140,7 +140,10 @@ async fn admin_certificate_serves_namespace_crud_and_rejects_anonymous() {
 
     let (status, body) = request(addr, &pki, true, "GET", "/version", "").await;
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains("v1.35.7"), "{body}");
+    assert!(
+        body.contains(diorama_apiserver::KUBERNETES_VERSION),
+        "{body}"
+    );
 
     let (status, body) = request(
         addr,

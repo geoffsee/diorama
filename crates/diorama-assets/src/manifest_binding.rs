@@ -285,7 +285,7 @@ fn descriptor(value: &Value) -> Result<Descriptor<'_>, ManifestBindingError> {
         return Err(ManifestBindingError::Descriptor);
     }
     let mut digest = [0; 32];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let nibble = |b| match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),

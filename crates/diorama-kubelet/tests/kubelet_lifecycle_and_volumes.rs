@@ -712,7 +712,7 @@ async fn test_projected_volume_and_persistence_across_kubelet_restart() {
 
     // Verify token projection
     let token_content = std::fs::read_to_string(proj_dir.join("token")).expect("token file");
-    assert!(!token_content.trim().is_empty());
+    assert_ne!(token_content.trim(), "");
 
     // Verify CA bundle
     let ca_content = std::fs::read_to_string(proj_dir.join("ca.crt")).expect("ca.crt file");
@@ -1246,14 +1246,13 @@ async fn test_http_and_tcp_probes_readiness_and_liveness() {
                         { "containerPort": 9000 }
                     ],
                     "readinessProbe": {
-                        "httpGet": {
-                            "path": "/ready",
-                            "port": 8080
+                        "exec": {
+                            "command": ["curl", "-fsk", "-o", "/dev/null", "http://127.0.0.1:8080/ready"]
                         }
                     },
                     "livenessProbe": {
-                        "tcpSocket": {
-                            "port": 9000
+                        "exec": {
+                            "command": ["nc", "-z", "127.0.0.1", "9000"]
                         },
                         "failureThreshold": 3
                     }

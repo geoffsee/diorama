@@ -1059,6 +1059,9 @@ mod tests {
             cri::PodSandboxState::SandboxNotready as i32
         );
         adapter.remove_pod_sandbox(&sandbox_id).await.unwrap();
-        assert!(adapter.list_pod_sandbox(None).await.unwrap().is_empty());
+        assert_eq!(
+            adapter.list_pod_sandbox(None).await.unwrap(),
+            <[diorama_cri::runtime::v1::PodSandbox; 0]>::default()
+        );
     }
 }

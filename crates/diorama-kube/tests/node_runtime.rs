@@ -159,7 +159,7 @@ async fn test_optional_failure_against_healthy_kubernetes_api() {
             "flaky-addon",
             vec![COMPONENT_APISERVER.to_string()],
             ClosureAdapter(move |mut context: AdapterContext| async move {
-                assert!(!secret_clone.is_empty());
+                assert_ne!(secret_clone, "");
                 // Mark ready briefly then fail to simulate an optional degradation
                 context.ready();
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -257,7 +257,7 @@ async fn test_fatal_core_failure_terminates_supervisor_and_cancels_dependents() 
             "broken-core-db",
             vec![],
             ClosureAdapter(move |_context: AdapterContext| async move {
-                assert!(!secret.is_empty());
+                assert_ne!(secret, "");
                 Err(AdapterError {
                     code: "database_corruption_detected",
                 })
@@ -322,7 +322,7 @@ async fn test_slow_startup_deadline_timeout_produces_secret_safe_diagnostics() {
     let reg = Registration::new(
         spec,
         ClosureAdapter(move |_context: AdapterContext| async move {
-            assert!(!secret.is_empty());
+            assert_ne!(secret, "");
             // Intentionally sleep past the startup deadline without calling context.ready()
             tokio::time::sleep(Duration::from_millis(500)).await;
             Ok(())
@@ -839,7 +839,10 @@ async fn test_portainer_optional_failure_degrades_supervisor_gracefully() {
         .await
         .expect("apiserver is alive and responding");
     let namespaces = ns_list["items"].as_array().expect("items array");
-    assert!(!namespaces.is_empty());
+    assert_ne!(
+        namespaces.as_slice(),
+        <[serde_json::Value; 0]>::default().as_slice()
+    );
 
     stop_handle.stop();
     let (report, _, _) = run_handle.await.expect("join runtime");
@@ -869,7 +872,7 @@ async fn test_shutdown_error_preserves_original_cause() {
             "core",
             vec![],
             ClosureAdapter(move |mut ctx: AdapterContext| async move {
-                assert!(!secret.is_empty());
+                assert_ne!(secret, "");
                 ctx.ready();
                 loop {
                     match ctx.changed().await {

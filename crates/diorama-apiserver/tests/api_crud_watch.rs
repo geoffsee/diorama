@@ -170,7 +170,17 @@ async fn authenticated_crud_list_watch_on_configmaps_and_namespaces() {
         .list_configmaps("team-a")
         .await
         .expect("list configmaps");
-    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    let items = list["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item["metadata"]["name"] == "service-cfg")
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["metadata"]["name"] == "kube-root-ca.crt")
+    );
 
     // 7. Delete ConfigMap
     client

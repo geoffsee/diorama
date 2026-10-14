@@ -342,7 +342,10 @@ async fn test_aggregated_apiservice_persistence_and_restore() {
     assert_eq!(fetched["spec"]["group"], "custom.metrics.k8s.io");
 
     let list = admin.list_api_services().await.expect("list APIServices");
-    assert!(!list["items"].as_array().unwrap().is_empty());
+    assert_ne!(
+        list["items"].as_array().unwrap().as_slice(),
+        <[serde_json::Value; 0]>::default().as_slice()
+    );
 
     // Drop service and admin to release lock
     drop(admin);

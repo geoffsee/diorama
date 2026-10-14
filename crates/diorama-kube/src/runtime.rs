@@ -14,7 +14,7 @@ use diorama_apiserver::client::KubernetesApiClient;
 use diorama_apiserver::service::ApiserverService;
 use diorama_apiserver::storage::KubernetesStorage;
 use diorama_apiserver::supervisor::ApiserverAdapter;
-use diorama_apiserver::{ApiserverConfig, PodLogReader};
+use diorama_apiserver::{ApiserverConfig, PodExec, PodLogReader};
 use diorama_config::ValidatedConfig;
 use diorama_containerd::{
     ContainerdPaths, ContainerdService, ContainerdServiceOptions, ImageImportConfig,
@@ -159,6 +159,7 @@ pub struct RuntimeBuilder {
     metrics_registry: Option<Arc<MetricsRegistry>>,
     datastore_bound_addr: Option<Arc<Mutex<Option<SocketAddr>>>>,
     kubelet_log_reader: Option<Arc<dyn PodLogReader>>,
+    kubelet_exec: Option<Arc<dyn PodExec>>,
     registrations: Vec<Registration>,
 }
 
@@ -177,6 +178,7 @@ impl RuntimeBuilder {
             metrics_registry: None,
             datastore_bound_addr: None,
             kubelet_log_reader: None,
+            kubelet_exec: None,
             registrations: Vec::new(),
         }
     }
@@ -217,6 +219,9 @@ impl RuntimeBuilder {
     pub fn with_apiserver(mut self, apiserver: Arc<ApiserverService>) -> Self {
         if let Some(reader) = &self.kubelet_log_reader {
             apiserver.set_pod_log_reader(reader.clone());
+        }
+        if let Some(exec) = &self.kubelet_exec {
+            apiserver.set_pod_exec(exec.clone());
         }
         self.client = Some(apiserver.admin_client());
         self.apiserver = Some(apiserver);
@@ -347,7 +352,8 @@ impl RuntimeBuilder {
     }
 
     /// Registers the in-process kubelet component under supervision and connects
-    /// its log reader to the API server so `kubectl logs` resolves without cyclic references.
+    /// its log reader and exec target to the API server so `kubectl logs` and
+    /// `kubectl exec` resolve without cyclic references.
     #[must_use]
     pub fn register_kubelet(
         mut self,
@@ -359,6 +365,11 @@ impl RuntimeBuilder {
             apiserver.set_pod_log_reader(log_reader.clone());
         }
         self.kubelet_log_reader = Some(log_reader);
+        let exec: Arc<dyn PodExec> = Arc::new(kubelet.exec_source());
+        if let Some(apiserver) = &self.apiserver {
+            apiserver.set_pod_exec(exec.clone());
+        }
+        self.kubelet_exec = Some(exec);
 
         let timeout = self.policy.startup_timeout();
         let reg = KubeletAdapter::registration(

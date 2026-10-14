@@ -76,7 +76,7 @@ async fn test_disposable_backup_restore_round_trip_preserves_records_and_revisio
     assert_eq!(meta.format_version, BACKUP_FORMAT_VERSION);
     assert_eq!(meta.revision, 8);
     assert_eq!(meta.total_keys, 5); // 6 created - 1 deleted = 5 keys
-    assert!(!meta.snapshot_sha256.is_empty());
+    assert_ne!(meta.snapshot_sha256, "");
 
     // Mutate source datastore after backup to demonstrate divergence
     client

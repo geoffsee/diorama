@@ -23,6 +23,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::client::KubernetesApiClient;
 use crate::error::ApiserverError;
+use crate::exec::{PodExecOptions, select_subprotocol, serve_exec};
 use crate::service::ApiserverService;
 
 use super::dispatch::{self, Payload};
@@ -100,19 +101,21 @@ pub(crate) async fn serve(
                     let mut hyper = hyper::server::conn::http1::Builder::new();
                     hyper.timer(TokioTimer::new());
                     hyper.header_read_timeout(Duration::from_secs(30));
-                    let connection = hyper.serve_connection(
-                        io,
-                        service_fn(move |request| {
-                            let service = service.clone();
-                            let peer = peer.clone();
-                            let shutdown_rx = shutdown_rx.clone();
-                            async move {
-                                Ok::<_, Infallible>(
-                                    handle(request, &service, peer.as_ref(), shutdown_rx).await,
-                                )
-                            }
-                        }),
-                    );
+                    let connection = hyper
+                        .serve_connection(
+                            io,
+                            service_fn(move |request| {
+                                let service = service.clone();
+                                let peer = peer.clone();
+                                let shutdown_rx = shutdown_rx.clone();
+                                async move {
+                                    Ok::<_, Infallible>(
+                                        handle(request, &service, peer.as_ref(), shutdown_rx).await,
+                                    )
+                                }
+                            }),
+                        )
+                        .with_upgrades();
                     let _ = connection.await;
                 });
             }
@@ -142,6 +145,12 @@ async fn handle(
     let query = request.uri().query().map(str::to_owned);
     let bearer = bearer_token(&request);
     let client = client_for(service, peer, bearer.as_deref());
+    if is_websocket_upgrade(&request)
+        && let Route::Resource(path) = &route
+        && path.subresource.as_deref() == Some("exec")
+    {
+        return exec_upgrade(request, service, &client, path).await;
+    }
     let accept = request
         .headers()
         .get(header::ACCEPT)
@@ -185,6 +194,9 @@ async fn handle(
         Route::OpenApiV3Index => authenticated_document(&client, crate::openapi::v3_index),
         Route::OpenApiV3Core => authenticated_document(&client, crate::openapi::v3_core),
         Route::OpenApiV3StorageV1 => authenticated_document(&client, crate::openapi::v3_storage_v1),
+        Route::OpenApiV3Group { group, version } => {
+            authenticated_document(&client, || crate::openapi::v3_group(&group, &version))
+        },
         Route::CoreDiscovery => aggregated_or(
             accept.as_deref(),
             || core_aggregated(&client),
@@ -219,6 +231,102 @@ async fn handle(
             }
         },
     }
+}
+
+fn is_websocket_upgrade(request: &Request<Incoming>) -> bool {
+    let upgrade = request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let connection = request
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    upgrade.contains("websocket") && connection.contains("upgrade")
+}
+
+/// Upgrades a pod `exec` request to the channel subprotocol and streams the
+/// command output. Pre-upgrade failures (bad query, missing pod, no kubelet)
+/// are plain HTTP errors so clients fail fast without switching protocols.
+async fn exec_upgrade(
+    request: Request<Incoming>,
+    service: &ApiserverService,
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+) -> Response<Body> {
+    let query = request.uri().query().map(str::to_owned);
+    let options = match PodExecOptions::from_query(query.as_deref()) {
+        Ok(options) => options,
+        Err(err) => return error_response(&err),
+    };
+    let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "exec requires a namespaced pod",
+        );
+    };
+    if let Err(err) = client.authorize_pod_exec(namespace, name) {
+        return error_response(&err);
+    }
+    let pod = match client.get_pod(namespace, name).await {
+        Ok(pod) => pod,
+        Err(err) => return error_response(&err),
+    };
+    let container = match options.resolve_container(&pod) {
+        Ok(container) => container,
+        Err(err) => return error_response(&err),
+    };
+    let Some(exec) = service.pod_exec() else {
+        return error_response(&ApiserverError::Internal {
+            reason: "no kubelet is registered to serve pod exec".to_string(),
+        });
+    };
+    let Some(key) = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "missing Sec-WebSocket-Key",
+        );
+    };
+    let protocol = select_subprotocol(
+        request
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let upgrade = hyper::upgrade::on(request);
+    tokio::spawn(async move {
+        match upgrade.await {
+            Ok(upgraded) => {
+                serve_exec(TokioIo::new(upgraded), exec, pod, options, container).await;
+            },
+            Err(err) => eprintln!("exec upgrade failed: {err}"),
+        }
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header("sec-websocket-accept", accept);
+    if let Some(protocol) = protocol {
+        builder = builder.header("sec-websocket-protocol", protocol);
+    }
+    builder
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap_or_else(|_| {
+            status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", "exec")
+        })
 }
 
 fn outcome_to_response(
@@ -546,12 +654,21 @@ fn object_key(object: &Value) -> String {
 }
 
 fn version() -> Value {
+    let (major, minor) = split_kubernetes_version(crate::KUBERNETES_VERSION);
     json!({
-        "major": "1",
-        "minor": "35",
-        "gitVersion": "v1.35.7",
+        "major": major,
+        "minor": minor,
+        "gitVersion": crate::KUBERNETES_VERSION,
         "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
     })
+}
+
+/// `v1.37.1` splits into major `1` and minor `37`.
+fn split_kubernetes_version(version: &str) -> (&str, &str) {
+    let rest = version.strip_prefix('v').unwrap_or(version);
+    let (major, rest) = rest.split_once('.').unwrap_or((rest, "0"));
+    let minor = rest.split_once('.').map_or(rest, |(minor, _)| minor);
+    (major, minor)
 }
 
 /// Serves a static document to any client that may read core discovery.
@@ -565,13 +682,21 @@ fn authenticated_document(
     }
 }
 
+/// Media type clients use to recognise an aggregated discovery document.
+/// client-go falls back to legacy parsing when this is absent.
+const AGGREGATED_DISCOVERY_TYPE: &str =
+    "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+
 fn aggregated_or(
     accept: Option<&str>,
     aggregated: impl FnOnce() -> Result<Value, ApiserverError>,
     legacy: impl FnOnce() -> Result<Value, ApiserverError>,
 ) -> Response<Body> {
     if wants_aggregated_discovery(accept) {
-        discovery_result(aggregated())
+        match aggregated() {
+            Ok(body) => json_response_with_type(StatusCode::OK, AGGREGATED_DISCOVERY_TYPE, &body),
+            Err(err) => error_response(&err),
+        }
     } else {
         discovery_result(legacy())
     }
@@ -632,6 +757,15 @@ fn groups_aggregated(client: &KubernetesApiClient) -> Result<Value, ApiserverErr
             continue;
         };
         let resources = client.discover_group_resources(name, version)?;
+        // client-go fails the whole discovery when a group lists no resources,
+        // so groups without served kinds are left out of the aggregated view.
+        if resources
+            .get("resources")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            continue;
+        }
         items.push(group_item(name, version, &resources));
     }
     Ok(json!({
@@ -683,6 +817,7 @@ fn group_item(group: &str, version: &str, resources: &Value) -> Value {
         "metadata": { "name": group },
         "versions": [{
             "version": version,
+            "freshness": "Current",
             "resources": entries
         }]
     })
@@ -734,6 +869,20 @@ fn error_response(err: &ApiserverError) -> Response<Body> {
         ApiserverError::Conflict { .. } => (StatusCode::CONFLICT, "AlreadyExists"),
         ApiserverError::BadRequest { .. } | ApiserverError::InvalidInput { .. } => {
             (StatusCode::BAD_REQUEST, "BadRequest")
+        },
+        ApiserverError::Expired { continue_token } => {
+            return json_response(
+                StatusCode::GONE,
+                &json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": { "continue": continue_token },
+                    "status": "Failure",
+                    "message": "The provided continue parameter is too old to display a consistent list result. Start a new list request without the continue token.",
+                    "reason": "Expired",
+                    "code": 410
+                }),
+            );
         },
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     };
@@ -1215,4 +1364,52 @@ fn response(status: StatusCode, content_type: &'static str, bytes: Bytes) -> Res
         .unwrap_or_else(|_| {
             Response::new(Full::new(Bytes::from_static(b"{\"kind\":\"Status\"}")).boxed())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_item;
+    use serde_json::json;
+
+    #[test]
+    fn version_advertises_the_conformance_release() {
+        let body = super::version();
+        assert_eq!(body["major"], "1");
+        assert_eq!(body["minor"], "37");
+        assert_eq!(body["gitVersion"], "v1.37.1");
+        let spec = crate::openapi::v3_group("apps", "v1");
+        assert_eq!(spec["info"]["version"], "v1.37.1");
+    }
+
+    #[test]
+    fn aggregated_discovery_uses_aggregated_media_type() {
+        let response = super::aggregated_or(
+            Some("application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList"),
+            || Ok(json!({ "items": [] })),
+            || Ok(json!({ "groups": [] })),
+        );
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList"
+        );
+        let legacy = super::aggregated_or(None, || Ok(json!({})), || Ok(json!({ "groups": [] })));
+        assert_eq!(legacy.headers()["content-type"], "application/json");
+    }
+
+    #[test]
+    fn aggregated_versions_are_marked_current() {
+        let resources = json!({ "resources": [{
+            "name": "deployments",
+            "singularName": "deployment",
+            "namespaced": true,
+            "kind": "Deployment",
+            "verbs": ["get"]
+        }]});
+        let item = group_item("apps", "v1", &resources);
+        assert_eq!(item["versions"][0]["freshness"], "Current");
+        assert_eq!(
+            item["versions"][0]["resources"][0]["resource"],
+            "deployments"
+        );
+    }
 }

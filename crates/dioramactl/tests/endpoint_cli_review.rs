@@ -77,7 +77,7 @@ fn backup_failure_never_announces_success_for_route_or_remove() {
             )
             .is_err()
         );
-        assert!(stdout.is_empty());
+        assert_eq!(stdout, <[u8; 0]>::default());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), document());
     }
 }
@@ -122,7 +122,7 @@ fn production_cli_inspects_named_container_and_preserves_config_on_engine_failur
     std::fs::write(&docker, "#!/bin/sh\nexit 7\n").unwrap();
     let failure = run();
     assert!(!failure.status.success());
-    assert!(failure.stdout.is_empty());
+    assert_eq!(failure.stdout, <[u8; 0]>::default());
     assert!(String::from_utf8_lossy(&failure.stderr).contains("port inspection failed"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
 }
@@ -145,7 +145,7 @@ fn unknown_endpoint_subcommand_fails_before_read_or_inspection() {
     )
     .unwrap();
     assert_eq!(code, 1);
-    assert!(output.is_empty());
+    assert_eq!(output, <[u8; 0]>::default());
     assert!(String::from_utf8(errors).unwrap().contains("unknown"));
 }
 

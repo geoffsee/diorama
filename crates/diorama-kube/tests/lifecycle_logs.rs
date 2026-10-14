@@ -45,11 +45,17 @@ fn deterministic_jsonl_escaping_debug_filter_and_monotonic_time() {
         "{\"component\":\"line\\n\\\"quote\\\\雪\",\"event\":\"component_state\",\"kind\":\"long_running\",\"level\":\"debug\",\"policy\":\"fatal\",\"schema\":1,\"startup_remaining_ms\":7000,\"state\":\"starting\",\"state_age_ms\":3000}\n"
     );
     assert_eq!(batch.frames[0].as_str().lines().count(), 1);
-    assert!(renderer.render(&state).unwrap().frames.is_empty());
+    assert_eq!(
+        renderer.render(&state).unwrap().frames,
+        <[diorama::lifecycle_logs::LogFrame; 0]>::default()
+    );
     let quiet = LifecycleRenderer::new(LogLevel::from_debug(false))
         .render(&state)
         .unwrap();
-    assert!(quiet.frames.is_empty());
+    assert_eq!(
+        quiet.frames,
+        <[diorama::lifecycle_logs::LogFrame; 0]>::default()
+    );
     assert_eq!(quiet.filtered, 1);
 }
 #[test]
@@ -78,7 +84,10 @@ fn all_thresholds_preserve_severe_records_and_deduplicate_retained_causes() {
         assert_eq!(batch.frames.len(), count);
         assert_eq!(batch.filtered, filtered);
         assert_eq!(values(&batch)[0]["detail_code"], "unavailable");
-        assert!(renderer.render(&state).unwrap().frames.is_empty());
+        assert_eq!(
+            renderer.render(&state).unwrap().frames,
+            <[diorama::lifecycle_logs::LogFrame; 0]>::default()
+        );
     }
 }
 #[test]
@@ -178,7 +187,7 @@ async fn optional_failure_is_logged_while_healthy_worker_answers_without_secret(
     let (ping, mut requests) = mpsc::channel::<oneshot::Sender<()>>(1);
     let secret = "private-adapter-token".to_string();
     let (supervisor,observer)=Supervisor::new(vec![
-        registration("optional",FailurePolicy::Degrade,move |_|async move {failed.await.unwrap();assert!(!secret.is_empty());Err(AdapterError{code:"optional_failed"})}),
+        registration("optional",FailurePolicy::Degrade,move |_|async move {failed.await.unwrap();assert_ne!(secret, "");Err(AdapterError{code:"optional_failed"})}),
         registration("core",FailurePolicy::Fatal,move |mut context|async move {context.ready();loop{tokio::select!{request=requests.recv()=>{request.unwrap().send(()).unwrap();},_=context.changed()=>return Ok(())}}}),
     ]).unwrap().with_observer();
     let (sender, mut receiver) = log_channel(64).unwrap();

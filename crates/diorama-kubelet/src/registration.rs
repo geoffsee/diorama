@@ -117,7 +117,7 @@ impl NodeRegistration {
                     "pods": "110"
                 },
                 "nodeInfo": {
-                    "kubeletVersion": "v1.35.7",
+                    "kubeletVersion": diorama_apiserver::KUBERNETES_VERSION,
                     "containerRuntimeVersion": runtime_version,
                     "operatingSystem": "linux",
                     "architecture": arch,

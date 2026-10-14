@@ -171,6 +171,13 @@ impl ControllerManagerService {
     pub async fn reconcile_all(&self) -> Result<Vec<ReconciliationSummary>, ControllerError> {
         let client = self.client();
         let namespaces = list_active_namespaces(&client).await;
+        // The root-ca publisher keeps kube-root-ca.crt in every namespace.
+        // A missing or edited ConfigMap is repaired on this pass.
+        for namespace in &namespaces {
+            if let Err(err) = client.ensure_kube_root_ca_configmap(namespace).await {
+                tracing::warn!(namespace, error = %err, "root ca publisher failed");
+            }
+        }
         let workload_mgr = self.workload_manager();
         let mut summaries = Vec::new();
         for ns in &namespaces {

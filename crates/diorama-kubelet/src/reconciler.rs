@@ -28,11 +28,11 @@ use crate::status::{
 use crate::workload::{
     ANNOTATION_RESTART_COUNT, CpuManager, ExecResult, LABEL_CONTAINER_NAME, LABEL_MANAGED_BY,
     LABEL_POD_NAME, LABEL_POD_NAMESPACE, LABEL_POD_UID, LogOptions, MANAGED_BY, ReconcileReport,
-    RestartPolicy, RuntimeProvider, WorkloadRestartReport, check_pod_restart_need,
-    container_labels, cri, determine_pod_qos, is_container_cpu_pinning_eligible,
-    parse_cpu_quantity_milli, parse_memory_quantity_bytes, sandbox_labels, secs_from_nanos,
-    stage_configmap_files, stage_projected_downward_api, stage_projected_sa_token,
-    stage_secret_files,
+    RestartPolicy, RuntimeProvider, WorkloadRestartReport, apply_fs_group_ownership,
+    check_pod_restart_need, container_labels, cri, determine_pod_qos,
+    is_container_cpu_pinning_eligible, parse_cpu_quantity_milli, parse_memory_quantity_bytes,
+    pod_fs_group, sandbox_labels, secs_from_nanos, stage_configmap_files,
+    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files,
 };
 
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 10;
@@ -88,6 +88,7 @@ struct SyncContext<'a> {
     pod: &'a Value,
     sandbox_id: &'a str,
     sandbox_config: &'a cri::PodSandboxConfig,
+    pod_ip: Option<String>,
 }
 
 fn container_name_of(container: &Value) -> &str {
@@ -344,23 +345,86 @@ fn sandbox_config_base(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
         }
     }
 
-    cri::PodSandboxConfig {
+    let mut config = cri::PodSandboxConfig {
         metadata: Some(cri::PodSandboxMetadata {
             name: name.to_string(),
             uid: uid.to_string(),
             namespace: namespace.to_string(),
             attempt,
         }),
-        hostname: pod
-            .pointer("/spec/hostname")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string(),
+        // A host-network sandbox joins the node's UTS namespace, and the runtime
+        // rejects a hostname in that case.
+        hostname: if pod_bool(pod, "hostNetwork") {
+            String::new()
+        } else {
+            pod.pointer("/spec/hostname")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_string()
+        },
         log_directory: format!("/var/log/pods/{namespace}_{name}_{uid}"),
         labels: sandbox_labels(namespace, name, uid),
         port_mappings,
         ..cri::PodSandboxConfig::default()
+    };
+    apply_sandbox_linux(pod, &mut config);
+    config
+}
+
+fn pod_bool(pod: &Value, field: &str) -> bool {
+    pod.pointer(&format!("/spec/{field}"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn container_privileged(container: &Value) -> bool {
+    container
+        .pointer("/securityContext/privileged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn pod_runs_privileged(pod: &Value) -> bool {
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+    let init_containers = pod
+        .pointer("/spec/initContainers")
+        .and_then(Value::as_array);
+    containers
+        .into_iter()
+        .flatten()
+        .chain(init_containers.into_iter().flatten())
+        .any(container_privileged)
+}
+
+/// A privileged container, or a pod that joins the host namespaces, has to say
+/// so on the sandbox. The runtime rejects a privileged container whose sandbox
+/// did not opt in.
+fn apply_sandbox_linux(pod: &Value, config: &mut cri::PodSandboxConfig) {
+    let host_network = pod_bool(pod, "hostNetwork");
+    let host_pid = pod_bool(pod, "hostPID");
+    let host_ipc = pod_bool(pod, "hostIPC");
+    let privileged = pod_runs_privileged(pod);
+    if !host_network && !host_pid && !host_ipc && !privileged {
+        return;
     }
+    let mut namespaces = cri::NamespaceOption::default();
+    if host_network {
+        namespaces.network = cri::NamespaceMode::Node as i32;
+    }
+    if host_pid {
+        namespaces.pid = cri::NamespaceMode::Node as i32;
+    }
+    if host_ipc {
+        namespaces.ipc = cri::NamespaceMode::Node as i32;
+    }
+    config.linux = Some(cri::LinuxPodSandboxConfig {
+        security_context: Some(cri::LinuxSandboxSecurityContext {
+            namespace_options: (host_network || host_pid || host_ipc).then_some(namespaces),
+            privileged,
+            ..cri::LinuxSandboxSecurityContext::default()
+        }),
+        ..cri::LinuxPodSandboxConfig::default()
+    });
 }
 
 /// Builds the CRI sandbox configuration for a pod with custom cluster DNS and domain.
@@ -612,6 +676,13 @@ fn pod_has_service_account_token(pod: &Value) -> bool {
         })
 }
 
+/// Secrets and config maps already fetched for `valueFrom` env sources.
+#[derive(Debug, Default, Clone)]
+struct EnvObjects {
+    secrets: BTreeMap<String, Value>,
+    configmaps: BTreeMap<String, Value>,
+}
+
 /// Builds the CRI container configuration for one attempt of a spec container,
 /// optionally resolving volume mounts against the given root directory.
 pub fn container_config_with_root(
@@ -619,6 +690,16 @@ pub fn container_config_with_root(
     container: &Value,
     attempt: u32,
     root_dir: Option<&Path>,
+) -> Result<cri::ContainerConfig, KubeletError> {
+    container_config_with_env(pod, container, attempt, root_dir, &EnvObjects::default())
+}
+
+fn container_config_with_env(
+    pod: &Value,
+    container: &Value,
+    attempt: u32,
+    root_dir: Option<&Path>,
+    env_objects: &EnvObjects,
 ) -> Result<cri::ContainerConfig, KubeletError> {
     let name = container
         .get("name")
@@ -657,7 +738,7 @@ pub fn container_config_with_root(
         };
         envs.push(cri::KeyValue {
             key: key.to_string(),
-            value: resolve_env_value(pod, name, key, entry)?.into_bytes(),
+            value: resolve_env_value(pod, name, key, entry, env_objects)?.into_bytes(),
         });
     }
     let namespace = pod
@@ -677,10 +758,13 @@ pub fn container_config_with_root(
     let default_root = Path::new("/var/lib/kubelet");
     let root = root_dir.unwrap_or(default_root);
     let mounts = build_container_mounts(container, spec_volumes, root, uid);
-    let linux = build_container_resources(container).map(|resources| cri::LinuxContainerConfig {
-        resources: Some(resources),
-        ..cri::LinuxContainerConfig::default()
-    });
+    let resources = build_container_resources(container);
+    let security_context = build_security_context(pod, container)?;
+    let linux =
+        (resources.is_some() || security_context.is_some()).then_some(cri::LinuxContainerConfig {
+            resources,
+            security_context,
+        });
 
     Ok(cri::ContainerConfig {
         metadata: Some(cri::ContainerMetadata {
@@ -797,6 +881,128 @@ fn build_container_mounts(
     mounts
 }
 
+/// Maps pod and container `securityContext` onto the CRI security context.
+///
+/// Container fields override pod fields; the pod `fsGroup` joins the
+/// supplementary groups so group-owned volumes are writable, as upstream.
+fn build_security_context(
+    pod: &Value,
+    container: &Value,
+) -> Result<Option<cri::LinuxContainerSecurityContext>, KubeletError> {
+    let pod_sc = pod.pointer("/spec/securityContext");
+    let container_sc = container.get("securityContext");
+    let id = |key: &str| {
+        container_sc
+            .and_then(|sc| sc.get(key))
+            .or_else(|| pod_sc.and_then(|sc| sc.get(key)))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+    };
+    let run_as_user = id("runAsUser");
+    let run_as_group = id("runAsGroup");
+    let non_root = container_sc
+        .and_then(|sc| sc.get("runAsNonRoot"))
+        .or_else(|| pod_sc.and_then(|sc| sc.get("runAsNonRoot")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if non_root && run_as_user == Some(0) {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "securityContext.runAsNonRoot".to_string(),
+            reason: "container would run as root".to_string(),
+        });
+    }
+    let mut supplemental: Vec<i64> = pod_sc
+        .and_then(|sc| sc.get("supplementalGroups"))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(Value::as_i64)
+                .filter(|group| *group >= 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(fs_group) = pod_sc
+        .and_then(|sc| sc.get("fsGroup"))
+        .and_then(Value::as_i64)
+        .filter(|group| *group >= 0)
+        && !supplemental.contains(&fs_group)
+    {
+        supplemental.push(fs_group);
+    }
+    let privileged = container_sc
+        .and_then(|sc| sc.get("privileged"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let readonly_rootfs = container_sc
+        .and_then(|sc| sc.get("readOnlyRootFilesystem"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let capabilities = container_sc
+        .and_then(|sc| sc.get("capabilities"))
+        .map(|caps| cri::Capability {
+            add_capabilities: security_str_list(caps, "add"),
+            drop_capabilities: security_str_list(caps, "drop"),
+            ..cri::Capability::default()
+        })
+        .filter(|caps| !caps.add_capabilities.is_empty() || !caps.drop_capabilities.is_empty());
+    let selinux_options = container_sc
+        .and_then(|sc| sc.get("seLinuxOptions"))
+        .or_else(|| pod_sc.and_then(|sc| sc.get("seLinuxOptions")))
+        .map(|options| cri::SeLinuxOption {
+            user: security_str_field(options, "user"),
+            role: security_str_field(options, "role"),
+            r#type: security_str_field(options, "type"),
+            level: security_str_field(options, "level"),
+        })
+        .filter(|options| {
+            !options.user.is_empty()
+                || !options.role.is_empty()
+                || !options.r#type.is_empty()
+                || !options.level.is_empty()
+        });
+    if run_as_user.is_none()
+        && run_as_group.is_none()
+        && supplemental.is_empty()
+        && !privileged
+        && !readonly_rootfs
+        && capabilities.is_none()
+        && selinux_options.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(cri::LinuxContainerSecurityContext {
+        run_as_user: run_as_user.map(|value| cri::Int64Value { value }),
+        run_as_group: run_as_group.map(|value| cri::Int64Value { value }),
+        supplemental_groups: supplemental,
+        privileged,
+        readonly_rootfs,
+        capabilities,
+        selinux_options,
+        ..cri::LinuxContainerSecurityContext::default()
+    }))
+}
+
+fn security_str_list(sc: &Value, key: &str) -> Vec<String> {
+    sc.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn security_str_field(sc: &Value, key: &str) -> String {
+    sc.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn build_container_resources(container: &Value) -> Option<cri::LinuxContainerResources> {
     let res = container.get("resources")?;
     let mut resources = cri::LinuxContainerResources::default();
@@ -843,8 +1049,8 @@ fn build_container_resources(container: &Value) -> Option<cri::LinuxContainerRes
 /// Builds the CRI container configuration for one attempt of a spec container.
 ///
 /// Follows the kubelet: `command` and `args` map onto the CRI fields of the same
-/// name, `env.valueFrom.fieldRef` resolves pod metadata and status fields, and
-/// other `valueFrom` sources are configuration errors.
+/// name, and `env.valueFrom.fieldRef` resolves pod metadata and status fields.
+/// `secretKeyRef` and `configMapKeyRef` are resolved by `start_attempt`.
 pub fn container_config(
     pod: &Value,
     container: &Value,
@@ -858,6 +1064,7 @@ fn resolve_env_value(
     container: &str,
     key: &str,
     entry: &Value,
+    env_objects: &EnvObjects,
 ) -> Result<String, KubeletError> {
     if let Some(value) = entry.get("value").and_then(Value::as_str) {
         return Ok(value.to_string());
@@ -865,6 +1072,26 @@ fn resolve_env_value(
     let Some(source) = entry.get("valueFrom") else {
         return Ok(String::new());
     };
+    if let Some(secret_ref) = source.get("secretKeyRef") {
+        return key_ref_value(
+            container,
+            key,
+            "secretKeyRef",
+            secret_ref,
+            &env_objects.secrets,
+            secret_data_value,
+        );
+    }
+    if let Some(config_ref) = source.get("configMapKeyRef") {
+        return key_ref_value(
+            container,
+            key,
+            "configMapKeyRef",
+            config_ref,
+            &env_objects.configmaps,
+            configmap_data_value,
+        );
+    }
     let Some(field) = source
         .pointer("/fieldRef/fieldPath")
         .and_then(Value::as_str)
@@ -898,6 +1125,108 @@ fn resolve_env_value(
         },
     };
     Ok(value)
+}
+
+/// `(object name, required)`. A name is required when any reference to it is not optional.
+fn env_key_refs(pod: &Value, kind: &str) -> Vec<(String, bool)> {
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+    let init_containers = pod
+        .pointer("/spec/initContainers")
+        .and_then(Value::as_array);
+    let mut names: Vec<(String, bool)> = Vec::new();
+    for container in containers
+        .into_iter()
+        .flatten()
+        .chain(init_containers.into_iter().flatten())
+    {
+        let Some(env) = container.get("env").and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in env {
+            let Some(reference) = entry.pointer(&format!("/valueFrom/{kind}")) else {
+                continue;
+            };
+            let Some(name) = reference
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let required = !reference
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(existing) = names.iter_mut().find(|(existing, _)| existing == name) {
+                existing.1 |= required;
+            } else {
+                names.push((name.to_string(), required));
+            }
+        }
+    }
+    names
+}
+
+fn key_ref_value(
+    container: &str,
+    env_key: &str,
+    kind: &str,
+    reference: &Value,
+    objects: &BTreeMap<String, Value>,
+    read_key: fn(&Value, &str) -> Option<String>,
+) -> Result<String, KubeletError> {
+    let name = reference.get("name").and_then(Value::as_str).unwrap_or("");
+    let key = reference.get("key").and_then(Value::as_str).unwrap_or("");
+    let optional = reference
+        .get("optional")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let field = format!("spec.containers[{container}].env[{env_key}]");
+    let Some(object) = objects.get(name) else {
+        if optional {
+            return Ok(String::new());
+        }
+        return Err(KubeletError::InvalidConfiguration {
+            field,
+            reason: format!("{kind} {name} was not found"),
+        });
+    };
+    match read_key(object, key) {
+        Some(value) => Ok(value),
+        None if optional => Ok(String::new()),
+        None => Err(KubeletError::InvalidConfiguration {
+            field,
+            reason: format!("{kind} {name} has no key {key}"),
+        }),
+    }
+}
+
+fn secret_data_value(secret: &Value, key: &str) -> Option<String> {
+    if let Some(value) = secret
+        .get("stringData")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get(key))
+        .and_then(Value::as_str)
+    {
+        return Some(value.to_string());
+    }
+    let encoded = secret
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get(key))
+        .and_then(Value::as_str)?;
+    let bytes =
+        diorama_pki::base64_decode(encoded.trim()).unwrap_or_else(|_| encoded.as_bytes().to_vec());
+    String::from_utf8(bytes).ok()
+}
+
+fn configmap_data_value(configmap: &Value, key: &str) -> Option<String> {
+    configmap
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(|data| data.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Pull behaviour from `imagePullPolicy`, defaulting as the kubelet does:
@@ -1452,6 +1781,49 @@ impl PodReconciler {
         }
     }
 
+    async fn load_env_objects(
+        &self,
+        namespace: &str,
+        pod: &Value,
+    ) -> Result<EnvObjects, StartFailure> {
+        let mut objects = EnvObjects::default();
+        for (reference, required) in env_key_refs(pod, "secretKeyRef") {
+            if objects.secrets.contains_key(&reference) {
+                continue;
+            }
+            match self.client.get_secret(namespace, &reference).await {
+                Ok(secret) => {
+                    objects.secrets.insert(reference, secret);
+                },
+                Err(err) if required => {
+                    return Err(StartFailure {
+                        reason: "CreateContainerConfigError",
+                        message: format!("failed to read secret {reference}: {err}"),
+                    });
+                },
+                Err(_) => {},
+            }
+        }
+        for (reference, required) in env_key_refs(pod, "configMapKeyRef") {
+            if objects.configmaps.contains_key(&reference) {
+                continue;
+            }
+            match self.client.get_configmap(namespace, &reference).await {
+                Ok(configmap) => {
+                    objects.configmaps.insert(reference, configmap);
+                },
+                Err(err) if required => {
+                    return Err(StartFailure {
+                        reason: "CreateContainerConfigError",
+                        message: format!("failed to read configmap {reference}: {err}"),
+                    });
+                },
+                Err(_) => {},
+            }
+        }
+        Ok(objects)
+    }
+
     /// Pulls, creates and starts one attempt of a spec container.
     async fn start_attempt(
         &self,
@@ -1462,11 +1834,17 @@ impl PodReconciler {
         attempt: u32,
     ) -> Result<String, StartFailure> {
         self.ensure_image(container, sandbox_config).await?;
-        let mut config = container_config_with_root(pod, container, attempt, Some(&self.root_dir))
-            .map_err(|e| StartFailure {
-                reason: "CreateContainerConfigError",
-                message: e.to_string(),
-            })?;
+        let namespace = pod
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let env_objects = self.load_env_objects(namespace, pod).await?;
+        let mut config =
+            container_config_with_env(pod, container, attempt, Some(&self.root_dir), &env_objects)
+                .map_err(|e| StartFailure {
+                    reason: "CreateContainerConfigError",
+                    message: e.to_string(),
+                })?;
         let service_list = self
             .client
             .list_services("")
@@ -1481,10 +1859,6 @@ impl PodReconciler {
             .cloned()
             .unwrap_or_default();
         apply_service_links(&mut config.envs, pod, &services);
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("default");
         let name = pod_name(pod);
         let assignment = self.cpu_assignment(namespace, name, pod, container);
         if !assignment.cpuset.is_empty() {
@@ -1615,11 +1989,22 @@ impl PodReconciler {
         let mut statuses = self.container_statuses(&sandbox_id).await?;
         let mut state = SyncState::default();
 
+        // The sandbox network exists before any container starts, so probes
+        // can dial the pod IP on this very pass.
+        let pod_ip = self
+            .runtime
+            .pod_sandbox_status(&sandbox_id)
+            .await
+            .ok()
+            .and_then(|status| status.network)
+            .map(|network| network.ip)
+            .filter(|ip| !ip.is_empty());
         let ctx = SyncContext {
             namespace,
             pod,
             sandbox_id: &sandbox_id,
             sandbox_config: &sandbox_config,
+            pod_ip: pod_ip.clone(),
         };
 
         let all_inits_complete = self
@@ -1633,21 +2018,19 @@ impl PodReconciler {
 
         if !state.started_now.is_empty() {
             statuses = self.container_statuses(&sandbox_id).await?;
-            self.probe_started(spec_init_containers, &statuses, &mut state)
-                .await?;
-            self.probe_started(spec_containers, &statuses, &mut state)
+            self.probe_started(
+                spec_init_containers,
+                &statuses,
+                pod_ip.as_deref(),
+                &mut state,
+            )
+            .await?;
+            self.probe_started(spec_containers, &statuses, pod_ip.as_deref(), &mut state)
                 .await?;
         }
         self.prune_attempts(&statuses).await;
         let views = self.build_views(namespace, pod, spec_containers, &statuses, &state);
         let init_views = self.build_views(namespace, pod, spec_init_containers, &statuses, &state);
-        let pod_ip = self
-            .runtime
-            .pod_sandbox_status(&sandbox_id)
-            .await
-            .ok()
-            .and_then(|status| status.network)
-            .map(|network| network.ip);
         let status = pod_status(
             pod,
             self.runtime.provider_name(),
@@ -1683,7 +2066,14 @@ impl PodReconciler {
                 continue;
             }
             let Some(attempt) = self
-                .next_attempt(ctx.namespace, ctx.pod, init_container, latest, state)
+                .next_attempt(
+                    ctx.namespace,
+                    ctx.pod,
+                    init_container,
+                    latest,
+                    ctx.pod_ip.as_deref(),
+                    state,
+                )
                 .await?
             else {
                 return Ok(false);
@@ -1725,7 +2115,14 @@ impl PodReconciler {
                 .get(c_name)
                 .and_then(|attempts| attempts.last().copied());
             let Some(attempt) = self
-                .next_attempt(ctx.namespace, ctx.pod, container, latest, state)
+                .next_attempt(
+                    ctx.namespace,
+                    ctx.pod,
+                    container,
+                    latest,
+                    ctx.pod_ip.as_deref(),
+                    state,
+                )
                 .await?
             else {
                 continue;
@@ -1788,12 +2185,14 @@ impl PodReconciler {
     /// Decides what one spec container needs this pass: `Some(attempt)` to start a
     /// new attempt, `None` to leave it alone. Probes running containers and stops
     /// one whose liveness probe failed; records readiness and back-off in `state`.
+    #[allow(clippy::too_many_arguments)]
     async fn next_attempt(
         &self,
         namespace: &str,
         pod: &Value,
         container: &Value,
         latest: Option<&cri::ContainerStatus>,
+        pod_ip: Option<&str>,
         state: &mut SyncState,
     ) -> Result<Option<u32>, KubeletError> {
         let c_name = container_name_of(container);
@@ -1810,7 +2209,7 @@ impl PodReconciler {
             cri::ContainerState::ContainerRunning => {
                 let started_at_secs = secs_from_nanos(latest.started_at).unwrap_or(0);
                 let (live, is_ready) = self
-                    .evaluate_container_probes(&latest.id, container, started_at_secs)
+                    .evaluate_container_probes(&latest.id, container, started_at_secs, pod_ip)
                     .await?;
                 if live || policy == RestartPolicy::Never {
                     state.ready.insert(c_name.to_string(), is_ready);
@@ -1860,6 +2259,7 @@ impl PodReconciler {
         &self,
         spec_containers: &[Value],
         statuses: &[cri::ContainerStatus],
+        pod_ip: Option<&str>,
         state: &mut SyncState,
     ) -> Result<(), KubeletError> {
         let grouped = attempts_by_name(statuses);
@@ -1872,7 +2272,7 @@ impl PodReconciler {
             let is_ready = match latest {
                 Some(latest) if !state.restarted.contains(c_name) => {
                     let started_at_secs = secs_from_nanos(latest.started_at).unwrap_or(0);
-                    self.evaluate_container_probes(&latest.id, container, started_at_secs)
+                    self.evaluate_container_probes(&latest.id, container, started_at_secs, pod_ip)
                         .await?
                         .1
                 },
@@ -2066,80 +2466,41 @@ impl PodReconciler {
         container_id: &str,
         container: &Value,
         probe: &Value,
+        pod_ip: Option<&str>,
     ) -> Result<bool, KubeletError> {
-        let timeout_secs = probe
-            .get("timeoutSeconds")
-            .and_then(Value::as_i64)
-            .unwrap_or(EXEC_TIMEOUT_SECS);
-        let command: Option<Vec<String>> = if let Some(exec) = probe.get("exec") {
-            exec.get("command").and_then(Value::as_array).map(|cmd| {
-                cmd.iter()
-                    .filter_map(Value::as_str)
-                    .map(ToString::to_string)
-                    .collect()
-            })
-        } else if let Some(http) = probe.get("httpGet") {
-            let Some(port) = resolve_probe_port(container, http.get("port")) else {
-                return Ok(false);
-            };
-            let scheme = http
-                .get("scheme")
-                .and_then(Value::as_str)
-                .unwrap_or("HTTP")
-                .to_lowercase();
-            let host = http
-                .get("host")
-                .and_then(Value::as_str)
-                .unwrap_or("127.0.0.1");
-            let host = if host.is_empty() { "127.0.0.1" } else { host };
-            let raw_path = http.get("path").and_then(Value::as_str).unwrap_or("/");
-            let path = if raw_path.starts_with('/') {
-                raw_path.to_string()
-            } else {
-                format!("/{raw_path}")
-            };
-            let url = format!("{scheme}://{host}:{port}{path}");
-            Some(vec![
-                "curl".to_string(),
-                "-fsk".to_string(),
-                "-o".to_string(),
-                "/dev/null".to_string(),
-                url,
-            ])
-        } else if let Some(tcp) = probe.get("tcpSocket") {
-            let Some(port) = resolve_probe_port(container, tcp.get("port")) else {
-                return Ok(false);
-            };
-            let host = tcp
-                .get("host")
-                .and_then(Value::as_str)
-                .unwrap_or("127.0.0.1");
-            let host = if host.is_empty() { "127.0.0.1" } else { host };
-            Some(vec![
-                "nc".to_string(),
-                "-z".to_string(),
-                host.to_string(),
-                port.to_string(),
-            ])
-        } else {
-            None
-        };
-        let Some(command) = command else {
-            return Ok(true);
-        };
-        let exec_probe = probe.get("exec").is_some();
-        match self
-            .runtime
-            .exec_sync(container_id, &command, timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(result.exit_code == 0),
-            Err(e) if exec_probe => Err(e),
-            // HTTP and TCP probes are emulated through exec; treat execution failure as probe failure.
-            Err(_) => Ok(false),
+        if let Some(exec) = probe.get("exec") {
+            let command: Vec<String> = exec
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|cmd| {
+                    cmd.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let timeout_secs = probe
+                .get("timeoutSeconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(EXEC_TIMEOUT_SECS);
+            return self
+                .runtime
+                .exec_sync(container_id, &command, timeout_secs)
+                .await
+                .map(|result| result.exit_code == 0);
         }
+        // HTTP and TCP probes dial the pod IP from the node, like upstream.
+        // Emulating them through exec would require curl/nc inside every image.
+        if let Some(http) = probe.get("httpGet") {
+            return Ok(http_probe(&self.runtime, container_id, pod_ip, container, http).await);
+        }
+        if let Some(tcp) = probe.get("tcpSocket") {
+            return Ok(tcp_probe(pod_ip, container, tcp).await);
+        }
+        Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn evaluate_single_probe(
         &self,
         container_id: &str,
@@ -2148,6 +2509,7 @@ impl PodReconciler {
         probe_kind: &str,
         started_at_secs: u64,
         now: u64,
+        pod_ip: Option<&str>,
     ) -> Result<bool, KubeletError> {
         let failure_threshold = probe
             .get("failureThreshold")
@@ -2183,7 +2545,9 @@ impl PodReconciler {
             }
         }
 
-        let success = self.evaluate_probe(container_id, container, probe).await?;
+        let success = self
+            .evaluate_probe(container_id, container, probe, pod_ip)
+            .await?;
 
         let mut trackers = self
             .probe_trackers
@@ -2205,6 +2569,7 @@ impl PodReconciler {
         container_id: &str,
         container: &Value,
         started_at_secs: u64,
+        pod_ip: Option<&str>,
     ) -> Result<(bool, bool), KubeletError> {
         let now = now_unix();
         let mut liveness_ok = true;
@@ -2217,6 +2582,7 @@ impl PodReconciler {
                     "liveness",
                     started_at_secs,
                     now,
+                    pod_ip,
                 )
                 .await?;
         }
@@ -2232,6 +2598,7 @@ impl PodReconciler {
                     "readiness",
                     started_at_secs,
                     now,
+                    pod_ip,
                 )
                 .await?;
         }
@@ -2458,6 +2825,41 @@ impl PodReconciler {
             }
         }
 
+        // Managed volumes adopt the pod fsGroup so non-root containers can
+        // write them. Inline hostPath is left alone: mutating arbitrary host
+        // ownership from a volume mount is never safe.
+        if let Some(fs_group) = pod_fs_group(pod) {
+            let owned = if vol.get("secret").is_some() {
+                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~secret", vol_name))
+            } else if vol.get("configMap").is_some() {
+                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name))
+            } else if vol.get("projected").is_some() {
+                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~projected", vol_name))
+            } else if vol.get("emptyDir").is_some() {
+                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~empty-dir", vol_name))
+            } else if vol.get("persistentVolumeClaim").is_some() {
+                let link = self.get_pod_volume_dir(
+                    pod_uid,
+                    "kubernetes.io~persistent-volume-claim",
+                    vol_name,
+                );
+                Some(std::fs::canonicalize(&link).unwrap_or(link))
+            } else {
+                None
+            };
+            if let Some(dir) = owned {
+                apply_fs_group_ownership(&dir, fs_group).map_err(|e| {
+                    KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!(
+                            "failed to apply fsGroup ownership to {}: {e}",
+                            dir.display()
+                        ),
+                    }
+                })?;
+            }
+        }
+
         Ok(())
     }
 
@@ -2549,6 +2951,180 @@ impl PodReconciler {
     }
 }
 
+/// Target host for an `httpGet`/`tcpSocket` probe: the explicit host, with
+/// blank and loopback values meaning the pod IP, as upstream resolves them.
+fn probe_host(pod_ip: Option<&str>, configured: Option<&str>) -> Option<String> {
+    match configured.map_or("", str::trim) {
+        "" | "localhost" | "127.0.0.1" | "::1" => {
+            pod_ip.filter(|ip| !ip.is_empty()).map(str::to_string)
+        },
+        host => Some(host.to_string()),
+    }
+}
+
+fn probe_timeout(probe: &Value) -> std::time::Duration {
+    let secs = probe
+        .get("timeoutSeconds")
+        .and_then(Value::as_u64)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(1);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Dials a `tcpSocket` probe from the node. Refused and timed-out dials fail.
+async fn tcp_probe(pod_ip: Option<&str>, container: &Value, tcp: &Value) -> bool {
+    let Some(port) = resolve_probe_port(container, tcp.get("port")) else {
+        return false;
+    };
+    let host = tcp.get("host").and_then(Value::as_str);
+    let Some(target) = probe_host(pod_ip, host) else {
+        return false;
+    };
+    tokio::time::timeout(
+        probe_timeout(tcp),
+        tokio::net::TcpStream::connect((target.as_str(), port)),
+    )
+    .await
+    .is_ok_and(|connected| connected.is_ok())
+}
+
+/// Performs an `httpGet` probe from the node with a minimal `HTTP/1.0`
+/// client. Any 2xx/3xx status succeeds, as upstream. `https` has no TLS
+/// stack here, so it keeps the previous `curl` emulation inside the
+/// container as a best effort.
+async fn http_probe(
+    runtime: &Arc<dyn RuntimeProvider>,
+    container_id: &str,
+    pod_ip: Option<&str>,
+    container: &Value,
+    http: &Value,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let scheme = http
+        .get("scheme")
+        .and_then(Value::as_str)
+        .unwrap_or("HTTP")
+        .to_ascii_lowercase();
+    if scheme == "https" {
+        return curl_probe(runtime, container, container_id, http).await;
+    }
+    let Some(port) = resolve_probe_port(container, http.get("port")) else {
+        return false;
+    };
+    let host = http.get("host").and_then(Value::as_str);
+    let Some(target) = probe_host(pod_ip, host) else {
+        return false;
+    };
+    let timeout = probe_timeout(http);
+    let raw_path = http.get("path").and_then(Value::as_str).unwrap_or("/");
+    let path = if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else {
+        format!("/{raw_path}")
+    };
+    let headers = http.get("httpHeaders").and_then(Value::as_array);
+    let has_custom_host = headers.is_some_and(|items| {
+        items.iter().any(|header| {
+            header
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("host"))
+        })
+    });
+    let mut request = format!("GET {path} HTTP/1.0\r\n");
+    if !has_custom_host {
+        request.push_str("Host: ");
+        request.push_str(&target);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n");
+    if let Some(headers) = headers {
+        for header in headers {
+            let name = header.get("name").and_then(Value::as_str).unwrap_or("");
+            let value = header.get("value").and_then(Value::as_str).unwrap_or("");
+            if !name.is_empty() {
+                request.push_str(name);
+                request.push_str(": ");
+                request.push_str(value);
+                request.push_str("\r\n");
+            }
+        }
+    }
+    request.push_str("\r\n");
+    let dialled = tokio::time::timeout(
+        timeout,
+        tokio::net::TcpStream::connect((target.as_str(), port)),
+    )
+    .await;
+    let Ok(Ok(mut stream)) = dialled else {
+        return false;
+    };
+    let responded = tokio::time::timeout(timeout, async {
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&chunk[..read]);
+            if head.contains(&b'\n') || head.len() > 8192 {
+                break;
+            }
+        }
+        std::io::Result::Ok(head)
+    })
+    .await;
+    let Ok(Ok(head)) = responded else {
+        return false;
+    };
+    let status_line = String::from_utf8_lossy(&head);
+    let code = status_line
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (200..400).contains(&code)
+}
+
+/// Best-effort `https` probe through `curl` inside the container, for images
+/// that ship it. Failure (including a missing binary) fails the probe.
+async fn curl_probe(
+    runtime: &Arc<dyn RuntimeProvider>,
+    container: &Value,
+    container_id: &str,
+    http: &Value,
+) -> bool {
+    let port = resolve_probe_port(container, http.get("port")).unwrap_or(443);
+    let raw_path = http.get("path").and_then(Value::as_str).unwrap_or("/");
+    let path = if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else {
+        format!("/{raw_path}")
+    };
+    let url = format!("https://127.0.0.1:{port}{path}");
+    let timeout = probe_timeout(http).as_secs().max(1);
+    let timeout = i64::try_from(timeout).unwrap_or(EXEC_TIMEOUT_SECS);
+    runtime
+        .exec_sync(
+            container_id,
+            &[
+                "curl".to_string(),
+                "-fsk".to_string(),
+                "-o".to_string(),
+                "/dev/null".to_string(),
+                url,
+            ],
+            timeout,
+        )
+        .await
+        .is_ok_and(|result| result.exit_code == 0)
+}
+
 fn resolve_probe_port(container: &Value, port_val: Option<&Value>) -> Option<u16> {
     let port_val = port_val?;
     if let Some(port) = port_val.as_u64() {
@@ -2603,6 +3179,199 @@ fn dead_container_views<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_context_maps_users_groups_and_privilege() {
+        let pod = json!({
+            "metadata": { "name": "app", "namespace": "default", "uid": "uid-1" },
+            "spec": {
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "runAsGroup": 3000,
+                    "fsGroup": 2000,
+                    "supplementalGroups": [4000]
+                },
+                "containers": [{
+                    "name": "main",
+                    "image": "busybox:1.36",
+                    "securityContext": { "runAsUser": 1001, "privileged": true }
+                }]
+            }
+        });
+        let container = pod["spec"]["containers"][0].clone();
+        let config = container_config(&pod, &container, 0).unwrap();
+        let sc = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.security_context.as_ref())
+            .expect("security context is mapped");
+        // Container runAsUser overrides the pod value.
+        assert_eq!(sc.run_as_user.as_ref().map(|id| id.value), Some(1001));
+        assert_eq!(sc.run_as_group.as_ref().map(|id| id.value), Some(3000));
+        // fsGroup joins the supplementary groups.
+        assert!(sc.supplemental_groups.contains(&2000));
+        assert!(sc.supplemental_groups.contains(&4000));
+        assert!(sc.privileged);
+    }
+
+    #[test]
+    fn security_context_absent_without_security_fields() {
+        let pod = json!({
+            "metadata": { "name": "app", "namespace": "default", "uid": "uid-1" },
+            "spec": { "containers": [{ "name": "main", "image": "busybox:1.36" }] }
+        });
+        let container = pod["spec"]["containers"][0].clone();
+        let config = container_config(&pod, &container, 0).unwrap();
+        assert!(config.linux.is_none());
+    }
+
+    #[test]
+    fn secret_key_ref_decodes_into_the_container_env() {
+        let pod = json!({
+            "metadata": { "name": "app", "namespace": "sonobuoy", "uid": "uid-1" },
+            "spec": { "containers": [{
+                "name": "worker",
+                "image": "sonobuoy:v0.57.5",
+                "env": [{
+                    "name": "CLIENT_CERT",
+                    "valueFrom": { "secretKeyRef": { "name": "kube", "key": "cert" } }
+                }]
+            }]}
+        });
+        let container = pod["spec"]["containers"][0].clone();
+        let mut env_objects = EnvObjects::default();
+        env_objects.secrets.insert(
+            "kube".to_string(),
+            json!({ "data": { "cert": "Y2VydA==" } }),
+        );
+        let config = container_config_with_env(&pod, &container, 0, None, &env_objects).unwrap();
+        assert_eq!(env_of(&config.envs, "CLIENT_CERT").as_deref(), Some("cert"));
+    }
+
+    #[test]
+    fn privileged_host_pod_opts_the_sandbox_in() {
+        let pod = json!({
+            "metadata": { "name": "logs", "namespace": "sonobuoy", "uid": "uid-1" },
+            "spec": {
+                "hostNetwork": true,
+                "hostPID": true,
+                "containers": [{
+                    "name": "systemd-logs",
+                    "image": "sonobuoy/systemd-logs:v0.4",
+                    "securityContext": { "privileged": true }
+                }]
+            }
+        });
+        let config = sandbox_config(&pod, 0);
+        assert_eq!(config.hostname, "");
+        let security = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.security_context.as_ref())
+            .expect("sandbox security");
+        assert!(security.privileged);
+        let namespaces = security.namespace_options.as_ref().expect("namespaces");
+        assert_eq!(namespaces.network, cri::NamespaceMode::Node as i32);
+        assert_eq!(namespaces.pid, cri::NamespaceMode::Node as i32);
+    }
+
+    #[test]
+    fn probe_host_prefers_pod_ip_for_loopback() {
+        assert_eq!(
+            probe_host(Some("10.42.0.5"), None).as_deref(),
+            Some("10.42.0.5")
+        );
+        assert_eq!(
+            probe_host(Some("10.42.0.5"), Some("127.0.0.1")).as_deref(),
+            Some("10.42.0.5")
+        );
+        assert_eq!(
+            probe_host(Some("10.42.0.5"), Some("10.0.0.9")).as_deref(),
+            Some("10.0.0.9")
+        );
+        assert_eq!(probe_host(None, None), None);
+    }
+
+    async fn serve_probe_status(mut stream: tokio::net::TcpStream, request: Vec<u8>) {
+        use tokio::io::AsyncWriteExt;
+        let status = if String::from_utf8_lossy(&request).contains("/bad") {
+            "500"
+        } else {
+            "200"
+        };
+        let body = format!("HTTP/1.0 {status} OK\r\nContent-Length: 2\r\n\r\nok");
+        let _ = stream.write_all(body.as_bytes()).await;
+    }
+
+    async fn read_probe_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut head = vec![0_u8; 1024];
+        let read = stream.read(&mut head).await.ok()?;
+        head.truncate(read);
+        Some(head)
+    }
+
+    async fn run_probe_server(listener: tokio::net::TcpListener) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Some(request) = read_probe_request(&mut stream).await else {
+                continue;
+            };
+            serve_probe_status(stream, request).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn http_probe_accepts_2xx_and_rejects_500() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(run_probe_server(listener));
+        let container = json!({});
+        let ok = json!({ "path": "/health", "port": port });
+        assert!(http_probe(&mock_runtime(), "id", Some("127.0.0.1"), &container, &ok).await);
+        let bad = json!({ "path": "/bad", "port": port });
+        assert!(!http_probe(&mock_runtime(), "id", Some("127.0.0.1"), &container, &bad).await);
+        let refused = json!({ "path": "/", "port": 1 });
+        assert!(
+            !http_probe(
+                &mock_runtime(),
+                "id",
+                Some("127.0.0.1"),
+                &container,
+                &refused
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_checks_connectivity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let container = json!({});
+        let open = json!({ "port": port });
+        assert!(tcp_probe(Some("127.0.0.1"), &container, &open).await);
+        let closed = json!({ "port": 1 });
+        assert!(!tcp_probe(Some("127.0.0.1"), &container, &closed).await);
+        assert!(!tcp_probe(None, &container, &open).await);
+    }
+
+    fn mock_runtime() -> Arc<dyn RuntimeProvider> {
+        Arc::new(crate::mock::MockRuntimeProvider::new("mock"))
+    }
+
+    #[test]
+    fn run_as_non_root_rejects_uid_zero() {
+        let pod = json!({
+            "metadata": { "name": "app", "namespace": "default", "uid": "uid-1" },
+            "spec": {
+                "securityContext": { "runAsNonRoot": true, "runAsUser": 0 },
+                "containers": [{ "name": "main", "image": "busybox:1.36" }]
+            }
+        });
+        let container = pod["spec"]["containers"][0].clone();
+        assert!(container_config(&pod, &container, 0).is_err());
+    }
 
     fn env_of(envs: &[cri::KeyValue], key: &str) -> Option<String> {
         envs.iter()
@@ -2771,7 +3540,7 @@ mod tests {
         let dns = build_dns_config(&pod, &["10.43.0.10".to_string()], "cluster.local").unwrap();
         assert_eq!(dns.servers, vec!["1.1.1.1"]);
         assert_eq!(dns.searches, vec!["foo.bar"]);
-        assert!(dns.options.is_empty());
+        assert_eq!(dns.options, <[String; 0]>::default());
     }
 
     #[test]

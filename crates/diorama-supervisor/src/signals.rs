@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(report.first_signal, None);
         assert_eq!(report.listener_closed, Some(ShutdownSignal::Interrupt));
         assert_eq!(report.supervisor.cause, StopCause::Requested);
-        assert!(report.supervisor.cleanup_failures.is_empty());
+        assert_eq!(report.supervisor.cleanup_failures, []);
     }
     #[tokio::test(start_paused = true)]
     async fn repeated_notifications_do_not_extend_shutdown_budget() {

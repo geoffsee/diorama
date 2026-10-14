@@ -8,7 +8,7 @@ autotests = false
 
 [dependencies]
 async-trait = "=0.1.89"
-k8s-openapi = { version = "=0.28.0", default-features = false, features = ["v1_35"] }
+rustix = { version = "=1.1.5", features = ["fs"] }
 diorama-apiserver = { version = "=0.1.0", path = "../diorama-apiserver" }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-cri = { version = "=0.1.0", path = "../diorama-cri" }

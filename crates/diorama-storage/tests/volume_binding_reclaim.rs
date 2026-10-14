@@ -219,7 +219,10 @@ async fn test_data_survives_writing_pod_deletion_and_replacement() {
     assert!(test_file.exists());
 
     // Delete Pod 1 (simulating pod termination/eviction)
-    client.delete_pod(ns, "pod-writer-1").await.unwrap();
+    client
+        .delete_pod_options(ns, "pod-writer-1", Some(0))
+        .await
+        .unwrap();
     assert!(client.get_pod(ns, "pod-writer-1").await.is_err());
 
     // Verify data survives pod deletion

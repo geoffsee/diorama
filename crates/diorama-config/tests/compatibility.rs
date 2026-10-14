@@ -285,7 +285,7 @@ fn every_inventory_field_accepts_an_explicit_nondefault_typed_value() {
         let output = serde_json::to_value(decoded.config).unwrap();
         let pointer = format!("/{}", field.path.replace('.', "/"));
         assert_eq!(output.pointer(&pointer), Some(&value), "{}", field.path);
-        assert!(!field.owner.is_empty());
+        assert_ne!(field.owner, "");
     }
 }
 

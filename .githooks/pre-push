@@ -5,6 +5,9 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Honor rust-toolchain.toml. A stable cargo earlier on PATH cannot parse nightly profile keys.
+export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${PATH}"
+
 # Run in non-interactive CI mode to avoid TTY input handler / pager traps in background executions.
 export CI=1
 export NEXTEST_SHOW_PROGRESS=none

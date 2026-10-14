@@ -219,7 +219,7 @@ fn test_warn_missing_cni_plugins_detects_absent_binaries() {
     fs::write(bin_dir.join("loopback"), b"mock-loopback").expect("write loopback");
 
     let missing = warn_missing_cni_plugins(bin_dir);
-    assert!(missing.is_empty());
+    assert_eq!(missing, Vec::<String>::new());
 }
 
 #[test]

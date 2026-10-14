@@ -25,6 +25,7 @@ pub fn build_tls_acceptor(config: &DatastoreConfig) -> Result<TlsAcceptor, Datas
         DatastoreError::AuthenticationConfig("missing key_file for datastore server".into())
     })?;
 
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ca_certs = load_certs(ca_file, "datastore CA")?;
     let mut roots = RootCertStore::empty();
     for cert in ca_certs {

@@ -454,7 +454,7 @@ mod tests {
         fs::write(plugins_dir.join("loopback"), b"").expect("write loopback");
 
         let missing = warn_missing_cni_plugins(plugins_dir);
-        assert!(missing.is_empty());
+        assert_eq!(missing, Vec::<String>::new());
     }
 
     #[test]

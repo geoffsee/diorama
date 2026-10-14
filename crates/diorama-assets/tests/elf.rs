@@ -20,7 +20,8 @@ fn independent_machine_vectors_and_missing_loader_are_observations_only() {
         assert_eq!(r.loader_relation(), LoaderRelation::Unresolved);
         assert_eq!(r.loader_family(), LoaderFamily::Unknown);
         assert!(r.interpreter().is_none());
-        assert!(r.needed().is_empty());
+        let empty: &[Vec<u8>] = &[];
+        assert_eq!(r.needed(), empty);
     }
 }
 #[test]

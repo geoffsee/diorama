@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,69 @@ fn setup_test_environment(dir: &TempDir) -> (ApiserverService, ControllerManager
     let controller_config = ControllerManagerConfig::default_for_pki(&pki_dir, node_ip);
 
     (apiserver_service, controller_config)
+}
+
+#[tokio::test]
+async fn root_ca_publisher_repairs_deleted_and_edited_configmaps() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, controller_config) = setup_test_environment(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+    let apiserver = Arc::new(apiserver);
+    let controller = ControllerManagerService::new(controller_config, apiserver.clone());
+    let admin = apiserver.admin_client();
+
+    let boot = admin
+        .get_configmap("kube-system", "kube-root-ca.crt")
+        .await
+        .expect("startup publishes kube-root-ca.crt into existing namespaces");
+    assert!(
+        boot["data"]["ca.crt"]
+            .as_str()
+            .unwrap_or("")
+            .contains("BEGIN CERTIFICATE")
+    );
+
+    admin.create_namespace("published").await.unwrap();
+    let created = admin
+        .get_configmap("published", "kube-root-ca.crt")
+        .await
+        .expect("namespace creation publishes kube-root-ca.crt");
+    let original = created["data"]["ca.crt"]
+        .as_str()
+        .expect("ca.crt")
+        .to_string();
+
+    admin
+        .delete_configmap("published", "kube-root-ca.crt", None)
+        .await
+        .unwrap();
+    controller.reconcile_once().await.unwrap();
+    let restored = admin
+        .get_configmap("published", "kube-root-ca.crt")
+        .await
+        .expect("publisher recreates a deleted kube-root-ca.crt");
+    assert_eq!(restored["data"]["ca.crt"], original);
+
+    let mut tampered = BTreeMap::new();
+    tampered.insert("ca.crt".to_string(), "tampered".to_string());
+    tampered.insert("extra".to_string(), "drop-me".to_string());
+    admin
+        .update_configmap("published", "kube-root-ca.crt", tampered, None)
+        .await
+        .unwrap();
+    controller.reconcile_once().await.unwrap();
+    let repaired = admin
+        .get_configmap("published", "kube-root-ca.crt")
+        .await
+        .expect("publisher repairs an edited kube-root-ca.crt");
+    assert_eq!(repaired["data"]["ca.crt"], original);
+    assert!(repaired["data"].get("extra").is_none());
+    assert_ne!(
+        repaired["metadata"]["annotations"]["kubernetes.io/description"]
+            .as_str()
+            .unwrap_or(""),
+        ""
+    );
 }
 
 #[tokio::test]
@@ -82,7 +146,7 @@ async fn test_controller_manager_startup_and_authenticated_identity() {
     assert!(health.is_healthy);
     assert!(health.authenticated);
     assert!(health.apiserver_connected);
-    assert!(!health.configured_controllers.is_empty());
+    assert_ne!(health.configured_controllers, <[String; 0]>::default());
     assert_eq!(
         health.active_controllers,
         vec![
@@ -144,7 +208,7 @@ async fn test_controller_manager_supervision_lifecycle() {
     let report = controller_svc.check_readiness().await.unwrap();
     assert!(report.is_healthy);
     assert!(report.authenticated);
-    assert!(!report.configured_controllers.is_empty());
+    assert_ne!(report.configured_controllers, <[String; 0]>::default());
     assert_eq!(
         report.active_controllers,
         vec![

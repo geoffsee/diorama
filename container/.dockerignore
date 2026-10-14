@@ -1,0 +1,5 @@
+.git
+target
+third_party/saphyr-parser/target
+*.qcow2
+libnull.rlib

@@ -41,6 +41,31 @@ async fn projected_service_account_token_volume_and_authentication() {
     let admin = service.admin_client();
 
     admin.create_namespace("production").await.unwrap();
+    let default_sa = admin
+        .get_service_account("production", "default")
+        .await
+        .expect("namespace creation creates the default service account");
+    assert_eq!(default_sa["metadata"]["name"], "default");
+    assert_eq!(default_sa["metadata"]["namespace"], "production");
+    admin
+        .get_service_account("kube-system", "default")
+        .await
+        .expect("bootstrapped namespaces also have a default service account");
+    let root_ca = admin
+        .get_configmap("production", "kube-root-ca.crt")
+        .await
+        .expect("namespace creation publishes kube-root-ca.crt");
+    let ca_crt = root_ca["data"]["ca.crt"].as_str().unwrap_or("");
+    assert!(
+        ca_crt.contains("BEGIN CERTIFICATE"),
+        "kube-root-ca.crt must carry the cluster CA"
+    );
+    assert_ne!(
+        root_ca["metadata"]["annotations"]["kubernetes.io/description"]
+            .as_str()
+            .unwrap_or(""),
+        ""
+    );
 
     // 1. Grant RBAC permissions to ServiceAccount 'production:app-service'
     let app_role = Role {

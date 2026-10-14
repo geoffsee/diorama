@@ -14,7 +14,6 @@ diorama-assets = { version = "=0.1.0", path = "../diorama-assets" }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-containerd-api = { version = "=0.1.0", path = "../diorama-containerd-api" }
 diorama-cri = { version = "=0.1.0", path = "../diorama-cri" }
-diorama-network = { version = "=0.1.0", path = "../diorama-network" }
 diorama-platform = { version = "=0.1.0", path = "../diorama-platform" }
 diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
 rustix = { version = "=1.1.5", features = ["fs"] }

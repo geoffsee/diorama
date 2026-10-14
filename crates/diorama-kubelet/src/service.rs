@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use diorama_apiserver::{
-    ApiserverError, ApiserverService, KubernetesApiClient, PodLogOptions, PodLogReader,
+    ApiserverError, ApiserverService, KubernetesApiClient, PodExec, PodExecResult, PodLogOptions,
+    PodLogReader,
 };
 use serde_json::Value;
 
@@ -257,6 +258,15 @@ impl KubeletService {
         }
     }
 
+    /// Exec target for the apiserver's pod exec subresource.
+    #[must_use]
+    pub fn exec_source(&self) -> KubeletExecSource {
+        KubeletExecSource {
+            node_name: self.options.node_name.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
     /// One pass of the kubelet loop: bind, sync and clean up every pod in the cluster.
     pub async fn reconcile_once(&self) -> Result<ReconcileReport, KubeletError> {
         self.reconciler.reconcile_all().await
@@ -486,5 +496,66 @@ impl PodLogReader for KubeletLogSource {
             .map_err(|e| ApiserverError::Internal {
                 reason: format!("kubelet could not read logs for {name}/{container}: {e}"),
             })
+    }
+}
+
+/// Serves the pod exec subresource for pods this kubelet runs.
+///
+/// Like [`KubeletLogSource`] it holds only the runtime provider and node name,
+/// never the apiserver, so registering it cannot create a reference cycle.
+#[derive(Clone, Debug)]
+pub struct KubeletExecSource {
+    node_name: String,
+    runtime: Arc<dyn RuntimeProvider>,
+}
+
+#[async_trait]
+impl PodExec for KubeletExecSource {
+    async fn exec_in_pod(
+        &self,
+        pod: &Value,
+        container: &str,
+        command: &[String],
+    ) -> Result<PodExecResult, ApiserverError> {
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
+        if assigned != Some(self.node_name.as_str()) {
+            return Err(ApiserverError::BadRequest {
+                message: format!("pod {name} is not assigned to node {}", self.node_name),
+            });
+        }
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiserverError::BadRequest {
+                message: format!("pod {name} has no uid"),
+            })?;
+        if command.is_empty() {
+            return Err(ApiserverError::BadRequest {
+                message: "exec requires a command".to_string(),
+            });
+        }
+        let id = resolve_container(self.runtime.as_ref(), uid, container, false)
+            .await
+            .map_err(|e| ApiserverError::BadRequest {
+                message: format!("{e}"),
+            })?;
+        // Interactive exec is emulated with one synchronous CRI call; the
+        // gateway replays the captured output on the websocket channels.
+        let output = self
+            .runtime
+            .exec_sync(&id, command, 30)
+            .await
+            .map_err(|e| ApiserverError::Internal {
+                reason: format!("kubelet could not exec in {name}/{container}: {e}"),
+            })?;
+        Ok(PodExecResult {
+            exit_code: output.exit_code,
+            stdout: output.stdout.into_bytes(),
+            stderr: output.stderr.into_bytes(),
+        })
     }
 }

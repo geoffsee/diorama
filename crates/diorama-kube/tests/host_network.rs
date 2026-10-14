@@ -167,13 +167,14 @@ impl AssessmentInputs for Fake {
     fn ports(&mut self, _: bool) -> Result<[Observation<PortAvailability>; 4], PlatformError> {
         Ok([Observation::Present(PortAvailability::Available); 4])
     }
-    async fn version(&mut self, _: StopReceiver) -> VersionProbe {
-        VersionProbe {
+    fn version(&mut self, _: StopReceiver) -> impl std::future::Future<Output = VersionProbe> {
+        let probe = VersionProbe {
             family: self.family,
             failure: None,
             cleanup: cleanup(true),
             observer: None,
-        }
+        };
+        std::future::ready(probe)
     }
 }
 impl NetworkPreparationInputs for Fake {
@@ -282,7 +283,10 @@ async fn fixed_backend_lists_and_external_runtime_keep_network_effects() {
             expected_backend
         );
         assert!(report.shared_effects_possible);
-        assert!(report.ipv6.is_empty());
+        assert_eq!(
+            report.ipv6,
+            <[diorama::host_network::Ipv6Step; 0]>::default()
+        );
         assert!(
             report
                 .modules
@@ -345,7 +349,10 @@ async fn unjoined_module_owner_stops_all_further_effects() {
     assert_eq!(report.status, NetworkStatus::CleanupIncomplete);
     assert_eq!(report.modules.len(), 1);
     assert!(report.modules[0].after.is_none());
-    assert!(fake.controls.is_empty());
+    assert_eq!(
+        fake.controls,
+        <[diorama::host_network::Ipv6Control; 0]>::default()
+    );
     assert!(report.shared_effects_possible);
 }
 #[tokio::test]
@@ -375,7 +382,10 @@ async fn cancellation_during_module_waits_for_stop_acknowledgement() {
     assert_eq!(report.status, NetworkStatus::Cancelled);
     assert!(fake.stop_acknowledged);
     assert_eq!(fake.modules.len(), 1);
-    assert!(fake.controls.is_empty());
+    assert_eq!(
+        fake.controls,
+        <[diorama::host_network::Ipv6Control; 0]>::default()
+    );
     assert!(report.shared_effects_possible);
 }
 #[tokio::test]
@@ -404,7 +414,10 @@ async fn requested_unknown_ipv6_is_deferred_only_by_preparation() {
             Ipv6Outcome::Unreadable(SysctlError::Malformed)
         ]
     );
-    assert!(fake.writes.is_empty());
+    assert_eq!(
+        fake.writes,
+        <[diorama::host_network::Ipv6Control; 0]>::default()
+    );
 }
 #[tokio::test]
 async fn ipv6_only_zero_writes_and_success_requires_readback() {
@@ -473,7 +486,10 @@ async fn cancellation_between_ipv6_read_and_write_prevents_write() {
     .await;
     assert_eq!(report.status, NetworkStatus::Cancelled);
     assert_eq!(report.ipv6[0].outcome, Ipv6Outcome::CancelledBeforeWrite);
-    assert!(fake.writes.is_empty());
+    assert_eq!(
+        fake.writes,
+        <[diorama::host_network::Ipv6Control; 0]>::default()
+    );
     assert!(!report.shared_effects_possible);
 }
 #[tokio::test]

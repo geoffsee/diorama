@@ -41,7 +41,7 @@ pub use reconciler::{
     PodReconciler, PullPolicy, StartFailure, build_dns_config, container_config,
     container_config_with_root, sandbox_config, sandbox_config_with_dns,
 };
-pub use service::{KubeletLogSource, KubeletService};
+pub use service::{KubeletExecSource, KubeletLogSource, KubeletService};
 pub use status::{
     ContainerView, CpuAssignment, PodViews, observed_conditions, observed_phase, pod_status,
 };

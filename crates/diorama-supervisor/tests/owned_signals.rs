@@ -105,7 +105,7 @@ fn check_report(report: &diorama_supervisor::signals::SignalRunReport, mode: &st
                 ShutdownSignal::Terminate
             })
         );
-        assert!(report.supervisor.failures.is_empty());
+        assert_eq!(report.supervisor.failures, []);
     }
     let expected_cleanup = if mode == "force" {
         vec![diorama_supervisor::CleanupFailure {
@@ -256,13 +256,13 @@ async fn disposable_owned_signals() {
     let external_task = tokio::spawn(external.run(external_receiver));
     tokio::time::sleep(Duration::from_millis(50)).await;
     external_stop.stop();
-    assert!(
+    assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), external_task)
             .await
             .expect("external stop deadline")
             .expect("external join")
-            .cleanup_failures
-            .is_empty()
+            .cleanup_failures,
+        []
     );
     assert_ne!(
         before,
@@ -270,13 +270,13 @@ async fn disposable_owned_signals() {
     );
     assert!(!observer.snapshot().leader_reaped);
     stop.stop();
-    assert!(
+    assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), sentinel_task)
             .await
             .expect("sentinel stop deadline")
             .expect("sentinel join")
-            .cleanup_failures
-            .is_empty()
+            .cleanup_failures,
+        []
     );
     assert!(observer.wait(Duration::from_secs(2)).await.complete());
     println!(

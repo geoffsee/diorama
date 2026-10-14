@@ -360,7 +360,7 @@ fn test_daemon_and_foreground_modes() {
     let def = generate_service_definition(&daemon_config).expect("daemon definition");
     assert_eq!(def.backend, None);
     assert_eq!(def.primary_file, PathBuf::from("/var/run/test-daemon.pid"));
-    assert!(def.files.is_empty());
+    assert_eq!(def.files, <[dioramactl::ServiceFile; 0]>::default());
     assert_eq!(def.directories, vec![(PathBuf::from("/var/log"), 0o755)]);
 
     let fg_config = ServiceConfig {
@@ -370,7 +370,7 @@ fn test_daemon_and_foreground_modes() {
     let fg_def = generate_service_definition(&fg_config).expect("foreground definition");
     assert_eq!(fg_def.backend, None);
     assert_eq!(fg_def.primary_file, PathBuf::from("/bin/node"));
-    assert!(fg_def.files.is_empty());
+    assert_eq!(fg_def.files, <[dioramactl::ServiceFile; 0]>::default());
 }
 
 #[test]
@@ -497,7 +497,7 @@ fn test_lifecycle_plans_for_all_backends() {
                 },
                 LifecycleAction::Uninstall => {
                     assert!(plan.definition.is_none());
-                    assert!(!plan.cleanup_paths.is_empty());
+                    assert_ne!(plan.cleanup_paths, <[std::path::PathBuf; 0]>::default());
                 },
                 _ => {
                     assert!(plan.definition.is_none());

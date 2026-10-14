@@ -1,0 +1,69 @@
+# Full image build that compiles diorama inside the build container.
+# The everyday loop is container/Dockerfile plus container/dev-image.sh, which
+# copies a host incremental binary and skips this compile.
+
+FROM rust:1.97.1-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+ARG TARGETARCH
+RUN set -eu; \
+    arch=${TARGETARCH:-}; \
+    if [ -z "$arch" ]; then \
+        case "$(uname -m)" in \
+            x86_64) arch=amd64 ;; \
+            aarch64|arm64) arch=arm64 ;; \
+            *) printf 'unsupported build architecture: %s\n' "$(uname -m)" >&2; exit 1 ;; \
+        esac; \
+    fi; \
+    case "$arch" in \
+        amd64) target=x86_64-unknown-linux-musl ;; \
+        arm64) target=aarch64-unknown-linux-musl ;; \
+        *) printf 'unsupported target architecture: %s\n' "$arch" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$target"; \
+    cc_var=CC_$(printf '%s' "$target" | tr '-' '_'); \
+    export "$cc_var=musl-gcc"; \
+    cargo build --locked --release --target "$target" -p diorama; \
+    mkdir -p /out; \
+    cp "target/$target/release/diorama" /out/diorama
+
+FROM alpine:3.22
+
+RUN printf '%s\n' \
+        "https://dl-cdn.alpinelinux.org/alpine/v3.22/main" \
+        "https://dl-cdn.alpinelinux.org/alpine/v3.22/community" \
+        > /etc/apk/repositories \
+    && apk add --no-cache \
+        iptables \
+        ip6tables \
+        nftables \
+        conntrack-tools \
+        iproute2 \
+        kmod \
+        e2fsprogs \
+        ca-certificates \
+        containerd \
+        crun \
+        cni-plugins \
+    && mkdir -p /var/lib/diorama /opt/cni/bin \
+    && for plugin in bridge host-local portmap loopback; do \
+        ln -sfn "/usr/libexec/cni/$plugin" "/opt/cni/bin/$plugin"; \
+    done
+
+COPY --from=build --chmod=755 /out/diorama /usr/local/bin/diorama
+COPY --chmod=755 container/entrypoint.sh /usr/local/bin/diorama-entrypoint
+
+VOLUME ["/var/lib/diorama"]
+
+EXPOSE 6443 10250
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/diorama-entrypoint"]
+CMD ["--container-mode"]
