@@ -19,7 +19,7 @@ image=${IMAGE:-localhost/diorama:latest}
 
 export PATH="${HOME}/.cargo/bin:${PATH}"
 cd "$root"
-if ! cargo build --locked --target "$target" -p diorama; then
+if ! CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo build --locked --target "$target" -p diorama; then
     if [ "$(uname -s)" != "Linux" ]; then
         printf 'host musl build failed on %s; run "make image-source" to compile inside the container\n' "$(uname -s)" >&2
     fi
