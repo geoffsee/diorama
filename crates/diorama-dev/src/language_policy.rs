@@ -50,6 +50,7 @@ pub fn violations(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
     let executable_text = ["sh", "bash", "zsh", "yml", "yaml", "ps1", "cmd", "bat"]
         .contains(&extension)
         || name == "Dockerfile"
+        || name.starts_with("Dockerfile")
         || name.ends_with(".Dockerfile")
         || name == "Makefile"
         || name == "Justfile";
@@ -58,6 +59,7 @@ pub fn violations(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
         let interpreter = regex::Regex::new(
             r#"(?i)(?:^|[\s;|&"'])(?:exec\s+)?(?:[/\w.-]*/)?(?:python(?:[23](?:\.\d+)*)?|pypy[23]?)(?:[\s;"']|$)|#!/.*\b(?:python[23]?|pypy[23]?)\b"#,
         )?;
+        let gh_stack_view = regex::Regex::new(r"gh\s+stack\s+view\b")?;
         for (index, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if (trimmed.starts_with('#') && !trimmed.starts_with("#!")) || trimmed.starts_with("//")
@@ -67,6 +69,13 @@ pub fn violations(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
             if interpreter.is_match(line) {
                 issues.push(format!(
                     "{}:{}: Python interpreter invocation",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            if gh_stack_view.is_match(line) {
+                issues.push(format!(
+                    "{}:{}: interactive 'gh stack view' TUI invocation (hangs non-interactive sessions)",
                     path.display(),
                     index + 1
                 ));
@@ -151,6 +160,7 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
             ]
             .contains(&extension)
                 || name == "Dockerfile"
+                || name.starts_with("Dockerfile")
                 || name.ends_with(".Dockerfile")
                 || name == "Makefile"
                 || name == "Justfile";
@@ -213,6 +223,26 @@ mod tests {
                 "{name}"
             );
         }
+        Ok(())
+    }
+    #[test]
+    fn rejects_interactive_gh_stack_view_tui_regression() -> Result<()> {
+        assert!(
+            !violations(Path::new("script.sh"), b"gh stack view\n")?.is_empty(),
+            "expected gh stack view in script.sh to be rejected"
+        );
+        assert!(
+            !violations(Path::new("ci.yml"), b"run: gh stack view\n")?.is_empty(),
+            "expected gh stack view in ci.yml to be rejected"
+        );
+        assert!(
+            violations(
+                Path::new("script.sh"),
+                b"gh stack submit --auto --open --remote origin\n"
+            )?
+            .is_empty(),
+            "expected gh stack submit in script.sh to be allowed"
+        );
         Ok(())
     }
 }
