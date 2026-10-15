@@ -144,6 +144,13 @@ pub fn v3_core() -> Value {
     ] {
         let collection = path.trim_end_matches("/{name}");
         paths.insert(collection.to_string(), json!({ "post": operation(kind) }));
+        paths.insert(
+            path.to_string(),
+            json!({
+                "put": operation(kind),
+                "patch": operation(kind)
+            }),
+        );
     }
     json!({
         "openapi": "3.0.0",
@@ -177,6 +184,13 @@ pub fn v3_storage_v1() -> Value {
         paths.insert(
             path.to_string(),
             json!({ "post": group_operation("storage.k8s.io", "v1", kind) }),
+        );
+        paths.insert(
+            format!("{path}/{{name}}"),
+            json!({
+                "put": group_operation("storage.k8s.io", "v1", kind),
+                "patch": group_operation("storage.k8s.io", "v1", kind)
+            }),
         );
     }
     json!({
@@ -801,6 +815,15 @@ mod tests {
             doc["paths"]["/api/v1/persistentvolumes"]["post"],
             Value::Object(_)
         ));
+        let patch = &doc["paths"]["/api/v1/namespaces/{namespace}/pods/{name}"]["patch"];
+        assert_eq!(patch["x-kubernetes-group-version-kind"]["kind"], "Pod");
+        let patch_params: Vec<&str> = patch["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(patch_params.contains(&"fieldValidation"));
     }
 
     #[test]

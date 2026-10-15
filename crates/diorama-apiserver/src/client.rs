@@ -2238,6 +2238,49 @@ impl KubernetesApiClient {
         true
     }
 
+    fn default_container_spec(c_obj: &mut serde_json::Map<String, Value>) {
+        c_obj
+            .entry("terminationMessagePath".to_string())
+            .or_insert_with(|| json!("/dev/termination-log"));
+        c_obj
+            .entry("terminationMessagePolicy".to_string())
+            .or_insert_with(|| json!("File"));
+        if !c_obj.contains_key("imagePullPolicy") {
+            let image = c_obj
+                .get("image")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let pull_policy = if image.ends_with(":latest") || !image.contains(':') {
+                "Always"
+            } else {
+                "IfNotPresent"
+            };
+            c_obj.insert("imagePullPolicy".to_string(), json!(pull_policy));
+        }
+    }
+
+    fn default_pod_spec(pod: &mut Value) {
+        let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut) else {
+            return;
+        };
+        spec.entry("terminationGracePeriodSeconds".to_string())
+            .or_insert_with(|| json!(30));
+        spec.entry("restartPolicy".to_string())
+            .or_insert_with(|| json!("Always"));
+        spec.entry("dnsPolicy".to_string())
+            .or_insert_with(|| json!("ClusterFirst"));
+
+        for containers_key in ["containers", "initContainers"] {
+            let Some(containers) = spec.get_mut(containers_key).and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for c_obj in containers.iter_mut().filter_map(Value::as_object_mut) {
+                Self::default_container_spec(c_obj);
+            }
+        }
+    }
+
     fn validate_pod_spec(pod: &Value) -> Result<(), ApiserverError> {
         if let Some(sysctls) = pod
             .pointer("/spec/securityContext/sysctls")
@@ -2438,6 +2481,7 @@ impl KubernetesApiClient {
             .await?;
 
         self.check_auth_detailed("create", "", "pods", Some(namespace), Some(&name))?;
+        Self::default_pod_spec(&mut pod);
         Self::validate_pod_spec(&pod)?;
         self.admit_runtime_class(&mut pod).await?;
 
@@ -2471,6 +2515,7 @@ impl KubernetesApiClient {
         self.admission.run_validating_admission(&adm_req).await?;
         if let Some(obj) = adm_req.object {
             pod = obj;
+            Self::default_pod_spec(&mut pod);
         }
         let qos_class = Self::compute_pod_qos_class(&pod);
         // The kubelet reports Pending once it accepts the pod. Tests read the
@@ -6870,5 +6915,68 @@ impl KubernetesApiClient {
             prefix.trim_start_matches('/')
         );
         Ok(self.storage.watch(&full_prefix).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pod_spec_defaulting() {
+        let mut pod = json!({
+            "metadata": { "name": "test-pod" },
+            "spec": {
+                "containers": [
+                    { "name": "c1", "image": "busybox:1.36" },
+                    { "name": "c2", "image": "nginx" },
+                    { "name": "c3", "image": "custom:latest", "imagePullPolicy": "Never" }
+                ]
+            }
+        });
+        KubernetesApiClient::default_pod_spec(&mut pod);
+
+        let spec = pod.get("spec").unwrap();
+        assert_eq!(
+            spec.get("terminationGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            Some(30)
+        );
+        assert_eq!(
+            spec.get("restartPolicy").and_then(Value::as_str),
+            Some("Always")
+        );
+        assert_eq!(
+            spec.get("dnsPolicy").and_then(Value::as_str),
+            Some("ClusterFirst")
+        );
+
+        let containers = spec.get("containers").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            containers[0]
+                .get("terminationMessagePath")
+                .and_then(Value::as_str),
+            Some("/dev/termination-log")
+        );
+        assert_eq!(
+            containers[0]
+                .get("terminationMessagePolicy")
+                .and_then(Value::as_str),
+            Some("File")
+        );
+        assert_eq!(
+            containers[0].get("imagePullPolicy").and_then(Value::as_str),
+            Some("IfNotPresent")
+        );
+
+        assert_eq!(
+            containers[1].get("imagePullPolicy").and_then(Value::as_str),
+            Some("Always")
+        );
+        assert_eq!(
+            containers[2].get("imagePullPolicy").and_then(Value::as_str),
+            Some("Never")
+        );
     }
 }
