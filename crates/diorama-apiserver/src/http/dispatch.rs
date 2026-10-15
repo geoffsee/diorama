@@ -129,10 +129,19 @@ fn item_pagination_key(item: &Value) -> String {
 /// inconsistent token so clients can resume without the original resourceVersion.
 fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverError> {
     let params = query::parse(query);
-    let Some(limit) = params
-        .get("limit")
-        .and_then(|value| value.parse::<usize>().ok())
-    else {
+    let limit = if let Some(limit_str) = params.get("limit") {
+        match limit_str.parse::<usize>() {
+            Ok(l) => Some(l),
+            Err(_) => {
+                return Err(ApiserverError::BadRequest {
+                    message: "limit must be a non-negative integer".to_string(),
+                });
+            },
+        }
+    } else {
+        None
+    };
+    let Some(limit) = limit else {
         return Ok(list);
     };
     if limit == 0 {
@@ -187,7 +196,8 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
     let current_rv = list
         .pointer("/metadata/resourceVersion")
         .and_then(Value::as_str)
-        .unwrap_or("0")
+        .filter(|s| !s.is_empty() && *s != "0")
+        .unwrap_or("1")
         .to_string();
     let rv = response_rv.unwrap_or(current_rv);
     if let Some(meta) = list.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -575,6 +585,7 @@ async fn replace(
             message: "replace requires a resource name".to_string(),
         });
     };
+    client.validate_crd_schema(&path.group, &path.resource, &doc)?;
     if is_dry_run(query) {
         // Validate the object exists, then echo the replacement without storing.
         let _ = read_single(client, path, name).await?;
@@ -668,6 +679,7 @@ async fn patch(
         },
         PatchType::Apply => unreachable!("handled above"),
     }
+    client.validate_crd_schema(&path.group, &path.resource, &target)?;
     if is_dry_run(query) {
         return Ok(target);
     }
@@ -823,7 +835,7 @@ async fn list_all_namespaces(
     }
     let namespaces = client.list_namespaces().await?;
     let mut items = Vec::new();
-    let mut version = String::new();
+    let mut max_rv: u64 = 0;
     if let Some(entries) = namespaces.get("items").and_then(Value::as_array) {
         for entry in entries {
             let Some(name) = entry.pointer("/metadata/name").and_then(Value::as_str) else {
@@ -836,8 +848,9 @@ async fn list_all_namespaces(
             if let Some(resource_version) = page
                 .pointer("/metadata/resourceVersion")
                 .and_then(Value::as_str)
+                && let Ok(rv_num) = resource_version.parse::<u64>()
             {
-                version = resource_version.to_string();
+                max_rv = max_rv.max(rv_num);
             }
         }
     }
@@ -847,14 +860,19 @@ async fn list_all_namespaces(
         if let Some(cluster_items) = cluster_page.get("items").and_then(Value::as_array) {
             items.extend(cluster_items.iter().cloned());
         }
-        if version.is_empty()
-            && let Some(rv) = cluster_page
-                .pointer("/metadata/resourceVersion")
-                .and_then(Value::as_str)
+        if let Some(rv) = cluster_page
+            .pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            && let Ok(rv_num) = rv.parse::<u64>()
         {
-            version = rv.to_string();
+            max_rv = max_rv.max(rv_num);
         }
     }
+    let version = if max_rv > 0 {
+        max_rv.to_string()
+    } else {
+        "1".to_string()
+    };
     let api_version = items
         .first()
         .and_then(|item| item.get("apiVersion"))
@@ -2186,4 +2204,72 @@ fn scale_from(current: &Value, path: &ResourcePath) -> Value {
             "resource": path.resource,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn page_list_chunking_and_continuation() {
+        let items: Vec<Value> = (1..=5)
+            .map(|i| {
+                json!({
+                    "metadata": {
+                        "name": format!("item-{i}"),
+                        "namespace": "default"
+                    }
+                })
+            })
+            .collect();
+        let list = json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": { "resourceVersion": "42" },
+            "items": items
+        });
+
+        // 1. First chunk of limit 2
+        let page1 = page_list(list.clone(), Some("limit=2")).expect("page 1 succeeds");
+        let p1_items = page1["items"].as_array().unwrap();
+        assert_eq!(p1_items.len(), 2);
+        assert_eq!(p1_items[0]["metadata"]["name"], "item-1");
+        assert_eq!(p1_items[1]["metadata"]["name"], "item-2");
+        assert_eq!(page1["metadata"]["resourceVersion"], "42");
+        assert_eq!(page1["metadata"]["remainingItemCount"], 3);
+        let token1 = page1["metadata"]["continue"].as_str().unwrap();
+        assert_ne!(token1, "");
+
+        // 2. Second chunk using continue token
+        let query2 = format!("limit=2&continue={token1}");
+        let page2 = page_list(list.clone(), Some(&query2)).expect("page 2 succeeds");
+        let p2_items = page2["items"].as_array().unwrap();
+        assert_eq!(p2_items.len(), 2);
+        assert_eq!(p2_items[0]["metadata"]["name"], "item-3");
+        assert_eq!(p2_items[1]["metadata"]["name"], "item-4");
+        assert_eq!(page2["metadata"]["resourceVersion"], "42");
+        assert_eq!(page2["metadata"]["remainingItemCount"], 1);
+        let token2 = page2["metadata"]["continue"].as_str().unwrap();
+
+        // 3. Third and final chunk
+        let query3 = format!("limit=2&continue={token2}");
+        let page3 = page_list(list.clone(), Some(&query3)).expect("page 3 succeeds");
+        let p3_items = page3["items"].as_array().unwrap();
+        assert_eq!(p3_items.len(), 1);
+        assert_eq!(p3_items[0]["metadata"]["name"], "item-5");
+        assert_eq!(page3["metadata"]["resourceVersion"], "42");
+        assert!(page3["metadata"].get("continue").is_none());
+        assert!(page3["metadata"].get("remainingItemCount").is_none());
+
+        // 4. No limit returns all items
+        let all = page_list(list.clone(), None).expect("all succeeds");
+        assert_eq!(all["items"].as_array().unwrap().len(), 5);
+
+        // 5. Invalid limit returns BadRequest
+        let err = page_list(list.clone(), Some("limit=invalid")).unwrap_err();
+        assert!(matches!(err, ApiserverError::BadRequest { .. }));
+        let err_neg = page_list(list, Some("limit=-1")).unwrap_err();
+        assert!(matches!(err_neg, ApiserverError::BadRequest { .. }));
+    }
 }

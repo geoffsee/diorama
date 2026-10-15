@@ -1,9 +1,10 @@
 //! Accept loop for the API server HTTPS listener.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,7 +18,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
@@ -234,9 +235,9 @@ async fn handle(
             || client.discover_apis(),
         ),
         Route::ApiGroup { group } => discovery_result(client.discover_api_group(&group)),
-        Route::GroupDiscovery { group, version } => {
-            discovery_result(client.discover_group_resources(&group, &version))
-        },
+        Route::GroupDiscovery { group, version } => discovery_result(
+            discover_group_resources_with_crds(&client, &group, &version),
+        ),
         Route::Resource(path) => {
             let params = query::parse(query.as_deref());
             if method == Method::GET && path.name.is_none() && is_watch(&params) {
@@ -398,6 +399,106 @@ fn is_watch(params: &BTreeMap<String, String>) -> bool {
 /// the `k8s.io/initial-events-end` annotation, then live events. Either way the
 /// stream ends when `timeoutSeconds` elapses or the client goes away.
 /// `fieldSelector=metadata.name=<name>` is the only selector honoured.
+struct WatchHub {
+    inner: RwLock<WatchHubInner>,
+}
+
+struct WatchHubInner {
+    last_assigned_rev: u64,
+    buffer: VecDeque<Arc<BufferedWatchEvent>>,
+    broadcast_tx: tokio::sync::broadcast::Sender<Arc<BufferedWatchEvent>>,
+}
+
+struct BufferedWatchEvent {
+    resource_version: u64,
+    event_type: String, // "ADDED", "MODIFIED", "DELETED"
+    key: String,
+    object: Value,
+}
+
+static WATCH_HUBS: LazyLock<Mutex<HashMap<usize, Arc<WatchHub>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn get_or_init_watch_hub(service: &ApiserverService) -> Arc<WatchHub> {
+    let key = Arc::as_ptr(service.crd_registry()) as usize;
+    {
+        let guard = WATCH_HUBS.lock().unwrap();
+        if let Some(hub) = guard.get(&key) {
+            return Arc::clone(hub);
+        }
+    }
+    let cur_rev = service.storage().current_revision().await;
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel(8192);
+    let hub = Arc::new(WatchHub {
+        inner: RwLock::new(WatchHubInner {
+            last_assigned_rev: cur_rev.max(1),
+            buffer: VecDeque::with_capacity(10_000),
+            broadcast_tx,
+        }),
+    });
+    let raw_rx = service.storage().client().watch("").await;
+    let hub_clone = Arc::clone(&hub);
+    tokio::spawn(async move {
+        watch_hub_loop(hub_clone, raw_rx).await;
+    });
+
+    let mut guard = WATCH_HUBS.lock().unwrap();
+    guard.entry(key).or_insert_with(|| Arc::clone(&hub)).clone()
+}
+
+async fn watch_hub_loop(hub: Arc<WatchHub>, mut raw_rx: WatchReceiver) {
+    loop {
+        let event = match raw_rx.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+        };
+        let mut inner = hub.inner.write().await;
+        let assigned_rev = match event.event_type {
+            WatchEventType::Put => event.kv.mod_revision.max(inner.last_assigned_rev + 1),
+            WatchEventType::Delete => inner.last_assigned_rev + 1,
+        };
+        inner.last_assigned_rev = assigned_rev;
+
+        let event_type = match event.event_type {
+            WatchEventType::Put => {
+                if event.prev_kv.is_some() {
+                    "MODIFIED".to_string()
+                } else {
+                    "ADDED".to_string()
+                }
+            },
+            WatchEventType::Delete => "DELETED".to_string(),
+        };
+
+        let mut object = serde_json::from_slice(&event.kv.value).unwrap_or(Value::Null);
+        if object.is_null()
+            && let Some(prev) = &event.prev_kv
+        {
+            object = serde_json::from_slice(&prev.value).unwrap_or(Value::Null);
+        }
+        if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(assigned_rev.to_string()),
+            );
+        }
+
+        let buffered = Arc::new(BufferedWatchEvent {
+            resource_version: assigned_rev,
+            event_type,
+            key: event.kv.key,
+            object,
+        });
+
+        if inner.buffer.len() >= 10_000 {
+            inner.buffer.pop_front();
+        }
+        inner.buffer.push_back(Arc::clone(&buffered));
+        let _ = inner.broadcast_tx.send(buffered);
+    }
+}
+
 async fn watch_response(
     service: &ApiserverService,
     client: &KubernetesApiClient,
@@ -405,21 +506,24 @@ async fn watch_response(
     params: &BTreeMap<String, String>,
     shutdown: watch::Receiver<bool>,
 ) -> Response<Body> {
-    let receiver = match client
-        .watch_resource(&path.group, &path.resource, path.namespace.as_deref())
-        .await
-    {
-        Ok(receiver) => receiver,
-        Err(err) => return error_response(&err),
+    let hub = get_or_init_watch_hub(service).await;
+    let broadcast_rx = hub.inner.read().await.broadcast_tx.subscribe();
+
+    let storage_prefix = service.storage().prefix();
+    let group_segment = if path.group.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", path.group)
     };
-    let initial =
-        match dispatch::dispatch(service, client, &Method::GET, path, None, None, &[]).await {
-            Ok(outcome) => match outcome.body {
-                Payload::Json(body) => body,
-                Payload::Text(_) | Payload::ChunkedText(_) => Value::Null,
-            },
-            Err(err) => return error_response(&err),
-        };
+    let namespace_segment = path
+        .namespace
+        .as_ref()
+        .map_or_else(String::new, |ns| format!("{ns}/"));
+    let resource_key_prefix = format!(
+        "{}{group_segment}/{}/{namespace_segment}",
+        storage_prefix, path.resource
+    );
+
     let filter = WatchFilter {
         name: params
             .get("fieldSelector")
@@ -444,14 +548,50 @@ async fn watch_response(
             .unwrap_or("Object")
             .to_string(),
     };
+
     let timeout = params
         .get("timeoutSeconds")
         .and_then(|value| value.parse().ok())
         .map_or(DEFAULT_WATCH_TIMEOUT, Duration::from_secs);
+
+    let (initial, snapshot_rev, buffered_events) = if filter.since == 0
+        || filter.send_initial_events
+    {
+        let initial_doc =
+            match dispatch::dispatch(service, client, &Method::GET, path, None, None, &[]).await {
+                Ok(outcome) => match outcome.body {
+                    Payload::Json(body) => body,
+                    Payload::Text(_) | Payload::ChunkedText(_) => Value::Null,
+                },
+                Err(err) => return error_response(&err),
+            };
+        let snapshot_rev = hub.inner.read().await.last_assigned_rev;
+        (Some(initial_doc), snapshot_rev, Vec::new())
+    } else {
+        let guard = hub.inner.read().await;
+        let events: Vec<Arc<BufferedWatchEvent>> = guard
+            .buffer
+            .iter()
+            .filter(|ev| ev.resource_version > filter.since)
+            .cloned()
+            .collect();
+        let snapshot_rev = guard.last_assigned_rev;
+        (None, snapshot_rev, events)
+    };
+
     let (sender, channel) = Channel::<Bytes, Infallible>::new(32);
     tokio::spawn(stream_watch(
-        sender, receiver, initial, filter, timeout, shutdown,
+        sender,
+        broadcast_rx,
+        initial,
+        snapshot_rev,
+        buffered_events,
+        filter,
+        resource_key_prefix,
+        timeout,
+        shutdown,
     ));
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
@@ -501,53 +641,55 @@ impl WatchFilter {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn stream_watch(
     mut sender: http_body_util::channel::Sender<Bytes, Infallible>,
-    receiver: WatchReceiver,
-    initial: Value,
+    mut broadcast_rx: tokio::sync::broadcast::Receiver<Arc<BufferedWatchEvent>>,
+    initial: Option<Value>,
+    snapshot_rev: u64,
+    buffered_events: Vec<Arc<BufferedWatchEvent>>,
     filter: WatchFilter,
+    resource_key_prefix: String,
     timeout: Duration,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     if *shutdown.borrow() {
         return;
     }
     let mut sent: BTreeMap<String, u64> = BTreeMap::new();
+    let mut last_delivered_rv: u64 = filter.since;
     let mut found = false;
-    let list_version = resource_version(&initial);
-    for item in initial
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if *shutdown.borrow() {
-            return;
-        }
-        if !filter.accepts(item) {
-            continue;
-        }
-        found = true;
-        let version = resource_version(item);
-        sent.insert(object_key(item), version);
-        let wanted = filter.send_initial_events || version > filter.since;
-        if wanted && send_event(&mut sender, "ADDED", item).await.is_err() {
-            return;
+
+    if let Some(initial_doc) = initial {
+        for item in initial_doc
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if *shutdown.borrow() {
+                return;
+            }
+            if !filter.accepts(item) {
+                continue;
+            }
+            found = true;
+            let version = resource_version(item);
+            sent.insert(object_key(item), version);
+            last_delivered_rv = last_delivered_rv.max(version);
+            if send_event(&mut sender, "ADDED", item).await.is_err() {
+                return;
+            }
         }
     }
-    // Live events start after what the client already has: the list for a
-    // watch-list request, its own resourceVersion for a classic watch.
-    let threshold = if filter.send_initial_events {
-        list_version.max(filter.since)
-    } else {
-        filter.since
-    };
+
     if filter.send_initial_events {
+        let bookmark_rv = last_delivered_rv.max(snapshot_rev);
         let bookmark = json!({
             "kind": filter.kind,
             "apiVersion": filter.api_version,
             "metadata": {
-                "resourceVersion": threshold.to_string(),
+                "resourceVersion": bookmark_rv.to_string(),
                 "annotations": { "k8s.io/initial-events-end": "true" }
             }
         });
@@ -557,82 +699,38 @@ async fn stream_watch(
         {
             return;
         }
-    } else if !found
-        && filter.since > 0
-        && let Some(name) = &filter.name
-    {
-        // The named object vanished between the client's GET and this watch.
-        let mut metadata = json!({ "name": name });
-        if let Some(namespace) = &filter.namespace {
-            metadata["namespace"] = json!(namespace);
-        }
-        let gone = json!({
-            "kind": filter.kind,
-            "apiVersion": filter.api_version,
-            "metadata": metadata
-        });
-        let _ = send_event(&mut sender, "DELETED", &gone).await;
-        return;
+        last_delivered_rv = bookmark_rv;
     }
-    stream_live_events(
-        sender, receiver, &filter, &mut sent, threshold, timeout, shutdown,
-    )
-    .await;
-}
 
-/// Forwards datastore events newer than `threshold` until the timeout or disconnect.
-async fn stream_live_events(
-    mut sender: http_body_util::channel::Sender<Bytes, Infallible>,
-    mut receiver: WatchReceiver,
-    filter: &WatchFilter,
-    sent: &mut BTreeMap<String, u64>,
-    threshold: u64,
-    timeout: Duration,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
+    for event in buffered_events {
         if *shutdown.borrow() {
-            break;
+            return;
         }
-        let event = tokio::select! {
-            () = tokio::time::sleep_until(deadline) => break,
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-                continue;
-            }
-            event = receiver.recv() => match event {
-                Ok(event) => event,
-                Err(_) => break,
-            },
-        };
-        let (kind, source) = match event.event_type {
-            WatchEventType::Put if event.prev_kv.is_none() => ("ADDED", Some(&event.kv)),
-            WatchEventType::Put => ("MODIFIED", Some(&event.kv)),
-            WatchEventType::Delete => ("DELETED", event.prev_kv.as_ref()),
-        };
-        // A delete may arrive without the previous value; the key still names the object.
-        let mut object = match source.and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok())
-        {
-            Some(object) => object,
-            None if kind == "DELETED" => filter.object_from_key(&event.kv.key),
-            None => continue,
+        if !event.key.starts_with(&resource_key_prefix) {
+            continue;
+        }
+        if event.resource_version <= last_delivered_rv {
+            continue;
+        }
+        let mut object = if event.object.is_null() {
+            filter.object_from_key(&event.key)
+        } else {
+            event.object.clone()
         };
         if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert(
                 "resourceVersion".to_string(),
-                json!(event.kv.mod_revision.to_string()),
+                json!(event.resource_version.to_string()),
             );
         }
+        if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
+            continue;
+        }
         let key = object_key(&object);
-        let mut kind = kind;
+        let mut kind = event.event_type.as_str();
         if !filter.accepts(&object) {
-            // An object that no longer satisfies the selector leaves the watch
-            // window: upstream reports it as DELETED to the selective watcher.
             if kind == "MODIFIED"
-                && event.kv.mod_revision > threshold
+                && event.resource_version > filter.since
                 && sent.remove(&key).is_some()
                 && send_event(&mut sender, "DELETED", &object).await.is_err()
             {
@@ -640,26 +738,96 @@ async fn stream_live_events(
             }
             continue;
         }
+        found = true;
         if kind == "MODIFIED" && !sent.contains_key(&key) && filter.has_selector() {
-            // The object just started matching the selector.
             kind = "ADDED";
         }
-        // The datastore reports a delete with the deleted entry's own revision, so
-        // the revision threshold applies only to puts; a delete always moves forward.
-        let stale = kind != "DELETED"
-            && (sent
-                .get(&key)
-                .is_some_and(|last| *last >= event.kv.mod_revision)
-                || event.kv.mod_revision <= threshold);
-        if stale {
-            continue;
-        }
-        if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
-            continue;
-        }
-        sent.insert(key, event.kv.mod_revision);
+        sent.insert(key, event.resource_version);
+        last_delivered_rv = event.resource_version;
         if send_event(&mut sender, kind, &object).await.is_err() {
             return;
+        }
+    }
+
+    if !found
+        && filter.since > 0
+        && let Some(name) = &filter.name
+    {
+        let mut metadata =
+            json!({ "name": name, "resourceVersion": (filter.since + 1).to_string() });
+        if let Some(namespace) = &filter.namespace {
+            metadata["namespace"] = json!(namespace);
+        }
+        let gone = json!({
+            "kind": filter.kind,
+            "apiVersion": filter.api_version,
+            "metadata": metadata,
+        });
+        if send_event(&mut sender, "DELETED", &gone).await.is_err() {
+            return;
+        }
+        last_delivered_rv = filter.since + 1;
+    }
+
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut sleep => return,
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            recv_result = broadcast_rx.recv() => {
+                let event = match recv_result {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                };
+                if !event.key.starts_with(&resource_key_prefix) {
+                    continue;
+                }
+                if event.resource_version <= last_delivered_rv {
+                    continue;
+                }
+                let mut object = if event.object.is_null() {
+                    filter.object_from_key(&event.key)
+                } else {
+                    event.object.clone()
+                };
+                if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+                    meta.insert(
+                        "resourceVersion".to_string(),
+                        json!(event.resource_version.to_string()),
+                    );
+                }
+                if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
+                    continue;
+                }
+                let key = object_key(&object);
+                let mut kind = event.event_type.as_str();
+                if !filter.accepts(&object) {
+                    if kind == "MODIFIED"
+                        && event.resource_version > filter.since
+                        && sent.remove(&key).is_some()
+                        && send_event(&mut sender, "DELETED", &object).await.is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if kind == "MODIFIED" && !sent.contains_key(&key) && filter.has_selector() {
+                    kind = "ADDED";
+                }
+                sent.insert(key, event.resource_version);
+                last_delivered_rv = event.resource_version;
+                if send_event(&mut sender, kind, &object).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -779,6 +947,169 @@ fn core_aggregated(client: &KubernetesApiClient) -> Result<Value, ApiserverError
     Ok(discovery_list("", "v1", &legacy))
 }
 
+#[allow(clippy::too_many_lines)]
+fn discover_group_resources_with_crds(
+    client: &KubernetesApiClient,
+    group: &str,
+    version: &str,
+) -> Result<Value, ApiserverError> {
+    let apis = client.discover_apis()?;
+    let groups = apis
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiserverError::NotFound {
+            resource: "apigroups".to_string(),
+            name: group.to_string(),
+        })?;
+    let group_entry = groups
+        .iter()
+        .find(|g| g.get("name").and_then(Value::as_str) == Some(group))
+        .ok_or_else(|| ApiserverError::NotFound {
+            resource: "apigroups".to_string(),
+            name: group.to_string(),
+        })?;
+
+    let version_exists = group_entry
+        .get("versions")
+        .and_then(Value::as_array)
+        .is_some_and(|vers| {
+            vers.iter()
+                .any(|v| v.get("version").and_then(Value::as_str) == Some(version))
+        });
+    if !version_exists {
+        return Err(ApiserverError::NotFound {
+            resource: "groupversions".to_string(),
+            name: format!("{group}/{version}"),
+        });
+    }
+
+    let mut doc = client.discover_group_resources(group, version)?;
+    let Some(resources) = doc.get_mut("resources").and_then(Value::as_array_mut) else {
+        return Ok(doc);
+    };
+
+    if group == "apiextensions.k8s.io" && version == "v1" {
+        for res in resources.iter_mut() {
+            if res.get("name").and_then(Value::as_str) == Some("customresourcedefinitions")
+                && let Some(obj) = res.as_object_mut()
+            {
+                obj.insert("shortNames".to_string(), json!(["crd", "crds"]));
+            }
+        }
+    }
+
+    let crds = client.list_registered_crds();
+    for crd in &crds {
+        let Some(spec) = crd.get("spec") else {
+            continue;
+        };
+        if spec.get("group").and_then(Value::as_str) != Some(group) {
+            continue;
+        }
+        let Some(versions) = spec.get("versions").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(v) = versions.iter().find(|v| {
+            v.get("name").and_then(Value::as_str) == Some(version)
+                && v.get("served").and_then(Value::as_bool) != Some(false)
+        }) else {
+            continue;
+        };
+        let plural = spec
+            .pointer("/names/plural")
+            .and_then(Value::as_str)
+            .unwrap_or("customresources");
+        let singular = spec
+            .pointer("/names/singular")
+            .and_then(Value::as_str)
+            .unwrap_or("customresource");
+        let kind = spec
+            .pointer("/names/kind")
+            .and_then(Value::as_str)
+            .unwrap_or("CustomResource");
+        let namespaced = spec.get("scope").and_then(Value::as_str) != Some("Cluster");
+
+        let short_names = spec.pointer("/names/shortNames").and_then(Value::as_array);
+        let categories = spec.pointer("/names/categories").and_then(Value::as_array);
+
+        let subresources = v.get("subresources").or_else(|| spec.get("subresources"));
+        let has_status = subresources.and_then(|s| s.get("status")).is_some();
+        let has_scale = subresources.and_then(|s| s.get("scale")).is_some();
+
+        if let Some(res) = resources
+            .iter_mut()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some(plural))
+        {
+            if let Some(obj) = res.as_object_mut() {
+                obj.insert("singularName".to_string(), json!(singular));
+                obj.insert("kind".to_string(), json!(kind));
+                obj.insert("namespaced".to_string(), json!(namespaced));
+                if let Some(sn) = short_names {
+                    obj.insert("shortNames".to_string(), json!(sn));
+                }
+                if let Some(cat) = categories {
+                    obj.insert("categories".to_string(), json!(cat));
+                }
+            }
+        } else {
+            let mut obj = json!({
+                "name": plural,
+                "singularName": singular,
+                "namespaced": namespaced,
+                "kind": kind,
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            });
+            if let Some(sn) = short_names {
+                obj["shortNames"] = json!(sn);
+            }
+            if let Some(cat) = categories {
+                obj["categories"] = json!(cat);
+            }
+            resources.push(obj);
+        }
+
+        let status_name = format!("{plural}/status");
+        if has_status {
+            if !resources
+                .iter()
+                .any(|r| r.get("name").and_then(Value::as_str) == Some(&status_name))
+            {
+                resources.push(json!({
+                    "name": status_name,
+                    "singularName": "",
+                    "namespaced": namespaced,
+                    "kind": kind,
+                    "verbs": ["get", "patch", "update"]
+                }));
+            }
+        } else {
+            resources.retain(|r| r.get("name").and_then(Value::as_str) != Some(&status_name));
+        }
+
+        let scale_name = format!("{plural}/scale");
+        if has_scale {
+            if !resources
+                .iter()
+                .any(|r| r.get("name").and_then(Value::as_str) == Some(&scale_name))
+            {
+                resources.push(json!({
+                    "name": scale_name,
+                    "singularName": "",
+                    "namespaced": namespaced,
+                    "group": "autoscaling",
+                    "version": "v1",
+                    "kind": "Scale",
+                    "verbs": ["get", "patch", "update"]
+                }));
+            }
+        } else {
+            resources.retain(|r| r.get("name").and_then(Value::as_str) != Some(&scale_name));
+        }
+    }
+
+    Ok(doc)
+}
+
 fn groups_aggregated(client: &KubernetesApiClient) -> Result<Value, ApiserverError> {
     let groups = client.discover_apis()?;
     let mut items = Vec::new();
@@ -814,7 +1145,9 @@ fn groups_aggregated(client: &KubernetesApiClient) -> Result<Value, ApiserverErr
         };
         let mut version_items = Vec::new();
         for version in fallback_versions {
-            let resources = client.discover_group_resources(name, version)?;
+            let Ok(resources) = discover_group_resources_with_crds(client, name, version) else {
+                continue;
+            };
             // client-go fails the whole discovery when a group lists no resources,
             // so versions without served kinds are left out of the aggregated view.
             if resources
@@ -1480,5 +1813,199 @@ mod tests {
             item["versions"][0]["resources"][0]["resource"],
             "deployments"
         );
+    }
+
+    #[tokio::test]
+    async fn crd_discovery_metadata_and_subresources() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _) = diorama_datastore::DatastoreEngine::open(
+            diorama_datastore::DatastoreConfig::new(dir.path().join("ds")),
+        )
+        .unwrap();
+        let storage = crate::storage::KubernetesStorage::new(engine.client(), "/registry");
+        let pki_dir = dir.path().join("pki");
+        let config =
+            crate::config::ApiserverConfig::default_for_pki(&pki_dir, "127.0.0.1".parse().unwrap());
+        let service = crate::service::ApiserverService::new(config, storage);
+        let client = service.admin_client();
+
+        // Register CRD with shortNames, categories, status, and scale
+        let crd = json!({
+            "spec": {
+                "group": "example.com",
+                "names": {
+                    "kind": "CronTab",
+                    "plural": "crontabs",
+                    "singular": "crontab",
+                    "shortNames": ["ct", "cron"],
+                    "categories": ["all", "batch"]
+                },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "subresources": {
+                        "status": {},
+                        "scale": {
+                            "specReplicasPath": ".spec.replicas",
+                            "statusReplicasPath": ".status.replicas"
+                        }
+                    }
+                }]
+            }
+        });
+        service
+            .crd_registry()
+            .write()
+            .unwrap()
+            .insert("crontabs.example.com".to_string(), crd);
+
+        // 1. Discover registered CRD group/version
+        let doc = super::discover_group_resources_with_crds(&client, "example.com", "v1")
+            .expect("discovery succeeds");
+        let res_list = doc["resources"].as_array().expect("resources array");
+
+        let crontabs = res_list
+            .iter()
+            .find(|r| r["name"] == "crontabs")
+            .expect("crontabs found");
+        assert_eq!(crontabs["singularName"], "crontab");
+        assert_eq!(crontabs["kind"], "CronTab");
+        assert_eq!(crontabs["shortNames"], json!(["ct", "cron"]));
+        assert_eq!(crontabs["categories"], json!(["all", "batch"]));
+
+        let status = res_list
+            .iter()
+            .find(|r| r["name"] == "crontabs/status")
+            .expect("status subresource found");
+        assert_eq!(status["kind"], "CronTab");
+
+        let scale = res_list
+            .iter()
+            .find(|r| r["name"] == "crontabs/scale")
+            .expect("scale subresource found");
+        assert_eq!(scale["kind"], "Scale");
+        assert_eq!(scale["group"], "autoscaling");
+
+        // 2. Unserved version returns 404
+        let err =
+            super::discover_group_resources_with_crds(&client, "example.com", "v2").unwrap_err();
+        assert!(matches!(err, crate::error::ApiserverError::NotFound { .. }));
+
+        // 3. Builtin apiextensions.k8s.io has crd/crds shortNames
+        let crd_group =
+            super::discover_group_resources_with_crds(&client, "apiextensions.k8s.io", "v1")
+                .expect("apiextensions discovery succeeds");
+        let crd_res = crd_group["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "customresourcedefinitions")
+            .expect("crd resource found");
+        assert_eq!(crd_res["shortNames"], json!(["crd", "crds"]));
+    }
+
+    #[tokio::test]
+    async fn watch_hub_consistency_across_concurrent_subscribers() {
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (engine, _) = diorama_datastore::DatastoreEngine::open(
+            diorama_datastore::DatastoreConfig::new(dir.path().join("ds")),
+        )
+        .unwrap();
+        let storage = crate::storage::KubernetesStorage::new(engine.client(), "/registry");
+        let pki_dir = dir.path().join("pki");
+        let config =
+            crate::config::ApiserverConfig::default_for_pki(&pki_dir, "127.0.0.1".parse().unwrap());
+        let service = crate::service::ApiserverService::new(config, storage.clone());
+
+        let hub = super::get_or_init_watch_hub(&service).await;
+        let mut rx1 = hub.inner.read().await.broadcast_tx.subscribe();
+        let mut rx2 = hub.inner.read().await.broadcast_tx.subscribe();
+
+        // Perform concurrent operations: create, update, delete
+        let pod_json = serde_json::to_vec(&json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-1", "namespace": "default" }
+        }))
+        .unwrap();
+        storage
+            .client()
+            .create("/registry/pods/default/pod-1", pod_json.clone())
+            .await
+            .unwrap();
+
+        let other_pod_json = serde_json::to_vec(&json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-2", "namespace": "default" }
+        }))
+        .unwrap();
+        storage
+            .client()
+            .create("/registry/pods/default/pod-2", other_pod_json)
+            .await
+            .unwrap();
+
+        let updated_pod = serde_json::to_vec(&json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-1", "namespace": "default", "labels": { "app": "test" } }
+        }))
+        .unwrap();
+        storage
+            .client()
+            .update("/registry/pods/default/pod-1", updated_pod, None)
+            .await
+            .unwrap();
+
+        storage
+            .client()
+            .delete("/registry/pods/default/pod-2", None)
+            .await
+            .unwrap();
+
+        let mut events1 = Vec::new();
+        let mut events2 = Vec::new();
+        for _ in 0..4 {
+            events1.push(
+                tokio::time::timeout(Duration::from_secs(2), rx1.recv())
+                    .await
+                    .expect("recv rx1")
+                    .unwrap(),
+            );
+            events2.push(
+                tokio::time::timeout(Duration::from_secs(2), rx2.recv())
+                    .await
+                    .expect("recv rx2")
+                    .unwrap(),
+            );
+        }
+
+        // Both subscribers received identical events in identical order
+        assert_eq!(events1.len(), 4);
+        assert_eq!(events2.len(), 4);
+        for i in 0..4 {
+            assert_eq!(events1[i].resource_version, events2[i].resource_version);
+            assert_eq!(events1[i].event_type, events2[i].event_type);
+            assert_eq!(events1[i].key, events2[i].key);
+        }
+
+        // ResourceVersions are strictly monotonically increasing
+        for window in events1.windows(2) {
+            assert!(
+                window[0].resource_version < window[1].resource_version,
+                "rv must strictly increase: {} < {}",
+                window[0].resource_version,
+                window[1].resource_version
+            );
+        }
+
+        // Deletion event has strictly greater resourceVersion than preceding update
+        assert_eq!(events1[3].event_type, "DELETED");
+        assert!(events1[3].resource_version > events1[2].resource_version);
     }
 }
