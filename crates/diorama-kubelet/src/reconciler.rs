@@ -28,10 +28,11 @@ use crate::status::{
 use crate::workload::{
     ANNOTATION_RESTART_COUNT, CpuManager, ExecResult, LABEL_CONTAINER_NAME, LABEL_MANAGED_BY,
     LABEL_POD_NAME, LABEL_POD_NAMESPACE, LABEL_POD_UID, LogOptions, MANAGED_BY, ReconcileReport,
-    RestartPolicy, RuntimeProvider, WorkloadRestartReport, apply_fs_group_ownership,
-    check_pod_restart_need, container_labels, cri, determine_pod_qos,
+    RestartPolicy, RuntimeProvider, WorkloadRestartReport, apply_fs_group_ownership_with_options,
+    check_pod_restart_need, chmod_volume_file, container_labels, cri, determine_pod_qos,
     is_container_cpu_pinning_eligible, parse_cpu_quantity_milli, parse_memory_quantity_bytes,
-    pod_fs_group, sandbox_labels, secs_from_nanos, stage_configmap_files,
+    pod_fs_group, prune_stale_volume_files, resolve_downward_field_path,
+    resolve_downward_resource_field, sandbox_labels, secs_from_nanos, stage_configmap_files,
     stage_projected_downward_api, stage_projected_sa_token, stage_secret_files,
 };
 
@@ -107,6 +108,51 @@ pub struct StartFailure {
 
 fn state_of(status: &cri::ContainerStatus) -> cri::ContainerState {
     cri::ContainerState::try_from(status.state).unwrap_or(cri::ContainerState::ContainerUnknown)
+}
+
+/// Minimal scheduler predicates for the single node: `nodeSelector`, pod count
+/// and CPU/memory/ephemeral-storage requests against `status.allocatable`.
+fn pod_fits_node(
+    node: &Value,
+    committed: &BTreeMap<String, i128>,
+    pod: &Value,
+) -> Result<(), String> {
+    if let Some(selector) = pod.pointer("/spec/nodeSelector").and_then(Value::as_object) {
+        let labels = node.pointer("/metadata/labels").and_then(Value::as_object);
+        let matches = selector
+            .iter()
+            .all(|(k, v)| labels.and_then(|l| l.get(k)).and_then(Value::as_str) == v.as_str());
+        if !matches {
+            return Err("node(s) didn't match Pod's node affinity/selector".to_string());
+        }
+    }
+    let usage = diorama_apiserver::quota::pod_usage(pod);
+    for (resource, key, label) in [
+        ("pods", "pods", "Too many pods"),
+        ("cpu", "requests.cpu", "Insufficient cpu"),
+        ("memory", "requests.memory", "Insufficient memory"),
+        (
+            "ephemeral-storage",
+            "requests.ephemeral-storage",
+            "Insufficient ephemeral-storage",
+        ),
+    ] {
+        let Some(want) = usage.get(key).copied().filter(|v| *v > 0) else {
+            continue;
+        };
+        let Some(alloc) = node
+            .pointer(&format!("/status/allocatable/{resource}"))
+            .and_then(Value::as_str)
+            .and_then(diorama_apiserver::quota::parse_quantity_milli)
+        else {
+            continue;
+        };
+        let used = committed.get(key).copied().unwrap_or(0);
+        if used + want > alloc {
+            return Err(label.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn pod_name(pod: &Value) -> &str {
@@ -597,18 +643,6 @@ fn push_service_link_envs(envs: &mut Vec<cri::KeyValue>, service: &Value) {
     }
 }
 
-fn apply_service_links(envs: &mut Vec<cri::KeyValue>, pod: &Value, services: &[Value]) {
-    let links = service_link_envs(pod, services);
-    if links.is_empty() {
-        return;
-    }
-    let explicit = std::mem::take(envs);
-    *envs = links;
-    for env in explicit {
-        push_env_kv(envs, env);
-    }
-}
-
 fn push_env(envs: &mut Vec<cri::KeyValue>, key: String, value: String) {
     push_env_kv(
         envs,
@@ -676,11 +710,153 @@ fn pod_has_service_account_token(pod: &Value) -> bool {
         })
 }
 
-/// Secrets and config maps already fetched for `valueFrom` env sources.
+/// Secrets and config maps already fetched for `valueFrom` and `envFrom` env sources.
 #[derive(Debug, Default, Clone)]
 struct EnvObjects {
     secrets: BTreeMap<String, Value>,
     configmaps: BTreeMap<String, Value>,
+    services: Vec<Value>,
+}
+
+fn expand_k8s_env(input: &str, envs: &[cri::KeyValue]) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len()
+                && bytes[i + 1] == b'('
+                && let Some(rel_end) = input[i + 2..].find(')')
+            {
+                let var_name = &input[i + 2..i + 2 + rel_end];
+                if !var_name.is_empty()
+                    && let Some(kv) = envs.iter().rfind(|kv| kv.key == var_name)
+                {
+                    out.push_str(&String::from_utf8_lossy(&kv.value));
+                } else {
+                    out.push_str(&input[i..=i + 2 + rel_end]);
+                }
+                i += 3 + rel_end;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+fn append_cm_env_from(envs: &mut Vec<cri::KeyValue>, cm: &Value, prefix: &str) {
+    if let Some(data) = cm.get("data").and_then(Value::as_object) {
+        for (k, v) in data {
+            if let Some(val_str) = v.as_str() {
+                push_env(envs, format!("{prefix}{k}"), val_str.to_string());
+            }
+        }
+    }
+}
+
+fn append_secret_env_from(envs: &mut Vec<cri::KeyValue>, sec: &Value, prefix: &str) {
+    let mut keys = BTreeSet::new();
+    if let Some(data) = sec.get("data").and_then(Value::as_object) {
+        keys.extend(data.keys().cloned());
+    }
+    if let Some(sdata) = sec.get("stringData").and_then(Value::as_object) {
+        keys.extend(sdata.keys().cloned());
+    }
+    for k in keys {
+        if let Some(val_str) = secret_data_value(sec, &k) {
+            push_env(envs, format!("{prefix}{k}"), val_str);
+        }
+    }
+}
+
+fn populate_env_from(
+    container_name: &str,
+    container: &Value,
+    env_objects: &EnvObjects,
+    envs: &mut Vec<cri::KeyValue>,
+) -> Result<(), KubeletError> {
+    let Some(env_from) = container.get("envFrom").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for source in env_from {
+        let prefix = source.get("prefix").and_then(Value::as_str).unwrap_or("");
+        if let Some(cm_ref) = source.get("configMapRef") {
+            let cm_name = cm_ref.get("name").and_then(Value::as_str).unwrap_or("");
+            let optional = cm_ref
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let Some(cm) = env_objects.configmaps.get(cm_name) else {
+                if optional {
+                    continue;
+                }
+                return Err(KubeletError::InvalidConfiguration {
+                    field: format!("spec.containers[{container_name}].envFrom"),
+                    reason: format!("configMap {cm_name} was not found"),
+                });
+            };
+            append_cm_env_from(envs, cm, prefix);
+        }
+        if let Some(sec_ref) = source.get("secretRef") {
+            let sec_name = sec_ref.get("name").and_then(Value::as_str).unwrap_or("");
+            let optional = sec_ref
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let Some(sec) = env_objects.secrets.get(sec_name) else {
+                if optional {
+                    continue;
+                }
+                return Err(KubeletError::InvalidConfiguration {
+                    field: format!("spec.containers[{container_name}].envFrom"),
+                    reason: format!("secret {sec_name} was not found"),
+                });
+            };
+            append_secret_env_from(envs, sec, prefix);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_container_envs(
+    pod: &Value,
+    name: &str,
+    container: &Value,
+    env_objects: &EnvObjects,
+) -> Result<Vec<cri::KeyValue>, KubeletError> {
+    let mut envs = service_link_envs(pod, &env_objects.services);
+    populate_env_from(name, container, env_objects, &mut envs)?;
+    for entry in container
+        .get("env")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(key) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let raw_val = resolve_env_value(pod, name, key, entry, env_objects)?;
+        let val = if entry.get("value").is_some() {
+            expand_k8s_env(&raw_val, &envs)
+        } else {
+            raw_val
+        };
+        push_env_kv(
+            &mut envs,
+            cri::KeyValue {
+                key: key.to_string(),
+                value: val.into_bytes(),
+            },
+        );
+    }
+    Ok(envs)
 }
 
 /// Builds the CRI container configuration for one attempt of a spec container,
@@ -726,21 +902,15 @@ fn container_config_with_env(
             })
             .unwrap_or_default()
     };
-    let mut envs = Vec::new();
-    for entry in container
-        .get("env")
-        .and_then(Value::as_array)
+    let envs = resolve_container_envs(pod, name, container, env_objects)?;
+    let command: Vec<String> = strings("command")
         .into_iter()
-        .flatten()
-    {
-        let Some(key) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        envs.push(cri::KeyValue {
-            key: key.to_string(),
-            value: resolve_env_value(pod, name, key, entry, env_objects)?.into_bytes(),
-        });
-    }
+        .map(|s| expand_k8s_env(&s, &envs))
+        .collect();
+    let args: Vec<String> = strings("args")
+        .into_iter()
+        .map(|s| expand_k8s_env(&s, &envs))
+        .collect();
     let namespace = pod
         .pointer("/metadata/namespace")
         .and_then(Value::as_str)
@@ -757,7 +927,7 @@ fn container_config_with_env(
         .unwrap_or(&empty_vec);
     let default_root = Path::new("/var/lib/kubelet");
     let root = root_dir.unwrap_or(default_root);
-    let mounts = build_container_mounts(container, spec_volumes, root, uid);
+    let mounts = build_container_mounts(container, spec_volumes, root, uid, &envs)?;
     let resources = build_container_resources(container);
     let security_context = build_security_context(pod, container)?;
     let linux =
@@ -776,8 +946,8 @@ fn container_config_with_env(
             user_specified_image: image.to_string(),
             ..cri::ImageSpec::default()
         }),
-        command: strings("command"),
-        args: strings("args"),
+        command,
+        args,
         working_dir: container
             .get("workingDir")
             .and_then(Value::as_str)
@@ -812,6 +982,12 @@ fn resolve_volume_host_path(
             .join("volumes")
             .join("kubernetes.io~configmap")
             .join(vol_name)
+    } else if vol.get("downwardAPI").is_some() {
+        root.join("pods")
+            .join(uid)
+            .join("volumes")
+            .join("kubernetes.io~downward-api")
+            .join(vol_name)
     } else if vol.get("projected").is_some() {
         root.join("pods")
             .join(uid)
@@ -838,8 +1014,34 @@ fn resolve_volume_host_path(
     };
     if !sub_path.is_empty() {
         base.push(sub_path);
+        if vol.get("emptyDir").is_some() || vol.get("hostPath").is_some() {
+            let _ = std::fs::create_dir_all(&base);
+        }
     }
     Some(base)
+}
+
+fn validate_sub_path(sub_path: &str) -> Result<(), KubeletError> {
+    if sub_path.is_empty() {
+        return Ok(());
+    }
+    let path = Path::new(sub_path);
+    if path.is_absolute() || sub_path.starts_with('/') || sub_path.starts_with('\\') {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} must not be an absolute path"),
+        });
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} must not contain '..'"),
+        });
+    }
+    Ok(())
 }
 
 fn build_container_mounts(
@@ -847,10 +1049,11 @@ fn build_container_mounts(
     spec_volumes: &[Value],
     root: &Path,
     uid: &str,
-) -> Vec<cri::Mount> {
+    envs: &[cri::KeyValue],
+) -> Result<Vec<cri::Mount>, KubeletError> {
     let mut mounts = Vec::new();
     let Some(vol_mounts) = container.get("volumeMounts").and_then(Value::as_array) else {
-        return mounts;
+        return Ok(mounts);
     };
     for vm in vol_mounts {
         let Some(mount_path) = vm.get("mountPath").and_then(Value::as_str) else {
@@ -860,7 +1063,16 @@ fn build_container_mounts(
             continue;
         };
         let readonly = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false);
-        let sub_path = vm.get("subPath").and_then(Value::as_str).unwrap_or("");
+        let sub_path_expr = vm.get("subPathExpr").and_then(Value::as_str).unwrap_or("");
+        let resolved_sub_path = if sub_path_expr.is_empty() {
+            vm.get("subPath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            expand_k8s_env(sub_path_expr, envs)
+        };
+        validate_sub_path(&resolved_sub_path)?;
 
         let Some(vol) = spec_volumes
             .iter()
@@ -869,7 +1081,9 @@ fn build_container_mounts(
             continue;
         };
 
-        if let Some(host_path) = resolve_volume_host_path(root, uid, vol, vol_name, sub_path) {
+        if let Some(host_path) =
+            resolve_volume_host_path(root, uid, vol, vol_name, &resolved_sub_path)
+        {
             mounts.push(cri::Mount {
                 container_path: mount_path.to_string(),
                 host_path: host_path.to_string_lossy().to_string(),
@@ -878,7 +1092,7 @@ fn build_container_mounts(
             });
         }
     }
-    mounts
+    Ok(mounts)
 }
 
 /// Maps pod and container `securityContext` onto the CRI security context.
@@ -1092,6 +1306,14 @@ fn resolve_env_value(
             configmap_data_value,
         );
     }
+    if let Some(res_ref) = source.get("resourceFieldRef") {
+        return resolve_downward_resource_field(pod, Some(container), res_ref).ok_or_else(|| {
+            KubeletError::InvalidConfiguration {
+                field: format!("spec.containers[{container}].env[{key}]"),
+                reason: "invalid resourceFieldRef".to_string(),
+            }
+        });
+    }
     let Some(field) = source
         .pointer("/fieldRef/fieldPath")
         .and_then(Value::as_str)
@@ -1105,26 +1327,16 @@ fn resolve_env_value(
             reason: format!("env source {kind} is not supported by this runtime"),
         });
     };
-    let value = match field {
-        "metadata.name"
-        | "metadata.namespace"
-        | "metadata.uid"
-        | "spec.nodeName"
-        | "spec.serviceAccountName"
-        | "status.hostIP"
-        | "status.podIP" => pod
-            .pointer(&format!("/{}", field.replace('.', "/")))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        other => {
-            return Err(KubeletError::InvalidConfiguration {
-                field: format!("spec.containers[{container}].env[{key}]"),
-                reason: format!("fieldRef {other} is not supported"),
-            });
-        },
-    };
-    Ok(value)
+    let namespace = pod
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    resolve_downward_field_path(pod, namespace, field).ok_or_else(|| {
+        KubeletError::InvalidConfiguration {
+            field: format!("spec.containers[{container}].env[{key}]"),
+            reason: format!("fieldRef {field} is not supported"),
+        }
+    })
 }
 
 /// `(object name, required)`. A name is required when any reference to it is not optional.
@@ -1133,34 +1345,47 @@ fn env_key_refs(pod: &Value, kind: &str) -> Vec<(String, bool)> {
     let init_containers = pod
         .pointer("/spec/initContainers")
         .and_then(Value::as_array);
+    let env_from_kind = if kind == "secretKeyRef" {
+        "secretRef"
+    } else {
+        "configMapRef"
+    };
     let mut names: Vec<(String, bool)> = Vec::new();
+    let mut record = |reference: &Value| {
+        let Some(name) = reference
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return;
+        };
+        let required = !reference
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(existing) = names.iter_mut().find(|(existing, _)| existing == name) {
+            existing.1 |= required;
+        } else {
+            names.push((name.to_string(), required));
+        }
+    };
     for container in containers
         .into_iter()
         .flatten()
         .chain(init_containers.into_iter().flatten())
     {
-        let Some(env) = container.get("env").and_then(Value::as_array) else {
-            continue;
-        };
-        for entry in env {
-            let Some(reference) = entry.pointer(&format!("/valueFrom/{kind}")) else {
-                continue;
-            };
-            let Some(name) = reference
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-            else {
-                continue;
-            };
-            let required = !reference
-                .get("optional")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if let Some(existing) = names.iter_mut().find(|(existing, _)| existing == name) {
-                existing.1 |= required;
-            } else {
-                names.push((name.to_string(), required));
+        if let Some(env_from) = container.get("envFrom").and_then(Value::as_array) {
+            for source in env_from {
+                if let Some(reference) = source.get(env_from_kind) {
+                    record(reference);
+                }
+            }
+        }
+        if let Some(env) = container.get("env").and_then(Value::as_array) {
+            for entry in env {
+                if let Some(reference) = entry.pointer(&format!("/valueFrom/{kind}")) {
+                    record(reference);
+                }
             }
         }
     }
@@ -1532,12 +1757,20 @@ impl PodReconciler {
         Ok(reconciled)
     }
 
+    fn record_committed_quota(committed: &mut BTreeMap<String, i128>, pod: &Value) {
+        for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
+            *committed.entry(k).or_insert(0) += v;
+        }
+    }
+
     /// Reconciles every pod in the cluster: binds unscheduled pods to this node,
     /// syncs or terminates the pods assigned here, and removes sandboxes whose Pod is gone.
     pub async fn reconcile_all(&self) -> Result<ReconcileReport, KubeletError> {
         let pod_list = self.client.list_all_pods().await?;
         let mut report = ReconcileReport::default();
         let mut live_uids = BTreeSet::new();
+        let node = self.client.get_node(&self.node_name).await.ok();
+        let mut committed = self.committed_usage(&pod_list);
         for pod in pod_list
             .get("items")
             .and_then(Value::as_array)
@@ -1553,19 +1786,33 @@ impl PodReconciler {
                 .unwrap_or("default")
                 .to_string();
             let name = pod_name(pod).to_string();
-            let pod = match pod.pointer("/spec/nodeName").and_then(Value::as_str) {
+            let pod = match pod
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
                 Some(node) if node == self.node_name => pod.clone(),
                 Some(_) => continue,
-                None => match self.bind_pod_to_node(&namespace, pod).await {
-                    Ok(bound) => {
-                        report.bound += 1;
-                        bound
-                    },
-                    Err(e) => {
-                        report.failed += 1;
-                        eprintln!("Failed to bind pod {namespace}/{name}: {e}");
+                None => {
+                    if pod.pointer("/metadata/deletionTimestamp").is_none()
+                        && let Some(node) = &node
+                        && let Err(reason) = pod_fits_node(node, &committed, pod)
+                    {
+                        self.mark_unschedulable(&namespace, pod, &reason).await;
                         continue;
-                    },
+                    }
+                    match self.bind_pod_to_node(&namespace, pod).await {
+                        Ok(bound) => {
+                            report.bound += 1;
+                            Self::record_committed_quota(&mut committed, &bound);
+                            bound
+                        },
+                        Err(e) => {
+                            report.failed += 1;
+                            eprintln!("Failed to bind pod {namespace}/{name}: {e}");
+                            continue;
+                        },
+                    }
                 },
             };
             let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
@@ -1583,6 +1830,60 @@ impl PodReconciler {
         }
         report.orphans_stopped = self.stop_orphaned_pods(&live_uids).await?;
         Ok(report)
+    }
+
+    /// Resource requests already committed by live pods bound to this node.
+    fn committed_usage(&self, pod_list: &Value) -> BTreeMap<String, i128> {
+        let mut committed = BTreeMap::new();
+        for pod in pod_list
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|p| {
+                p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(&self.node_name)
+            })
+        {
+            for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
+                *committed.entry(k).or_insert(0) += v;
+            }
+        }
+        committed
+    }
+
+    /// Records `PodScheduled=False/Unschedulable` once for a pod that cannot fit.
+    async fn mark_unschedulable(&self, namespace: &str, pod: &Value, reason: &str) {
+        let message = format!("0/1 nodes are available: 1 {reason}.");
+        let already = pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conds| {
+                conds.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some("PodScheduled")
+                        && c.get("message").and_then(Value::as_str) == Some(message.as_str())
+                })
+            });
+        if already {
+            return;
+        }
+        let mut status = pod
+            .get("status")
+            .cloned()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        status["phase"] = json!("Pending");
+        status["conditions"] = json!([{
+            "type": "PodScheduled",
+            "status": "False",
+            "reason": "Unschedulable",
+            "message": message,
+            "lastProbeTime": null,
+            "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
+        }]);
+        let _ = self
+            .client
+            .patch_pod_status(namespace, pod_name(pod), status)
+            .await;
     }
 
     /// Assigns an unscheduled pod to this node. There is no scheduler in a
@@ -1641,6 +1942,7 @@ impl PodReconciler {
             for sandbox_id in sandbox_ids {
                 self.remove_sandbox_tree(sandbox_id).await?;
             }
+            crate::workload::unmount_tmpfs_under(&self.root_dir.join("pods").join(uid));
             eprintln!("removed sandbox of deleted pod {uid}");
         }
         Ok(orphaned.len())
@@ -1821,6 +2123,19 @@ impl PodReconciler {
                 Err(_) => {},
             }
         }
+        let service_list = self
+            .client
+            .list_services("")
+            .await
+            .map_err(|err| StartFailure {
+                reason: "CreateContainerConfigError",
+                message: format!("failed to list services for service links: {err}"),
+            })?;
+        objects.services = service_list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         Ok(objects)
     }
 
@@ -1845,20 +2160,6 @@ impl PodReconciler {
                     reason: "CreateContainerConfigError",
                     message: e.to_string(),
                 })?;
-        let service_list = self
-            .client
-            .list_services("")
-            .await
-            .map_err(|err| StartFailure {
-                reason: "CreateContainerConfigError",
-                message: format!("failed to list services for service links: {err}"),
-            })?;
-        let services = service_list
-            .get("items")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        apply_service_links(&mut config.envs, pod, &services);
         let name = pod_name(pod);
         let assignment = self.cpu_assignment(namespace, name, pod, container);
         if !assignment.cpuset.is_empty() {
@@ -1949,8 +2250,51 @@ impl PodReconciler {
         }
     }
 
+    fn enrich_pod_for_sync(&self, pod: &Value) -> Value {
+        let mut enriched = self.pod_with_service_account_volume(pod);
+        if enriched
+            .pointer("/status/hostIP")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            enriched["status"]["hostIP"] = json!(self.node_ip);
+        }
+        enriched
+    }
+
+    async fn fetch_sandbox_pod_ip(&self, sandbox_id: &str) -> Option<String> {
+        self.runtime
+            .pod_sandbox_status(sandbox_id)
+            .await
+            .ok()
+            .and_then(|status| status.network)
+            .map(|network| network.ip)
+            .filter(|ip| !ip.is_empty())
+    }
+
+    async fn probe_and_prune(
+        &self,
+        sandbox_id: &str,
+        spec_inits: &[Value],
+        spec_containers: &[Value],
+        pod_ip: Option<&str>,
+        statuses: &mut Vec<cri::ContainerStatus>,
+        state: &mut SyncState,
+    ) -> Result<(), KubeletError> {
+        if !state.started_now.is_empty() {
+            *statuses = self.container_statuses(sandbox_id).await?;
+            self.probe_started(spec_inits, statuses, pod_ip, state)
+                .await?;
+            self.probe_started(spec_containers, statuses, pod_ip, state)
+                .await?;
+        }
+        self.prune_attempts(statuses).await;
+        Ok(())
+    }
+
     /// Synchronizes an individual pod's runtime state and updates its API status.
     pub async fn sync_pod(&self, namespace: &str, pod: &Value) -> Result<(), KubeletError> {
+        let orig_pod = pod;
         let name = pod_name(pod);
         pod_uid(pod)?;
         if matches!(
@@ -1959,23 +2303,29 @@ impl PodReconciler {
         ) {
             return Ok(());
         }
-        let enriched = self.pod_with_service_account_volume(pod);
-        let pod = &enriched;
-        self.prepare_pod_volumes(namespace, pod).await?;
-        let (sandbox_id, sandbox_config) = match self.ensure_sandbox(namespace, pod).await {
+        let mut enriched = self.enrich_pod_for_sync(pod);
+        self.prepare_pod_volumes(namespace, &enriched).await?;
+        let (sandbox_id, sandbox_config) = match self.ensure_sandbox(namespace, &enriched).await {
             Ok(sandbox) => sandbox,
             Err(e) => {
                 let failed = pending_status(
-                    pod,
+                    orig_pod,
                     &self.node_ip,
                     "FailedCreatePodSandBox",
                     Some(&e.to_string()),
                 );
-                self.patch_status_if_changed(namespace, name, pod, failed)
+                self.patch_status_if_changed(namespace, name, orig_pod, failed)
                     .await?;
                 return Err(e);
             },
         };
+        let pod_ip = self.fetch_sandbox_pod_ip(&sandbox_id).await;
+        if let Some(ip) = &pod_ip
+            && enriched.pointer("/status/podIP").and_then(Value::as_str) != Some(ip.as_str())
+        {
+            enriched["status"]["podIP"] = json!(ip);
+        }
+        let pod = &enriched;
         let empty = Vec::new();
         let spec_init_containers = pod
             .pointer("/spec/initContainers")
@@ -1989,16 +2339,6 @@ impl PodReconciler {
         let mut statuses = self.container_statuses(&sandbox_id).await?;
         let mut state = SyncState::default();
 
-        // The sandbox network exists before any container starts, so probes
-        // can dial the pod IP on this very pass.
-        let pod_ip = self
-            .runtime
-            .pod_sandbox_status(&sandbox_id)
-            .await
-            .ok()
-            .and_then(|status| status.network)
-            .map(|network| network.ip)
-            .filter(|ip| !ip.is_empty());
         let ctx = SyncContext {
             namespace,
             pod,
@@ -2016,34 +2356,30 @@ impl PodReconciler {
                 .await?;
         }
 
-        if !state.started_now.is_empty() {
-            statuses = self.container_statuses(&sandbox_id).await?;
-            self.probe_started(
-                spec_init_containers,
-                &statuses,
-                pod_ip.as_deref(),
-                &mut state,
-            )
-            .await?;
-            self.probe_started(spec_containers, &statuses, pod_ip.as_deref(), &mut state)
-                .await?;
-        }
-        self.prune_attempts(&statuses).await;
+        self.probe_and_prune(
+            &sandbox_id,
+            spec_init_containers,
+            spec_containers,
+            pod_ip.as_deref(),
+            &mut statuses,
+            &mut state,
+        )
+        .await?;
         let views = self.build_views(namespace, pod, spec_containers, &statuses, &state);
         let init_views = self.build_views(namespace, pod, spec_init_containers, &statuses, &state);
         let status = pod_status(
-            pod,
+            orig_pod,
             self.runtime.provider_name(),
             &self.node_ip,
             pod_ip.as_deref(),
             true,
-            RestartPolicy::of(pod),
+            RestartPolicy::of(orig_pod),
             PodViews {
                 containers: &views,
                 init_containers: &init_views,
             },
         );
-        self.patch_status_if_changed(namespace, name, pod, status)
+        self.patch_status_if_changed(namespace, name, orig_pod, status)
             .await
     }
 
@@ -2482,6 +2818,7 @@ impl PodReconciler {
             let timeout_secs = probe
                 .get("timeoutSeconds")
                 .and_then(Value::as_i64)
+                .filter(|v| *v > 0)
                 .unwrap_or(EXEC_TIMEOUT_SECS);
             return self
                 .runtime
@@ -2514,6 +2851,7 @@ impl PodReconciler {
         let failure_threshold = probe
             .get("failureThreshold")
             .and_then(Value::as_u64)
+            .filter(|v| *v > 0)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(1);
         let initial_delay_secs = probe
@@ -2611,29 +2949,60 @@ impl PodReconciler {
         namespace: &str,
         pod: &Value,
         source: &Value,
+        proj: &Value,
+        written: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<(), KubeletError> {
         if let Some(sa_tok) = source.get("serviceAccountToken") {
-            stage_projected_sa_token(vol_dir, namespace, pod, sa_tok, self.apiserver.as_ref())?;
+            written.extend(stage_projected_sa_token(
+                vol_dir,
+                namespace,
+                pod,
+                sa_tok,
+                self.apiserver.as_ref(),
+            )?);
         }
+
+        let with_default_mode = |spec: &Value| -> Value {
+            if spec.get("defaultMode").is_none()
+                && let Some(dm) = proj.get("defaultMode")
+            {
+                let mut merged = spec.clone();
+                if let Some(obj) = merged.as_object_mut() {
+                    obj.insert("defaultMode".to_string(), dm.clone());
+                }
+                merged
+            } else {
+                spec.clone()
+            }
+        };
 
         if let Some(cm) = source.get("configMap") {
             let cm_name = cm.get("name").and_then(Value::as_str).unwrap_or("");
             if let Ok(cm_obj) = self.client.get_configmap(namespace, cm_name).await {
-                let _ = stage_configmap_files(vol_dir, cm, &cm_obj);
+                let effective = with_default_mode(cm);
+                if let Ok(paths) = stage_configmap_files(vol_dir, &effective, &cm_obj) {
+                    written.extend(paths);
+                }
             }
         }
 
         if let Some(sec) = source.get("secret") {
             let sec_name = sec.get("name").and_then(Value::as_str).unwrap_or("");
             if let Ok(sec_obj) = self.client.get_secret(namespace, sec_name).await {
-                let _ = stage_secret_files(vol_dir, sec, &sec_obj);
+                let effective = with_default_mode(sec);
+                if let Ok(paths) = stage_secret_files(vol_dir, &effective, &sec_obj) {
+                    written.extend(paths);
+                }
             }
         }
 
         if let Some(dw) = source.get("downwardAPI")
             && let Some(items) = dw.get("items").and_then(Value::as_array)
         {
-            stage_projected_downward_api(vol_dir, namespace, pod, items)?;
+            let effective = with_default_mode(dw);
+            written.extend(stage_projected_downward_api(
+                vol_dir, namespace, pod, items, &effective,
+            )?);
         }
 
         Ok(())
@@ -2673,7 +3042,11 @@ impl PodReconciler {
                     pod: pod_name.to_string(),
                     reason: format!("failed to fetch secret '{sec_name}': {e}"),
                 })?;
-            stage_secret_files(&vol_dir, sec, &sec_obj)?;
+            let written: std::collections::HashSet<PathBuf> =
+                stage_secret_files(&vol_dir, sec, &sec_obj)?
+                    .into_iter()
+                    .collect();
+            prune_stale_volume_files(&vol_dir, &written);
         } else if let Some(cm) = vol.get("configMap") {
             let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name);
             std::fs::create_dir_all(&vol_dir).map_err(|e| {
@@ -2694,7 +3067,29 @@ impl PodReconciler {
                     pod: pod_name.to_string(),
                     reason: format!("failed to fetch configmap '{cm_name}': {e}"),
                 })?;
-            stage_configmap_files(&vol_dir, cm, &cm_obj)?;
+            let written: std::collections::HashSet<PathBuf> =
+                stage_configmap_files(&vol_dir, cm, &cm_obj)?
+                    .into_iter()
+                    .collect();
+            prune_stale_volume_files(&vol_dir, &written);
+        } else if let Some(dw) = vol.get("downwardAPI") {
+            let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~downward-api", vol_name);
+            std::fs::create_dir_all(&vol_dir).map_err(|e| {
+                KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!(
+                        "failed to create volume directory {}: {e}",
+                        vol_dir.display()
+                    ),
+                }
+            })?;
+            let mut written = std::collections::HashSet::new();
+            if let Some(items) = dw.get("items").and_then(Value::as_array) {
+                written.extend(stage_projected_downward_api(
+                    &vol_dir, namespace, pod, items, dw,
+                )?);
+            }
+            prune_stale_volume_files(&vol_dir, &written);
         } else if let Some(proj) = vol.get("projected")
             && let Some(sources) = proj.get("sources").and_then(Value::as_array)
         {
@@ -2708,12 +3103,15 @@ impl PodReconciler {
                     ),
                 }
             })?;
+            let mut written = std::collections::HashSet::new();
             for source in sources {
-                self.stage_projected_source(&vol_dir, namespace, pod, source)
+                self.stage_projected_source(&vol_dir, namespace, pod, source, proj, &mut written)
                     .await?;
             }
+            prune_stale_volume_files(&vol_dir, &written);
         } else if vol.get("emptyDir").is_some() {
             let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~empty-dir", vol_name);
+            let existed = vol_dir.exists();
             std::fs::create_dir_all(&vol_dir).map_err(|e| {
                 KubeletError::PodReconciliationFailed {
                     pod: pod_name.to_string(),
@@ -2723,6 +3121,16 @@ impl PodReconciler {
                     ),
                 }
             })?;
+            if !existed {
+                chmod_volume_file(&vol_dir, 0o777);
+            }
+            if vol.pointer("/emptyDir/medium").and_then(Value::as_str) == Some("Memory") {
+                let size = vol
+                    .pointer("/emptyDir/sizeLimit")
+                    .and_then(Value::as_str)
+                    .and_then(parse_memory_quantity_bytes);
+                crate::workload::ensure_tmpfs_mount(&vol_dir, size);
+            }
         } else if let Some(pvc) = vol.get("persistentVolumeClaim") {
             let claim_name = pvc
                 .get("claimName")
@@ -2826,36 +3234,57 @@ impl PodReconciler {
         }
 
         // Managed volumes adopt the pod fsGroup so non-root containers can
-        // write them. Inline hostPath is left alone: mutating arbitrary host
-        // ownership from a volume mount is never safe.
+        // read/write them. Inline hostPath is left alone: mutating arbitrary
+        // host ownership from a volume mount is never safe.
         if let Some(fs_group) = pod_fs_group(pod) {
             let owned = if vol.get("secret").is_some() {
-                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~secret", vol_name))
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~secret", vol_name),
+                    true,
+                ))
             } else if vol.get("configMap").is_some() {
-                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name))
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name),
+                    true,
+                ))
+            } else if vol.get("downwardAPI").is_some() {
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~downward-api", vol_name),
+                    true,
+                ))
             } else if vol.get("projected").is_some() {
-                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~projected", vol_name))
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~projected", vol_name),
+                    true,
+                ))
             } else if vol.get("emptyDir").is_some() {
-                Some(self.get_pod_volume_dir(pod_uid, "kubernetes.io~empty-dir", vol_name))
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~empty-dir", vol_name),
+                    false,
+                ))
             } else if vol.get("persistentVolumeClaim").is_some() {
                 let link = self.get_pod_volume_dir(
                     pod_uid,
                     "kubernetes.io~persistent-volume-claim",
                     vol_name,
                 );
-                Some(std::fs::canonicalize(&link).unwrap_or(link))
+                Some((std::fs::canonicalize(&link).unwrap_or(link), false))
             } else {
                 None
             };
-            if let Some(dir) = owned {
-                apply_fs_group_ownership(&dir, fs_group).map_err(|e| {
-                    KubeletError::PodReconciliationFailed {
-                        pod: pod_name.to_string(),
-                        reason: format!(
-                            "failed to apply fsGroup ownership to {}: {e}",
-                            dir.display()
-                        ),
-                    }
+            if let Some((dir, readonly)) = owned {
+                let on_root_mismatch = !readonly
+                    && pod
+                        .pointer("/spec/securityContext/fsGroupChangePolicy")
+                        .and_then(Value::as_str)
+                        == Some("OnRootMismatch");
+                apply_fs_group_ownership_with_options(&dir, fs_group, readonly, on_root_mismatch)
+                    .map_err(|e| KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!(
+                        "failed to apply fsGroup ownership to {}: {e}",
+                        dir.display()
+                    ),
                 })?;
             }
         }

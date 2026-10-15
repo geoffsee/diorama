@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt::Write;
 
 use diorama_network::CommandExecutor;
 
@@ -36,14 +37,7 @@ impl IptablesDataplane {
 
         for svc in table.services().values() {
             for port in &svc.ports {
-                Self::synthesize_service_rules(
-                    table,
-                    &svc.namespace,
-                    &svc.name,
-                    svc.cluster_ip.as_deref(),
-                    port,
-                    &mut rules,
-                );
+                Self::synthesize_service_rules(table, svc, port, &mut rules);
             }
         }
 
@@ -52,12 +46,13 @@ impl IptablesDataplane {
 
     fn synthesize_service_rules(
         table: &ServiceRoutingTable,
-        namespace: &str,
-        name: &str,
-        cluster_ip: Option<&str>,
+        svc: &crate::routing::ServiceDefinition,
         port: &ServicePort,
         rules: &mut Vec<IptablesRule>,
     ) {
+        let namespace = svc.namespace.as_str();
+        let name = svc.name.as_str();
+        let cluster_ip = svc.cluster_ip.as_deref();
         let proto = port.protocol.as_str().to_lowercase();
         let svc_key = format!("{namespace}/{name}:{}/{}", port.port, port.protocol);
         let svc_hash = service_chain_hash(&svc_key);
@@ -92,7 +87,12 @@ impl IptablesDataplane {
         // Ready endpoints distribution
         if let Ok(endpoints) = table.get_ready_endpoints(namespace, name, port.port, port.protocol)
         {
-            Self::synthesize_endpoint_rules(&svc_chain, &endpoints, rules);
+            Self::synthesize_endpoint_rules(
+                &svc_chain,
+                &endpoints,
+                svc.session_affinity_seconds,
+                rules,
+            );
         }
     }
 
@@ -100,13 +100,33 @@ impl IptablesDataplane {
     fn synthesize_endpoint_rules(
         svc_chain: &str,
         endpoints: &[TargetEndpoint],
+        affinity_seconds: Option<u32>,
         rules: &mut Vec<IptablesRule>,
     ) {
         let n = endpoints.len();
+        let sep_chain_of = |ep: &TargetEndpoint| {
+            let affinity = if affinity_seconds.is_some() {
+                "/affinity"
+            } else {
+                ""
+            };
+            let sep_key = format!("{}:{}/{}{affinity}", ep.ip, ep.port, ep.protocol);
+            format!("KUBE-SEP-{}", service_chain_hash(&sep_key))
+        };
+        if let Some(seconds) = affinity_seconds {
+            for ep in endpoints {
+                let sep_chain = sep_chain_of(ep);
+                rules.push(IptablesRule {
+                    table: "nat",
+                    chain: svc_chain.to_string(),
+                    rule: format!(
+                        "-m recent --name {sep_chain} --mask 255.255.255.255 --rsource --rcheck --seconds {seconds} --reap -j {sep_chain}"
+                    ),
+                });
+            }
+        }
         for (i, ep) in endpoints.iter().enumerate() {
-            let sep_key = format!("{}:{}/{}", ep.ip, ep.port, ep.protocol);
-            let sep_hash = service_chain_hash(&sep_key);
-            let sep_chain = format!("KUBE-SEP-{sep_hash}");
+            let sep_chain = sep_chain_of(ep);
             let proto = ep.protocol.as_str().to_lowercase();
 
             if i < n - 1 {
@@ -139,12 +159,17 @@ impl IptablesDataplane {
                 rule: "-j KUBE-MARK-MASQ".to_string(),
             });
 
-            // Endpoint DNAT rule
+            // Endpoint DNAT rule; affine SEPs record the client for affinity.
+            let recent = if affinity_seconds.is_some() {
+                format!("-m recent --set --name {sep_chain} --mask 255.255.255.255 --rsource ")
+            } else {
+                String::new()
+            };
             rules.push(IptablesRule {
                 table: "nat",
-                chain: sep_chain,
+                chain: sep_chain.clone(),
                 rule: format!(
-                    "-p {proto} -m {proto} -j DNAT --to-destination {}:{}",
+                    "-p {proto} {recent}-m {proto} -j DNAT --to-destination {}:{}",
                     ep.ip, ep.port
                 ),
             });
@@ -292,6 +317,10 @@ impl IptablesDataplane {
             );
         }
 
+        if Self::apply_rules_atomically(rules, executor) {
+            return Ok(());
+        }
+
         // Flush only owned base chains to clear previous service/nodeport mappings
         let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-SERVICES"]);
         let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-NODEPORTS"]);
@@ -340,6 +369,86 @@ impl IptablesDataplane {
         // (OUTPUT to 127.0.0.1:nodePort) only reaches KUBE-NODEPORTS through it.
         Self::ensure_kube_services_nodeports_jump(executor)?;
         Ok(())
+    }
+
+    /// Replaces the owned Service chains in a single `iptables-restore --noflush`
+    /// transaction. Returns `false` when the restore tool is unavailable or rejects
+    /// the payload so the caller can fall back to incremental programming.
+    fn apply_rules_atomically(rules: &[IptablesRule], executor: &dyn CommandExecutor) -> bool {
+        let Ok(existing) = executor.run("iptables", &["-t", "nat", "-S"]) else {
+            return false;
+        };
+        if !existing.success {
+            return false;
+        }
+        let payload = Self::restore_payload(rules, &existing.stdout);
+        let Ok(mut tmp) = tempfile::Builder::new()
+            .prefix("diorama-kube-proxy-")
+            .suffix(".rules")
+            .tempfile()
+        else {
+            return false;
+        };
+        if std::io::Write::write_all(&mut tmp, payload.as_bytes()).is_err() {
+            return false;
+        }
+        let Some(path_str) = tmp.path().to_str() else {
+            return false;
+        };
+        let result = executor.run("iptables-restore", &["--noflush", "-w", "5", path_str]);
+        match result {
+            Ok(out) if out.success => true,
+            Ok(out) => {
+                tracing::warn!(
+                    target: "kubeproxy::dataplane",
+                    reason = %out.stderr,
+                    "atomic iptables-restore rejected; falling back to incremental rules"
+                );
+                false
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Renders the `nat` table restore payload for the owned chains.
+    #[must_use]
+    pub fn restore_payload(rules: &[IptablesRule], existing_nat: &str) -> String {
+        let mut chains = BTreeSet::new();
+        for rule in rules {
+            if rule.chain.starts_with("KUBE-SVC-") || rule.chain.starts_with("KUBE-SEP-") {
+                chains.insert(rule.chain.clone());
+            }
+            for token in rule.rule.split_whitespace() {
+                if token.starts_with("KUBE-SVC-") || token.starts_with("KUBE-SEP-") {
+                    chains.insert(token.to_string());
+                }
+            }
+        }
+        let stale: BTreeSet<&str> = existing_nat
+            .split_whitespace()
+            .filter(|t| {
+                (t.starts_with("KUBE-SEP-") || t.starts_with("KUBE-SVC-")) && !chains.contains(*t)
+            })
+            .collect();
+
+        let mut out = String::from("*nat\n:KUBE-SERVICES - [0:0]\n:KUBE-NODEPORTS - [0:0]\n");
+        for chain in chains
+            .iter()
+            .map(String::as_str)
+            .chain(stale.iter().copied())
+        {
+            let _ = writeln!(out, ":{chain} - [0:0]");
+        }
+        for rule in rules {
+            let _ = writeln!(out, "-A {} {}", rule.chain, rule.rule);
+        }
+        // ClusterIP matches stay ahead of the NodePort dispatch.
+        out.push_str("-A KUBE-SERVICES -m addrtype --dst-type LOCAL -j KUBE-NODEPORTS\n");
+        for chain in &stale {
+            let _ = writeln!(out, "-X {chain}");
+        }
+        out.push_str("COMMIT\n");
+        out
     }
 
     /// Appends the kube-proxy dispatch from `KUBE-SERVICES` into `KUBE-NODEPORTS`.

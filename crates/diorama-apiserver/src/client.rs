@@ -168,7 +168,22 @@ fn group_version(group: &str) -> String {
     }
 }
 
-/// Applies an RFC 7386 JSON Merge Patch to a target JSON value.
+fn merge_patch_array_by_key(target_arr: &mut Vec<Value>, patch_arr: Vec<Value>, mk: &str) {
+    for patch_item in patch_arr {
+        let item_key = patch_item.get(mk).and_then(Value::as_str).unwrap_or("");
+        if let Some(existing_item) = target_arr
+            .iter_mut()
+            .find(|t| t.get(mk).and_then(Value::as_str) == Some(item_key))
+        {
+            json_merge_patch(existing_item, patch_item);
+        } else {
+            target_arr.push(patch_item);
+        }
+    }
+}
+
+/// Applies an RFC 7386 JSON Merge Patch (with Kubernetes strategic merge array
+/// merging for keyed object lists like `containers`, `volumes`, `conditions`) to a target JSON value.
 pub fn json_merge_patch(target: &mut Value, patch: Value) {
     if let Value::Object(patch_obj) = patch {
         if !target.is_object() {
@@ -183,6 +198,28 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
                     json_merge_patch(existing_sub, value);
                 } else {
                     target_obj.insert(key, value);
+                }
+            } else if let Value::Array(patch_arr) = value {
+                let merge_key = match key.as_str() {
+                    "containers"
+                    | "initContainers"
+                    | "ephemeralContainers"
+                    | "volumes"
+                    | "volumeMounts"
+                    | "env"
+                    | "ports" => Some("name"),
+                    "conditions" => Some("type"),
+                    _ => None,
+                };
+                if let Some(mk) = merge_key
+                    && let Some(Value::Array(target_arr)) = target_obj.get_mut(&key)
+                    && patch_arr
+                        .iter()
+                        .all(|item| item.get(mk).and_then(Value::as_str).is_some())
+                {
+                    merge_patch_array_by_key(target_arr, patch_arr, mk);
+                } else {
+                    target_obj.insert(key, Value::Array(patch_arr));
                 }
             } else {
                 target_obj.insert(key, value);
@@ -475,19 +512,33 @@ impl KubernetesApiClient {
                     "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 },
                 {
+                    "name": "namespaces/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "Namespace",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "namespaces/finalize",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "Namespace",
+                    "verbs": ["update"]
+                },
+                {
                     "name": "configmaps",
                     "singularName": "configmap",
                     "namespaced": true,
                     "kind": "ConfigMap",
                     "shortNames": ["cm"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "secrets",
                     "singularName": "secret",
                     "namespaced": true,
                     "kind": "Secret",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "pods",
@@ -495,97 +546,7 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "Pod",
                     "shortNames": ["po"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "pods/log",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "verbs": ["get"]
-                },
-                {
-                    "name": "podtemplates",
-                    "singularName": "podtemplate",
-                    "namespaced": true,
-                    "kind": "PodTemplate",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "limitranges",
-                    "singularName": "limitrange",
-                    "namespaced": true,
-                    "kind": "LimitRange",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "resourcequotas",
-                    "singularName": "resourcequota",
-                    "namespaced": true,
-                    "kind": "ResourceQuota",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "replicationcontrollers",
-                    "singularName": "replicationcontroller",
-                    "namespaced": true,
-                    "kind": "ReplicationController",
-                    "shortNames": ["rc"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "services",
-                    "singularName": "service",
-                    "namespaced": true,
-                    "kind": "Service",
-                    "shortNames": ["svc"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "endpoints",
-                    "singularName": "endpoints",
-                    "namespaced": true,
-                    "kind": "Endpoints",
-                    "shortNames": ["ep"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "serviceaccounts",
-                    "singularName": "serviceaccount",
-                    "namespaced": true,
-                    "kind": "ServiceAccount",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "nodes",
-                    "singularName": "node",
-                    "namespaced": false,
-                    "kind": "Node",
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "persistentvolumeclaims",
-                    "singularName": "persistentvolumeclaim",
-                    "namespaced": true,
-                    "kind": "PersistentVolumeClaim",
-                    "shortNames": ["pvc"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "persistentvolumes",
-                    "singularName": "persistentvolume",
-                    "namespaced": false,
-                    "kind": "PersistentVolume",
-                    "shortNames": ["pv"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "events",
-                    "singularName": "event",
-                    "namespaced": true,
-                    "kind": "Event",
-                    "shortNames": ["ev"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 },
                 {
                     "name": "pods/log",
@@ -600,9 +561,209 @@ impl KubernetesApiClient {
                     "namespaced": true,
                     "kind": "Pod",
                     "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "pods/resize",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "pods/eviction",
+                    "singularName": "",
+                    "namespaced": true,
+                    "group": "policy",
+                    "version": "v1",
+                    "kind": "Eviction",
+                    "verbs": ["create"]
+                },
+                {
+                    "name": "pods/exec",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "PodExecOptions",
+                    "verbs": ["create", "get"]
+                },
+                {
+                    "name": "podtemplates",
+                    "singularName": "podtemplate",
+                    "namespaced": true,
+                    "kind": "PodTemplate",
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "limitranges",
+                    "singularName": "limitrange",
+                    "namespaced": true,
+                    "kind": "LimitRange",
+                    "shortNames": ["limits"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "resourcequotas",
+                    "singularName": "resourcequota",
+                    "namespaced": true,
+                    "kind": "ResourceQuota",
+                    "shortNames": ["quota"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "resourcequotas/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "ResourceQuota",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "replicationcontrollers",
+                    "singularName": "replicationcontroller",
+                    "namespaced": true,
+                    "kind": "ReplicationController",
+                    "shortNames": ["rc"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "replicationcontrollers/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "ReplicationController",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "replicationcontrollers/scale",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Scale",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "services",
+                    "singularName": "service",
+                    "namespaced": true,
+                    "kind": "Service",
+                    "shortNames": ["svc"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "services/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Service",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "endpoints",
+                    "singularName": "endpoints",
+                    "namespaced": true,
+                    "kind": "Endpoints",
+                    "shortNames": ["ep"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "serviceaccounts",
+                    "singularName": "serviceaccount",
+                    "namespaced": true,
+                    "kind": "ServiceAccount",
+                    "shortNames": ["sa"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "nodes",
+                    "singularName": "node",
+                    "namespaced": false,
+                    "kind": "Node",
+                    "shortNames": ["no"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "nodes/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "Node",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "persistentvolumeclaims",
+                    "singularName": "persistentvolumeclaim",
+                    "namespaced": true,
+                    "kind": "PersistentVolumeClaim",
+                    "shortNames": ["pvc"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "persistentvolumeclaims/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "PersistentVolumeClaim",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "persistentvolumes",
+                    "singularName": "persistentvolume",
+                    "namespaced": false,
+                    "kind": "PersistentVolume",
+                    "shortNames": ["pv"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "persistentvolumes/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "PersistentVolume",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "events",
+                    "singularName": "event",
+                    "namespaced": true,
+                    "kind": "Event",
+                    "shortNames": ["ev"],
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 }
             ]
         }))
+    }
+
+    fn append_group_versions(existing_vers: &mut Vec<Value>, versions: Vec<Value>) {
+        for v in versions {
+            let gv = v.get("groupVersion").and_then(Value::as_str);
+            if !existing_vers
+                .iter()
+                .any(|ev| ev.get("groupVersion").and_then(Value::as_str) == gv)
+            {
+                existing_vers.push(v);
+            }
+        }
+    }
+
+    fn merge_crd_group(groups: &mut Vec<Value>, crd: &Value) {
+        let Some(spec) = crd.get("spec") else {
+            return;
+        };
+        let Some(group) = spec.get("group").and_then(Value::as_str) else {
+            return;
+        };
+        let versions = Self::extract_crd_versions(spec, group);
+        if versions.is_empty() {
+            return;
+        }
+        if let Some(existing) = groups
+            .iter_mut()
+            .find(|g| g.get("name").and_then(Value::as_str) == Some(group))
+        {
+            if let Some(existing_vers) = existing.get_mut("versions").and_then(Value::as_array_mut)
+            {
+                Self::append_group_versions(existing_vers, versions);
+            }
+            return;
+        }
+        let pref = versions.first().cloned().unwrap_or(json!({}));
+        groups.push(json!({
+            "name": group,
+            "versions": versions,
+            "preferredVersion": pref
+        }));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -622,6 +783,49 @@ impl KubernetesApiClient {
                     { "groupVersion": "batch/v1", "version": "v1" }
                 ],
                 "preferredVersion": { "groupVersion": "batch/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "autoscaling",
+                "versions": [
+                    { "groupVersion": "autoscaling/v2", "version": "v2" },
+                    { "groupVersion": "autoscaling/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "autoscaling/v2", "version": "v2" }
+            }),
+            json!({
+                "name": "policy",
+                "versions": [
+                    { "groupVersion": "policy/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "policy/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "networking.k8s.io",
+                "versions": [
+                    { "groupVersion": "networking.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "networking.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "certificates.k8s.io",
+                "versions": [
+                    { "groupVersion": "certificates.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "certificates.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "scheduling.k8s.io",
+                "versions": [
+                    { "groupVersion": "scheduling.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "scheduling.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "node.k8s.io",
+                "versions": [
+                    { "groupVersion": "node.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "node.k8s.io/v1", "version": "v1" }
             }),
             json!({
                 "name": "coordination.k8s.io",
@@ -684,24 +888,7 @@ impl KubernetesApiClient {
         // Dynamically add CRD groups
         let crd_guard = self.crd_registry.read().unwrap();
         for crd in crd_guard.values() {
-            if let Some(spec) = crd.get("spec")
-                && let Some(group) = spec.get("group").and_then(Value::as_str)
-            {
-                if groups
-                    .iter()
-                    .any(|g| g.get("name").and_then(Value::as_str) == Some(group))
-                {
-                    continue;
-                }
-
-                let versions = Self::extract_crd_versions(spec, group);
-                let pref = versions.first().cloned().unwrap_or(json!({}));
-                groups.push(json!({
-                    "name": group,
-                    "versions": versions,
-                    "preferredVersion": pref
-                }));
-            }
+            Self::merge_crd_group(&mut groups, crd);
         }
 
         // Dynamically add APIService groups
@@ -729,6 +916,34 @@ impl KubernetesApiClient {
         }))
     }
 
+    pub fn discover_api_group(&self, group: &str) -> Result<Value, ApiserverError> {
+        let list = self.discover_apis()?;
+        let found = list
+            .get("groups")
+            .and_then(Value::as_array)
+            .and_then(|groups| {
+                groups
+                    .iter()
+                    .find(|g| g.get("name").and_then(Value::as_str) == Some(group))
+            })
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: "apigroups".to_string(),
+                name: group.to_string(),
+            })?;
+        Ok(json!({
+            "kind": "APIGroup",
+            "apiVersion": "v1",
+            "name": found["name"],
+            "versions": found["versions"],
+            "preferredVersion": found["preferredVersion"]
+        }))
+    }
+
+    fn is_crd_version_served(v: &Value, version: &str) -> bool {
+        v.get("name").and_then(Value::as_str) == Some(version)
+            && v.get("served").and_then(Value::as_bool) != Some(false)
+    }
+
     fn namespaced_resource(name: &str, singular: &str, kind: &str) -> Value {
         let short_names: &[&str] = match name {
             "deployments" => &["deploy"],
@@ -739,6 +954,10 @@ impl KubernetesApiClient {
             "endpointslices" => &["es"],
             "jobs" => &["job"],
             "cronjobs" => &["cj"],
+            "horizontalpodautoscalers" => &["hpa"],
+            "poddisruptionbudgets" => &["pdb"],
+            "networkpolicies" => &["netpol"],
+            "ingresses" => &["ing"],
             _ => &[],
         };
         json!({
@@ -747,7 +966,7 @@ impl KubernetesApiClient {
             "namespaced": true,
             "kind": kind,
             "shortNames": short_names,
-            "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
         })
     }
 
@@ -757,7 +976,7 @@ impl KubernetesApiClient {
             "singularName": singular,
             "namespaced": false,
             "kind": kind,
-            "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
         })
     }
 
@@ -774,38 +993,61 @@ impl KubernetesApiClient {
 
         match (group, version) {
             ("apiextensions.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "customresourcedefinitions",
+                    "customresourcedefinition",
+                    "CustomResourceDefinition",
+                ));
                 resources.push(json!({
-                    "name": "customresourcedefinitions",
-                    "singularName": "customresourcedefinition",
+                    "name": "customresourcedefinitions/status",
+                    "singularName": "",
                     "namespaced": false,
                     "kind": "CustomResourceDefinition",
-                    "verbs": ["create", "delete", "get", "list", "watch"]
+                    "verbs": ["get", "patch", "update"]
                 }));
             },
             ("admissionregistration.k8s.io", "v1") => {
-                resources.push(json!({
-                    "name": "validatingwebhookconfigurations",
-                    "singularName": "validatingwebhookconfiguration",
-                    "namespaced": false,
-                    "kind": "ValidatingWebhookConfiguration",
-                    "verbs": ["create", "delete", "get", "list", "watch"]
-                }));
-                resources.push(json!({
-                    "name": "mutatingwebhookconfigurations",
-                    "singularName": "mutatingwebhookconfiguration",
-                    "namespaced": false,
-                    "kind": "MutatingWebhookConfiguration",
-                    "verbs": ["create", "delete", "get", "list", "watch"]
-                }));
+                for (name, singular, kind) in [
+                    (
+                        "validatingwebhookconfigurations",
+                        "validatingwebhookconfiguration",
+                        "ValidatingWebhookConfiguration",
+                    ),
+                    (
+                        "mutatingwebhookconfigurations",
+                        "mutatingwebhookconfiguration",
+                        "MutatingWebhookConfiguration",
+                    ),
+                    (
+                        "validatingadmissionpolicies",
+                        "validatingadmissionpolicy",
+                        "ValidatingAdmissionPolicy",
+                    ),
+                    (
+                        "validatingadmissionpolicybindings",
+                        "validatingadmissionpolicybinding",
+                        "ValidatingAdmissionPolicyBinding",
+                    ),
+                    (
+                        "mutatingadmissionpolicies",
+                        "mutatingadmissionpolicy",
+                        "MutatingAdmissionPolicy",
+                    ),
+                    (
+                        "mutatingadmissionpolicybindings",
+                        "mutatingadmissionpolicybinding",
+                        "MutatingAdmissionPolicyBinding",
+                    ),
+                ] {
+                    resources.push(Self::cluster_resource(name, singular, kind));
+                }
             },
             ("apiregistration.k8s.io", "v1") => {
-                resources.push(json!({
-                    "name": "apiservices",
-                    "singularName": "apiservice",
-                    "namespaced": false,
-                    "kind": "APIService",
-                    "verbs": ["create", "delete", "get", "list", "watch"]
-                }));
+                resources.push(Self::cluster_resource(
+                    "apiservices",
+                    "apiservice",
+                    "APIService",
+                ));
             },
             ("apps", "v1") => {
                 for (name, singular, kind) in [
@@ -813,6 +1055,11 @@ impl KubernetesApiClient {
                     ("replicasets", "replicaset", "ReplicaSet"),
                     ("statefulsets", "statefulset", "StatefulSet"),
                     ("daemonsets", "daemonset", "DaemonSet"),
+                    (
+                        "controllerrevisions",
+                        "controllerrevision",
+                        "ControllerRevision",
+                    ),
                 ] {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
@@ -829,17 +1076,17 @@ impl KubernetesApiClient {
                         "verbs": ["get", "patch", "update"]
                     }));
                 }
-                for status in [
-                    "deployments/status",
-                    "replicasets/status",
-                    "statefulsets/status",
-                    "daemonsets/status",
+                for (status, kind) in [
+                    ("deployments/status", "Deployment"),
+                    ("replicasets/status", "ReplicaSet"),
+                    ("statefulsets/status", "StatefulSet"),
+                    ("daemonsets/status", "DaemonSet"),
                 ] {
                     resources.push(json!({
                         "name": status,
                         "singularName": "",
                         "namespaced": true,
-                        "kind": status.split('/').next().unwrap_or(""),
+                        "kind": kind,
                         "verbs": ["get", "patch", "update"]
                     }));
                 }
@@ -850,15 +1097,99 @@ impl KubernetesApiClient {
                 {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
-                for status in ["jobs/status", "cronjobs/status"] {
+                for (status, kind) in [("jobs/status", "Job"), ("cronjobs/status", "CronJob")] {
                     resources.push(json!({
                         "name": status,
                         "singularName": "",
                         "namespaced": true,
-                        "kind": status.split('/').next().unwrap_or(""),
+                        "kind": kind,
                         "verbs": ["get", "patch", "update"]
                     }));
                 }
+            },
+            ("autoscaling", "v1" | "v2") => {
+                resources.push(Self::namespaced_resource(
+                    "horizontalpodautoscalers",
+                    "horizontalpodautoscaler",
+                    "HorizontalPodAutoscaler",
+                ));
+                resources.push(json!({
+                    "name": "horizontalpodautoscalers/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "HorizontalPodAutoscaler",
+                    "verbs": ["get", "patch", "update"]
+                }));
+            },
+            ("policy", "v1") => {
+                resources.push(Self::namespaced_resource(
+                    "poddisruptionbudgets",
+                    "poddisruptionbudget",
+                    "PodDisruptionBudget",
+                ));
+                resources.push(json!({
+                    "name": "poddisruptionbudgets/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "PodDisruptionBudget",
+                    "verbs": ["get", "patch", "update"]
+                }));
+            },
+            ("networking.k8s.io", "v1") => {
+                resources.push(Self::namespaced_resource(
+                    "networkpolicies",
+                    "networkpolicy",
+                    "NetworkPolicy",
+                ));
+                resources.push(Self::namespaced_resource("ingresses", "ingress", "Ingress"));
+                resources.push(json!({
+                    "name": "ingresses/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Ingress",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(Self::cluster_resource(
+                    "ingressclasses",
+                    "ingressclass",
+                    "IngressClass",
+                ));
+                resources.push(Self::cluster_resource(
+                    "ipaddresses",
+                    "ipaddress",
+                    "IPAddress",
+                ));
+                resources.push(Self::cluster_resource(
+                    "servicecidrs",
+                    "servicecidr",
+                    "ServiceCIDR",
+                ));
+            },
+            ("certificates.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "certificatesigningrequests",
+                    "certificatesigningrequest",
+                    "CertificateSigningRequest",
+                ));
+                resources.push(Self::cluster_resource(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                ));
+            },
+            ("scheduling.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "priorityclasses",
+                    "priorityclass",
+                    "PriorityClass",
+                ));
+            },
+            ("node.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "runtimeclasses",
+                    "runtimeclass",
+                    "RuntimeClass",
+                ));
             },
             ("coordination.k8s.io", "v1") => {
                 resources.push(Self::namespaced_resource("leases", "lease", "Lease"));
@@ -898,8 +1229,29 @@ impl KubernetesApiClient {
                     "namespaced": false,
                     "kind": "StorageClass",
                     "shortNames": ["sc"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 }));
+                resources.push(Self::cluster_resource("csinodes", "csinode", "CSINode"));
+                resources.push(Self::cluster_resource(
+                    "csidrivers",
+                    "csidriver",
+                    "CSIDriver",
+                ));
+                resources.push(Self::namespaced_resource(
+                    "csistoragecapacities",
+                    "csistoragecapacity",
+                    "CSIStorageCapacity",
+                ));
+                resources.push(Self::cluster_resource(
+                    "volumeattachments",
+                    "volumeattachment",
+                    "VolumeAttachment",
+                ));
+                resources.push(Self::cluster_resource(
+                    "volumeattributesclasses",
+                    "volumeattributesclass",
+                    "VolumeAttributesClass",
+                ));
             },
             _ => {},
         }
@@ -910,13 +1262,12 @@ impl KubernetesApiClient {
             if let Some(spec) = crd.get("spec")
                 && spec.get("group").and_then(Value::as_str) == Some(group)
             {
-                let version_match = spec.get("versions").and_then(Value::as_array).map_or(
-                    version == "v1",
-                    |vers| {
-                        vers.iter()
-                            .any(|v| v.get("name").and_then(Value::as_str) == Some(version))
-                    },
-                );
+                let version_match = spec
+                    .get("versions")
+                    .and_then(Value::as_array)
+                    .map_or(version == "v1", |vers| {
+                        vers.iter().any(|v| Self::is_crd_version_served(v, version))
+                    });
 
                 if version_match {
                     let plural = spec
@@ -944,7 +1295,14 @@ impl KubernetesApiClient {
                         "singularName": singular,
                         "namespaced": scope == "Namespaced",
                         "kind": kind,
-                        "verbs": ["create", "delete", "get", "list", "update", "watch"]
+                        "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+                    }));
+                    resources.push(json!({
+                        "name": format!("{plural}/status"),
+                        "singularName": "",
+                        "namespaced": scope == "Namespaced",
+                        "kind": kind,
+                        "verbs": ["get", "patch", "update"]
                     }));
                 }
             }
@@ -958,22 +1316,106 @@ impl KubernetesApiClient {
         }))
     }
 
+    async fn resolve_metadata_name(
+        &self,
+        doc: &mut Value,
+        reason: &str,
+    ) -> Result<String, ApiserverError> {
+        if let Some(name) = doc
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(name.to_string());
+        }
+        if let Some(prefix) = doc
+            .pointer("/metadata/generateName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let rev = self.storage.current_revision().await + 1;
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let generated = format!("{prefix}{rev:x}{seq:04x}");
+            if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.insert("name".to_string(), json!(generated));
+            }
+            return Ok(generated);
+        }
+        Err(ApiserverError::InvalidInput {
+            field: "metadata.name".to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    fn stamp_creation_and_uid(
+        meta: &mut serde_json::Map<String, Value>,
+        plural: &str,
+        name: &str,
+        cur_rev: u64,
+    ) {
+        let needs_ts = meta
+            .get("creationTimestamp")
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.is_empty() || s == "1970-01-01T00:00:00Z");
+        if needs_ts {
+            meta.insert(
+                "creationTimestamp".to_string(),
+                json!(crate::time::now_rfc3339()),
+            );
+        }
+        let needs_uid = meta
+            .get("uid")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty);
+        if needs_uid {
+            meta.insert(
+                "uid".to_string(),
+                json!(format!("uid-{plural}-{name}-{cur_rev}")),
+            );
+        }
+    }
+
     // --- Namespace CRUD ---
 
     pub async fn create_namespace(&self, name: &str) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("create", "", "namespaces", None, Some(name))?;
-        let key = format!("{}/namespaces/{name}", self.storage.prefix());
-        let doc = json!({
+        self.create_namespace_object(json!({
             "apiVersion": "v1",
             "kind": "Namespace",
-            "metadata": {
-                "name": name,
-                "creationTimestamp": crate::time::now_rfc3339()
-            },
-            "status": {
-                "phase": "Active"
+            "metadata": { "name": name }
+        }))
+        .await
+    }
+
+    pub async fn create_namespace_object(&self, mut doc: Value) -> Result<Value, ApiserverError> {
+        let name = self
+            .resolve_metadata_name(&mut doc, "Namespace requires metadata.name")
+            .await?;
+        self.check_auth_detailed("create", "", "namespaces", None, Some(&name))?;
+        let key = format!("{}/namespaces/{name}", self.storage.prefix());
+        let cur_rev = self.storage.current_revision().await + 1;
+        doc["apiVersion"] = json!("v1");
+        doc["kind"] = json!("Namespace");
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            Self::stamp_creation_and_uid(meta, "namespaces", &name, cur_rev);
+            let labels = meta
+                .entry("labels".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(labels_obj) = labels.as_object_mut() {
+                labels_obj
+                    .entry("kubernetes.io/metadata.name".to_string())
+                    .or_insert_with(|| json!(name));
             }
-        });
+        }
+        if doc.get("status").is_none_or(Value::is_null) {
+            doc["status"] = json!({ "phase": "Active" });
+        } else if let Some(status_obj) = doc.get_mut("status").and_then(Value::as_object_mut) {
+            status_obj
+                .entry("phase".to_string())
+                .or_insert_with(|| json!("Active"));
+        }
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.create(&key, bytes).await?;
         let mut result = doc;
@@ -985,11 +1427,11 @@ impl KubernetesApiClient {
         }
         // The service-account controller creates this before namespace creation
         // is visible. Do it here so a new namespace already has `default`.
-        if let Err(err) = self.ensure_default_service_account(name).await {
+        if let Err(err) = self.ensure_default_service_account(&name).await {
             let _ = self.storage.delete(&key, None).await;
             return Err(err);
         }
-        if let Err(err) = self.ensure_kube_root_ca_configmap(name).await {
+        if let Err(err) = self.ensure_kube_root_ca_configmap(&name).await {
             let sa_key = format!("{}/serviceaccounts/{name}/default", self.storage.prefix());
             let _ = self.storage.delete(&sa_key, None).await;
             let _ = self.storage.delete(&key, None).await;
@@ -1181,6 +1623,32 @@ impl KubernetesApiClient {
 
     // --- ConfigMap CRUD ---
 
+    fn validate_configmap_key(key: &str) -> Result<(), ApiserverError> {
+        let valid = !key.is_empty()
+            && key.len() <= 253
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        if !valid {
+            return Err(ApiserverError::InvalidInput {
+                field: "data".to_string(),
+                reason: format!("invalid ConfigMap key {key:?}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_configmap_doc(doc: &Value) -> Result<(), ApiserverError> {
+        for field in ["data", "binaryData"] {
+            if let Some(map) = doc.get(field).and_then(Value::as_object) {
+                for key in map.keys() {
+                    Self::validate_configmap_key(key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_configmap(
         &self,
         namespace: &str,
@@ -1188,21 +1656,26 @@ impl KubernetesApiClient {
         data: BTreeMap<String, String>,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("create", "", "configmaps", Some(namespace), Some(name))?;
+        for k in data.keys() {
+            Self::validate_configmap_key(k)?;
+        }
         let key = format!("{}/configmaps/{namespace}/{name}", self.storage.prefix());
+        let cur_rev = self.storage.current_revision().await + 1;
         let mut doc = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
                 "name": name,
                 "namespace": namespace,
-                "creationTimestamp": crate::time::now_rfc3339()
+                "creationTimestamp": crate::time::now_rfc3339(),
+                "uid": format!("uid-configmaps-{name}-{cur_rev}")
             },
             "data": data
         });
 
         // Admission reviews
         let mut adm_req = AdmissionRequest {
-            uid: format!("adm-{}", self.storage.current_revision().await + 1),
+            uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
                 group: String::new(),
                 version: "v1".to_string(),
@@ -1226,6 +1699,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object {
             doc = obj;
         }
+        Self::validate_configmap_doc(&doc)?;
 
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.create(&key, bytes).await?;
@@ -1272,6 +1746,9 @@ impl KubernetesApiClient {
         expected_version: Option<u64>,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("update", "", "configmaps", Some(namespace), Some(name))?;
+        for k in data.keys() {
+            Self::validate_configmap_key(k)?;
+        }
         let key = format!("{}/configmaps/{namespace}/{name}", self.storage.prefix());
         let doc = json!({
             "apiVersion": "v1",
@@ -1299,21 +1776,21 @@ impl KubernetesApiClient {
         namespace: &str,
         mut doc: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = doc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "ConfigMap missing metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut doc, "ConfigMap missing metadata.name")
+            .await?;
 
         self.check_auth_detailed("create", "", "configmaps", Some(namespace), Some(&name))?;
+        Self::validate_configmap_doc(&doc)?;
         let key = format!("{}/configmaps/{namespace}/{name}", self.storage.prefix());
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("namespace".to_string(), json!(namespace));
+            Self::stamp_creation_and_uid(meta, "configmaps", &name, cur_rev);
+        }
 
         let mut adm_req = AdmissionRequest {
-            uid: format!("adm-{}", self.storage.current_revision().await + 1),
+            uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
                 group: String::new(),
                 version: "v1".to_string(),
@@ -1337,6 +1814,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object {
             doc = obj;
         }
+        Self::validate_configmap_doc(&doc)?;
 
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.create(&key, bytes).await?;
@@ -1369,6 +1847,7 @@ impl KubernetesApiClient {
 
         let mut configmap: Value = serde_json::from_slice(&kv.value)?;
         json_merge_patch(&mut configmap, patch);
+        Self::validate_configmap_doc(&configmap)?;
 
         let bytes = serde_json::to_vec(&configmap)?;
         let updated_kv = self
@@ -1430,26 +1909,37 @@ impl KubernetesApiClient {
 
     // --- Secret CRUD ---
 
+    fn validate_secret_doc(doc: &Value) -> Result<(), ApiserverError> {
+        for field in ["data", "stringData"] {
+            if let Some(map) = doc.get(field).and_then(Value::as_object) {
+                for key in map.keys() {
+                    Self::validate_configmap_key(key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_secret_object(
         &self,
         namespace: &str,
         mut doc: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = doc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "Secret missing metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut doc, "Secret missing metadata.name")
+            .await?;
 
         self.check_auth_detailed("create", "", "secrets", Some(namespace), Some(&name))?;
+        Self::validate_secret_doc(&doc)?;
         let key = format!("{}/secrets/{namespace}/{name}", self.storage.prefix());
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("namespace".to_string(), json!(namespace));
+            Self::stamp_creation_and_uid(meta, "secrets", &name, cur_rev);
+        }
 
         let mut adm_req = AdmissionRequest {
-            uid: format!("adm-{}", self.storage.current_revision().await + 1),
+            uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
                 group: String::new(),
                 version: "v1".to_string(),
@@ -1473,6 +1963,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object {
             doc = obj;
         }
+        Self::validate_secret_doc(&doc)?;
 
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.create(&key, bytes).await?;
@@ -1609,17 +2100,11 @@ impl KubernetesApiClient {
     pub async fn create_service_account(
         &self,
         namespace: &str,
-        doc: Value,
+        mut doc: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = doc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "ServiceAccount missing metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut doc, "ServiceAccount missing metadata.name")
+            .await?;
 
         self.check_auth_detailed(
             "create",
@@ -1628,6 +2113,11 @@ impl KubernetesApiClient {
             Some(namespace),
             Some(&name),
         )?;
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("namespace".to_string(), json!(namespace));
+            Self::stamp_creation_and_uid(meta, "serviceaccounts", &name, cur_rev);
+        }
         let key = format!(
             "{}/serviceaccounts/{namespace}/{name}",
             self.storage.prefix()
@@ -1721,6 +2211,218 @@ impl KubernetesApiClient {
 
     // --- Pod CRUD with Admission ---
 
+    fn is_valid_sysctl_name(name: &str) -> bool {
+        if name.is_empty() || name.len() > 253 {
+            return false;
+        }
+        for seg in name.split('.') {
+            if seg.is_empty() {
+                return false;
+            }
+            let bytes = seg.as_bytes();
+            if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+                return false;
+            }
+            if !bytes[bytes.len() - 1].is_ascii_lowercase()
+                && !bytes[bytes.len() - 1].is_ascii_digit()
+            {
+                return false;
+            }
+            if !bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn validate_pod_spec(pod: &Value) -> Result<(), ApiserverError> {
+        if let Some(sysctls) = pod
+            .pointer("/spec/securityContext/sysctls")
+            .and_then(Value::as_array)
+        {
+            for (idx, sc) in sysctls.iter().enumerate() {
+                let name = sc.get("name").and_then(Value::as_str).unwrap_or("");
+                if !Self::is_valid_sysctl_name(name) {
+                    return Err(ApiserverError::InvalidInput {
+                        field: format!("spec.securityContext.sysctls[{idx}].name"),
+                        reason: format!("invalid sysctl name {name:?}"),
+                    });
+                }
+            }
+        }
+        if let Some(volumes) = pod.pointer("/spec/volumes").and_then(Value::as_array) {
+            Self::validate_pod_volumes(volumes)?;
+        }
+        Ok(())
+    }
+
+    fn validate_pod_volumes(volumes: &[Value]) -> Result<(), ApiserverError> {
+        for (v_idx, vol) in volumes.iter().enumerate() {
+            for src_kind in ["secret", "configMap"] {
+                if let Some(items) = vol
+                    .get(src_kind)
+                    .and_then(|s| s.get("items"))
+                    .and_then(Value::as_array)
+                {
+                    Self::validate_volume_items(
+                        items,
+                        &format!("spec.volumes[{v_idx}].{src_kind}"),
+                    )?;
+                }
+            }
+            if let Some(sources) = vol.pointer("/projected/sources").and_then(Value::as_array) {
+                Self::validate_projected_sources(v_idx, sources)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_projected_sources(v_idx: usize, sources: &[Value]) -> Result<(), ApiserverError> {
+        for (s_idx, src) in sources.iter().enumerate() {
+            for src_kind in ["secret", "configMap"] {
+                if let Some(items) = src
+                    .get(src_kind)
+                    .and_then(|s| s.get("items"))
+                    .and_then(Value::as_array)
+                {
+                    Self::validate_volume_items(
+                        items,
+                        &format!("spec.volumes[{v_idx}].projected.sources[{s_idx}].{src_kind}"),
+                    )?;
+                }
+            }
+            if let Some(max_exp) = src
+                .pointer("/podCertificate/maxExpirationSeconds")
+                .and_then(Value::as_i64)
+                && !(3600..=91 * 86_400).contains(&max_exp)
+            {
+                return Err(ApiserverError::InvalidInput {
+                    field: format!(
+                        "spec.volumes[{v_idx}].projected.sources[{s_idx}].podCertificate.maxExpirationSeconds"
+                    ),
+                    reason: format!(
+                        "maxExpirationSeconds ({max_exp}) must be between 3600 and 7862400"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_volume_items(items: &[Value], prefix: &str) -> Result<(), ApiserverError> {
+        for (i_idx, item) in items.iter().enumerate() {
+            let key = item.get("key").and_then(Value::as_str).unwrap_or("");
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            if key.is_empty() || path.is_empty() {
+                return Err(ApiserverError::InvalidInput {
+                    field: format!("{prefix}.items[{i_idx}]"),
+                    reason: "item key and path must not be empty".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn compute_pod_qos_class(pod: &Value) -> &'static str {
+        let empty: &[Value] = &[];
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .map_or(empty, Vec::as_slice);
+        let init_containers = pod
+            .pointer("/spec/initContainers")
+            .and_then(Value::as_array)
+            .map_or(empty, Vec::as_slice);
+        if containers.is_empty() && init_containers.is_empty() {
+            return "BestEffort";
+        }
+        let mut any_resource_set = false;
+        let mut all_guaranteed = true;
+        for c in containers.iter().chain(init_containers.iter()) {
+            let limits = c.pointer("/resources/limits").and_then(Value::as_object);
+            let requests = c.pointer("/resources/requests").and_then(Value::as_object);
+            let has_any_limit = limits.is_some_and(|m| !m.is_empty());
+            let has_any_request = requests.is_some_and(|m| !m.is_empty());
+            if has_any_limit || has_any_request {
+                any_resource_set = true;
+            }
+            let cpu_limit = limits
+                .and_then(|m| m.get("cpu"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && *s != "0");
+            let mem_limit = limits
+                .and_then(|m| m.get("memory"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && *s != "0");
+            let cpu_req = requests
+                .and_then(|m| m.get("cpu"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let mem_req = requests
+                .and_then(|m| m.get("memory"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let c_guaranteed = cpu_limit.is_some()
+                && mem_limit.is_some()
+                && cpu_req.is_none_or(|r| Some(r) == cpu_limit)
+                && mem_req.is_none_or(|r| Some(r) == mem_limit);
+            if !c_guaranteed {
+                all_guaranteed = false;
+            }
+        }
+        if !any_resource_set {
+            "BestEffort"
+        } else if all_guaranteed {
+            "Guaranteed"
+        } else {
+            "Burstable"
+        }
+    }
+
+    /// Applies `RuntimeClass` pod overhead and rejects unknown runtime classes.
+    async fn admit_runtime_class(&self, pod: &mut Value) -> Result<(), ApiserverError> {
+        let Some(rc_name) = pod
+            .pointer("/spec/runtimeClassName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let key = cluster_key(
+            self.storage.prefix(),
+            "node.k8s.io",
+            "runtimeclasses",
+            &rc_name,
+        );
+        let Some(kv) = self.storage.get(&key).await? else {
+            return Err(ApiserverError::AdmissionDenied {
+                reason: format!("pod rejected: RuntimeClass \"{rc_name}\" not found"),
+            });
+        };
+        let rc: Value = serde_json::from_slice(&kv.value)?;
+        let Some(fixed) = rc.pointer("/overhead/podFixed").filter(|v| v.is_object()) else {
+            return Ok(());
+        };
+        match pod.pointer("/spec/overhead") {
+            Some(existing) if existing != fixed => Err(ApiserverError::AdmissionDenied {
+                reason:
+                    "pod rejected: Pod's Overhead doesn't match RuntimeClass's defined Overhead"
+                        .to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                if let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut) {
+                    spec.insert("overhead".to_string(), fixed.clone());
+                }
+                Ok(())
+            },
+        }
+    }
+
     pub async fn create_pod(&self, namespace: &str, pod: Value) -> Result<Value, ApiserverError> {
         self.create_pod_options(namespace, pod, false).await
     }
@@ -1731,37 +2433,22 @@ impl KubernetesApiClient {
         mut pod: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
-        let name = pod
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "Pod requires metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut pod, "Pod requires metadata.name")
+            .await?;
 
         self.check_auth_detailed("create", "", "pods", Some(namespace), Some(&name))?;
+        Self::validate_pod_spec(&pod)?;
+        self.admit_runtime_class(&mut pod).await?;
 
+        let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("namespace".to_string(), json!(namespace));
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                let cur_rev = self.storage.current_revision().await + 1;
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-pods-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, "pods", &name, cur_rev);
         }
 
         let mut adm_req = AdmissionRequest {
-            uid: format!("adm-{}", self.storage.current_revision().await + 1),
+            uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
                 group: String::new(),
                 version: "v1".to_string(),
@@ -1785,19 +2472,28 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object {
             pod = obj;
         }
+        let qos_class = Self::compute_pod_qos_class(&pod);
         // The kubelet reports Pending once it accepts the pod. Tests read the
         // create response immediately, before that patch lands.
-        if pod
-            .pointer("/status/phase")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-            && let Some(status) = pod.as_object_mut().and_then(|pod| {
-                pod.entry("status")
-                    .or_insert_with(|| json!({}))
-                    .as_object_mut()
-            })
-        {
-            status.insert("phase".to_string(), json!("Pending"));
+        if let Some(status) = pod.as_object_mut().and_then(|pod| {
+            pod.entry("status")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        }) {
+            if status
+                .get("phase")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                status.insert("phase".to_string(), json!("Pending"));
+            }
+            if status
+                .get("qosClass")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                status.insert("qosClass".to_string(), json!(qos_class));
+            }
         }
 
         if dry_run {
@@ -1924,11 +2620,11 @@ impl KubernetesApiClient {
             .pointer("/spec/nodeName")
             .and_then(Value::as_str)
             .is_some_and(|node| !node.is_empty());
-        let acknowledged = matches!(
+        let terminal = matches!(
             pod.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending" | "Running")
+            Some("Succeeded" | "Failed")
         );
-        if grace_period_seconds == Some(0) || !scheduled || !acknowledged {
+        if grace_period_seconds == Some(0) || !scheduled || terminal {
             self.storage.delete(&key, None).await?;
             return Ok(None);
         }
@@ -2009,6 +2705,22 @@ impl KubernetesApiClient {
             meta.insert("name".to_string(), json!(name));
             if let Some(old_uid) = old_pod.get("metadata").and_then(|m| m.get("uid")) {
                 meta.insert("uid".to_string(), old_uid.clone());
+            }
+            if let Some(old_dt) = old_pod
+                .get("metadata")
+                .and_then(|m| m.get("deletionTimestamp"))
+                .filter(|v| !v.is_null())
+            {
+                meta.entry("deletionTimestamp".to_string())
+                    .or_insert_with(|| old_dt.clone());
+            }
+            if let Some(old_dgp) = old_pod
+                .get("metadata")
+                .and_then(|m| m.get("deletionGracePeriodSeconds"))
+                .filter(|v| !v.is_null())
+            {
+                meta.entry("deletionGracePeriodSeconds".to_string())
+                    .or_insert_with(|| old_dgp.clone());
             }
         }
 
@@ -2131,6 +2843,100 @@ impl KubernetesApiClient {
             .await
     }
 
+    fn normalize_template_for_compare(val: &Value) -> Value {
+        match val {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, v) in map {
+                    if k == "creationTimestamp" {
+                        continue;
+                    }
+                    let norm = Self::normalize_template_for_compare(v);
+                    let is_empty = match &norm {
+                        Value::Null => true,
+                        Value::String(s) => s.is_empty(),
+                        Value::Array(a) => a.is_empty(),
+                        Value::Object(o) => o.is_empty(),
+                        _ => false,
+                    };
+                    if !is_empty {
+                        out.insert(k.clone(), norm);
+                    }
+                }
+                Value::Object(out)
+            },
+            Value::Array(arr) => Value::Array(
+                arr.iter()
+                    .map(Self::normalize_template_for_compare)
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn resolve_list_gvk(
+        &self,
+        group: &str,
+        plural: &str,
+        default_kind_list: &str,
+        items: &[Value],
+    ) -> (String, String) {
+        if default_kind_list != "List" {
+            return (group_version(group), default_kind_list.to_string());
+        }
+        let registry = self.crd_registry.read().unwrap();
+        for crd in registry.values() {
+            let Some(spec) = crd.get("spec") else {
+                continue;
+            };
+            let spec_group = spec.get("group").and_then(Value::as_str);
+            let spec_plural = spec
+                .get("names")
+                .and_then(|n| n.get("plural"))
+                .and_then(Value::as_str);
+            if spec_group != Some(group) || spec_plural != Some(plural) {
+                continue;
+            }
+            let list_kind = spec
+                .pointer("/names/listKind")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    spec.pointer("/names/kind")
+                        .and_then(Value::as_str)
+                        .map(|k| format!("{k}List"))
+                })
+                .unwrap_or_else(|| default_kind_list.to_string());
+            let ver = spec
+                .get("versions")
+                .and_then(Value::as_array)
+                .and_then(|vers| {
+                    vers.iter()
+                        .find(|v| v.get("storage").and_then(Value::as_bool) == Some(true))
+                        .or_else(|| vers.first())
+                })
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("v1");
+            return (format!("{group}/{ver}"), list_kind);
+        }
+        drop(registry);
+        if let Some(first) = items.first() {
+            let item_api = first
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| group_version(group), ToString::to_string);
+            let item_kind_list = first
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| default_kind_list.to_string(), |k| format!("{k}List"));
+            return (item_api, item_kind_list);
+        }
+        (group_version(group), default_kind_list.to_string())
+    }
+
     async fn create_workload_options(
         &self,
         group: &str,
@@ -2140,34 +2946,34 @@ impl KubernetesApiClient {
         mut doc: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
-        let name = doc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: format!("{kind} requires metadata.name"),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut doc, &format!("{kind} requires metadata.name"))
+            .await?;
 
         self.check_auth_detailed("create", group, plural, Some(namespace), Some(&name))?;
         self.authorize_rbac_write(group, plural, Some(namespace), &doc)?;
+        if plural == "configmaps" {
+            Self::validate_configmap_doc(&doc)?;
+        }
 
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("namespace".to_string(), json!(namespace));
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-{plural}-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, plural, &name, cur_rev);
+        }
+        if doc
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            doc["kind"] = json!(kind);
+        }
+        if doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            doc["apiVersion"] = json!(group_version(group));
         }
 
         let mut adm_req = AdmissionRequest {
@@ -2191,10 +2997,11 @@ impl KubernetesApiClient {
             dry_run: if dry_run { Some(true) } else { None },
         };
         self.admission.run_mutating_admission(&mut adm_req).await?;
-        self.admission.run_validating_admission(&adm_req).await?;
-        if let Some(obj) = adm_req.object {
+        if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        self.admission.run_validating_admission(&adm_req).await?;
 
         if dry_run {
             return Ok(doc);
@@ -2292,14 +3099,11 @@ impl KubernetesApiClient {
             items.push(doc);
         }
         let cur_rev = self.storage.current_revision().await;
-        let api_version = if group.is_empty() {
-            "v1".to_string()
-        } else {
-            format!("{group}/v1")
-        };
+        let (api_version, resolved_kind_list) =
+            self.resolve_list_gvk(group, plural, kind_list, &items);
         Ok(json!({
             "apiVersion": api_version,
-            "kind": kind_list,
+            "kind": resolved_kind_list,
             "metadata": {
                 "resourceVersion": cur_rev.to_string()
             },
@@ -2320,6 +3124,44 @@ impl KubernetesApiClient {
             .await
     }
 
+    fn merge_updated_doc_metadata(doc: &mut Value, old_doc: &Value, namespace: &str, name: &str) {
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("namespace".to_string(), json!(namespace));
+            meta.insert("name".to_string(), json!(name));
+            if let Some(old_uid) = old_doc.get("metadata").and_then(|m| m.get("uid")) {
+                meta.insert("uid".to_string(), old_uid.clone());
+            }
+            if meta.get("creationTimestamp").is_none()
+                && let Some(created) = old_doc.pointer("/metadata/creationTimestamp").cloned()
+            {
+                meta.insert("creationTimestamp".to_string(), created);
+            }
+        }
+        if doc
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && let Some(old_kind) = old_doc.get("kind").cloned()
+        {
+            doc["kind"] = old_kind;
+        }
+        if doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && let Some(old_api) = old_doc.get("apiVersion").cloned()
+        {
+            doc["apiVersion"] = old_api;
+        }
+
+        if let (true, Some(old_status)) = (
+            doc.get("status").is_none_or(Value::is_null),
+            old_doc.get("status").filter(|s| !s.is_null()),
+        ) {
+            doc["status"] = old_status.clone();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn update_workload_options(
         &self,
@@ -2332,6 +3174,9 @@ impl KubernetesApiClient {
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("update", group, plural, Some(namespace), Some(name))?;
+        if plural == "configmaps" {
+            Self::validate_configmap_doc(&doc)?;
+        }
         let key = if group.is_empty() {
             format!("{}/{plural}/{namespace}/{name}", self.storage.prefix())
         } else {
@@ -2350,20 +3195,7 @@ impl KubernetesApiClient {
             })?;
         let old_doc: Value = serde_json::from_slice(&existing.value)?;
 
-        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
-            meta.insert("namespace".to_string(), json!(namespace));
-            meta.insert("name".to_string(), json!(name));
-            if let Some(old_uid) = old_doc.get("metadata").and_then(|m| m.get("uid")) {
-                meta.insert("uid".to_string(), old_uid.clone());
-            }
-        }
-
-        if let (true, Some(old_status)) = (
-            doc.get("status").is_none_or(Value::is_null),
-            old_doc.get("status").filter(|s| !s.is_null()),
-        ) {
-            doc["status"] = old_status.clone();
-        }
+        Self::merge_updated_doc_metadata(&mut doc, &old_doc, namespace, name);
 
         let expected_version = doc
             .pointer("/metadata/resourceVersion")
@@ -2394,12 +3226,16 @@ impl KubernetesApiClient {
         self.admission.run_mutating_admission(&mut adm_req).await?;
 
         if kind == "Job" {
+            let suspended = old_doc.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true);
             let old_tmpl = old_doc.pointer("/spec/template");
             let new_tmpl = adm_req
                 .object
                 .as_ref()
                 .and_then(|obj| obj.pointer("/spec/template"));
-            if old_tmpl.is_some() && old_tmpl != new_tmpl {
+            if !suspended
+                && old_tmpl.map(Self::normalize_template_for_compare)
+                    != new_tmpl.map(Self::normalize_template_for_compare)
+            {
                 return Err(ApiserverError::InvalidInput {
                     field: "spec.template".to_string(),
                     reason: "spec.template is immutable for jobs".to_string(),
@@ -2407,10 +3243,16 @@ impl KubernetesApiClient {
             }
         }
 
-        self.admission.run_validating_admission(&adm_req).await?;
-        if let Some(obj) = adm_req.object {
+        if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        if group.is_empty() && plural == "configmaps" {
+            Self::validate_configmap_doc(&doc)?;
+        } else if group.is_empty() && plural == "secrets" {
+            Self::validate_secret_doc(&doc)?;
+        }
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        self.admission.run_validating_admission(&adm_req).await?;
 
         self.authorize_rbac_write(group, plural, Some(namespace), &doc)?;
         if dry_run {
@@ -2476,6 +3318,7 @@ impl KubernetesApiClient {
     }
 
     /// Generic replace for cluster-scoped objects served over HTTP.
+    #[allow(clippy::too_many_lines)]
     pub async fn replace_cluster_object(
         &self,
         group: &str,
@@ -2506,11 +3349,74 @@ impl KubernetesApiClient {
                 meta.insert("creationTimestamp".to_string(), created);
             }
         }
-        if let (true, Some(old_status)) = (
-            doc.get("status").is_none_or(Value::is_null),
-            old_doc.get("status").filter(|s| !s.is_null()),
-        ) {
+        if doc
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && let Some(old_kind) = old_doc.get("kind").cloned()
+        {
+            doc["kind"] = old_kind;
+        }
+        if doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && let Some(old_api) = old_doc.get("apiVersion").cloned()
+        {
+            doc["apiVersion"] = old_api;
+        }
+        let status_empty = doc.get("status").is_none_or(|s| {
+            s.is_null()
+                || (s
+                    .pointer("/conditions")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                    && old_doc
+                        .pointer("/status/conditions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|c| !c.is_empty()))
+        });
+        if let (true, Some(old_status)) =
+            (status_empty, old_doc.get("status").filter(|s| !s.is_null()))
+        {
             doc["status"] = old_status.clone();
+        }
+        if group == "apiextensions.k8s.io" && plural == "customresourcedefinitions" {
+            let now = crate::time::now_rfc3339();
+            let accepted_names = doc
+                .pointer("/spec/names")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let stored_versions = Self::crd_stored_versions(&doc);
+            if doc
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                doc["status"] = json!({
+                    "conditions": [
+                        {
+                            "type": "NamesAccepted",
+                            "status": "True",
+                            "lastTransitionTime": now,
+                            "reason": "NoConflicts",
+                            "message": "no conflicts found"
+                        },
+                        {
+                            "type": "Established",
+                            "status": "True",
+                            "lastTransitionTime": now,
+                            "reason": "InitialNamesAccepted",
+                            "message": "the initial names have been accepted"
+                        }
+                    ],
+                    "acceptedNames": accepted_names,
+                    "storedVersions": stored_versions
+                });
+            } else if let Some(status_obj) = doc.get_mut("status").and_then(Value::as_object_mut) {
+                status_obj.insert("acceptedNames".to_string(), accepted_names);
+                status_obj.insert("storedVersions".to_string(), json!(stored_versions));
+            }
         }
         let expected_version = doc
             .pointer("/metadata/resourceVersion")
@@ -2538,15 +3444,20 @@ impl KubernetesApiClient {
             dry_run: None,
         };
         self.admission.run_mutating_admission(&mut adm_req).await?;
-        self.admission.run_validating_admission(&adm_req).await?;
-        if let Some(obj) = adm_req.object {
+        if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
         let bytes = serde_json::to_vec(&doc)?;
         let kv = self.storage.update(&key, bytes, expected_version).await?;
         let mut result = doc;
-        if result.get("kind").is_none() {
+        if result
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
             result["kind"] = json!(kind);
         }
         if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -2556,6 +3467,12 @@ impl KubernetesApiClient {
             );
         }
         self.install_rbac_object(group, plural, None, &result)?;
+        if group == "apiextensions.k8s.io" && plural == "customresourcedefinitions" {
+            self.crd_registry
+                .write()
+                .unwrap()
+                .insert(name.to_string(), result.clone());
+        }
         Ok(result)
     }
 
@@ -2567,32 +3484,28 @@ impl KubernetesApiClient {
         plural: &str,
         mut doc: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = doc
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: format!("{kind} requires metadata.name"),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut doc, &format!("{kind} requires metadata.name"))
+            .await?;
         self.check_auth_detailed("create", group, plural, None, Some(&name))?;
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-{plural}-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, plural, &name, cur_rev);
         }
-        doc["kind"] = json!(kind);
-        doc["apiVersion"] = json!(group_version(group));
+        if doc
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            doc["kind"] = json!(kind);
+        }
+        if doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            doc["apiVersion"] = json!(group_version(group));
+        }
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
@@ -2614,10 +3527,11 @@ impl KubernetesApiClient {
             dry_run: None,
         };
         self.admission.run_mutating_admission(&mut adm_req).await?;
-        self.admission.run_validating_admission(&adm_req).await?;
-        if let Some(obj) = adm_req.object {
+        if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
         let key = cluster_key(self.storage.prefix(), group, plural, &name);
         let bytes = serde_json::to_vec(&doc)?;
@@ -2681,9 +3595,11 @@ impl KubernetesApiClient {
             items.push(doc);
         }
         let cur_rev = self.storage.current_revision().await;
+        let (api_version, resolved_kind_list) =
+            self.resolve_list_gvk(group, plural, kind_list, &items);
         Ok(json!({
-            "apiVersion": group_version(group),
-            "kind": kind_list,
+            "apiVersion": api_version,
+            "kind": resolved_kind_list,
             "metadata": { "resourceVersion": cur_rev.to_string() },
             "items": items
         }))
@@ -2893,6 +3809,66 @@ impl KubernetesApiClient {
         name: &str,
     ) -> Result<(), ApiserverError> {
         self.delete_workload("apps", "replicasets", namespace, name)
+            .await
+    }
+
+    // ReplicationControllers
+    pub async fn create_replicationcontroller(
+        &self,
+        namespace: &str,
+        rc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.create_workload(
+            "",
+            "ReplicationController",
+            "replicationcontrollers",
+            namespace,
+            rc,
+        )
+        .await
+    }
+    pub async fn get_replicationcontroller(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.get_workload("", "replicationcontrollers", namespace, name)
+            .await
+    }
+    pub async fn list_replicationcontrollers(
+        &self,
+        namespace: &str,
+    ) -> Result<Value, ApiserverError> {
+        self.list_workload(
+            "",
+            "ReplicationControllerList",
+            "replicationcontrollers",
+            namespace,
+        )
+        .await
+    }
+    pub async fn update_replicationcontroller(
+        &self,
+        namespace: &str,
+        name: &str,
+        rc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.update_workload(
+            "",
+            "ReplicationController",
+            "replicationcontrollers",
+            namespace,
+            name,
+            rc,
+        )
+        .await
+    }
+    pub async fn delete_replicationcontroller(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), ApiserverError> {
+        self.delete_workload("", "replicationcontrollers", namespace, name)
             .await
     }
 
@@ -3134,15 +4110,9 @@ impl KubernetesApiClient {
     // --- StorageClass CRUD ---
 
     pub async fn create_storage_class(&self, mut sc: Value) -> Result<Value, ApiserverError> {
-        let name = sc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "StorageClass requires metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut sc, "StorageClass requires metadata.name")
+            .await?;
 
         self.check_auth_detailed(
             "create",
@@ -3152,20 +4122,9 @@ impl KubernetesApiClient {
             Some(&name),
         )?;
 
+        let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = sc.get_mut("metadata").and_then(Value::as_object_mut) {
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                let cur_rev = self.storage.current_revision().await + 1;
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-storageclasses-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, "storageclasses", &name, cur_rev);
         }
 
         let key = format!("{}/storageclasses/{name}", self.storage.prefix());
@@ -3292,32 +4251,15 @@ impl KubernetesApiClient {
     // --- PersistentVolume CRUD ---
 
     pub async fn create_pv(&self, mut pv: Value) -> Result<Value, ApiserverError> {
-        let name = pv
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "PersistentVolume requires metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut pv, "PersistentVolume requires metadata.name")
+            .await?;
 
         self.check_auth_detailed("create", "", "persistentvolumes", None, Some(&name))?;
 
+        let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = pv.get_mut("metadata").and_then(Value::as_object_mut) {
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                let cur_rev = self.storage.current_revision().await + 1;
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-persistentvolumes-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, "persistentvolumes", &name, cur_rev);
         }
 
         let key = format!("{}/persistentvolumes/{name}", self.storage.prefix());
@@ -4109,32 +5051,15 @@ impl KubernetesApiClient {
     // --- Node CRUD ---
 
     pub async fn create_node(&self, mut node: Value) -> Result<Value, ApiserverError> {
-        let name = node
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "Node requires metadata.name".to_string(),
-            })?
-            .to_string();
+        let name = self
+            .resolve_metadata_name(&mut node, "Node requires metadata.name")
+            .await?;
 
         self.check_auth_detailed("create", "", "nodes", None, Some(&name))?;
 
+        let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = node.get_mut("metadata").and_then(Value::as_object_mut) {
-            if !meta.contains_key("creationTimestamp") {
-                meta.insert(
-                    "creationTimestamp".to_string(),
-                    json!(crate::time::now_rfc3339()),
-                );
-            }
-            if !meta.contains_key("uid") {
-                let cur_rev = self.storage.current_revision().await + 1;
-                meta.insert(
-                    "uid".to_string(),
-                    json!(format!("uid-nodes-{name}-{cur_rev}")),
-                );
-            }
+            Self::stamp_creation_and_uid(meta, "nodes", &name, cur_rev);
         }
 
         let key = format!("{}/nodes/{name}", self.storage.prefix());
@@ -4327,16 +5252,10 @@ impl KubernetesApiClient {
 
     // --- CustomResourceDefinition CRUD ---
 
-    pub async fn create_crd(&self, crd: Value) -> Result<Value, ApiserverError> {
-        let name = crd
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "CustomResourceDefinition requires metadata.name".to_string(),
-            })?
-            .to_string();
+    pub async fn create_crd(&self, mut crd: Value) -> Result<Value, ApiserverError> {
+        let name = self
+            .resolve_metadata_name(&mut crd, "CustomResourceDefinition requires metadata.name")
+            .await?;
 
         self.check_auth_detailed(
             "create",
@@ -4345,6 +5264,43 @@ impl KubernetesApiClient {
             None,
             Some(&name),
         )?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        let now = crate::time::now_rfc3339();
+        if let Some(meta) = crd.get_mut("metadata").and_then(Value::as_object_mut) {
+            Self::stamp_creation_and_uid(meta, "customresourcedefinitions", &name, cur_rev);
+        }
+        if crd
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            let accepted_names = crd
+                .pointer("/spec/names")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let stored_versions = Self::crd_stored_versions(&crd);
+            crd["status"] = json!({
+                "conditions": [
+                    {
+                        "type": "NamesAccepted",
+                        "status": "True",
+                        "lastTransitionTime": now,
+                        "reason": "NoConflicts",
+                        "message": "no conflicts found"
+                    },
+                    {
+                        "type": "Established",
+                        "status": "True",
+                        "lastTransitionTime": now,
+                        "reason": "InitialNamesAccepted",
+                        "message": "the initial names have been accepted"
+                    }
+                ],
+                "acceptedNames": accepted_names,
+                "storedVersions": stored_versions
+            });
+        }
 
         let key = format!("{}/customresourcedefinitions/{name}", self.storage.prefix());
         let bytes = serde_json::to_vec(&crd)?;
@@ -4537,8 +5493,18 @@ impl KubernetesApiClient {
             if let Some(required) = schema.get("required").and_then(Value::as_array) {
                 Self::validate_object_required(map, required, path)?;
             }
+            let preserve_unknown = schema
+                .get("x-kubernetes-preserve-unknown-fields")
+                .and_then(Value::as_bool)
+                == Some(true)
+                || schema.get("additionalProperties").is_some();
             if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-                Self::validate_object_properties(map, props, path)?;
+                Self::validate_object_properties(map, props, path, preserve_unknown)?;
+            } else if !preserve_unknown
+                && schema.get("type").and_then(Value::as_str) == Some("object")
+            {
+                let empty_props = serde_json::Map::new();
+                Self::validate_object_properties(map, &empty_props, path, false)?;
             }
         }
 
@@ -4567,8 +5533,43 @@ impl KubernetesApiClient {
                     format!("{path}.{prop_name}")
                 };
                 return Err(ApiserverError::InvalidInput {
-                    field: field_path,
-                    reason: format!("missing required field '{prop_name}'"),
+                    field: field_path.clone(),
+                    reason: format!(
+                        "{field_path}: Required value: missing required field \"{prop_name}\""
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_crd_metadata_properties(prop_val: &Value) -> Result<(), ApiserverError> {
+        let Some(meta_map) = prop_val.as_object() else {
+            return Ok(());
+        };
+        for meta_key in meta_map.keys() {
+            if !matches!(
+                meta_key.as_str(),
+                "name"
+                    | "generateName"
+                    | "namespace"
+                    | "selfLink"
+                    | "uid"
+                    | "resourceVersion"
+                    | "generation"
+                    | "creationTimestamp"
+                    | "deletionTimestamp"
+                    | "deletionGracePeriodSeconds"
+                    | "labels"
+                    | "annotations"
+                    | "ownerReferences"
+                    | "finalizers"
+                    | "clusterName"
+                    | "managedFields"
+            ) {
+                return Err(ApiserverError::InvalidInput {
+                    field: format!("metadata.{meta_key}"),
+                    reason: format!(".metadata.{meta_key}: field not declared in schema"),
                 });
             }
         }
@@ -4579,15 +5580,28 @@ impl KubernetesApiClient {
         map: &serde_json::Map<String, Value>,
         props: &serde_json::Map<String, Value>,
         path: &str,
+        preserve_unknown: bool,
     ) -> Result<(), ApiserverError> {
         for (prop_name, prop_val) in map {
-            let Some(prop_schema) = props.get(prop_name) else {
-                continue;
-            };
             let next_path = if path.is_empty() {
                 prop_name.clone()
             } else {
                 format!("{path}.{prop_name}")
+            };
+            let Some(prop_schema) = props.get(prop_name) else {
+                if !(preserve_unknown
+                    || path.is_empty()
+                        && matches!(prop_name.as_str(), "apiVersion" | "kind" | "metadata"))
+                {
+                    return Err(ApiserverError::InvalidInput {
+                        field: next_path.clone(),
+                        reason: format!(".{next_path}: field not declared in schema"),
+                    });
+                }
+                if path.is_empty() && prop_name == "metadata" {
+                    Self::validate_crd_metadata_properties(prop_val)?;
+                }
+                continue;
             };
             Self::validate_json_schema(prop_schema, prop_val, &next_path)?;
         }
@@ -4605,10 +5619,31 @@ impl KubernetesApiClient {
         Ok(())
     }
 
+    pub fn list_registered_crds(&self) -> Vec<Value> {
+        self.crd_registry
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn validate_crd_schema(
+        &self,
+        group: &str,
+        plural: &str,
+        resource: &Value,
+    ) -> Result<(), ApiserverError> {
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, resource)
+    }
+
     fn extract_crd_versions(spec: &Value, group: &str) -> Vec<Value> {
         let mut versions = Vec::new();
         if let Some(vers) = spec.get("versions").and_then(Value::as_array) {
             for v in vers {
+                if v.get("served").and_then(Value::as_bool) == Some(false) {
+                    continue;
+                }
                 let Some(v_name) = v.get("name").and_then(Value::as_str) else {
                     continue;
                 };
@@ -4617,14 +5652,27 @@ impl KubernetesApiClient {
                     "version": v_name
                 }));
             }
-        }
-        if versions.is_empty() {
+        } else if versions.is_empty() {
             versions.push(json!({
                 "groupVersion": format!("{group}/v1"),
                 "version": "v1"
             }));
         }
         versions
+    }
+
+    fn crd_stored_versions(doc: &Value) -> Vec<String> {
+        doc.pointer("/spec/versions")
+            .and_then(Value::as_array)
+            .map_or_else(
+                || vec!["v1".to_string()],
+                |vers| {
+                    vers.iter()
+                        .filter(|v| v.get("storage").and_then(Value::as_bool) != Some(false))
+                        .filter_map(|v| v.get("name").and_then(Value::as_str).map(String::from))
+                        .collect()
+                },
+            )
     }
 
     fn validate_crd_instance_schema(
@@ -4656,7 +5704,20 @@ impl KubernetesApiClient {
         let Some(versions) = spec.get("versions").and_then(Value::as_array) else {
             return Ok(());
         };
+        let target_ver = resource
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .and_then(|av| av.split_once('/').map(|(_, v)| v));
         for ver in versions {
+            if ver.get("served").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            if let Some(tv) = target_ver
+                && let Some(vn) = ver.get("name").and_then(Value::as_str)
+                && vn != tv
+            {
+                continue;
+            }
             let Some(schema) = ver.get("schema").and_then(|s| s.get("openAPIV3Schema")) else {
                 continue;
             };
@@ -4871,24 +5932,27 @@ impl KubernetesApiClient {
 
     pub async fn create_validating_webhook_configuration(
         &self,
-        config: Value,
+        mut config: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = config
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "ValidatingWebhookConfiguration requires metadata.name".to_string(),
-            })?;
+        let name = self
+            .resolve_metadata_name(
+                &mut config,
+                "ValidatingWebhookConfiguration requires metadata.name",
+            )
+            .await?;
 
         self.check_auth_detailed(
             "create",
             "admissionregistration.k8s.io",
             "validatingwebhookconfigurations",
             None,
-            Some(name),
+            Some(&name),
         )?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = config.get_mut("metadata").and_then(Value::as_object_mut) {
+            Self::stamp_creation_and_uid(meta, "validatingwebhookconfigurations", &name, cur_rev);
+        }
 
         let typed: crate::admission::ValidatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
@@ -5002,24 +6066,27 @@ impl KubernetesApiClient {
 
     pub async fn create_mutating_webhook_configuration(
         &self,
-        config: Value,
+        mut config: Value,
     ) -> Result<Value, ApiserverError> {
-        let name = config
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "MutatingWebhookConfiguration requires metadata.name".to_string(),
-            })?;
+        let name = self
+            .resolve_metadata_name(
+                &mut config,
+                "MutatingWebhookConfiguration requires metadata.name",
+            )
+            .await?;
 
         self.check_auth_detailed(
             "create",
             "admissionregistration.k8s.io",
             "mutatingwebhookconfigurations",
             None,
-            Some(name),
+            Some(&name),
         )?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = config.get_mut("metadata").and_then(Value::as_object_mut) {
+            Self::stamp_creation_and_uid(meta, "mutatingwebhookconfigurations", &name, cur_rev);
+        }
 
         let typed: crate::admission::MutatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
@@ -5177,23 +6244,23 @@ impl KubernetesApiClient {
 
     // --- Aggregated APIService CRUD & Dispatch ---
 
-    pub async fn create_api_service(&self, service: Value) -> Result<Value, ApiserverError> {
-        let name = service
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiserverError::InvalidInput {
-                field: "metadata.name".to_string(),
-                reason: "APIService requires metadata.name".to_string(),
-            })?;
+    pub async fn create_api_service(&self, mut service: Value) -> Result<Value, ApiserverError> {
+        let name = self
+            .resolve_metadata_name(&mut service, "APIService requires metadata.name")
+            .await?;
 
         self.check_auth_detailed(
             "create",
             "apiregistration.k8s.io",
             "apiservices",
             None,
-            Some(name),
+            Some(&name),
         )?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = service.get_mut("metadata").and_then(Value::as_object_mut) {
+            Self::stamp_creation_and_uid(meta, "apiservices", &name, cur_rev);
+        }
 
         let typed: APIService = serde_json::from_value(service.clone())?;
         self.aggregation.register_api_service(typed);

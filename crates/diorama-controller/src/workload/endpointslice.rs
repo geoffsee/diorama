@@ -108,10 +108,10 @@ impl EndpointSliceReconciler {
             return Ok(None);
         }
 
-        let endpoints = self
+        let (endpoints, matching_pods) = self
             .extract_matching_pod_endpoints(namespace, selector)
             .await?;
-        let slice_ports = extract_service_slice_ports(service);
+        let slice_ports = extract_service_slice_ports(service, &matching_pods);
 
         let existing_slices = self
             .client
@@ -173,7 +173,7 @@ impl EndpointSliceReconciler {
         &self,
         namespace: &str,
         selector: &Map<String, Value>,
-    ) -> Result<Vec<Value>, ControllerError> {
+    ) -> Result<(Vec<Value>, Vec<Value>), ControllerError> {
         let pod_list = self.client.list_pods(namespace).await.map_err(|e| {
             ControllerError::ReconciliationFailed {
                 resource: "pods".to_string(),
@@ -188,6 +188,7 @@ impl EndpointSliceReconciler {
             .unwrap_or_default();
 
         let mut endpoints = Vec::new();
+        let mut matching_pods = Vec::new();
         for pod in all_pods {
             let pod_labels = pod
                 .get("metadata")
@@ -206,6 +207,7 @@ impl EndpointSliceReconciler {
 
             if let Some(ep) = build_endpoint_from_pod(namespace, &pod) {
                 endpoints.push(ep);
+                matching_pods.push(pod);
             }
         }
 
@@ -221,7 +223,7 @@ impl EndpointSliceReconciler {
             a_name.cmp(b_name)
         });
 
-        Ok(endpoints)
+        Ok((endpoints, matching_pods))
     }
 
     async fn apply_endpointslice(
@@ -349,7 +351,71 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value) -> Option<Value> {
     }))
 }
 
-fn extract_service_slice_ports(service: &Value) -> Vec<Value> {
+pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
+    let fallback = sp.get("port").and_then(Value::as_i64).unwrap_or(80);
+    let Some(tp) = sp.get("targetPort") else {
+        return fallback;
+    };
+    if let Some(n) = tp.as_i64() {
+        return if n > 0 { n } else { fallback };
+    }
+    if let Some(s) = tp.as_str() {
+        if s.is_empty() || s == "0" {
+            return fallback;
+        }
+        if let Ok(n) = s.parse::<i64>() {
+            return if n > 0 { n } else { fallback };
+        }
+        if let Some(cp) = find_named_container_port(pods, s) {
+            return cp;
+        }
+    }
+    if let Some(obj) = tp.as_object() {
+        if let Some(n) = obj.get("intVal").and_then(Value::as_i64)
+            && n > 0
+        {
+            return n;
+        }
+        if let Some(s) = obj.get("strVal").and_then(Value::as_str)
+            && !s.is_empty()
+            && s != "0"
+        {
+            if let Ok(n) = s.parse::<i64>()
+                && n > 0
+            {
+                return n;
+            }
+            if let Some(cp) = find_named_container_port(pods, s) {
+                return cp;
+            }
+        }
+    }
+    fallback
+}
+
+fn find_named_container_port(pods: &[Value], name: &str) -> Option<i64> {
+    for pod in pods {
+        let Some(containers) = pod.pointer("/spec/containers").and_then(Value::as_array) else {
+            continue;
+        };
+        for c in containers {
+            let Some(ports) = c.get("ports").and_then(Value::as_array) else {
+                continue;
+            };
+            for p in ports {
+                if p.get("name").and_then(Value::as_str) == Some(name)
+                    && let Some(cp) = p.get("containerPort").and_then(Value::as_i64)
+                    && cp > 0
+                {
+                    return Some(cp);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_service_slice_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
     let service_ports = service
         .get("spec")
         .and_then(|s| s.get("ports"))
@@ -359,15 +425,16 @@ fn extract_service_slice_ports(service: &Value) -> Vec<Value> {
 
     let mut slice_ports = Vec::new();
     for sp in service_ports {
-        let port_num = sp.get("port").and_then(Value::as_i64).unwrap_or(80);
-        let port_name = sp.get("name").and_then(Value::as_str);
+        let port_num = resolve_service_target_port(&sp, pods);
+        let port_name = sp.get("name").and_then(Value::as_str).unwrap_or("");
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
         let mut port_obj = Map::new();
+        port_obj.insert("name".to_string(), json!(port_name));
         port_obj.insert("port".to_string(), json!(port_num));
         port_obj.insert("protocol".to_string(), json!(protocol));
-        if let Some(pn) = port_name {
-            port_obj.insert("name".to_string(), json!(pn));
+        if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
+            port_obj.insert("appProtocol".to_string(), json!(ap));
         }
         slice_ports.push(Value::Object(port_obj));
     }

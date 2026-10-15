@@ -57,6 +57,9 @@ pub struct ServiceDefinition {
     pub service_type: ServiceType,
     pub cluster_ip: Option<String>,
     pub ports: Vec<ServicePort>,
+    /// `ClientIP` session affinity timeout; `None` when `sessionAffinity` is `None`.
+    #[serde(default)]
+    pub session_affinity_seconds: Option<u32>,
 }
 
 impl ServiceDefinition {
@@ -74,6 +77,7 @@ impl ServiceDefinition {
             service_type,
             cluster_ip,
             ports,
+            session_affinity_seconds: None,
         }
     }
 
@@ -553,12 +557,22 @@ pub fn service_from_value(val: &Value) -> Result<ServiceDefinition, ProxyError> 
         }
     }
 
+    let session_affinity_seconds =
+        (spec.get("sessionAffinity").and_then(Value::as_str) == Some("ClientIP")).then(|| {
+            spec.pointer("/sessionAffinityConfig/clientIP/timeoutSeconds")
+                .and_then(Value::as_u64)
+                .and_then(|t| u32::try_from(t).ok())
+                .filter(|t| *t > 0)
+                .unwrap_or(10_800)
+        });
+
     Ok(ServiceDefinition {
         namespace,
         name,
         service_type,
         cluster_ip,
         ports,
+        session_affinity_seconds,
     })
 }
 

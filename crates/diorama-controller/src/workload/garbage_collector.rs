@@ -18,9 +18,21 @@ fn matches_uid(item: &Value, expected_uid: Option<&str>) -> bool {
         == Some(uid)
 }
 
+fn has_foreground_deletion(item: &Value) -> bool {
+    let has_del_ts = item
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some();
+    let has_fg_finalizer = item
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("foregroundDeletion")));
+    has_del_ts && has_fg_finalizer
+}
+
 fn owner_present(res: Result<Value, ApiserverError>, expected_uid: Option<&str>) -> bool {
     match res {
-        Ok(owner) => matches_uid(&owner, expected_uid),
+        Ok(owner) => matches_uid(&owner, expected_uid) && !has_foreground_deletion(&owner),
         Err(ApiserverError::NotFound { .. }) => false,
         Err(_) => true, // Transient/permission error: assume owner present to prevent eager deletion
     }
@@ -67,7 +79,213 @@ impl GarbageCollector {
         let pod_count = self.reconcile_pods(namespace).await;
         let slice_count = self.reconcile_endpointslices(namespace).await;
         let endpoint_count = self.reconcile_endpoints(namespace).await;
-        Ok(rs_count + job_count + pod_count + slice_count + endpoint_count)
+        let fg_count = self.reconcile_foreground_owners(namespace).await;
+        Ok(rs_count + job_count + pod_count + slice_count + endpoint_count + fg_count)
+    }
+
+    async fn reconcile_foreground_owners(&self, namespace: &str) -> usize {
+        let pods = self
+            .client
+            .list_pods(namespace)
+            .await
+            .ok()
+            .and_then(|l| l.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default();
+        let rs_items = self
+            .client
+            .list_replicasets(namespace)
+            .await
+            .ok()
+            .and_then(|l| l.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default();
+
+        let mut dep_deployments = rs_items.clone();
+        dep_deployments.extend(pods.iter().cloned());
+
+        let mut finalized = 0;
+        if let Ok(list) = self.client.list_deployments(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_foreground_owner(namespace, "Deployment", items, &dep_deployments)
+                .await;
+        }
+        finalized += self
+            .finalize_foreground_owner(namespace, "ReplicaSet", &rs_items, &pods)
+            .await;
+        if let Ok(list) = self.client.list_replicationcontrollers(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_foreground_owner(namespace, "ReplicationController", items, &pods)
+                .await;
+        }
+        if let Ok(list) = self.client.list_jobs(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_foreground_owner(namespace, "Job", items, &pods)
+                .await;
+        }
+        if let Ok(list) = self.client.list_statefulsets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_foreground_owner(namespace, "StatefulSet", items, &pods)
+                .await;
+        }
+        if let Ok(list) = self.client.list_daemonsets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_foreground_owner(namespace, "DaemonSet", items, &pods)
+                .await;
+        }
+        finalized
+    }
+
+    async fn finalize_foreground_owner(
+        &self,
+        namespace: &str,
+        kind: &str,
+        items: &[Value],
+        dependents: &[Value],
+    ) -> usize {
+        let mut count = 0;
+        for item in items {
+            if !has_foreground_deletion(item) {
+                continue;
+            }
+            let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            let uid = item.pointer("/metadata/uid").and_then(Value::as_str);
+            if self
+                .has_blocking_dependent(namespace, dependents, kind, name, uid)
+                .await
+            {
+                continue;
+            }
+            if self.strip_and_delete(namespace, kind, name, item).await {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    async fn strip_and_delete(
+        &self,
+        namespace: &str,
+        kind: &str,
+        name: &str,
+        item: &Value,
+    ) -> bool {
+        let mut cleaned = item.clone();
+        Self::strip_deletion_metadata(&mut cleaned);
+        match kind {
+            "Deployment" => {
+                let _ = self
+                    .client
+                    .update_deployment(namespace, name, cleaned)
+                    .await;
+                self.client.delete_deployment(namespace, name).await.is_ok()
+            },
+            "ReplicaSet" => {
+                let _ = self
+                    .client
+                    .update_replicaset(namespace, name, cleaned)
+                    .await;
+                self.client.delete_replicaset(namespace, name).await.is_ok()
+            },
+            "ReplicationController" => {
+                let _ = self
+                    .client
+                    .update_replicationcontroller(namespace, name, cleaned)
+                    .await;
+                self.client
+                    .delete_replicationcontroller(namespace, name)
+                    .await
+                    .is_ok()
+            },
+            "Job" => {
+                let _ = self.client.update_job(namespace, name, cleaned).await;
+                self.client.delete_job(namespace, name).await.is_ok()
+            },
+            "StatefulSet" => {
+                let _ = self
+                    .client
+                    .update_statefulset(namespace, name, cleaned)
+                    .await;
+                self.client
+                    .delete_statefulset(namespace, name)
+                    .await
+                    .is_ok()
+            },
+            "DaemonSet" => {
+                let _ = self.client.update_daemonset(namespace, name, cleaned).await;
+                self.client.delete_daemonset(namespace, name).await.is_ok()
+            },
+            _ => false,
+        }
+    }
+
+    fn strip_deletion_metadata(obj: &mut Value) {
+        if let Some(meta) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.remove("finalizers");
+            meta.remove("deletionTimestamp");
+        }
+    }
+
+    async fn has_blocking_dependent(
+        &self,
+        namespace: &str,
+        dependents: &[Value],
+        owner_kind: &str,
+        owner_name: &str,
+        owner_uid: Option<&str>,
+    ) -> bool {
+        for dep in dependents {
+            let Some(owners) = dep
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let references_this_owner = owners.iter().any(|o| {
+                o.get("kind").and_then(Value::as_str) == Some(owner_kind)
+                    && (o.get("name").and_then(Value::as_str) == Some(owner_name)
+                        || (owner_uid.is_some()
+                            && o.get("uid").and_then(Value::as_str) == owner_uid))
+            });
+            if !references_this_owner {
+                continue;
+            }
+            // If the dependent is terminating or has no other valid live owner, it blocks foreground deletion
+            if dep.pointer("/metadata/deletionTimestamp").is_some() {
+                return true;
+            }
+            let mut has_other_live_owner = false;
+            for o in owners {
+                let Some(k) = o.get("kind").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(n) = o.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if k == owner_kind && n == owner_name {
+                    continue;
+                }
+                let uid = o.get("uid").and_then(Value::as_str);
+                if self.check_owner_exists(namespace, k, n, uid).await {
+                    has_other_live_owner = true;
+                    break;
+                }
+            }
+            if !has_other_live_owner {
+                return true;
+            }
+        }
+        false
     }
 
     async fn reconcile_replicasets(&self, namespace: &str) -> usize {
@@ -241,6 +459,16 @@ impl GarbageCollector {
             "Service" => {
                 owner_present(self.client.get_service(namespace, name).await, expected_uid)
             },
+            "ReplicationController" => owner_present(
+                self.client.get_replicationcontroller(namespace, name).await,
+                expected_uid,
+            ),
+            "Pod" => owner_present(self.client.get_pod(namespace, name).await, expected_uid),
+            "ConfigMap" => owner_present(
+                self.client.get_configmap(namespace, name).await,
+                expected_uid,
+            ),
+            "Secret" => owner_present(self.client.get_secret(namespace, name).await, expected_uid),
             _ => true,
         }
     }
@@ -287,5 +515,55 @@ impl GarbageCollector {
         }
 
         valid_owner_count > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn foreground_deletion_detection() {
+        let clean = json!({
+            "metadata": { "name": "test" }
+        });
+        assert!(!has_foreground_deletion(&clean));
+
+        let del_only = json!({
+            "metadata": {
+                "name": "test",
+                "deletionTimestamp": "2026-10-15T00:00:00Z"
+            }
+        });
+        assert!(!has_foreground_deletion(&del_only));
+
+        let finalizer_only = json!({
+            "metadata": {
+                "name": "test",
+                "finalizers": ["foregroundDeletion"]
+            }
+        });
+        assert!(!has_foreground_deletion(&finalizer_only));
+
+        let foreground = json!({
+            "metadata": {
+                "name": "test",
+                "deletionTimestamp": "2026-10-15T00:00:00Z",
+                "finalizers": ["foregroundDeletion"]
+            }
+        });
+        assert!(has_foreground_deletion(&foreground));
+    }
+
+    #[test]
+    fn uid_matching() {
+        let item = json!({
+            "metadata": { "name": "test", "uid": "abc-123" }
+        });
+        assert!(matches_uid(&item, None));
+        assert!(matches_uid(&item, Some("")));
+        assert!(matches_uid(&item, Some("abc-123")));
+        assert!(!matches_uid(&item, Some("xyz-789")));
     }
 }

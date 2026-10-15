@@ -207,6 +207,9 @@ fn message_for(
 }
 
 fn message_for_gvk(api_version: &str, kind: &str) -> Option<String> {
+    if kind == "DeleteOptions" {
+        return Some("k8s.io.apimachinery.pkg.apis.meta.v1.DeleteOptions".to_string());
+    }
     let (group, version) = api_version
         .split_once('/')
         .map_or(("", api_version), |(group, version)| (group, version));
@@ -334,7 +337,7 @@ fn decode_message(name: &str, bytes: &[u8], depth: usize) -> Result<Value, Apise
             let (chunk, rest) = read_len(input)?;
             input = rest;
             for item in decode_packed(field, chunk)? {
-                store_field(&mut object, field, item);
+                store_field(name, &mut object, field, item);
             }
             continue;
         }
@@ -378,9 +381,48 @@ fn decode_message(name: &str, bytes: &[u8], depth: usize) -> Result<Value, Apise
                 continue;
             },
         };
-        store_field(&mut object, field, value);
+        store_field(name, &mut object, field, value);
+    }
+    if let Some(val) = unwrap_props_union(name, &mut object) {
+        return Ok(val);
     }
     Ok(Value::Object(object))
+}
+
+fn unwrap_props_union(name: &str, object: &mut Map<String, Value>) -> Option<Value> {
+    match name {
+        "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrArray" => {
+            if let Some(arr) = object.remove("jSONSchemas") {
+                return Some(arr);
+            }
+            if let Some(schema) = object.remove("schema")
+                && schema.as_object().is_some_and(|m| !m.is_empty())
+            {
+                return Some(schema);
+            }
+            Some(Value::Null)
+        },
+        "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrBool" => {
+            if let Some(schema) = object.remove("schema")
+                && schema.as_object().is_some_and(|m| !m.is_empty())
+            {
+                return Some(schema);
+            }
+            Some(object.remove("allows").unwrap_or(Value::Bool(false)))
+        },
+        "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaPropsOrStringArray" => {
+            if let Some(arr) = object.remove("property") {
+                return Some(arr);
+            }
+            if let Some(schema) = object.remove("schema")
+                && schema.as_object().is_some_and(|m| !m.is_empty())
+            {
+                return Some(schema);
+            }
+            Some(Value::Null)
+        },
+        _ => None,
+    }
 }
 
 const fn is_packed_scalar(kind: WireKind) -> bool {
@@ -437,11 +479,21 @@ fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverEr
             Ok(Some(string_field(bytes, 1).unwrap_or_else(|| json!(""))))
         },
         "k8s.io.apimachinery.pkg.apis.meta.v1.Time"
-        | "k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime"
         | "k8s.io.apimachinery.pkg.apis.meta.v1.Timestamp" => {
             let seconds = varint_field(bytes, 1).unwrap_or(0) as i64;
             let nanos = varint_field(bytes, 2).unwrap_or(0) as i32;
+            if seconds <= 0 && nanos <= 0 {
+                return Ok(Some(Value::Null));
+            }
             Ok(Some(json!(rfc3339(seconds, nanos))))
+        },
+        "k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime" => {
+            let seconds = varint_field(bytes, 1).unwrap_or(0) as i64;
+            let nanos = varint_field(bytes, 2).unwrap_or(0) as i32;
+            if seconds <= 0 && nanos <= 0 {
+                return Ok(Some(Value::Null));
+            }
+            Ok(Some(json!(rfc3339_micro(seconds, nanos))))
         },
         "k8s.io.apimachinery.pkg.util.intstr.IntOrString" => {
             let kind = varint_field(bytes, 1);
@@ -463,6 +515,17 @@ fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverEr
                 return Ok(Some(value));
             }
             Ok(Some(json!({})))
+        },
+        "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSON"
+        | "k8s.io.apimachinery.pkg.apis.meta.v1.FieldsV1" => {
+            let raw = bytes_field(bytes, 1).unwrap_or_default();
+            if raw.is_empty() {
+                return Ok(Some(Value::Null));
+            }
+            if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+                return Ok(Some(value));
+            }
+            Ok(Some(Value::Null))
         },
         _ => Ok(None),
     }
@@ -541,7 +604,63 @@ fn decode_map_entry(field: &FieldDef, chunk: &[u8], depth: usize) -> Result<Valu
     Ok(json!({ "key": key, "value": value }))
 }
 
-fn store_field(object: &mut Map<String, Value>, field: &FieldDef, value: Value) {
+fn is_inline_field(name: &str, type_name: &str) -> bool {
+    matches!(
+        (name, type_name),
+        ("volumeSource", "k8s.io.api.core.v1.VolumeSource")
+            | (
+                "persistentVolumeSource",
+                "k8s.io.api.core.v1.PersistentVolumeSource"
+            )
+            | ("handler", "k8s.io.api.core.v1.ProbeHandler")
+            | (
+                "localObjectReference",
+                "k8s.io.api.core.v1.LocalObjectReference"
+            )
+            | (
+                "ephemeralContainerCommon",
+                "k8s.io.api.core.v1.EphemeralContainerCommon"
+            )
+            | (
+                "ingressRuleValue",
+                "k8s.io.api.networking.v1.IngressRuleValue"
+            )
+            | (
+                "ruleWithOperations",
+                "k8s.io.api.admissionregistration.v1.RuleWithOperations"
+            )
+            | ("rule", "k8s.io.api.admissionregistration.v1.Rule")
+            | ("typeMeta", "k8s.io.apimachinery.pkg.runtime.TypeMeta")
+    )
+}
+
+fn json_field_name<'a>(parent_message: &str, field_name: &'a str) -> &'a str {
+    if parent_message == "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps"
+    {
+        match field_name {
+            "schema" => "$schema",
+            "ref" => "$ref",
+            "xKubernetesPreserveUnknownFields" => "x-kubernetes-preserve-unknown-fields",
+            "xKubernetesEmbeddedResource" => "x-kubernetes-embedded-resource",
+            "xKubernetesIntOrString" => "x-kubernetes-int-or-string",
+            "xKubernetesListMapKeys" => "x-kubernetes-list-map-keys",
+            "xKubernetesListType" => "x-kubernetes-list-type",
+            "xKubernetesMapType" => "x-kubernetes-map-type",
+            "xKubernetesValidations" => "x-kubernetes-validations",
+            _ => field_name,
+        }
+    } else {
+        field_name
+    }
+}
+
+fn store_field(
+    parent_message: &str,
+    object: &mut Map<String, Value>,
+    field: &FieldDef,
+    value: Value,
+) {
+    let key_name = json_field_name(parent_message, field.name);
     if field.map_value.is_some() {
         let Value::Object(entry) = value else {
             return;
@@ -552,8 +671,11 @@ fn store_field(object: &mut Map<String, Value>, field: &FieldDef, value: Value) 
             .unwrap_or("")
             .to_string();
         let mapped = entry.get("value").cloned().unwrap_or(Value::Null);
+        if mapped.is_null() {
+            return;
+        }
         let map = object
-            .entry(field.name.to_string())
+            .entry(key_name.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(map) = map.as_object_mut() {
             map.insert(key, mapped);
@@ -562,14 +684,28 @@ fn store_field(object: &mut Map<String, Value>, field: &FieldDef, value: Value) 
     }
     if field.repeated {
         let list = object
-            .entry(field.name.to_string())
+            .entry(key_name.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Some(list) = list.as_array_mut() {
             list.push(value);
         }
         return;
     }
-    object.insert(field.name.to_string(), value);
+    if value.is_null() {
+        return;
+    }
+    if field.kind == WireKind::String && value.as_str().is_some_and(str::is_empty) {
+        return;
+    }
+    if is_inline_field(field.name, field.type_name)
+        && let Value::Object(inner) = value
+    {
+        for (k, v) in inner {
+            object.insert(k, v);
+        }
+        return;
+    }
+    object.insert(key_name.to_string(), value);
 }
 
 fn string_field(bytes: &[u8], number: u64) -> Option<Value> {
@@ -694,6 +830,20 @@ fn rfc3339(seconds: i64, nanos: i32) -> String {
     } else {
         format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     }
+}
+
+fn rfc3339_micro(seconds: i64, nanos: i32) -> String {
+    if seconds < 0 {
+        return format!("{seconds}");
+    }
+    let days = seconds.div_euclid(86_400);
+    let tod = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+    let micros = nanos.max(0).rem_euclid(1_000_000_000) / 1_000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z")
 }
 
 fn civil_from_days(days: i64) -> (i32, u32, u32) {

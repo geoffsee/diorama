@@ -51,7 +51,7 @@ pub(crate) async fn dispatch(
         return delete(client, path, query, body).await;
     }
     if method == Method::PUT {
-        let doc = decode_body(content_type, body, path)?;
+        let doc = decode_body(content_type, query, body, path)?;
         return replace(client, path, query, doc).await.map(ok_json);
     }
     if method == Method::PATCH {
@@ -60,7 +60,7 @@ pub(crate) async fn dispatch(
             .map(ok_json);
     }
     if method == Method::POST {
-        let doc = decode_body(content_type, body, path)?;
+        let doc = decode_body(content_type, query, body, path)?;
         return create(client, path, doc).await.map(created_json);
     }
     Ok(status_outcome(
@@ -75,32 +75,36 @@ async fn read(
     path: &ResourcePath,
     query: Option<&str>,
 ) -> Result<Value, ApiserverError> {
-    if is_namespaced(&path.resource) {
-        if let Some(namespace) = &path.namespace {
-            if let Some(name) = &path.name {
-                get_namespaced(client, &path.group, &path.resource, namespace, name).await
-            } else {
-                let list = list_namespaced(client, &path.group, &path.resource, namespace).await?;
-                page_list(filter_list(list, query), query)
-            }
-        } else if path.name.is_none() {
-            let list = list_all_namespaces(client, &path.group, &path.resource).await?;
-            page_list(filter_list(list, query), query)
-        } else {
-            Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
+    if is_cluster_resource(&path.resource) {
+        if path.namespace.is_some() {
+            Err(ApiserverError::NotFound {
+                resource: path.resource.clone(),
+                name: path.name.clone().unwrap_or_default(),
             })
+        } else if let Some(name) = &path.name {
+            get_cluster(client, &path.group, &path.resource, name).await
+        } else {
+            let list = list_cluster(client, &path.group, &path.resource).await?;
+            page_list(filter_list(list, query), query)
         }
-    } else if path.namespace.is_some() {
-        Err(ApiserverError::NotFound {
-            resource: path.resource.clone(),
-            name: path.name.clone().unwrap_or_default(),
+    } else if let Some(namespace) = &path.namespace {
+        if let Some(name) = &path.name {
+            get_namespaced(client, &path.group, &path.resource, namespace, name).await
+        } else {
+            let list = list_namespaced(client, &path.group, &path.resource, namespace).await?;
+            page_list(filter_list(list, query), query)
+        }
+    } else if path.name.is_none() {
+        let list = list_all_namespaces(client, &path.group, &path.resource).await?;
+        page_list(filter_list(list, query), query)
+    } else if is_builtin_namespaced(&path.resource) {
+        Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
         })
     } else if let Some(name) = &path.name {
         get_cluster(client, &path.group, &path.resource, name).await
     } else {
-        let list = list_cluster(client, &path.group, &path.resource).await?;
-        page_list(filter_list(list, query), query)
+        unreachable!()
     }
 }
 
@@ -203,10 +207,9 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
     Ok(list)
 }
 
-/// Applies `labelSelector` (`key=value,key2=value2`) and `fieldSelector`
-/// (`metadata.name=x`) to a list response. Selectors kubectl always sends
-/// (`spec.nodeName`, `status.phase`) that we do not index are ignored rather
-/// than rejected so list calls succeed.
+/// Applies `labelSelector` and `fieldSelector` (`metadata.name=x`) to a list
+/// response. Selectors kubectl always sends (`spec.nodeName`, `status.phase`)
+/// that we do not index are ignored rather than rejected so list calls succeed.
 fn filter_list(mut list: Value, query: Option<&str>) -> Value {
     let params = query::parse(query);
     let label_selector = params.get("labelSelector").cloned().unwrap_or_default();
@@ -214,30 +217,114 @@ fn filter_list(mut list: Value, query: Option<&str>) -> Value {
     if label_selector.is_empty() && field_selector.is_empty() {
         return list;
     }
-    let labels = parse_label_selector(&label_selector);
     let fields = parse_label_selector(&field_selector);
     let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
         return list;
     };
     items.retain(|item| {
-        labels.iter().all(|(key, want)| {
-            item.pointer("/metadata/labels")
-                .and_then(|v| v.get(key))
-                .and_then(Value::as_str)
-                == Some(want.as_str())
-        }) && fields.iter().all(|(key, want)| match key.as_str() {
-            "metadata.name" => {
-                item.pointer("/metadata/name").and_then(Value::as_str) == Some(want.as_str())
-            },
-            "metadata.namespace" => {
-                item.pointer("/metadata/namespace").and_then(Value::as_str) == Some(want.as_str())
-            },
-            // Unindexed selectors (spec.nodeName, status.phase, ...) match
-            // everything so controllers can list without field indexing.
-            _ => true,
-        })
+        matches_label_selector(item, &label_selector)
+            && fields.iter().all(|(key, want)| match key.as_str() {
+                "metadata.name" => {
+                    item.pointer("/metadata/name").and_then(Value::as_str) == Some(want.as_str())
+                },
+                "metadata.namespace" => {
+                    item.pointer("/metadata/namespace").and_then(Value::as_str)
+                        == Some(want.as_str())
+                },
+                // Unindexed selectors (spec.nodeName, status.phase, ...) match
+                // everything so controllers can list without field indexing.
+                _ => true,
+            })
     });
     list
+}
+
+pub(crate) fn matches_label_selector(item: &Value, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return true;
+    }
+    let labels = item.pointer("/metadata/labels").and_then(Value::as_object);
+    let get_label = |k: &str| labels.and_then(|m| m.get(k)).and_then(Value::as_str);
+
+    for req in split_selector_terms(selector) {
+        let req = req.trim();
+        if req.is_empty() {
+            continue;
+        }
+        if let Some((key, rest)) = req.split_once(" notin ") {
+            let key = key.trim();
+            let vals = parse_set_values(rest);
+            if let Some(actual) = get_label(key)
+                && vals.contains(&actual)
+            {
+                return false;
+            }
+        } else if let Some((key, rest)) = req.split_once(" in ") {
+            let key = key.trim();
+            let vals = parse_set_values(rest);
+            let Some(actual) = get_label(key) else {
+                return false;
+            };
+            if !vals.contains(&actual) {
+                return false;
+            }
+        } else if let Some((key, val)) = req.split_once("!=") {
+            let key = key.trim();
+            let val = val.trim();
+            if get_label(key) == Some(val) {
+                return false;
+            }
+        } else if let Some((key, val)) = req.split_once("==") {
+            let key = key.trim();
+            let val = val.trim();
+            if get_label(key) != Some(val) {
+                return false;
+            }
+        } else if let Some((key, val)) = req.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            if get_label(key) != Some(val) {
+                return false;
+            }
+        } else if let Some(key) = req.strip_prefix('!') {
+            let key = key.trim();
+            if get_label(key).is_some() {
+                return false;
+            }
+        } else if get_label(req).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+fn split_selector_terms(selector: &str) -> Vec<&str> {
+    let mut terms = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                terms.push(&selector[start..idx]);
+                start = idx + 1;
+            },
+            _ => {},
+        }
+    }
+    terms.push(&selector[start..]);
+    terms
+}
+
+fn parse_set_values(raw: &str) -> Vec<&str> {
+    let trimmed = raw.trim().trim_start_matches('(').trim_end_matches(')');
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn parse_label_selector(selector: &str) -> Vec<(String, String)> {
@@ -266,12 +353,9 @@ async fn delete(
         return delete_collection(client, path, query).await;
     };
     let deleted = status_outcome(http::StatusCode::OK, "Success", "deleted");
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
+    if is_cluster_resource(&path.resource) {
+        delete_cluster(client, &path.group, &path.resource, name).await?;
+    } else if let Some(namespace) = &path.namespace {
         if path.group.is_empty() && path.resource == "pods" {
             // Pods delete gracefully: the kubelet owns the final removal.
             let grace = grace_period_seconds(query, body);
@@ -280,11 +364,155 @@ async fn delete(
                 .await?
                 .map_or(deleted, ok_json));
         }
+        let policy = delete_propagation_policy(body, &path.group, &path.resource);
+        if policy.as_deref() == Some("Orphan") {
+            orphan_dependents(client, path, namespace, name).await?;
+        } else if policy.as_deref() == Some("Foreground")
+            && matches!(
+                path.resource.as_str(),
+                "deployments"
+                    | "replicasets"
+                    | "replicationcontrollers"
+                    | "statefulsets"
+                    | "daemonsets"
+                    | "jobs"
+            )
+        {
+            let mut current = read_single(client, path, name).await?;
+            if let Some(meta) = current.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.entry("deletionTimestamp".to_string())
+                    .or_insert_with(|| json!(crate::time::now_rfc3339()));
+                let finalizers = meta
+                    .entry("finalizers".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = finalizers.as_array_mut()
+                    && !arr.iter().any(|v| v.as_str() == Some("foregroundDeletion"))
+                {
+                    arr.push(json!("foregroundDeletion"));
+                }
+            }
+            let updated = persist_object(client, path, name, current).await?;
+            return Ok(ok_json(updated));
+        }
         delete_namespaced(client, &path.group, &path.resource, namespace, name).await?;
+    } else if is_builtin_namespaced(&path.resource) {
+        return Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
+        });
     } else {
         delete_cluster(client, &path.group, &path.resource, name).await?;
     }
     Ok(deleted)
+}
+
+fn delete_options_json(body: &[u8], group: &str, resource: &str) -> Option<Value> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(val) = serde_json::from_slice::<Value>(body) {
+        return Some(val);
+    }
+    crate::http::protojson::decode_k8s_protobuf(body, group, resource)
+        .ok()
+        .flatten()
+}
+
+fn delete_propagation_policy(body: &[u8], group: &str, resource: &str) -> Option<String> {
+    let opts = delete_options_json(body, group, resource)?;
+    if let Some(policy) = opts.get("propagationPolicy").and_then(Value::as_str)
+        && !policy.is_empty()
+    {
+        return Some(policy.to_string());
+    }
+    if let Some(orphan) = opts.get("orphanDependents").and_then(Value::as_bool) {
+        return Some(if orphan {
+            "Orphan".to_string()
+        } else {
+            "Foreground".to_string()
+        });
+    }
+    None
+}
+
+async fn orphan_dependents(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ApiserverError> {
+    let Ok(parent) = read_single(client, path, name).await else {
+        return Ok(());
+    };
+    let parent_uid = parent
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let parent_kind = kind_name(&path.resource).unwrap_or_default();
+
+    let matches_owner = |oref: &Value| -> bool {
+        let uid_match = !parent_uid.is_empty()
+            && oref.get("uid").and_then(Value::as_str) == Some(parent_uid.as_str());
+        let name_kind_match = oref.get("name").and_then(Value::as_str) == Some(name)
+            && (parent_kind.is_empty()
+                || oref.get("kind").and_then(Value::as_str) == Some(parent_kind));
+        uid_match || name_kind_match
+    };
+
+    if path.resource == "deployments"
+        && let Ok(rs_list) = client.list_replicasets(namespace).await
+        && let Some(items) = rs_list.get("items").and_then(Value::as_array)
+    {
+        for mut rs in items.iter().cloned() {
+            let Some(rs_name) = rs
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(orefs) = rs
+                .pointer_mut("/metadata/ownerReferences")
+                .and_then(Value::as_array_mut)
+            {
+                let before = orefs.len();
+                orefs.retain(|r| !matches_owner(r));
+                changed = orefs.len() != before;
+            }
+            if changed {
+                let _ = client.update_replicaset(namespace, &rs_name, rs).await;
+            }
+        }
+    }
+
+    if let Ok(pod_list) = client.list_pods(namespace).await
+        && let Some(items) = pod_list.get("items").and_then(Value::as_array)
+    {
+        for mut pod in items.iter().cloned() {
+            let Some(pod_name) = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(orefs) = pod
+                .pointer_mut("/metadata/ownerReferences")
+                .and_then(Value::as_array_mut)
+            {
+                let before = orefs.len();
+                orefs.retain(|r| !matches_owner(r));
+                changed = orefs.len() != before;
+            }
+            if changed {
+                let _ = client.update_pod(namespace, &pod_name, pod).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Deletes every object selected by a collection `DELETE`, honouring
@@ -305,14 +533,14 @@ async fn delete_collection(
         let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
             continue;
         };
-        let deleted = if is_namespaced(&path.resource) {
-            let namespace = item
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .or(path.namespace.as_deref());
-            let Some(namespace) = namespace else {
-                continue;
-            };
+        let namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or(path.namespace.as_deref());
+        let deleted = if is_cluster_resource(&path.resource) {
+            delete_cluster(client, &path.group, &path.resource, name).await
+        } else if let Some(namespace) = namespace {
             if path.group.is_empty() && path.resource == "pods" {
                 // Best effort; the kubelet owns graceful pod removal.
                 client
@@ -322,6 +550,8 @@ async fn delete_collection(
             } else {
                 delete_namespaced(client, &path.group, &path.resource, namespace, name).await
             }
+        } else if is_builtin_namespaced(&path.resource) {
+            continue;
         } else {
             delete_cluster(client, &path.group, &path.resource, name).await
         };
@@ -350,16 +580,7 @@ async fn replace(
         let _ = read_single(client, path, name).await?;
         return Ok(stamp_replacement(doc, path, name));
     }
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
-        update_namespaced(client, &path.group, &path.resource, namespace, name, doc).await
-    } else {
-        update_cluster(client, &path.group, &path.resource, name, doc).await
-    }
+    persist_object(client, path, name, doc).await
 }
 
 fn stamp_replacement(mut doc: Value, path: &ResourcePath, name: &str) -> Value {
@@ -377,13 +598,14 @@ async fn read_single(
     path: &ResourcePath,
     name: &str,
 ) -> Result<Value, ApiserverError> {
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
+    if is_cluster_resource(&path.resource) {
+        get_cluster(client, &path.group, &path.resource, name).await
+    } else if let Some(namespace) = &path.namespace {
         get_namespaced(client, &path.group, &path.resource, namespace, name).await
+    } else if is_builtin_namespaced(&path.resource) {
+        Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
+        })
     } else {
         get_cluster(client, &path.group, &path.resource, name).await
     }
@@ -449,16 +671,7 @@ async fn patch(
     if is_dry_run(query) {
         return Ok(target);
     }
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
-        update_namespaced(client, &path.group, &path.resource, namespace, name, target).await
-    } else {
-        update_cluster(client, &path.group, &path.resource, name, target).await
-    }
+    persist_object(client, path, name, target).await
 }
 
 /// Server-side apply: creates the object when absent, otherwise merges the
@@ -472,10 +685,16 @@ async fn apply_patch(
     body: &[u8],
     existing: Result<Value, ApiserverError>,
 ) -> Result<Value, ApiserverError> {
-    let mut applied: Value =
-        serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
-            message: format!("apply body is not JSON: {err}"),
-        })?;
+    let is_strict = crate::http::field_validation::is_strict(query);
+    let mut applied: Value = crate::http::field_validation::decode_body_with_validation(
+        body,
+        Some("application/apply-patch+yaml"),
+        is_strict,
+        path,
+    )?;
+    if is_strict {
+        client.validate_crd_schema(&path.group, &path.resource, &applied)?;
+    }
     // The applied manifest wins for its fields; strip server-assigned metadata
     // that must never be taken from the client.
     if let Some(meta) = applied.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -493,13 +712,14 @@ async fn apply_patch(
             if dry_run {
                 return Ok(applied);
             }
-            if is_namespaced(&path.resource) {
-                let Some(namespace) = &path.namespace else {
-                    return Err(ApiserverError::BadRequest {
-                        message: format!("{} requires a namespace", path.resource),
-                    });
-                };
+            if is_cluster_resource(&path.resource) {
+                create_cluster(client, &path.group, &path.resource, applied).await
+            } else if let Some(namespace) = &path.namespace {
                 create_namespaced(client, &path.group, &path.resource, namespace, applied).await
+            } else if is_builtin_namespaced(&path.resource) {
+                Err(ApiserverError::BadRequest {
+                    message: format!("{} requires a namespace", path.resource),
+                })
             } else {
                 create_cluster(client, &path.group, &path.resource, applied).await
             }
@@ -510,24 +730,7 @@ async fn apply_patch(
             if dry_run {
                 return Ok(current);
             }
-            if is_namespaced(&path.resource) {
-                let Some(namespace) = &path.namespace else {
-                    return Err(ApiserverError::BadRequest {
-                        message: format!("{} requires a namespace", path.resource),
-                    });
-                };
-                update_namespaced(
-                    client,
-                    &path.group,
-                    &path.resource,
-                    namespace,
-                    name,
-                    current,
-                )
-                .await
-            } else {
-                update_cluster(client, &path.group, &path.resource, name, current).await
-            }
+            persist_object(client, path, name, current).await
         },
     }
 }
@@ -540,8 +743,7 @@ fn grace_period_seconds(query: Option<&str>, body: &[u8]) -> Option<i64> {
     {
         return Some(value);
     }
-    serde_json::from_slice::<Value>(body)
-        .ok()?
+    delete_options_json(body, "", "pods")?
         .get("gracePeriodSeconds")?
         .as_i64()
 }
@@ -556,37 +758,59 @@ async fn create(
             message: "create does not take a resource name in the path".to_string(),
         });
     }
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
+    if is_cluster_resource(&path.resource) {
+        create_cluster(client, &path.group, &path.resource, doc).await
+    } else if let Some(namespace) = &path.namespace {
         create_namespaced(client, &path.group, &path.resource, namespace, doc).await
+    } else if is_builtin_namespaced(&path.resource) {
+        Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
+        })
     } else {
         create_cluster(client, &path.group, &path.resource, doc).await
     }
 }
 
-fn is_namespaced(resource: &str) -> bool {
-    !matches!(
+pub(crate) fn is_cluster_resource(resource: &str) -> bool {
+    matches!(
         resource,
         "namespaces"
             | "nodes"
             | "persistentvolumes"
             | "storageclasses"
+            | "csinodes"
+            | "csidrivers"
+            | "volumeattachments"
+            | "volumeattributesclasses"
             | "clusterroles"
             | "clusterrolebindings"
             | "customresourcedefinitions"
             | "validatingwebhookconfigurations"
             | "mutatingwebhookconfigurations"
+            | "validatingadmissionpolicies"
+            | "validatingadmissionpolicybindings"
+            | "mutatingadmissionpolicies"
+            | "mutatingadmissionpolicybindings"
             | "apiservices"
             | "clustertrustbundles"
             | "certificatesigningrequests"
             | "ingressclasses"
             | "runtimeclasses"
             | "priorityclasses"
+            | "flowschemas"
+            | "prioritylevelconfigurations"
+            | "ipaddresses"
+            | "servicecidrs"
+            | "selfsubjectreviews"
+            | "tokenreviews"
+            | "subjectaccessreviews"
+            | "selfsubjectaccessreviews"
+            | "selfsubjectrulesreviews"
     )
+}
+
+fn is_builtin_namespaced(resource: &str) -> bool {
+    kind_name(resource).is_some() && !is_cluster_resource(resource)
 }
 
 async fn list_all_namespaces(
@@ -617,14 +841,49 @@ async fn list_all_namespaces(
             }
         }
     }
-    let api_version = if group.is_empty() {
-        "v1".to_string()
-    } else {
-        format!("{group}/v1")
+    if !is_builtin_namespaced(resource)
+        && let Ok(cluster_page) = list_cluster(client, group, resource).await
+    {
+        if let Some(cluster_items) = cluster_page.get("items").and_then(Value::as_array) {
+            items.extend(cluster_items.iter().cloned());
+        }
+        if version.is_empty()
+            && let Some(rv) = cluster_page
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+        {
+            version = rv.to_string();
+        }
+    }
+    let api_version = items
+        .first()
+        .and_then(|item| item.get("apiVersion"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                if group.is_empty() {
+                    "v1".to_string()
+                } else {
+                    format!("{group}/v1")
+                }
+            },
+            str::to_owned,
+        );
+    let kind = {
+        let base = list_kind(resource);
+        if base == "List" {
+            items
+                .first()
+                .and_then(|item| item.get("kind"))
+                .and_then(Value::as_str)
+                .map_or_else(|| "List".to_string(), |k| format!("{k}List"))
+        } else {
+            base.to_string()
+        }
     };
     Ok(json!({
         "apiVersion": api_version,
-        "kind": list_kind(resource),
+        "kind": kind,
         "metadata": { "resourceVersion": version },
         "items": items
     }))
@@ -638,6 +897,7 @@ async fn list_namespaced(
 ) -> Result<Value, ApiserverError> {
     match (group, resource) {
         ("", "pods") => client.list_pods(namespace).await,
+        ("", "replicationcontrollers") => client.list_replicationcontrollers(namespace).await,
         ("", "configmaps") => client.list_configmaps(namespace).await,
         ("", "secrets") => client.list_secrets(namespace).await,
         ("", "services") => client.list_services(namespace).await,
@@ -699,6 +959,7 @@ async fn get_namespaced(
 ) -> Result<Value, ApiserverError> {
     match (group, resource) {
         ("", "pods") => client.get_pod(namespace, name).await,
+        ("", "replicationcontrollers") => client.get_replicationcontroller(namespace, name).await,
         ("", "configmaps") => client.get_configmap(namespace, name).await,
         ("", "secrets") => client.get_secret(namespace, name).await,
         ("", "services") => client.get_service(namespace, name).await,
@@ -749,6 +1010,9 @@ async fn delete_namespaced(
     name: &str,
 ) -> Result<(), ApiserverError> {
     match (group, resource) {
+        ("", "replicationcontrollers") => {
+            client.delete_replicationcontroller(namespace, name).await
+        },
         ("", "configmaps") => client.delete_configmap(namespace, name, None).await,
         ("", "secrets") => client.delete_secret(namespace, name, None).await,
         ("", "services") => client.delete_service(namespace, name).await,
@@ -798,6 +1062,38 @@ async fn delete_namespaced(
     }
 }
 
+/// Rejects a create that would exceed a `ResourceQuota` hard limit.
+async fn enforce_quota(
+    client: &KubernetesApiClient,
+    group: &str,
+    resource: &str,
+    namespace: &str,
+    doc: &Value,
+) -> Result<(), ApiserverError> {
+    let counted = crate::quota::COUNTED_RESOURCES
+        .iter()
+        .any(|(g, _, p)| *g == group && *p == resource);
+    if !counted {
+        return Ok(());
+    }
+    let quotas =
+        crate::quota::list_counted(client, "", "ResourceQuotaList", "resourcequotas", namespace)
+            .await;
+    for quota in &quotas {
+        if !crate::quota::quota_tracks(quota, group, resource)
+            || !crate::quota::object_in_scope(quota, group, resource, doc)
+        {
+            continue;
+        }
+        let delta = crate::quota::usage_for(group, resource, doc);
+        let totals = crate::quota::compute_totals(client, quota, namespace).await;
+        if let Some(reason) = crate::quota::exceeded(quota, &totals, &delta) {
+            return Err(ApiserverError::AdmissionDenied { reason });
+        }
+    }
+    Ok(())
+}
+
 async fn create_namespaced(
     client: &KubernetesApiClient,
     group: &str,
@@ -805,8 +1101,10 @@ async fn create_namespaced(
     namespace: &str,
     doc: Value,
 ) -> Result<Value, ApiserverError> {
+    enforce_quota(client, group, resource, namespace, &doc).await?;
     match (group, resource) {
         ("", "pods") => client.create_pod(namespace, doc).await,
+        ("", "replicationcontrollers") => client.create_replicationcontroller(namespace, doc).await,
         ("", "configmaps") => client.create_configmap_object(namespace, doc).await,
         ("", "secrets") => client.create_secret_object(namespace, doc).await,
         ("", "services") => client.create_service(namespace, doc).await,
@@ -854,9 +1152,12 @@ async fn create_namespaced(
                 .await
         },
         _ => {
-            let kind = kind_name(resource).unwrap_or("Object");
+            let kind = kind_name(resource)
+                .map(str::to_owned)
+                .or_else(|| doc.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "Object".to_string());
             client
-                .create_namespaced_object(group, kind, resource, namespace, doc)
+                .create_namespaced_object(group, &kind, resource, namespace, doc)
                 .await
         },
     }
@@ -872,6 +1173,11 @@ async fn update_namespaced(
 ) -> Result<Value, ApiserverError> {
     match (group, resource) {
         ("", "pods") => client.update_pod(namespace, name, doc).await,
+        ("", "replicationcontrollers") => {
+            client
+                .update_replicationcontroller(namespace, name, doc)
+                .await
+        },
         ("", "services") => client.update_service(namespace, name, doc).await,
         ("", "endpoints") => client.update_endpoints(namespace, name, doc).await,
         ("", "persistentvolumeclaims") => client.update_pvc(namespace, name, doc).await,
@@ -886,9 +1192,12 @@ async fn update_namespaced(
         ("batch", "cronjobs") => client.update_cronjob(namespace, name, doc).await,
         ("coordination.k8s.io", "leases") => client.update_lease(namespace, name, doc).await,
         _ => {
-            let kind = kind_name(resource).unwrap_or("Object");
+            let kind = kind_name(resource)
+                .map(str::to_owned)
+                .or_else(|| doc.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "Object".to_string());
             client
-                .replace_namespaced_object(group, kind, resource, namespace, name, doc)
+                .replace_namespaced_object(group, &kind, resource, namespace, name, doc)
                 .await
         },
     }
@@ -1017,10 +1326,7 @@ async fn create_cluster(
     doc: Value,
 ) -> Result<Value, ApiserverError> {
     match (group, resource) {
-        ("", "namespaces") => {
-            let name = object_name(&doc)?;
-            client.create_namespace(&name).await
-        },
+        ("", "namespaces") => client.create_namespace_object(doc).await,
         ("", "nodes") => client.create_node(doc).await,
         ("", "persistentvolumes") => client.create_pv(doc).await,
         ("storage.k8s.io" | "", "storageclasses") => client.create_storage_class(doc).await,
@@ -1053,9 +1359,12 @@ async fn create_cluster(
         },
         ("apiregistration.k8s.io", "apiservices") => client.create_api_service(doc).await,
         _ => {
-            let kind = kind_name(resource).unwrap_or("Object");
+            let kind = kind_name(resource)
+                .map(str::to_owned)
+                .or_else(|| doc.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "Object".to_string());
             client
-                .create_cluster_object(group, kind, resource, doc)
+                .create_cluster_object(group, &kind, resource, doc)
                 .await
         },
     }
@@ -1073,9 +1382,12 @@ async fn update_cluster(
         ("", "persistentvolumes") => client.update_pv(name, doc).await,
         ("storage.k8s.io" | "", "storageclasses") => client.update_storage_class(name, doc).await,
         _ => {
-            let kind = kind_name(resource).unwrap_or("Object");
+            let kind = kind_name(resource)
+                .map(str::to_owned)
+                .or_else(|| doc.get("kind").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "Object".to_string());
             client
-                .replace_cluster_object(group, kind, resource, name, doc)
+                .replace_cluster_object(group, &kind, resource, name, doc)
                 .await
         },
     }
@@ -1083,6 +1395,7 @@ async fn update_cluster(
 
 fn decode_body(
     content_type: Option<&str>,
+    query: Option<&str>,
     body: &[u8],
     path: &ResourcePath,
 ) -> Result<Value, ApiserverError> {
@@ -1098,9 +1411,8 @@ fn decode_body(
         stamp_type_meta(&mut value, path);
         return Ok(value);
     }
-    serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
-        message: format!("request body is not JSON: {err}"),
-    })
+    let is_strict = crate::http::field_validation::is_strict(query);
+    crate::http::field_validation::decode_body_with_validation(body, content_type, is_strict, path)
 }
 
 fn stamp_type_meta(doc: &mut Value, path: &ResourcePath) {
@@ -1144,6 +1456,7 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "replicasets" => "ReplicaSet",
         "statefulsets" => "StatefulSet",
         "daemonsets" => "DaemonSet",
+        "controllerrevisions" => "ControllerRevision",
         "jobs" => "Job",
         "cronjobs" => "CronJob",
         "leases" => "Lease",
@@ -1153,9 +1466,18 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "clusterroles" => "ClusterRole",
         "clusterrolebindings" => "ClusterRoleBinding",
         "storageclasses" => "StorageClass",
+        "csinodes" => "CSINode",
+        "csidrivers" => "CSIDriver",
+        "csistoragecapacities" => "CSIStorageCapacity",
+        "volumeattachments" => "VolumeAttachment",
+        "volumeattributesclasses" => "VolumeAttributesClass",
         "customresourcedefinitions" => "CustomResourceDefinition",
         "validatingwebhookconfigurations" => "ValidatingWebhookConfiguration",
         "mutatingwebhookconfigurations" => "MutatingWebhookConfiguration",
+        "validatingadmissionpolicies" => "ValidatingAdmissionPolicy",
+        "validatingadmissionpolicybindings" => "ValidatingAdmissionPolicyBinding",
+        "mutatingadmissionpolicies" => "MutatingAdmissionPolicy",
+        "mutatingadmissionpolicybindings" => "MutatingAdmissionPolicyBinding",
         "apiservices" => "APIService",
         "clustertrustbundles" => "ClusterTrustBundle",
         "certificatesigningrequests" => "CertificateSigningRequest",
@@ -1164,24 +1486,21 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "networkpolicies" => "NetworkPolicy",
         "ingresses" => "Ingress",
         "ingressclasses" => "IngressClass",
+        "ipaddresses" => "IPAddress",
+        "servicecidrs" => "ServiceCIDR",
         "runtimeclasses" => "RuntimeClass",
         "priorityclasses" => "PriorityClass",
+        "flowschemas" => "FlowSchema",
+        "prioritylevelconfigurations" => "PriorityLevelConfiguration",
         _ => return None,
     })
 }
 
-fn object_name(doc: &Value) -> Result<String, ApiserverError> {
-    doc.pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| ApiserverError::InvalidInput {
-            field: "metadata.name".to_string(),
-            reason: "resource requires metadata.name".to_string(),
-        })
-}
-
 fn list_kind(resource: &str) -> &'static str {
     match resource {
+        "namespaces" => "NamespaceList",
+        "nodes" => "NodeList",
+        "persistentvolumes" => "PersistentVolumeList",
         "pods" => "PodList",
         "podtemplates" => "PodTemplateList",
         "limitranges" => "LimitRangeList",
@@ -1198,6 +1517,7 @@ fn list_kind(resource: &str) -> &'static str {
         "replicasets" => "ReplicaSetList",
         "statefulsets" => "StatefulSetList",
         "daemonsets" => "DaemonSetList",
+        "controllerrevisions" => "ControllerRevisionList",
         "jobs" => "JobList",
         "cronjobs" => "CronJobList",
         "leases" => "LeaseList",
@@ -1207,6 +1527,19 @@ fn list_kind(resource: &str) -> &'static str {
         "clusterroles" => "ClusterRoleList",
         "clusterrolebindings" => "ClusterRoleBindingList",
         "storageclasses" => "StorageClassList",
+        "csinodes" => "CSINodeList",
+        "csidrivers" => "CSIDriverList",
+        "csistoragecapacities" => "CSIStorageCapacityList",
+        "volumeattachments" => "VolumeAttachmentList",
+        "volumeattributesclasses" => "VolumeAttributesClassList",
+        "customresourcedefinitions" => "CustomResourceDefinitionList",
+        "validatingwebhookconfigurations" => "ValidatingWebhookConfigurationList",
+        "mutatingwebhookconfigurations" => "MutatingWebhookConfigurationList",
+        "validatingadmissionpolicies" => "ValidatingAdmissionPolicyList",
+        "validatingadmissionpolicybindings" => "ValidatingAdmissionPolicyBindingList",
+        "mutatingadmissionpolicies" => "MutatingAdmissionPolicyList",
+        "mutatingadmissionpolicybindings" => "MutatingAdmissionPolicyBindingList",
+        "apiservices" => "APIServiceList",
         "clustertrustbundles" => "ClusterTrustBundleList",
         "certificatesigningrequests" => "CertificateSigningRequestList",
         "horizontalpodautoscalers" => "HorizontalPodAutoscalerList",
@@ -1214,8 +1547,12 @@ fn list_kind(resource: &str) -> &'static str {
         "networkpolicies" => "NetworkPolicyList",
         "ingresses" => "IngressList",
         "ingressclasses" => "IngressClassList",
+        "ipaddresses" => "IPAddressList",
+        "servicecidrs" => "ServiceCIDRList",
         "runtimeclasses" => "RuntimeClassList",
         "priorityclasses" => "PriorityClassList",
+        "flowschemas" => "FlowSchemaList",
+        "prioritylevelconfigurations" => "PriorityLevelConfigurationList",
         _ => "List",
     }
 }
@@ -1269,7 +1606,7 @@ async fn subresource_dispatch(
         });
     }
     match (path.group.as_str(), path.resource.as_str(), subresource) {
-        (_, _, "status") => match *method {
+        (_, _, "status" | "finalize" | "resize") => match *method {
             Method::GET => {
                 let object = ResourcePath {
                     subresource: None,
@@ -1280,14 +1617,19 @@ async fn subresource_dispatch(
             Method::PUT | Method::PATCH => {
                 let Some(name) = &path.name else {
                     return Err(ApiserverError::BadRequest {
-                        message: "status requires a resource name".to_string(),
+                        message: format!("{subresource} requires a resource name"),
                     });
                 };
                 let mut current = read_single(client, &strip_subresource(path), name).await?;
                 if method == Method::PUT {
-                    let doc = decode_body(content_type, body, path)?;
+                    let doc = decode_body(content_type, query, body, path)?;
                     if let Some(status) = doc.get("status") {
                         current["status"] = status.clone();
+                    }
+                    if matches!(subresource, "finalize" | "resize")
+                        && let Some(spec) = doc.get("spec")
+                    {
+                        current["spec"] = spec.clone();
                     }
                 } else {
                     apply_body_patch(&mut current, content_type, body)?;
@@ -1302,48 +1644,50 @@ async fn subresource_dispatch(
                 "method is not supported",
             )),
         },
-        (_, "deployments" | "replicasets" | "statefulsets", "scale") => match *method {
-            Method::GET => {
-                let Some(name) = &path.name else {
-                    return Err(ApiserverError::BadRequest {
-                        message: "scale requires a resource name".to_string(),
-                    });
-                };
-                let current = read_single(client, &strip_subresource(path), name).await?;
-                Ok(ok_json(scale_from(&current, path)))
-            },
-            Method::PUT | Method::PATCH => {
-                let Some(name) = &path.name else {
-                    return Err(ApiserverError::BadRequest {
-                        message: "scale requires a resource name".to_string(),
-                    });
-                };
-                let mut current = read_single(client, &strip_subresource(path), name).await?;
-                let replicas = if method == Method::PUT {
-                    let doc = decode_body(content_type, body, path)?;
-                    scale_replicas(&doc)
-                } else {
-                    let mut scale = scale_from(&current, path);
-                    apply_body_patch(&mut scale, content_type, body)?;
-                    scale_replicas(&scale)
-                };
-                let Some(replicas) = replicas else {
-                    return Err(ApiserverError::BadRequest {
-                        message: "scale requires spec.replicas".to_string(),
-                    });
-                };
-                if current.get("spec").is_none_or(|v| !v.is_object()) {
-                    current["spec"] = json!({});
-                }
-                current["spec"]["replicas"] = json!(replicas);
-                let updated = persist_object(client, path, name, current).await?;
-                Ok(ok_json(scale_from(&updated, path)))
-            },
-            _ => Ok(status_outcome(
-                http::StatusCode::METHOD_NOT_ALLOWED,
-                "MethodNotAllowed",
-                "method is not supported",
-            )),
+        (_, "deployments" | "replicasets" | "statefulsets" | "replicationcontrollers", "scale") => {
+            match *method {
+                Method::GET => {
+                    let Some(name) = &path.name else {
+                        return Err(ApiserverError::BadRequest {
+                            message: "scale requires a resource name".to_string(),
+                        });
+                    };
+                    let current = read_single(client, &strip_subresource(path), name).await?;
+                    Ok(ok_json(scale_from(&current, path)))
+                },
+                Method::PUT | Method::PATCH => {
+                    let Some(name) = &path.name else {
+                        return Err(ApiserverError::BadRequest {
+                            message: "scale requires a resource name".to_string(),
+                        });
+                    };
+                    let mut current = read_single(client, &strip_subresource(path), name).await?;
+                    let replicas = if method == Method::PUT {
+                        let doc = decode_body(content_type, query, body, path)?;
+                        scale_replicas(&doc)
+                    } else {
+                        let mut scale = scale_from(&current, path);
+                        apply_body_patch(&mut scale, content_type, body)?;
+                        scale_replicas(&scale)
+                    };
+                    let Some(replicas) = replicas else {
+                        return Err(ApiserverError::BadRequest {
+                            message: "scale requires spec.replicas".to_string(),
+                        });
+                    };
+                    if current.get("spec").is_none_or(|v| !v.is_object()) {
+                        current["spec"] = json!({});
+                    }
+                    current["spec"]["replicas"] = json!(replicas);
+                    let updated = persist_object(client, path, name, current).await?;
+                    Ok(ok_json(scale_from(&updated, path)))
+                },
+                _ => Ok(status_outcome(
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "method is not supported",
+                )),
+            }
         },
         ("", "pods", "log") => {
             if method != Method::GET {
@@ -1377,6 +1721,19 @@ async fn subresource_dispatch(
                 body,
             })
         },
+        ("", "pods", "eviction") => {
+            if method != Method::POST {
+                return Ok(status_outcome(
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "method is not supported",
+                ));
+            }
+            evict_pod(client, path, body).await
+        },
+        ("", "pods" | "services", sub) if sub == "proxy" || sub.starts_with("proxy/") => {
+            proxy_subresource(client, method, path, sub, query, content_type, body).await
+        },
         (_, "pods", "exec" | "attach" | "portforward") => Err(ApiserverError::BadRequest {
             message: format!("{subresource} requires a websocket upgrade"),
         }),
@@ -1385,6 +1742,342 @@ async fn subresource_dispatch(
             name: path.name.clone().unwrap_or_default(),
         }),
     }
+}
+
+/// `POST pods/<name>/eviction`: a graceful delete gated by `PodDisruptionBudgets`.
+async fn evict_pod(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    body: &[u8],
+) -> Result<Outcome, ApiserverError> {
+    let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
+        return Err(ApiserverError::BadRequest {
+            message: "eviction requires a namespace and name".to_string(),
+        });
+    };
+    let pod = client.get_pod(namespace, name).await?;
+    let grace = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+        v.pointer("/deleteOptions/gracePeriodSeconds")
+            .and_then(Value::as_i64)
+    });
+
+    let pods: Vec<Value> = client
+        .list_pods(namespace)
+        .await?
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pdbs: Vec<Value> = client
+        .list_namespaced_objects(
+            "policy",
+            "PodDisruptionBudgetList",
+            "poddisruptionbudgets",
+            namespace,
+        )
+        .await
+        .ok()
+        .and_then(|l| l.get("items").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let matching: Vec<&Value> = pdbs
+        .iter()
+        .filter(|pdb| {
+            crate::pdb::selector_matches(
+                pdb.pointer("/spec/selector"),
+                pod.pointer("/metadata/labels"),
+            )
+        })
+        .collect();
+
+    // Terminal or already-unhealthy pods never consume budget.
+    let pod_healthy = crate::pdb::is_healthy(&pod);
+    if pod_healthy && matching.len() > 1 {
+        return Ok(status_outcome(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.",
+        ));
+    }
+    if pod_healthy && let Some(pdb) = matching.first() {
+        let counts = crate::pdb::compute_counts(pdb, &pods);
+        if counts.disruptions_allowed <= 0 {
+            let pdb_name = pdb
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = format!(
+                "The disruption budget {pdb_name} needs {} healthy pods and has {} currently",
+                counts.desired_healthy, counts.current_healthy
+            );
+            return Ok(Outcome {
+                status: http::StatusCode::TOO_MANY_REQUESTS,
+                body: Payload::Json(json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": "Cannot evict pod as it would violate the pod's disruption budget.",
+                    "reason": "TooManyRequests",
+                    "details": { "causes": [{ "reason": "DisruptionBudget", "message": message }] },
+                    "code": 429
+                })),
+            });
+        }
+        record_pdb_disruption(client, pdb, &counts, namespace, name).await;
+    }
+
+    client.delete_pod_options(namespace, name, grace).await?;
+    Ok(status_outcome(
+        http::StatusCode::CREATED,
+        "Success",
+        "evicted",
+    ))
+}
+
+async fn record_pdb_disruption(
+    client: &KubernetesApiClient,
+    pdb: &Value,
+    counts: &crate::pdb::PdbCounts,
+    namespace: &str,
+    pod_name: &str,
+) {
+    let mut updated = (*pdb).clone();
+    if let Some(status) = updated.get_mut("status").and_then(Value::as_object_mut) {
+        let allowed = counts.disruptions_allowed - 1;
+        status.insert("disruptionsAllowed".to_string(), json!(allowed));
+        let disrupted = status
+            .entry("disruptedPods".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(map) = disrupted.as_object_mut() {
+            map.insert(pod_name.to_string(), json!(crate::time::now_rfc3339()));
+        }
+    }
+    if let Some(pdb_name) = pdb.pointer("/metadata/name").and_then(Value::as_str) {
+        let _ = client
+            .replace_namespaced_object(
+                "policy",
+                "PodDisruptionBudget",
+                "poddisruptionbudgets",
+                namespace,
+                pdb_name,
+                updated,
+            )
+            .await;
+    }
+}
+
+fn split_proxy_name(raw: &str) -> (&str, Option<&str>) {
+    let parts: Vec<&str> = raw.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [_scheme, name, port] => (*name, Some(*port).filter(|p| !p.is_empty())),
+        [name, port] => (*name, Some(*port).filter(|p| !p.is_empty())),
+        _ => (raw, None),
+    }
+}
+
+fn find_pod_port(pod: &Value, port_spec: &str) -> Option<u16> {
+    if let Ok(num) = port_spec.parse::<u16>() {
+        return Some(num);
+    }
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array)?;
+    for c in containers {
+        let Some(ports) = c.get("ports").and_then(Value::as_array) else {
+            continue;
+        };
+        for p in ports {
+            if p.get("name").and_then(Value::as_str) == Some(port_spec)
+                && let Some(cp) = p.get("containerPort").and_then(Value::as_u64)
+                && let Ok(num) = u16::try_from(cp)
+            {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
+fn first_pod_port(pod: &Value) -> Option<u16> {
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array)?;
+    for c in containers {
+        let Some(ports) = c.get("ports").and_then(Value::as_array) else {
+            continue;
+        };
+        for p in ports {
+            if let Some(cp) = p.get("containerPort").and_then(Value::as_u64)
+                && let Ok(num) = u16::try_from(cp)
+            {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
+async fn resolve_proxy_target(
+    client: &KubernetesApiClient,
+    resource: &str,
+    namespace: &str,
+    obj_name: &str,
+    port_spec: Option<&str>,
+) -> Result<(String, u16), ApiserverError> {
+    if resource == "pods" {
+        let pod = client.get_pod(namespace, obj_name).await?;
+        let ip = pod
+            .pointer("/status/podIP")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        let port = port_spec
+            .and_then(|ps| find_pod_port(&pod, ps))
+            .or_else(|| first_pod_port(&pod))
+            .unwrap_or(80);
+        return Ok((ip, port));
+    }
+
+    let svc = client.get_service(namespace, obj_name).await?;
+    let svc_ports = svc.pointer("/spec/ports").and_then(Value::as_array);
+    let matched_sp = svc_ports.and_then(|ports| {
+        if let Some(ps) = port_spec {
+            ports.iter().find(|sp| {
+                sp.get("name").and_then(Value::as_str) == Some(ps)
+                    || ps
+                        .parse::<u64>()
+                        .is_ok_and(|n| sp.get("port").and_then(Value::as_u64) == Some(n))
+            })
+        } else {
+            ports.first()
+        }
+    });
+    let svc_port_name = matched_sp
+        .and_then(|sp| sp.get("name"))
+        .and_then(Value::as_str);
+    let svc_port_num = matched_sp
+        .and_then(|sp| sp.get("port"))
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .or_else(|| port_spec.and_then(|ps| ps.parse::<u16>().ok()))
+        .unwrap_or(80);
+
+    if let Ok(ep) = client.get_endpoints(namespace, obj_name).await
+        && let Some(subset) = ep.pointer("/subsets/0")
+        && let Some(ep_ip) = subset.pointer("/addresses/0/ip").and_then(Value::as_str)
+        && !ep_ip.is_empty()
+    {
+        let ep_ports = subset.get("ports").and_then(Value::as_array);
+        let ep_port = ep_ports
+            .and_then(|ports| {
+                if let Some(name) = svc_port_name.or(port_spec) {
+                    ports
+                        .iter()
+                        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+                        .or_else(|| ports.first())
+                } else {
+                    ports.first()
+                }
+            })
+            .and_then(|p| p.get("port"))
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(svc_port_num);
+        return Ok((ep_ip.to_string(), ep_port));
+    }
+
+    let cluster_ip = svc
+        .pointer("/spec/clusterIP")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && *s != "None")
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    Ok((cluster_ip, svc_port_num))
+}
+
+async fn proxy_subresource(
+    client: &KubernetesApiClient,
+    method: &Method,
+    path: &ResourcePath,
+    subresource: &str,
+    query: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Outcome, ApiserverError> {
+    let (Some(namespace), Some(raw_name)) = (&path.namespace, &path.name) else {
+        return Err(ApiserverError::BadRequest {
+            message: format!("{} proxy requires a namespace and name", path.resource),
+        });
+    };
+    let (obj_name, port_spec) = split_proxy_name(raw_name);
+    let (ip, port) =
+        resolve_proxy_target(client, &path.resource, namespace, obj_name, port_spec).await?;
+    let suffix = subresource.strip_prefix("proxy/").unwrap_or("");
+    let target_uri = match (suffix, query) {
+        ("", Some(q)) if !q.is_empty() => format!("/?{q}"),
+        ("", _) => "/".to_string(),
+        (s, Some(q)) if !q.is_empty() => format!("/{s}?{q}"),
+        (s, _) => format!("/{s}"),
+    };
+
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect((ip.as_str(), port)),
+    )
+    .await
+    .map_err(|_| ApiserverError::Internal {
+        reason: format!("proxy connection to {ip}:{port} timed out"),
+    })?
+    .map_err(|err| ApiserverError::Internal {
+        reason: format!("proxy connection to {ip}:{port} failed: {err}"),
+    })?;
+
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|err| ApiserverError::Internal {
+            reason: format!("proxy HTTP handshake with {ip}:{port} failed: {err}"),
+        })?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut req_builder = http::Request::builder()
+        .method(method)
+        .uri(&target_uri)
+        .header(http::header::HOST, format!("{ip}:{port}"));
+    if let Some(ct) = content_type {
+        req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
+    }
+    let req = req_builder
+        .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
+            body,
+        )))
+        .map_err(|err| ApiserverError::Internal {
+            reason: format!("failed to build proxy request: {err}"),
+        })?;
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|err| ApiserverError::Internal {
+            reason: format!("proxy request to {ip}:{port}{target_uri} failed: {err}"),
+        })?;
+    let status = resp.status();
+    let collected = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .map_err(|err| ApiserverError::Internal {
+            reason: format!("reading proxy response body failed: {err}"),
+        })?;
+    let mut text = String::from_utf8_lossy(&collected.to_bytes()).into_owned();
+    let proxy_prefix = format!(
+        "/api/v1/namespaces/{namespace}/{}/{raw_name}/proxy/",
+        path.resource
+    );
+    if text.contains("href=\"/") && !text.contains("href=\"/api/") {
+        text = text.replace("href=\"/", &format!("href=\"{proxy_prefix}"));
+    }
+    Ok(Outcome {
+        status,
+        body: Payload::Text(text),
+    })
 }
 
 fn strip_subresource(path: &ResourcePath) -> ResourcePath {
@@ -1402,10 +2095,10 @@ fn apply_body_patch(
     match patch_type(content_type) {
         PatchType::Json => crate::admission::apply_json_patch(target, body),
         PatchType::Merge | PatchType::Apply => {
-            let patch: Value =
-                serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
-                    message: format!("patch body is not JSON: {err}"),
-                })?;
+            let patch: Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => crate::http::field_validation::decode_yaml(body, false)?,
+            };
             crate::client::json_merge_patch(target, patch);
             Ok(())
         },
@@ -1418,13 +2111,14 @@ async fn persist_object(
     name: &str,
     doc: Value,
 ) -> Result<Value, ApiserverError> {
-    if is_namespaced(&path.resource) {
-        let Some(namespace) = &path.namespace else {
-            return Err(ApiserverError::BadRequest {
-                message: format!("{} requires a namespace", path.resource),
-            });
-        };
+    if is_cluster_resource(&path.resource) {
+        update_cluster(client, &path.group, &path.resource, name, doc).await
+    } else if let Some(namespace) = &path.namespace {
         update_namespaced(client, &path.group, &path.resource, namespace, name, doc).await
+    } else if is_builtin_namespaced(&path.resource) {
+        Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
+        })
     } else {
         update_cluster(client, &path.group, &path.resource, name, doc).await
     }
@@ -1450,10 +2144,18 @@ fn scale_from(current: &Value, path: &ResourcePath) -> Value {
         .pointer("/status/replicas")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let selector = current
+    let selector_map = current
         .pointer("/spec/selector/matchLabels")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+        .and_then(Value::as_object)
+        .or_else(|| current.pointer("/spec/selector").and_then(Value::as_object));
+    let selector = selector_map
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
     let name = current
         .pointer("/metadata/name")
         .cloned()
