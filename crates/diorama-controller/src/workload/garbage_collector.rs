@@ -18,9 +18,21 @@ fn matches_uid(item: &Value, expected_uid: Option<&str>) -> bool {
         == Some(uid)
 }
 
+fn has_foreground_deletion(item: &Value) -> bool {
+    let has_del_ts = item
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some();
+    let has_fg_finalizer = item
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("foregroundDeletion")));
+    has_del_ts || has_fg_finalizer
+}
+
 fn owner_present(res: Result<Value, ApiserverError>, expected_uid: Option<&str>) -> bool {
     match res {
-        Ok(owner) => matches_uid(&owner, expected_uid),
+        Ok(owner) => matches_uid(&owner, expected_uid) && !has_foreground_deletion(&owner),
         Err(ApiserverError::NotFound { .. }) => false,
         Err(_) => true, // Transient/permission error: assume owner present to prevent eager deletion
     }
@@ -67,7 +79,121 @@ impl GarbageCollector {
         let pod_count = self.reconcile_pods(namespace).await;
         let slice_count = self.reconcile_endpointslices(namespace).await;
         let endpoint_count = self.reconcile_endpoints(namespace).await;
-        Ok(rs_count + job_count + pod_count + slice_count + endpoint_count)
+        let fg_count = self.reconcile_foreground_owners(namespace).await;
+        Ok(rs_count + job_count + pod_count + slice_count + endpoint_count + fg_count)
+    }
+
+    async fn reconcile_foreground_owners(&self, namespace: &str) -> usize {
+        let mut finalized = 0;
+
+        let pods = self
+            .client
+            .list_pods(namespace)
+            .await
+            .ok()
+            .and_then(|l| l.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default();
+
+        if let Ok(rc_list) = self.client.list_replicationcontrollers(namespace).await
+            && let Some(rcs) = rc_list.get("items").and_then(Value::as_array)
+        {
+            for rc in rcs {
+                if !has_foreground_deletion(rc) {
+                    continue;
+                }
+                let Some(rc_name) = rc.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let rc_uid = rc.pointer("/metadata/uid").and_then(Value::as_str);
+                let has_blocking_pod = self
+                    .has_blocking_dependent(
+                        namespace,
+                        &pods,
+                        "ReplicationController",
+                        rc_name,
+                        rc_uid,
+                    )
+                    .await;
+                if has_blocking_pod {
+                    continue;
+                }
+                let mut cleaned = rc.clone();
+                Self::strip_deletion_metadata(&mut cleaned);
+                let _ = self
+                    .client
+                    .update_replicationcontroller(namespace, rc_name, cleaned)
+                    .await;
+                if self
+                    .client
+                    .delete_replicationcontroller(namespace, rc_name)
+                    .await
+                    .is_ok()
+                {
+                    finalized += 1;
+                }
+            }
+        }
+
+        finalized
+    }
+
+    fn strip_deletion_metadata(obj: &mut Value) {
+        if let Some(meta) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.remove("finalizers");
+            meta.remove("deletionTimestamp");
+        }
+    }
+
+    async fn has_blocking_dependent(
+        &self,
+        namespace: &str,
+        dependents: &[Value],
+        owner_kind: &str,
+        owner_name: &str,
+        owner_uid: Option<&str>,
+    ) -> bool {
+        for dep in dependents {
+            let Some(owners) = dep
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let references_this_owner = owners.iter().any(|o| {
+                o.get("kind").and_then(Value::as_str) == Some(owner_kind)
+                    && (o.get("name").and_then(Value::as_str) == Some(owner_name)
+                        || (owner_uid.is_some()
+                            && o.get("uid").and_then(Value::as_str) == owner_uid))
+            });
+            if !references_this_owner {
+                continue;
+            }
+            // If the dependent is terminating or has no other valid live owner, it blocks foreground deletion
+            if dep.pointer("/metadata/deletionTimestamp").is_some() {
+                return true;
+            }
+            let mut has_other_live_owner = false;
+            for o in owners {
+                let Some(k) = o.get("kind").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(n) = o.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if k == owner_kind && n == owner_name {
+                    continue;
+                }
+                let uid = o.get("uid").and_then(Value::as_str);
+                if self.check_owner_exists(namespace, k, n, uid).await {
+                    has_other_live_owner = true;
+                    break;
+                }
+            }
+            if !has_other_live_owner {
+                return true;
+            }
+        }
+        false
     }
 
     async fn reconcile_replicasets(&self, namespace: &str) -> usize {
@@ -241,6 +367,16 @@ impl GarbageCollector {
             "Service" => {
                 owner_present(self.client.get_service(namespace, name).await, expected_uid)
             },
+            "ReplicationController" => owner_present(
+                self.client.get_replicationcontroller(namespace, name).await,
+                expected_uid,
+            ),
+            "Pod" => owner_present(self.client.get_pod(namespace, name).await, expected_uid),
+            "ConfigMap" => owner_present(
+                self.client.get_configmap(namespace, name).await,
+                expected_uid,
+            ),
+            "Secret" => owner_present(self.client.get_secret(namespace, name).await, expected_uid),
             _ => true,
         }
     }

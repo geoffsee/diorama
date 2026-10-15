@@ -53,19 +53,36 @@ impl StatefulSetReconciler {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_ordinal_pods(
         &self,
         namespace: &str,
         name: &str,
         uid: &str,
         desired_replicas: usize,
+        ordered_ready: bool,
+        has_nodes: bool,
+        update_revision: &str,
         template_labels: &Value,
         template_spec: &Value,
     ) -> Result<(), ControllerError> {
         for idx in 0..desired_replicas {
             let pod_name = format!("{name}-{idx}");
-            if self.client.get_pod(namespace, &pod_name).await.is_ok() {
-                continue;
+            if let Ok(existing_pod) = self.client.get_pod(namespace, &pod_name).await {
+                if existing_pod
+                    .pointer("/status/phase")
+                    .and_then(Value::as_str)
+                    == Some("Failed")
+                {
+                    let _ = self.client.delete_pod(namespace, &pod_name).await;
+                } else if ordered_ready
+                    && (has_nodes || existing_pod.pointer("/status/conditions").is_some())
+                    && !super::replicaset::is_pod_ready(&existing_pod)
+                {
+                    break;
+                } else {
+                    continue;
+                }
             }
 
             let mut pod_labels = template_labels.clone();
@@ -77,6 +94,10 @@ impl StatefulSetReconciler {
                 labels_obj.insert(
                     "apps.kubernetes.io/pod-index".to_string(),
                     json!(idx.to_string()),
+                );
+                labels_obj.insert(
+                    "controller-revision-hash".to_string(),
+                    json!(update_revision),
                 );
             }
 
@@ -109,6 +130,10 @@ impl StatefulSetReconciler {
                     resource: format!("pods/{pod_name}"),
                     reason: e.to_string(),
                 })?;
+
+            if ordered_ready && has_nodes {
+                break;
+            }
         }
         Ok(())
     }
@@ -119,6 +144,8 @@ impl StatefulSetReconciler {
         name: &str,
         uid: &str,
         desired_replicas: usize,
+        ordered_ready: bool,
+        has_nodes: bool,
     ) -> Result<(), ControllerError> {
         let pod_list = self.client.list_pods(namespace).await.map_err(|e| {
             ControllerError::ReconciliationFailed {
@@ -132,6 +159,20 @@ impl StatefulSetReconciler {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+
+        if ordered_ready {
+            for idx in 0..desired_replicas {
+                let pname = format!("{name}-{idx}");
+                if let Some(pod) = all_pods
+                    .iter()
+                    .find(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(&pname))
+                    && (has_nodes || pod.pointer("/status/conditions").is_some())
+                    && !super::replicaset::is_pod_ready(pod)
+                {
+                    return Ok(());
+                }
+            }
+        }
 
         let mut to_delete: Vec<(usize, String)> = Vec::new();
         for pod in all_pods {
@@ -149,6 +190,21 @@ impl StatefulSetReconciler {
 
             if !is_owned {
                 continue;
+            }
+
+            if ordered_ready {
+                if pod
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(Value::as_str)
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if (has_nodes || pod.pointer("/status/conditions").is_some())
+                    && !super::replicaset::is_pod_ready(&pod)
+                {
+                    return Ok(());
+                }
             }
 
             if let Some(pname) = pod
@@ -175,8 +231,52 @@ impl StatefulSetReconciler {
                     });
                 },
             }
+            if ordered_ready && has_nodes {
+                break;
+            }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rolling_update_ordinal_pods(
+        &self,
+        namespace: &str,
+        name: &str,
+        desired_replicas: usize,
+        partition: usize,
+        ordered_ready: bool,
+        has_nodes: bool,
+        update_revision: &str,
+    ) {
+        for idx in (0..desired_replicas).rev() {
+            let pname = format!("{name}-{idx}");
+            let Ok(pod) = self.client.get_pod(namespace, &pname).await else {
+                return;
+            };
+            if ordered_ready
+                && (has_nodes || pod.pointer("/status/conditions").is_some())
+                && !super::replicaset::is_pod_ready(&pod)
+            {
+                return;
+            }
+        }
+
+        for idx in (partition.min(desired_replicas)..desired_replicas).rev() {
+            let pname = format!("{name}-{idx}");
+            let Ok(pod) = self.client.get_pod(namespace, &pname).await else {
+                continue;
+            };
+            let pod_rev = pod
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str);
+            if pod_rev != Some(update_revision) {
+                let _ = self.client.delete_pod(namespace, &pname).await;
+                if ordered_ready && has_nodes {
+                    break;
+                }
+            }
+        }
     }
 
     /// Reconciles a single `StatefulSet` by maintaining ordered ordinal pods (name-0, name-1, etc.).
@@ -185,94 +285,303 @@ impl StatefulSetReconciler {
         namespace: &str,
         ss: &Value,
     ) -> Result<Value, ControllerError> {
-        let name = ss
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| ControllerError::InvalidConfiguration {
-                field: "metadata.name".to_string(),
-                reason: "StatefulSet missing metadata.name".to_string(),
-            })?;
+        let cfg = parse_statefulset_config(ss)?;
+        let has_nodes = self
+            .client
+            .list_nodes()
+            .await
+            .ok()
+            .and_then(|n| n.get("items").and_then(Value::as_array).cloned())
+            .is_some_and(|items| !items.is_empty());
 
-        let uid = ss
-            .get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        let desired_replicas = ss
-            .get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(Value::as_i64)
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(1);
-
-        let template = ss
-            .get("spec")
-            .and_then(|s| s.get("template"))
-            .cloned()
-            .unwrap_or_else(|| json!({ "spec": { "containers": [] } }));
-
-        let template_labels = template
-            .get("metadata")
-            .and_then(|m| m.get("labels"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-
-        let template_spec = template
-            .get("spec")
-            .cloned()
-            .unwrap_or_else(|| json!({ "containers": [] }));
-
-        self.ensure_ordinal_pods(
+        let _ = super::adopt_and_release_pods(
+            &self.client,
             namespace,
-            name,
-            uid,
-            desired_replicas,
-            &template_labels,
-            &template_spec,
+            "apps/v1",
+            "StatefulSet",
+            cfg.name,
+            cfg.uid,
+            cfg.deleting,
+            ss.pointer("/spec/selector"),
         )
         .await?;
 
-        self.prune_excess_ordinal_pods(namespace, name, uid, desired_replicas)
+        if !cfg.deleting {
+            self.ensure_ordinal_pods(
+                namespace,
+                cfg.name,
+                cfg.uid,
+                cfg.desired_replicas,
+                cfg.ordered_ready,
+                has_nodes,
+                &cfg.update_revision,
+                &cfg.template_labels,
+                &cfg.template_spec,
+            )
             .await?;
 
-        let mut ready_count = 0;
-        for idx in 0..desired_replicas {
-            let pname = format!("{name}-{idx}");
-            if let Ok(pod) = self.client.get_pod(namespace, &pname).await
-                && super::replicaset::is_pod_ready(&pod)
-            {
-                ready_count += 1;
+            self.prune_excess_ordinal_pods(
+                namespace,
+                cfg.name,
+                cfg.uid,
+                cfg.desired_replicas,
+                cfg.ordered_ready,
+                has_nodes,
+            )
+            .await?;
+
+            if cfg.update_strategy_type == "RollingUpdate" {
+                self.rolling_update_ordinal_pods(
+                    namespace,
+                    cfg.name,
+                    cfg.desired_replicas,
+                    cfg.partition,
+                    cfg.ordered_ready,
+                    has_nodes,
+                    &cfg.update_revision,
+                )
+                .await;
             }
         }
 
+        let counts = self
+            .count_pod_status(
+                namespace,
+                cfg.name,
+                cfg.desired_replicas,
+                &cfg.update_revision,
+                ss,
+            )
+            .await;
+        let observed_generation = ss
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+
         let mut updated_ss = ss.clone();
-        if let Some(status) = updated_ss.get_mut("status").and_then(Value::as_object_mut) {
-            status.insert("replicas".to_string(), json!(desired_replicas));
-            status.insert("currentReplicas".to_string(), json!(desired_replicas));
-            status.insert("readyReplicas".to_string(), json!(ready_count));
-            status.insert("availableReplicas".to_string(), json!(ready_count));
-            status.insert("observedGeneration".to_string(), json!(1));
-        } else if let Some(ss_obj) = updated_ss.as_object_mut() {
-            ss_obj.insert(
-                "status".to_string(),
-                json!({
-                    "replicas": desired_replicas,
-                    "currentReplicas": desired_replicas,
-                    "readyReplicas": ready_count,
-                    "availableReplicas": ready_count,
-                    "observedGeneration": 1
-                }),
-            );
+        apply_statefulset_status(
+            &mut updated_ss,
+            &counts,
+            &cfg.update_revision,
+            observed_generation,
+        );
+
+        if updated_ss.get("status") == ss.get("status") {
+            return Ok(updated_ss);
         }
 
         self.client
-            .update_statefulset(namespace, name, updated_ss)
+            .update_statefulset(namespace, cfg.name, updated_ss)
             .await
             .map_err(|e| ControllerError::ReconciliationFailed {
-                resource: format!("statefulsets/{name}"),
+                resource: format!("statefulsets/{}", cfg.name),
                 reason: e.to_string(),
             })
     }
+
+    async fn count_pod_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        desired_replicas: usize,
+        update_revision: &str,
+        ss: &Value,
+    ) -> StatefulSetCounts {
+        let mut existing_replicas = 0usize;
+        let mut ready_count = 0usize;
+        let mut updated_count = 0usize;
+        let mut pod_revisions = Vec::new();
+        for idx in 0..desired_replicas {
+            let pname = format!("{name}-{idx}");
+            let Ok(pod) = self.client.get_pod(namespace, &pname).await else {
+                continue;
+            };
+            if pod
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                continue;
+            }
+            existing_replicas += 1;
+            if super::replicaset::is_pod_ready(&pod) {
+                ready_count += 1;
+            }
+            let pod_rev = pod
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str)
+                .unwrap_or(update_revision)
+                .to_string();
+            if pod_rev == update_revision {
+                updated_count += 1;
+            }
+            pod_revisions.push(pod_rev);
+        }
+
+        let current_revision = if updated_count == existing_replicas && existing_replicas > 0 {
+            update_revision.to_string()
+        } else if let Some(first_rev) = pod_revisions.first() {
+            first_rev.clone()
+        } else {
+            ss.pointer("/status/currentRevision")
+                .and_then(Value::as_str)
+                .unwrap_or(update_revision)
+                .to_string()
+        };
+        let current_replicas = pod_revisions
+            .iter()
+            .filter(|rev| *rev == &current_revision)
+            .count();
+
+        StatefulSetCounts {
+            existing: existing_replicas,
+            ready: ready_count,
+            updated: updated_count,
+            current: current_replicas,
+            current_revision,
+        }
+    }
+}
+
+struct StatefulSetCounts {
+    existing: usize,
+    ready: usize,
+    updated: usize,
+    current: usize,
+    current_revision: String,
+}
+
+fn apply_statefulset_status(
+    updated_ss: &mut Value,
+    counts: &StatefulSetCounts,
+    update_revision: &str,
+    observed_generation: i64,
+) {
+    if let Some(status) = updated_ss.get_mut("status").and_then(Value::as_object_mut) {
+        status.insert("replicas".to_string(), json!(counts.existing));
+        status.insert("currentReplicas".to_string(), json!(counts.current));
+        status.insert("updatedReplicas".to_string(), json!(counts.updated));
+        status.insert("readyReplicas".to_string(), json!(counts.ready));
+        status.insert("availableReplicas".to_string(), json!(counts.ready));
+        status.insert(
+            "currentRevision".to_string(),
+            json!(counts.current_revision),
+        );
+        status.insert("updateRevision".to_string(), json!(update_revision));
+        status.insert("observedGeneration".to_string(), json!(observed_generation));
+    } else if let Some(ss_obj) = updated_ss.as_object_mut() {
+        ss_obj.insert(
+            "status".to_string(),
+            json!({
+                "replicas": counts.existing,
+                "currentReplicas": counts.current,
+                "updatedReplicas": counts.updated,
+                "readyReplicas": counts.ready,
+                "availableReplicas": counts.ready,
+                "currentRevision": counts.current_revision,
+                "updateRevision": update_revision,
+                "observedGeneration": observed_generation
+            }),
+        );
+    }
+}
+
+fn compute_template_revision(name: &str, template: &Value) -> String {
+    let serialized = serde_json::to_string(template).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in serialized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{name}-{:010x}", hash & 0x00ff_ffff_ffff)
+}
+
+struct StatefulSetConfig<'a> {
+    name: &'a str,
+    uid: &'a str,
+    deleting: bool,
+    desired_replicas: usize,
+    ordered_ready: bool,
+    update_strategy_type: &'a str,
+    partition: usize,
+    update_revision: String,
+    template_labels: Value,
+    template_spec: Value,
+}
+
+fn parse_statefulset_config(ss: &Value) -> Result<StatefulSetConfig<'_>, ControllerError> {
+    let name = ss
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ControllerError::InvalidConfiguration {
+            field: "metadata.name".to_string(),
+            reason: "StatefulSet missing metadata.name".to_string(),
+        })?;
+
+    let uid = ss
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let deleting = ss
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some();
+
+    let desired_replicas = ss
+        .get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(Value::as_i64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(1);
+
+    let ordered_ready = ss
+        .pointer("/spec/podManagementPolicy")
+        .and_then(Value::as_str)
+        != Some("Parallel");
+
+    let update_strategy_type = ss
+        .pointer("/spec/updateStrategy/type")
+        .and_then(Value::as_str)
+        .unwrap_or("RollingUpdate");
+
+    let partition = ss
+        .pointer("/spec/updateStrategy/rollingUpdate/partition")
+        .and_then(Value::as_i64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0);
+
+    let template = ss
+        .get("spec")
+        .and_then(|s| s.get("template"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "spec": { "containers": [] } }));
+
+    let update_revision = compute_template_revision(name, &template);
+
+    let template_labels = template
+        .get("metadata")
+        .and_then(|m| m.get("labels"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let template_spec = template
+        .get("spec")
+        .cloned()
+        .unwrap_or_else(|| json!({ "containers": [] }));
+
+    Ok(StatefulSetConfig {
+        name,
+        uid,
+        deleting,
+        desired_replicas,
+        ordered_ready,
+        update_strategy_type,
+        partition,
+        update_revision,
+        template_labels,
+        template_spec,
+    })
 }

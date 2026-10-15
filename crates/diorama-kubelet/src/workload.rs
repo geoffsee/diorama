@@ -806,6 +806,54 @@ pub(crate) fn chmod_volume_file(path: &Path, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777));
 }
 
+/// Mount points from `/proc/self/mountinfo` (field 5), with octal escapes decoded.
+fn mount_points() -> Vec<PathBuf> {
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    info.lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(|p| PathBuf::from(p.replace("\\040", " ")))
+        .collect()
+}
+
+/// Backs a `medium: Memory` `emptyDir` with tmpfs unless it is already mounted.
+pub(crate) fn ensure_tmpfs_mount(dir: &Path, size_bytes: Option<u64>) {
+    if mount_points().iter().any(|m| m == dir) {
+        return;
+    }
+    let opts = match size_bytes.filter(|s| *s > 0) {
+        Some(size) => format!("mode=0777,size={size}"),
+        None => "mode=0777".to_string(),
+    };
+    match std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "-o", &opts, "tmpfs"])
+        .arg(dir)
+        .output()
+    {
+        Ok(out) if out.status.success() => {},
+        Ok(out) => eprintln!(
+            "tmpfs mount for {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("tmpfs mount for {} failed: {e}", dir.display()),
+    }
+}
+
+/// Unmounts every mount nested under a removed pod's directory.
+pub(crate) fn unmount_tmpfs_under(pod_dir: &Path) {
+    let mut nested: Vec<PathBuf> = mount_points()
+        .into_iter()
+        .filter(|m| m.starts_with(pod_dir))
+        .collect();
+    // Deepest first so nested mounts release cleanly.
+    nested.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for mount in nested {
+        let _ = std::process::Command::new("umount").arg(&mount).output();
+    }
+}
+
 /// Effective mode for one staged file: per-item `mode`, else the volume
 /// `defaultMode`, else the Kubernetes default (`0644` for config/secret data).
 pub(crate) fn volume_file_mode(item: Option<&Value>, vol_spec: &Value) -> u32 {
@@ -827,11 +875,21 @@ pub(crate) fn pod_fs_group(pod: &Value) -> Option<u32> {
 /// symlinks) and group read/write is added so non-root containers can use
 /// `emptyDir` and projected volumes. Skips the walk when the root already
 /// carries the group (`OnRootMismatch` behaviour).
+#[cfg(test)]
 pub(crate) fn apply_fs_group_ownership(vol_dir: &Path, fs_group: u32) -> Result<(), KubeletError> {
+    apply_fs_group_ownership_with_options(vol_dir, fs_group, false, true)
+}
+
+pub(crate) fn apply_fs_group_ownership_with_options(
+    vol_dir: &Path,
+    fs_group: u32,
+    readonly: bool,
+    on_root_mismatch: bool,
+) -> Result<(), KubeletError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let root_meta = std::fs::symlink_metadata(vol_dir).map_err(KubeletError::Io)?;
-    if root_meta.gid() == fs_group {
+    if on_root_mismatch && root_meta.gid() == fs_group {
         return Ok(());
     }
     let mut stack = vec![vol_dir.to_path_buf()];
@@ -845,9 +903,9 @@ pub(crate) fn apply_fs_group_ownership(vol_dir: &Path, fs_group: u32) -> Result<
         chown_group(&path, fs_group)?;
         let mut mode = meta.permissions().mode();
         if meta.is_dir() {
-            mode |= 0o070;
+            mode |= if readonly { 0o050 } else { 0o070 };
         } else {
-            mode |= 0o060;
+            mode |= if readonly { 0o040 } else { 0o060 };
             if mode & 0o100 != 0 {
                 mode |= 0o010;
             }
@@ -876,13 +934,42 @@ fn chown_group(_path: &Path, _gid: u32) -> Result<(), KubeletError> {
     Ok(())
 }
 
+pub(crate) fn prune_stale_volume_files(
+    vol_dir: &Path,
+    expected: &std::collections::HashSet<PathBuf>,
+) {
+    let mut stack = vec![vol_dir.to_path_buf()];
+    let mut dirs = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                dirs.push(path.clone());
+                stack.push(path);
+            } else if !expected.contains(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    for dir in dirs.into_iter().rev() {
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
 pub(crate) fn stage_secret_files(
     vol_dir: &Path,
     vol_spec: &Value,
     sec_obj: &Value,
-) -> Result<(), KubeletError> {
+) -> Result<Vec<PathBuf>, KubeletError> {
     let data_map = sec_obj.get("data").and_then(Value::as_object);
     let string_data_map = sec_obj.get("stringData").and_then(Value::as_object);
+    let mut written = Vec::new();
 
     if let Some(items) = vol_spec.get("items").and_then(Value::as_array) {
         for item in items {
@@ -895,12 +982,14 @@ pub(crate) fn stage_secret_files(
                     .unwrap_or_else(|_| val.as_bytes().to_vec());
                 write_volume_file(&file_path, &bytes)?;
                 chmod_volume_file(&file_path, mode);
+                written.push(file_path);
             } else if let Some(val) = string_data_map
                 .and_then(|m| m.get(key))
                 .and_then(Value::as_str)
             {
                 write_volume_file(&file_path, val.as_bytes())?;
                 chmod_volume_file(&file_path, mode);
+                written.push(file_path);
             }
         }
     } else {
@@ -913,6 +1002,7 @@ pub(crate) fn stage_secret_files(
                         .unwrap_or_else(|_| val_str.as_bytes().to_vec());
                     write_volume_file(&file_path, &bytes)?;
                     chmod_volume_file(&file_path, mode);
+                    written.push(file_path);
                 }
             }
         }
@@ -922,20 +1012,22 @@ pub(crate) fn stage_secret_files(
                     let file_path = safe_volume_path(vol_dir, key)?;
                     write_volume_file(&file_path, val_str.as_bytes())?;
                     chmod_volume_file(&file_path, mode);
+                    written.push(file_path);
                 }
             }
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 pub(crate) fn stage_configmap_files(
     vol_dir: &Path,
     vol_spec: &Value,
     cm_obj: &Value,
-) -> Result<(), KubeletError> {
+) -> Result<Vec<PathBuf>, KubeletError> {
     let data_map = cm_obj.get("data").and_then(Value::as_object);
     let binary_data_map = cm_obj.get("binaryData").and_then(Value::as_object);
+    let mut written = Vec::new();
 
     if let Some(items) = vol_spec.get("items").and_then(Value::as_array) {
         for item in items {
@@ -946,6 +1038,7 @@ pub(crate) fn stage_configmap_files(
             if let Some(val) = data_map.and_then(|m| m.get(key)).and_then(Value::as_str) {
                 write_volume_file(&file_path, val.as_bytes())?;
                 chmod_volume_file(&file_path, mode);
+                written.push(file_path);
             } else if let Some(val) = binary_data_map
                 .and_then(|m| m.get(key))
                 .and_then(Value::as_str)
@@ -954,6 +1047,7 @@ pub(crate) fn stage_configmap_files(
                     .unwrap_or_else(|_| val.as_bytes().to_vec());
                 write_volume_file(&file_path, &bytes)?;
                 chmod_volume_file(&file_path, mode);
+                written.push(file_path);
             }
         }
     } else {
@@ -964,6 +1058,7 @@ pub(crate) fn stage_configmap_files(
                     let file_path = safe_volume_path(vol_dir, key)?;
                     write_volume_file(&file_path, val_str.as_bytes())?;
                     chmod_volume_file(&file_path, mode);
+                    written.push(file_path);
                 }
             }
         }
@@ -975,11 +1070,12 @@ pub(crate) fn stage_configmap_files(
                         .unwrap_or_else(|_| val_str.as_bytes().to_vec());
                     write_volume_file(&file_path, &bytes)?;
                     chmod_volume_file(&file_path, mode);
+                    written.push(file_path);
                 }
             }
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 pub(crate) fn stage_projected_sa_token(
@@ -988,7 +1084,7 @@ pub(crate) fn stage_projected_sa_token(
     pod: &Value,
     sa_tok: &Value,
     apiserver: Option<&Arc<ApiserverService>>,
-) -> Result<(), KubeletError> {
+) -> Result<Vec<PathBuf>, KubeletError> {
     let rel_path = sa_tok
         .get("path")
         .and_then(Value::as_str)
@@ -1027,13 +1123,16 @@ pub(crate) fn stage_projected_sa_token(
         format!("mock-token-{namespace}-{sa_name}")
     };
 
+    let mut written = Vec::new();
     let token_path = safe_volume_path(vol_dir, rel_path)?;
     write_volume_file(&token_path, token_str.as_bytes())?;
+    written.push(token_path);
 
     let ns_path = safe_volume_path(vol_dir, "namespace")?;
     if !ns_path.exists() {
         let _ = write_volume_file(&ns_path, namespace.as_bytes());
     }
+    written.push(ns_path);
 
     let ca_path = safe_volume_path(vol_dir, "ca.crt")?;
     if !ca_path.exists() {
@@ -1048,8 +1147,198 @@ pub(crate) fn stage_projected_sa_token(
             .unwrap_or_else(|| b"mock-ca-cert".to_vec());
         let _ = write_volume_file(&ca_path, &ca_bytes);
     }
+    written.push(ca_path);
 
-    Ok(())
+    Ok(written)
+}
+
+pub(crate) fn format_downward_map(map: Option<&serde_json::Map<String, Value>>) -> String {
+    let Some(map) = map else {
+        return String::new();
+    };
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut lines = Vec::with_capacity(keys.len());
+    for k in keys {
+        if let Some(v) = map.get(k).and_then(Value::as_str) {
+            let escaped = v
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            lines.push(format!("{k}=\"{escaped}\""));
+        }
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn resolve_downward_field_path(
+    pod: &Value,
+    namespace: &str,
+    field_path: &str,
+) -> Option<String> {
+    match field_path {
+        "metadata.name" => Some(
+            pod.pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "metadata.namespace" => Some(
+            pod.pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(namespace)
+                .to_string(),
+        ),
+        "metadata.uid" => Some(
+            pod.pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "spec.nodeName" => Some(
+            pod.pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "spec.serviceAccountName" => Some(
+            pod.pointer("/spec/serviceAccountName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string(),
+        ),
+        "status.hostIP" => Some(
+            pod.pointer("/status/hostIP")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("127.0.0.1")
+                .to_string(),
+        ),
+        "status.podIP" | "status.podIPs" => Some(
+            pod.pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
+        "metadata.labels" => Some(format_downward_map(
+            pod.pointer("/metadata/labels").and_then(Value::as_object),
+        )),
+        "metadata.annotations" => Some(format_downward_map(
+            pod.pointer("/metadata/annotations")
+                .and_then(Value::as_object),
+        )),
+        other => {
+            if let Some(key) = other
+                .strip_prefix("metadata.labels['")
+                .and_then(|s| s.strip_suffix("']"))
+            {
+                return Some(
+                    pod.pointer("/metadata/labels")
+                        .and_then(Value::as_object)
+                        .and_then(|m| m.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            if let Some(key) = other
+                .strip_prefix("metadata.annotations['")
+                .and_then(|s| s.strip_suffix("']"))
+            {
+                return Some(
+                    pod.pointer("/metadata/annotations")
+                        .and_then(Value::as_object)
+                        .and_then(|m| m.get(key))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            None
+        },
+    }
+}
+
+pub(crate) fn resolve_downward_resource_field(
+    pod: &Value,
+    default_container: Option<&str>,
+    res_ref: &Value,
+) -> Option<String> {
+    let target_name = res_ref
+        .get("containerName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(default_container);
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+    let init_containers = pod
+        .pointer("/spec/initContainers")
+        .and_then(Value::as_array);
+    let container = if let Some(name) = target_name {
+        containers
+            .into_iter()
+            .flatten()
+            .chain(init_containers.into_iter().flatten())
+            .find(|c| c.get("name").and_then(Value::as_str) == Some(name))
+    } else {
+        containers.and_then(|arr| arr.first())
+    };
+    let resource = res_ref.get("resource").and_then(Value::as_str)?;
+    let divisor = res_ref.get("divisor").and_then(Value::as_str);
+
+    match resource {
+        "limits.cpu" | "requests.cpu" => {
+            let milli = if resource == "limits.cpu" {
+                container
+                    .and_then(|c| c.pointer("/resources/limits/cpu"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_cpu_quantity_milli)
+                    .unwrap_or(2000)
+            } else {
+                container
+                    .and_then(|c| {
+                        c.pointer("/resources/requests/cpu")
+                            .or_else(|| c.pointer("/resources/limits/cpu"))
+                    })
+                    .and_then(Value::as_str)
+                    .and_then(parse_cpu_quantity_milli)
+                    .unwrap_or(0)
+            };
+            let div = divisor
+                .filter(|d| !d.is_empty() && *d != "0")
+                .and_then(parse_cpu_quantity_milli)
+                .unwrap_or(1000)
+                .max(1);
+            Some(milli.div_ceil(div).to_string())
+        },
+        "limits.memory" | "requests.memory" => {
+            let bytes = if resource == "limits.memory" {
+                container
+                    .and_then(|c| c.pointer("/resources/limits/memory"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_memory_quantity_bytes)
+                    .unwrap_or(4 * 1024 * 1024 * 1024)
+            } else {
+                container
+                    .and_then(|c| {
+                        c.pointer("/resources/requests/memory")
+                            .or_else(|| c.pointer("/resources/limits/memory"))
+                    })
+                    .and_then(Value::as_str)
+                    .and_then(parse_memory_quantity_bytes)
+                    .unwrap_or(0)
+            };
+            let div = divisor
+                .filter(|d| !d.is_empty() && *d != "0")
+                .and_then(parse_memory_quantity_bytes)
+                .unwrap_or(1)
+                .max(1);
+            Some(bytes.div_ceil(div).to_string())
+        },
+        "limits.ephemeral-storage" | "requests.ephemeral-storage" => Some("0".to_string()),
+        _ => None,
+    }
 }
 
 pub(crate) fn stage_projected_downward_api(
@@ -1057,34 +1346,30 @@ pub(crate) fn stage_projected_downward_api(
     namespace: &str,
     pod: &Value,
     items: &[Value],
-) -> Result<(), KubeletError> {
+    vol_spec: &Value,
+) -> Result<Vec<PathBuf>, KubeletError> {
+    let mut written = Vec::new();
     for item in items {
         let path = item.get("path").and_then(Value::as_str).unwrap_or("");
-        let field_path = item
+        let mode = volume_file_mode(Some(item), vol_spec);
+        let val = if let Some(field_path) = item
             .get("fieldRef")
             .and_then(|f| f.get("fieldPath"))
             .and_then(Value::as_str)
-            .unwrap_or("");
-
-        let val = match field_path {
-            "metadata.name" => pod
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "metadata.namespace" => namespace,
-            "metadata.uid" => pod
-                .get("metadata")
-                .and_then(|m| m.get("uid"))
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            _ => "",
+        {
+            resolve_downward_field_path(pod, namespace, field_path).unwrap_or_default()
+        } else if let Some(res_ref) = item.get("resourceFieldRef") {
+            resolve_downward_resource_field(pod, None, res_ref).unwrap_or_default()
+        } else {
+            String::new()
         };
 
         let target = safe_volume_path(vol_dir, path)?;
         write_volume_file(&target, val.as_bytes())?;
+        chmod_volume_file(&target, mode);
+        written.push(target);
     }
-    Ok(())
+    Ok(written)
 }
 
 pub(crate) fn check_pod_restart_need(

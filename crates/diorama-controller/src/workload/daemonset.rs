@@ -142,6 +142,10 @@ impl DaemonSetReconciler {
             );
         }
 
+        if updated_ds.get("status") == ds.get("status") {
+            return Ok(updated_ds);
+        }
+
         self.client
             .update_daemonset(namespace, name, updated_ds)
             .await

@@ -204,6 +204,36 @@ fn terminated_state(provider: &str, status: &cri::ContainerStatus) -> Value {
     })
 }
 
+fn effective_container_resources(spec: &Value) -> (Value, Option<Value>) {
+    let Some(res_obj) = spec.get("resources").and_then(Value::as_object) else {
+        return (json!({}), None);
+    };
+    let limits = res_obj.get("limits").and_then(Value::as_object).cloned();
+    let mut requests = res_obj
+        .get("requests")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(lim) = &limits {
+        for (k, v) in lim {
+            requests.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(lim) = limits
+        && !lim.is_empty()
+    {
+        out.insert("limits".to_string(), Value::Object(lim));
+    }
+    let alloc = if requests.is_empty() {
+        None
+    } else {
+        out.insert("requests".to_string(), Value::Object(requests.clone()));
+        Some(Value::Object(requests))
+    };
+    (Value::Object(out), alloc)
+}
+
 fn container_status_json(
     provider: &str,
     view: &ContainerView<'_>,
@@ -219,6 +249,7 @@ fn container_status_json(
         .get("image")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let (res, alloc) = effective_container_resources(view.spec);
     let mut status = json!({
         "name": name,
         "image": image,
@@ -226,7 +257,11 @@ fn container_status_json(
         "ready": false,
         "started": false,
         "restartCount": view.latest.and_then(|s| s.metadata.as_ref()).map_or(0, |m| m.attempt),
+        "resources": res,
     });
+    if let Some(alloc_res) = alloc {
+        status["allocatedResources"] = alloc_res;
+    }
     if let Some(latest) = view.latest {
         status["containerID"] = json!(format!("{provider}://{}", latest.id));
     }

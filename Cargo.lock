@@ -480,6 +480,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "rustls",
+ "saphyr-parser",
  "serde",
  "serde_json",
  "tempfile",

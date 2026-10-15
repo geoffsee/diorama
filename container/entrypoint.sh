@@ -67,4 +67,12 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     fi
 fi
 
+# The apiserver listens on 127.0.0.1. In container mode with published ports (-p 6443:6443),
+# route incoming host traffic to the loopback listener.
+if command -v iptables >/dev/null 2>&1; then
+    sysctl -w net.ipv4.conf.all.route_localnet=1 2>/dev/null || true
+    iptables -t nat -C PREROUTING -p tcp --dport 6443 -j DNAT --to-destination 127.0.0.1:6443 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p tcp --dport 6443 -j DNAT --to-destination 127.0.0.1:6443 2>/dev/null || true
+fi
+
 exec /usr/local/bin/diorama "$@"

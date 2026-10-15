@@ -127,6 +127,7 @@ pub(crate) async fn serve(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle(
     request: Request<Incoming>,
     service: &ApiserverService,
@@ -191,12 +192,37 @@ async fn handle(
             "the server could not find the requested resource",
         ),
         Route::ApiVersions => authenticated_document(&client, || api_versions(service)),
-        Route::OpenApiV3Index => authenticated_document(&client, crate::openapi::v3_index),
+        Route::OpenApiV2 => {
+            let wants_proto = accept.as_deref().is_some_and(|a| {
+                a.contains("proto-openapi.spec.v2")
+                    || (a.contains("protobuf") && !a.contains("json"))
+            });
+            if wants_proto {
+                match client.discover_core() {
+                    Ok(_) => response(
+                        StatusCode::OK,
+                        "application/com.github.proto-openapi.spec.v2@v1.0+protobuf",
+                        Bytes::from_static(crate::openapi::OPENAPI_V2_PROTO_BYTES),
+                    ),
+                    Err(err) => error_response(&err),
+                }
+            } else {
+                authenticated_document(&client, || {
+                    let crds = client.list_registered_crds();
+                    crate::openapi::v2_with_crds(&crds)
+                })
+            }
+        },
+        Route::OpenApiV3Index => authenticated_document(&client, || {
+            let crds = client.list_registered_crds();
+            crate::openapi::v3_index_with_crds(&crds)
+        }),
         Route::OpenApiV3Core => authenticated_document(&client, crate::openapi::v3_core),
         Route::OpenApiV3StorageV1 => authenticated_document(&client, crate::openapi::v3_storage_v1),
-        Route::OpenApiV3Group { group, version } => {
-            authenticated_document(&client, || crate::openapi::v3_group(&group, &version))
-        },
+        Route::OpenApiV3Group { group, version } => authenticated_document(&client, || {
+            let crds = client.list_registered_crds();
+            crate::openapi::v3_group_with_crds(&group, &version, &crds)
+        }),
         Route::CoreDiscovery => aggregated_or(
             accept.as_deref(),
             || core_aggregated(&client),
@@ -207,6 +233,7 @@ async fn handle(
             || groups_aggregated(&client),
             || client.discover_apis(),
         ),
+        Route::ApiGroup { group } => discovery_result(client.discover_api_group(&group)),
         Route::GroupDiscovery { group, version } => {
             discovery_result(client.discover_group_resources(&group, &version))
         },
@@ -398,6 +425,7 @@ async fn watch_response(
             .get("fieldSelector")
             .and_then(|selector| selector.strip_prefix("metadata.name="))
             .map(str::to_owned),
+        label_selector: params.get("labelSelector").cloned().unwrap_or_default(),
         since: params
             .get("resourceVersion")
             .and_then(|value| value.parse().ok())
@@ -434,14 +462,12 @@ async fn watch_response(
 }
 
 fn dispatch_is_namespaced(resource: &str) -> bool {
-    !matches!(
-        resource,
-        "namespaces" | "nodes" | "persistentvolumes" | "storageclasses"
-    )
+    !dispatch::is_cluster_resource(resource)
 }
 
 struct WatchFilter {
     name: Option<String>,
+    label_selector: String,
     since: u64,
     send_initial_events: bool,
     namespaced: bool,
@@ -467,7 +493,11 @@ impl WatchFilter {
     fn accepts(&self, object: &Value) -> bool {
         self.name.as_deref().is_none_or(|wanted| {
             object.pointer("/metadata/name").and_then(Value::as_str) == Some(wanted)
-        })
+        }) && dispatch::matches_label_selector(object, &self.label_selector)
+    }
+
+    fn has_selector(&self) -> bool {
+        self.name.is_some() || !self.label_selector.trim().is_empty()
     }
 }
 
@@ -596,10 +626,24 @@ async fn stream_live_events(
                 json!(event.kv.mod_revision.to_string()),
             );
         }
+        let key = object_key(&object);
+        let mut kind = kind;
         if !filter.accepts(&object) {
+            // An object that no longer satisfies the selector leaves the watch
+            // window: upstream reports it as DELETED to the selective watcher.
+            if kind == "MODIFIED"
+                && event.kv.mod_revision > threshold
+                && sent.remove(&key).is_some()
+                && send_event(&mut sender, "DELETED", &object).await.is_err()
+            {
+                return;
+            }
             continue;
         }
-        let key = object_key(&object);
+        if kind == "MODIFIED" && !sent.contains_key(&key) && filter.has_selector() {
+            // The object just started matching the selector.
+            kind = "ADDED";
+        }
         // The datastore reports a delete with the deleted entry's own revision, so
         // the revision threshold applies only to puts; a delete always moves forward.
         let stale = kind != "DELETED"
@@ -750,23 +794,44 @@ fn groups_aggregated(client: &KubernetesApiClient) -> Result<Value, ApiserverErr
         let Some(name) = group.get("name").and_then(Value::as_str) else {
             continue;
         };
-        let Some(version) = group
-            .pointer("/preferredVersion/version")
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let resources = client.discover_group_resources(name, version)?;
-        // client-go fails the whole discovery when a group lists no resources,
-        // so groups without served kinds are left out of the aggregated view.
-        if resources
-            .get("resources")
+        let declared_versions: Vec<&str> = group
+            .get("versions")
             .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-        {
-            continue;
+            .map(|vers| {
+                vers.iter()
+                    .filter_map(|v| v.get("version").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fallback_versions: Vec<&str> = if declared_versions.is_empty() {
+            group
+                .pointer("/preferredVersion/version")
+                .and_then(Value::as_str)
+                .into_iter()
+                .collect()
+        } else {
+            declared_versions
+        };
+        let mut version_items = Vec::new();
+        for version in fallback_versions {
+            let resources = client.discover_group_resources(name, version)?;
+            // client-go fails the whole discovery when a group lists no resources,
+            // so versions without served kinds are left out of the aggregated view.
+            if resources
+                .get("resources")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                continue;
+            }
+            version_items.push(group_version_item(name, version, &resources));
         }
-        items.push(group_item(name, version, &resources));
+        if !version_items.is_empty() {
+            items.push(json!({
+                "metadata": { "name": name },
+                "versions": version_items
+            }));
+        }
     }
     Ok(json!({
         "kind": "APIGroupDiscoveryList",
@@ -786,6 +851,13 @@ fn discovery_list(group: &str, version: &str, resources: &Value) -> Value {
 }
 
 fn group_item(group: &str, version: &str, resources: &Value) -> Value {
+    json!({
+        "metadata": { "name": group },
+        "versions": [group_version_item(group, version, resources)]
+    })
+}
+
+fn group_version_item(group: &str, version: &str, resources: &Value) -> Value {
     let entries = resources
         .get("resources")
         .and_then(Value::as_array)
@@ -814,12 +886,9 @@ fn group_item(group: &str, version: &str, resources: &Value) -> Value {
         })
         .unwrap_or_default();
     json!({
-        "metadata": { "name": group },
-        "versions": [{
-            "version": version,
-            "freshness": "Current",
-            "resources": entries
-        }]
+        "version": version,
+        "freshness": "Current",
+        "resources": entries
     })
 }
 

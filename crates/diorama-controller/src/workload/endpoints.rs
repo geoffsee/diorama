@@ -109,20 +109,10 @@ impl EndpointsReconciler {
             return Ok(None);
         }
 
-        let (ready_addrs, not_ready_addrs) = self
+        let (ready_addrs, not_ready_addrs, matching_pods) = self
             .extract_matching_pod_addresses(namespace, selector)
             .await?;
-        let ports = extract_service_endpoints_ports(service);
-
-        let subsets = if ready_addrs.is_empty() && not_ready_addrs.is_empty() {
-            Vec::new()
-        } else {
-            vec![json!({
-                "addresses": ready_addrs,
-                "notReadyAddresses": not_ready_addrs,
-                "ports": ports,
-            })]
-        };
+        let subsets = build_subsets(service, &ready_addrs, &not_ready_addrs, &matching_pods);
 
         let desired_endpoints = json!({
             "apiVersion": "v1",
@@ -155,7 +145,7 @@ impl EndpointsReconciler {
         &self,
         namespace: &str,
         selector: &Map<String, Value>,
-    ) -> Result<(Vec<Value>, Vec<Value>), ControllerError> {
+    ) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>), ControllerError> {
         let pod_list = self.client.list_pods(namespace).await.map_err(|e| {
             ControllerError::ReconciliationFailed {
                 resource: "pods".to_string(),
@@ -171,6 +161,7 @@ impl EndpointsReconciler {
 
         let mut ready_addresses = Vec::new();
         let mut not_ready_addresses = Vec::new();
+        let mut matching_pods = Vec::new();
 
         for pod in all_pods {
             let pod_labels = pod
@@ -194,13 +185,14 @@ impl EndpointsReconciler {
                 } else {
                     not_ready_addresses.push(addr_obj);
                 }
+                matching_pods.push(pod);
             }
         }
 
         sort_addresses(&mut ready_addresses);
         sort_addresses(&mut not_ready_addresses);
 
-        Ok((ready_addresses, not_ready_addresses))
+        Ok((ready_addresses, not_ready_addresses, matching_pods))
     }
 
     async fn apply_endpoints(
@@ -347,7 +339,62 @@ fn sort_addresses(addrs: &mut [Value]) {
     });
 }
 
-fn extract_service_endpoints_ports(service: &Value) -> Vec<Value> {
+struct EndpointGroup {
+    ready: Vec<Value>,
+    not_ready: Vec<Value>,
+    ports: Vec<Value>,
+}
+
+/// Packs addresses into subsets keyed by the port set each pod resolves to.
+fn build_subsets(
+    service: &Value,
+    ready: &[Value],
+    not_ready: &[Value],
+    pods: &[Value],
+) -> Vec<Value> {
+    use std::collections::BTreeMap;
+
+    let pod_for = |addr: &Value| -> Option<&Value> {
+        let name = addr.pointer("/targetRef/name").and_then(Value::as_str)?;
+        pods.iter()
+            .find(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(name))
+    };
+
+    let mut groups: BTreeMap<String, EndpointGroup> = BTreeMap::new();
+    for (addrs, is_ready) in [(ready, true), (not_ready, false)] {
+        for addr in addrs {
+            let pod_slice: Vec<Value> = pod_for(addr).cloned().into_iter().collect();
+            let ports = extract_service_endpoints_ports(service, &pod_slice);
+            let key = serde_json::to_string(&ports).unwrap_or_default();
+            let entry = groups.entry(key).or_insert_with(|| EndpointGroup {
+                ready: Vec::new(),
+                not_ready: Vec::new(),
+                ports,
+            });
+            if is_ready {
+                entry.ready.push(addr.clone());
+            } else {
+                entry.not_ready.push(addr.clone());
+            }
+        }
+    }
+    groups
+        .into_values()
+        .map(|grp| {
+            let mut subset = Map::new();
+            if !grp.ready.is_empty() {
+                subset.insert("addresses".to_string(), Value::Array(grp.ready));
+            }
+            if !grp.not_ready.is_empty() {
+                subset.insert("notReadyAddresses".to_string(), Value::Array(grp.not_ready));
+            }
+            subset.insert("ports".to_string(), Value::Array(grp.ports));
+            Value::Object(subset)
+        })
+        .collect()
+}
+
+fn extract_service_endpoints_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
     let service_ports = service
         .get("spec")
         .and_then(|s| s.get("ports"))
@@ -357,7 +404,7 @@ fn extract_service_endpoints_ports(service: &Value) -> Vec<Value> {
 
     let mut ports = Vec::new();
     for sp in service_ports {
-        let port_num = sp.get("port").and_then(Value::as_i64).unwrap_or(80);
+        let port_num = super::endpointslice::resolve_service_target_port(&sp, pods);
         let port_name = sp.get("name").and_then(Value::as_str);
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
@@ -366,6 +413,9 @@ fn extract_service_endpoints_ports(service: &Value) -> Vec<Value> {
         port_obj.insert("protocol".to_string(), json!(protocol));
         if let Some(pn) = port_name {
             port_obj.insert("name".to_string(), json!(pn));
+        }
+        if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
+            port_obj.insert("appProtocol".to_string(), json!(ap));
         }
         ports.push(Value::Object(port_obj));
     }
