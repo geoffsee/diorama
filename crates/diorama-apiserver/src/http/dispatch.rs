@@ -381,7 +381,7 @@ async fn delete(
             let mut current = read_single(client, path, name).await?;
             if let Some(meta) = current.get_mut("metadata").and_then(Value::as_object_mut) {
                 meta.entry("deletionTimestamp".to_string())
-                    .or_insert_with(|| json!("2026-01-01T00:00:00Z"));
+                    .or_insert_with(|| json!(crate::time::now_rfc3339()));
                 let finalizers = meta
                     .entry("finalizers".to_string())
                     .or_insert_with(|| json!([]));

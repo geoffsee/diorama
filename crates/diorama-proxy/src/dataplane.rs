@@ -382,17 +382,20 @@ impl IptablesDataplane {
             return false;
         }
         let payload = Self::restore_payload(rules, &existing.stdout);
-        let path =
-            std::env::temp_dir().join(format!("diorama-kube-proxy-{}.rules", std::process::id()));
-        if std::fs::write(&path, payload).is_err() {
+        let Ok(mut tmp) = tempfile::Builder::new()
+            .prefix("diorama-kube-proxy-")
+            .suffix(".rules")
+            .tempfile()
+        else {
+            return false;
+        };
+        if std::io::Write::write_all(&mut tmp, payload.as_bytes()).is_err() {
             return false;
         }
-        let Some(path_str) = path.to_str() else {
-            let _ = std::fs::remove_file(&path);
+        let Some(path_str) = tmp.path().to_str() else {
             return false;
         };
         let result = executor.run("iptables-restore", &["--noflush", "-w", "5", path_str]);
-        let _ = std::fs::remove_file(&path);
         match result {
             Ok(out) if out.success => true,
             Ok(out) => {

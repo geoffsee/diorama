@@ -334,7 +334,7 @@ impl JobReconciler {
             succeeded_pods.len() >= completions
         };
 
-        let now = "2026-01-01T00:00:00Z";
+        let now = diorama_apiserver::time::now_rfc3339();
 
         if let Some((reason, message)) = fail_job_reason {
             self.terminate_active_pods(namespace, &active_pods).await;
@@ -521,11 +521,11 @@ impl JobReconciler {
         conditions: Option<Value>,
         completed: bool,
     ) -> Result<Value, ControllerError> {
-        let now = "2026-01-01T00:00:00Z";
+        let now = diorama_apiserver::time::now_rfc3339();
         let start_time = job
             .pointer("/status/startTime")
             .and_then(Value::as_str)
-            .unwrap_or(now)
+            .unwrap_or(&now)
             .to_string();
 
         let mut updated_job = job.clone();
