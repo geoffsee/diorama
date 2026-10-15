@@ -201,7 +201,7 @@ async fn handle(
                 match client.discover_core() {
                     Ok(_) => response(
                         StatusCode::OK,
-                        "application/com.github.proto-openapi.spec.v2@v1.0+protobuf",
+                        "application/com.github.proto-openapi.spec.v2.v1.0+protobuf",
                         Bytes::from_static(crate::openapi::OPENAPI_V2_PROTO_BYTES),
                     ),
                     Err(err) => error_response(&err),
