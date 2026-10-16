@@ -30,6 +30,37 @@ fn has_foreground_deletion(item: &Value) -> bool {
     has_del_ts && has_fg_finalizer
 }
 
+fn has_orphan_deletion(item: &Value) -> bool {
+    let has_del_ts = item
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some();
+    has_del_ts && has_orphan_finalizer(item)
+}
+
+fn has_orphan_finalizer(item: &Value) -> bool {
+    item.pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter().any(|v| {
+                matches!(
+                    v.as_str(),
+                    Some("orphan" | "orphanDependents" | "kubernetes.io/orphan")
+                )
+            })
+        })
+}
+
+fn blocks_owner_deletion(owner_ref: &Value) -> bool {
+    if let Some(block) = owner_ref.get("blockOwnerDeletion").and_then(Value::as_bool) {
+        return block;
+    }
+    owner_ref
+        .get("controller")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn owner_present(res: Result<Value, ApiserverError>, expected_uid: Option<&str>) -> bool {
     match res {
         Ok(owner) => matches_uid(&owner, expected_uid) && !has_foreground_deletion(&owner),
@@ -55,6 +86,8 @@ impl GarbageCollector {
         let mut total_deleted = 0;
         let mut iterations = 0;
 
+        total_deleted += self.reconcile_namespace_termination(namespace).await?;
+
         loop {
             if iterations > 100 {
                 return Err(ControllerError::ReconciliationFailed {
@@ -70,6 +103,8 @@ impl GarbageCollector {
             total_deleted += pass_deleted;
         }
 
+        let _ = self.finalize_terminating_namespace(namespace).await;
+
         Ok(total_deleted)
     }
 
@@ -79,8 +114,17 @@ impl GarbageCollector {
         let pod_count = self.reconcile_pods(namespace).await;
         let slice_count = self.reconcile_endpointslices(namespace).await;
         let endpoint_count = self.reconcile_endpoints(namespace).await;
+        let cr_count = self.reconcile_custom_resources(namespace).await;
         let fg_count = self.reconcile_foreground_owners(namespace).await;
-        Ok(rs_count + job_count + pod_count + slice_count + endpoint_count + fg_count)
+        let orphan_count = self.reconcile_orphan_owners(namespace).await;
+        Ok(rs_count
+            + job_count
+            + pod_count
+            + slice_count
+            + endpoint_count
+            + cr_count
+            + fg_count
+            + orphan_count)
     }
 
     async fn reconcile_foreground_owners(&self, namespace: &str) -> usize {
@@ -225,8 +269,51 @@ impl GarbageCollector {
                 let _ = self.client.update_daemonset(namespace, name, cleaned).await;
                 self.client.delete_daemonset(namespace, name).await.is_ok()
             },
-            _ => false,
+            "CronJob" => {
+                let _ = self.client.update_cronjob(namespace, name, cleaned).await;
+                self.client.delete_cronjob(namespace, name).await.is_ok()
+            },
+            _ => {
+                self.strip_and_delete_cr(namespace, kind, name, cleaned)
+                    .await
+            },
         }
+    }
+
+    async fn strip_and_delete_cr(
+        &self,
+        namespace: &str,
+        kind: &str,
+        name: &str,
+        cleaned: Value,
+    ) -> bool {
+        if let Ok(crd_list) = self.client.list_crds().await
+            && let Some(items) = crd_list.get("items").and_then(Value::as_array)
+        {
+            for crd in items {
+                let crd_kind = crd.pointer("/spec/names/kind").and_then(Value::as_str);
+                if crd_kind == Some(kind) {
+                    let group = crd
+                        .pointer("/spec/group")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let plural = crd
+                        .pointer("/spec/names/plural")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let _ = self
+                        .client
+                        .update_custom_resource(group, plural, namespace, name, cleaned, None)
+                        .await;
+                    return self
+                        .client
+                        .delete_custom_resource(group, plural, namespace, name)
+                        .await
+                        .is_ok();
+                }
+            }
+        }
+        false
     }
 
     fn strip_deletion_metadata(obj: &mut Value) {
@@ -251,15 +338,21 @@ impl GarbageCollector {
             else {
                 continue;
             };
-            let references_this_owner = owners.iter().any(|o| {
+            let matching_owner = owners.iter().find(|o| {
                 o.get("kind").and_then(Value::as_str) == Some(owner_kind)
                     && (o.get("name").and_then(Value::as_str) == Some(owner_name)
                         || (owner_uid.is_some()
                             && o.get("uid").and_then(Value::as_str) == owner_uid))
             });
-            if !references_this_owner {
+            let Some(owner_ref) = matching_owner else {
+                continue;
+            };
+
+            // If blockOwnerDeletion is false, this reference does not block owner deletion
+            if !blocks_owner_deletion(owner_ref) {
                 continue;
             }
+
             // If the dependent is terminating or has no other valid live owner, it blocks foreground deletion
             if dep.pointer("/metadata/deletionTimestamp").is_some() {
                 return true;
@@ -469,8 +562,47 @@ impl GarbageCollector {
                 expected_uid,
             ),
             "Secret" => owner_present(self.client.get_secret(namespace, name).await, expected_uid),
-            _ => true,
+            "PersistentVolumeClaim" => {
+                owner_present(self.client.get_pvc(namespace, name).await, expected_uid)
+            },
+            "Lease" => owner_present(self.client.get_lease(namespace, name).await, expected_uid),
+            _ => {
+                self.check_crd_owner_exists(namespace, kind, name, expected_uid)
+                    .await
+            },
         }
+    }
+
+    async fn check_crd_owner_exists(
+        &self,
+        namespace: &str,
+        kind: &str,
+        name: &str,
+        expected_uid: Option<&str>,
+    ) -> bool {
+        if let Ok(crd_list) = self.client.list_crds().await
+            && let Some(items) = crd_list.get("items").and_then(Value::as_array)
+        {
+            for crd in items {
+                let crd_kind = crd.pointer("/spec/names/kind").and_then(Value::as_str);
+                if crd_kind == Some(kind) {
+                    let group = crd
+                        .pointer("/spec/group")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let plural = crd
+                        .pointer("/spec/names/plural")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let res = self
+                        .client
+                        .get_custom_resource(group, plural, namespace, name)
+                        .await;
+                    return owner_present(res, expected_uid);
+                }
+            }
+        }
+        true
     }
 
     async fn is_eligible_dependent(&self, namespace: &str, resource: &Value) -> bool {
@@ -480,6 +612,10 @@ impl GarbageCollector {
             .and_then(Value::as_str)
             .is_some()
         {
+            return false;
+        }
+
+        if has_orphan_finalizer(resource) {
             return false;
         }
 
@@ -515,6 +651,406 @@ impl GarbageCollector {
         }
 
         valid_owner_count > 0
+    }
+
+    async fn reconcile_custom_resources(&self, namespace: &str) -> usize {
+        let Ok(crd_list) = self.client.list_crds().await else {
+            return 0;
+        };
+        let Some(crds) = crd_list.get("items").and_then(Value::as_array) else {
+            return 0;
+        };
+
+        let mut deleted = 0;
+        for crd in crds {
+            let Some(group) = crd.pointer("/spec/group").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(plural) = crd.pointer("/spec/names/plural").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(list) = self
+                .client
+                .list_custom_resources(group, plural, namespace)
+                .await
+            else {
+                continue;
+            };
+            let Some(items) = list.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                if !self.is_eligible_dependent(namespace, item).await {
+                    continue;
+                }
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self
+                    .client
+                    .delete_custom_resource(group, plural, namespace, name)
+                    .await
+                    .is_ok()
+                {
+                    deleted += 1;
+                }
+            }
+        }
+        deleted
+    }
+
+    async fn reconcile_orphan_owners(&self, namespace: &str) -> usize {
+        let mut finalized = 0;
+        if let Ok(list) = self.client.list_deployments(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_orphan_owners(namespace, "Deployment", items)
+                .await;
+        }
+        if let Ok(list) = self.client.list_replicasets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_orphan_owners(namespace, "ReplicaSet", items)
+                .await;
+        }
+        if let Ok(list) = self.client.list_jobs(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self.finalize_orphan_owners(namespace, "Job", items).await;
+        }
+        if let Ok(list) = self.client.list_statefulsets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_orphan_owners(namespace, "StatefulSet", items)
+                .await;
+        }
+        if let Ok(list) = self.client.list_daemonsets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_orphan_owners(namespace, "DaemonSet", items)
+                .await;
+        }
+        finalized
+    }
+
+    async fn finalize_orphan_owners(&self, namespace: &str, kind: &str, items: &[Value]) -> usize {
+        let mut count = 0;
+        for item in items {
+            if !has_orphan_deletion(item) {
+                continue;
+            }
+            let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            let uid = item.pointer("/metadata/uid").and_then(Value::as_str);
+            self.disown_dependents_for_owner(namespace, kind, name, uid)
+                .await;
+            if self.strip_and_delete(namespace, kind, name, item).await {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn remove_owner_reference_if_present(
+        obj: &mut Value,
+        owner_kind: &str,
+        owner_name: &str,
+        owner_uid: Option<&str>,
+    ) -> bool {
+        let (removed, is_empty) = {
+            let Some(owners) = obj
+                .pointer_mut("/metadata/ownerReferences")
+                .and_then(Value::as_array_mut)
+            else {
+                return false;
+            };
+
+            let initial_len = owners.len();
+            owners.retain(|o| {
+                let matches = o.get("kind").and_then(Value::as_str) == Some(owner_kind)
+                    && (o.get("name").and_then(Value::as_str) == Some(owner_name)
+                        || (owner_uid.is_some()
+                            && o.get("uid").and_then(Value::as_str) == owner_uid));
+                !matches
+            });
+            (owners.len() != initial_len, owners.is_empty())
+        };
+
+        if is_empty && let Some(meta) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.remove("ownerReferences");
+        }
+
+        removed
+    }
+
+    async fn disown_dependents_for_owner(
+        &self,
+        namespace: &str,
+        owner_kind: &str,
+        owner_name: &str,
+        owner_uid: Option<&str>,
+    ) {
+        if let Ok(list) = self.client.list_pods(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for mut pod in items.clone() {
+                let Some(pname) = pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                else {
+                    continue;
+                };
+                if Self::remove_owner_reference_if_present(
+                    &mut pod, owner_kind, owner_name, owner_uid,
+                ) {
+                    let _ = self.client.update_pod(namespace, &pname, pod).await;
+                }
+            }
+        }
+
+        if let Ok(list) = self.client.list_replicasets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for mut rs in items.clone() {
+                let Some(rname) = rs
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                else {
+                    continue;
+                };
+                if Self::remove_owner_reference_if_present(
+                    &mut rs, owner_kind, owner_name, owner_uid,
+                ) {
+                    let _ = self.client.update_replicaset(namespace, &rname, rs).await;
+                }
+            }
+        }
+
+        if let Ok(list) = self.client.list_jobs(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for mut job in items.clone() {
+                let Some(jname) = job
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                else {
+                    continue;
+                };
+                if Self::remove_owner_reference_if_present(
+                    &mut job, owner_kind, owner_name, owner_uid,
+                ) {
+                    let _ = self.client.update_job(namespace, &jname, job).await;
+                }
+            }
+        }
+    }
+
+    pub async fn reconcile_namespace_termination(
+        &self,
+        namespace: &str,
+    ) -> Result<usize, ControllerError> {
+        let Ok(ns_doc) = self.client.get_namespace(namespace).await else {
+            return Ok(0);
+        };
+
+        let is_terminating = ns_doc.pointer("/metadata/deletionTimestamp").is_some()
+            || ns_doc.pointer("/status/phase").and_then(Value::as_str) == Some("Terminating");
+
+        if !is_terminating {
+            return Ok(0);
+        }
+
+        let mut deleted = self.cleanup_terminating_workloads(namespace).await;
+        deleted += self.cleanup_terminating_storage_and_crds(namespace).await;
+        Ok(deleted)
+    }
+
+    async fn cleanup_terminating_workloads(&self, namespace: &str) -> usize {
+        let mut count = 0;
+        if let Ok(list) = self.client.list_pods(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self.client.delete_pod(namespace, name).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(list) = self.client.list_replicasets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self.client.delete_replicaset(namespace, name).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(list) = self.client.list_deployments(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self.client.delete_deployment(namespace, name).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(list) = self.client.list_jobs(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self.client.delete_job(namespace, name).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    async fn cleanup_terminating_crd_instances(&self, namespace: &str, crd: &Value) -> usize {
+        let Some(group) = crd.pointer("/spec/group").and_then(Value::as_str) else {
+            return 0;
+        };
+        let Some(plural) = crd.pointer("/spec/names/plural").and_then(Value::as_str) else {
+            return 0;
+        };
+        let Ok(list) = self
+            .client
+            .list_custom_resources(group, plural, namespace)
+            .await
+        else {
+            return 0;
+        };
+        let Some(items) = list.get("items").and_then(Value::as_array) else {
+            return 0;
+        };
+
+        let mut count = 0;
+        for item in items {
+            let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            if self
+                .client
+                .delete_custom_resource(group, plural, namespace, name)
+                .await
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    async fn cleanup_terminating_storage_and_crds(&self, namespace: &str) -> usize {
+        let mut count = 0;
+        if let Ok(list) = self.client.list_configmaps(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self
+                    .client
+                    .delete_configmap(namespace, name, None)
+                    .await
+                    .is_ok()
+                {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(list) = self.client.list_secrets(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if self
+                    .client
+                    .delete_secret(namespace, name, None)
+                    .await
+                    .is_ok()
+                {
+                    count += 1;
+                }
+            }
+        }
+        if let Ok(crd_list) = self.client.list_crds().await
+            && let Some(crds) = crd_list.get("items").and_then(Value::as_array)
+        {
+            for crd in crds {
+                count += self.cleanup_terminating_crd_instances(namespace, crd).await;
+            }
+        }
+        count
+    }
+
+    pub async fn finalize_terminating_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<bool, ControllerError> {
+        let Ok(ns_doc) = self.client.get_namespace(namespace).await else {
+            return Ok(false);
+        };
+
+        let is_terminating = ns_doc.pointer("/metadata/deletionTimestamp").is_some()
+            || ns_doc.pointer("/status/phase").and_then(Value::as_str) == Some("Terminating");
+
+        if !is_terminating {
+            return Ok(false);
+        }
+
+        let has_pods = self
+            .client
+            .list_pods(namespace)
+            .await
+            .ok()
+            .and_then(|l| {
+                l.get("items")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+            })
+            .unwrap_or(false);
+        let has_rs = self
+            .client
+            .list_replicasets(namespace)
+            .await
+            .ok()
+            .and_then(|l| {
+                l.get("items")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+            })
+            .unwrap_or(false);
+
+        if !has_pods && !has_rs {
+            let _ = self.client.delete_namespace(namespace).await;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }
 
@@ -565,5 +1101,461 @@ mod tests {
         assert!(matches_uid(&item, Some("")));
         assert!(matches_uid(&item, Some("abc-123")));
         assert!(!matches_uid(&item, Some("xyz-789")));
+    }
+
+    #[test]
+    fn orphan_deletion_detection() {
+        let clean = json!({ "metadata": { "name": "test" } });
+        assert!(!has_orphan_deletion(&clean));
+
+        let finalizer_only = json!({
+            "metadata": {
+                "name": "test",
+                "finalizers": ["orphan"]
+            }
+        });
+        assert!(!has_orphan_deletion(&finalizer_only));
+
+        let del_with_orphan = json!({
+            "metadata": {
+                "name": "test",
+                "deletionTimestamp": "2026-10-15T00:00:00Z",
+                "finalizers": ["orphan"]
+            }
+        });
+        assert!(has_orphan_deletion(&del_with_orphan));
+
+        let del_with_k8s_orphan = json!({
+            "metadata": {
+                "name": "test",
+                "deletionTimestamp": "2026-10-15T00:00:00Z",
+                "finalizers": ["kubernetes.io/orphan"]
+            }
+        });
+        assert!(has_orphan_deletion(&del_with_k8s_orphan));
+    }
+
+    #[test]
+    fn blocks_owner_deletion_evaluation() {
+        let explicit_true = json!({ "blockOwnerDeletion": true });
+        assert!(blocks_owner_deletion(&explicit_true));
+
+        let explicit_false = json!({ "blockOwnerDeletion": false, "controller": true });
+        assert!(!blocks_owner_deletion(&explicit_false));
+
+        let controller_fallback = json!({ "controller": true });
+        assert!(blocks_owner_deletion(&controller_fallback));
+
+        let neither = json!({ "name": "owner" });
+        assert!(!blocks_owner_deletion(&neither));
+    }
+
+    use diorama_apiserver::{ApiserverConfig, ApiserverService, KubernetesStorage};
+    use diorama_datastore::{DatastoreConfig, DatastoreEngine};
+    use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
+    use tempfile::TempDir;
+
+    fn setup_test_client(dir: &TempDir) -> Arc<KubernetesApiClient> {
+        let node_ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let pki_dir = dir.path().join("pki");
+        std::fs::create_dir_all(&pki_dir).unwrap();
+        let datastore_dir = dir.path().join("datastore");
+
+        let pki_config = ClusterPkiConfig::new(pki_dir.clone(), "test-node".to_string(), node_ip);
+        let pki = ClusterPki::new(pki_config);
+        pki.reconcile().expect("PKI reconcile");
+
+        let (engine, _) = DatastoreEngine::open(DatastoreConfig::new(datastore_dir)).unwrap();
+        let storage = KubernetesStorage::new(engine.client(), "/registry");
+
+        let apiserver_config = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+        let apiserver_service = ApiserverService::new(apiserver_config, storage);
+
+        Arc::new(apiserver_service.controller_manager_client())
+    }
+
+    #[tokio::test]
+    async fn foreground_cascading_with_block_owner_deletion() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "fg-cascade-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "fg-parent", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "fg" } },
+                "template": { "metadata": { "labels": { "app": "fg" } }, "spec": { "containers": [{ "name": "app", "image": "nginx" }] } }
+            }
+        });
+        let created_dep = client.create_deployment(ns, dep).await.unwrap();
+        let dep_uid = created_dep
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let pod_blocking = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-blocking",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "fg-parent",
+                    "uid": dep_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+        });
+        client.create_pod(ns, pod_blocking).await.unwrap();
+
+        let mut dep_fg = created_dep;
+        dep_fg["metadata"]["deletionTimestamp"] = json!("2026-10-15T00:00:00Z");
+        dep_fg["metadata"]["finalizers"] = json!(["foregroundDeletion"]);
+        client
+            .update_deployment(ns, "fg-parent", dep_fg)
+            .await
+            .unwrap();
+
+        let collected = gc.reconcile(ns).await.unwrap();
+        assert!(collected >= 2);
+        assert!(client.get_deployment(ns, "fg-parent").await.is_err());
+        assert!(client.get_pod(ns, "pod-blocking").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn multi_owner_references_resolution() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "multi-owner-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep_a = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "dep-a", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "a" } },
+                "template": { "metadata": { "labels": { "app": "a" } }, "spec": { "containers": [{ "name": "app", "image": "nginx" }] } }
+            }
+        });
+        let dep_b = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "dep-b", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "b" } },
+                "template": { "metadata": { "labels": { "app": "b" } }, "spec": { "containers": [{ "name": "app", "image": "nginx" }] } }
+            }
+        });
+
+        let created_a = client.create_deployment(ns, dep_a).await.unwrap();
+        let created_b = client.create_deployment(ns, dep_b).await.unwrap();
+        let uid_a = created_a
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let uid_b = created_b
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let child_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "multi-owned-pod",
+                "namespace": ns,
+                "ownerReferences": [
+                    { "apiVersion": "apps/v1", "kind": "Deployment", "name": "dep-a", "uid": uid_a },
+                    { "apiVersion": "apps/v1", "kind": "Deployment", "name": "dep-b", "uid": uid_b }
+                ]
+            },
+            "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+        });
+        client.create_pod(ns, child_pod).await.unwrap();
+
+        // 1. Delete parent A only: child pod must survive because parent B is alive
+        client.delete_deployment(ns, "dep-a").await.unwrap();
+        let _ = gc.reconcile(ns).await.unwrap();
+        assert!(client.get_pod(ns, "multi-owned-pod").await.is_ok());
+
+        // 2. Delete parent B: child pod must now be collected
+        client.delete_deployment(ns, "dep-b").await.unwrap();
+        let collected = gc.reconcile(ns).await.unwrap();
+        assert!(collected >= 1);
+        assert!(client.get_pod(ns, "multi-owned-pod").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn orphan_propagation_policy_disowns_dependents() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "orphan-test-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "orphan-parent", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "orphan" } },
+                "template": { "metadata": { "labels": { "app": "orphan" } }, "spec": { "containers": [{ "name": "app", "image": "nginx" }] } }
+            }
+        });
+        let created_dep = client.create_deployment(ns, dep).await.unwrap();
+        let dep_uid = created_dep
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let child_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "orphan-child-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "orphan-parent",
+                    "uid": dep_uid
+                }]
+            },
+            "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+        });
+        client.create_pod(ns, child_pod).await.unwrap();
+
+        // Mark orphan-parent for deletion with orphan finalizer
+        let mut dep_orphan = created_dep;
+        dep_orphan["metadata"]["deletionTimestamp"] = json!("2026-10-15T00:00:00Z");
+        dep_orphan["metadata"]["finalizers"] = json!(["orphan"]);
+        client
+            .update_deployment(ns, "orphan-parent", dep_orphan)
+            .await
+            .unwrap();
+
+        let _ = gc.reconcile(ns).await.unwrap();
+
+        // Parent must be finalized and deleted
+        assert!(client.get_deployment(ns, "orphan-parent").await.is_err());
+
+        // Child pod must survive, and its ownerReferences must be cleared
+        let surviving_pod = client.get_pod(ns, "orphan-child-pod").await.unwrap();
+        assert!(surviving_pod.pointer("/metadata/ownerReferences").is_none());
+    }
+
+    async fn setup_widget_crd(client: &KubernetesApiClient) {
+        let crd = json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.com" },
+            "spec": {
+                "group": "example.com",
+                "names": {
+                    "kind": "Widget",
+                    "plural": "widgets",
+                    "singular": "widget"
+                },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "x-kubernetes-preserve-unknown-fields": true
+                        }
+                    }
+                }]
+            }
+        });
+        client.create_crd(crd).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_resource_as_owner_resolution() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "crd-owner-ns";
+        client.create_namespace(ns).await.unwrap();
+        setup_widget_crd(&client).await;
+
+        let widget = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "parent-widget", "namespace": ns, "uid": "cr-widget-uid-01" },
+            "spec": { "state": "active" }
+        });
+        let created_widget = client
+            .create_custom_resource("example.com", "widgets", ns, "parent-widget", widget)
+            .await
+            .unwrap();
+        let widget_uid = created_widget
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let child_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "cr-child-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "example.com/v1",
+                    "kind": "Widget",
+                    "name": "parent-widget",
+                    "uid": widget_uid
+                }]
+            },
+            "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+        });
+        client.create_pod(ns, child_pod).await.unwrap();
+
+        let _ = gc.reconcile(ns).await.unwrap();
+        assert!(client.get_pod(ns, "cr-child-pod").await.is_ok());
+
+        client
+            .delete_custom_resource("example.com", "widgets", ns, "parent-widget")
+            .await
+            .unwrap();
+        let collected = gc.reconcile(ns).await.unwrap();
+        assert!(collected >= 1);
+        assert!(client.get_pod(ns, "cr-child-pod").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_resource_as_dependent_resolution() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "crd-dep-ns";
+        client.create_namespace(ns).await.unwrap();
+        setup_widget_crd(&client).await;
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "cr-parent-deploy", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "cr-test" } },
+                "template": { "metadata": { "labels": { "app": "cr-test" } }, "spec": { "containers": [{ "name": "app", "image": "nginx" }] } }
+            }
+        });
+        let created_dep = client.create_deployment(ns, dep).await.unwrap();
+        let dep_uid = created_dep
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let dependent_widget = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "child-widget",
+                "namespace": ns,
+                "uid": "cr-widget-uid-02",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "cr-parent-deploy",
+                    "uid": dep_uid
+                }]
+            },
+            "spec": { "state": "child" }
+        });
+        client
+            .create_custom_resource(
+                "example.com",
+                "widgets",
+                ns,
+                "child-widget",
+                dependent_widget,
+            )
+            .await
+            .unwrap();
+
+        client
+            .delete_deployment(ns, "cr-parent-deploy")
+            .await
+            .unwrap();
+        let cr_collected = gc.reconcile(ns).await.unwrap();
+        assert!(cr_collected >= 1);
+        assert!(
+            client
+                .get_custom_resource("example.com", "widgets", ns, "child-widget")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_termination_finalizer_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let gc = GarbageCollector::new(client.clone());
+        let ns = "terminating-test-ns";
+
+        // Create namespace marked as Terminating
+        let ns_obj = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": ns,
+                "deletionTimestamp": "2026-10-15T00:00:00Z",
+                "finalizers": ["kubernetes"]
+            },
+            "status": {
+                "phase": "Terminating"
+            }
+        });
+        client.create_namespace_object(ns_obj).await.unwrap();
+
+        // Create a pod and configmap inside terminating-test-ns
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "doomed-ns-pod", "namespace": ns },
+            "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        let cm = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "doomed-ns-cm", "namespace": ns },
+            "data": { "key": "val" }
+        });
+        client.create_configmap_object(ns, cm).await.unwrap();
+
+        // Reconcile garbage collector
+        let collected = gc.reconcile(ns).await.unwrap();
+        assert!(collected >= 2);
+
+        // Namespace must be cleaned up and finalized
+        assert!(client.get_namespace(ns).await.is_err());
     }
 }
