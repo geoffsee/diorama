@@ -371,6 +371,7 @@ pub fn generate_storage_class(config: &LocalPathConfig) -> StorageClass {
         provisioner: LOCAL_PATH_PROVISIONER_NAME.to_string(),
         volume_binding_mode: Some(config.volume_binding_mode.clone()),
         reclaim_policy: Some(config.reclaim_policy.clone()),
+        allow_volume_expansion: Some(config.allow_volume_expansion),
         ..Default::default()
     }
 }
@@ -479,5 +480,132 @@ pub fn generate_deployment(config: &LocalPathConfig, namespace: &str) -> Deploym
 pub fn generate_config_map_patch(config_map: &ConfigMap) -> serde_json::Value {
     serde_json::json!({
         "data": config_map.data
+    })
+}
+
+/// Generate a `CSIDriver` object.
+#[must_use]
+pub fn generate_csi_driver(
+    name: &str,
+    attach_required: bool,
+    pod_info_on_mount: bool,
+    storage_capacity: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSIDriver",
+        "metadata": {
+            "name": name,
+            "labels": provisioner_labels(),
+        },
+        "spec": {
+            "attachRequired": attach_required,
+            "podInfoOnMount": pod_info_on_mount,
+            "storageCapacity": storage_capacity,
+            "volumeLifecycleModes": ["Persistent", "Ephemeral"],
+            "fsGroupPolicy": "File"
+        }
+    })
+}
+
+/// Generate a `CSINode` object.
+#[must_use]
+pub fn generate_csi_node(
+    node_name: &str,
+    driver_name: &str,
+    node_id: &str,
+    topology_keys: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSINode",
+        "metadata": {
+            "name": node_name,
+            "labels": provisioner_labels(),
+        },
+        "spec": {
+            "drivers": [
+                {
+                    "name": driver_name,
+                    "nodeID": node_id,
+                    "topologyKeys": topology_keys,
+                }
+            ]
+        }
+    })
+}
+
+/// Generate a `CSIStorageCapacity` object.
+#[must_use]
+pub fn generate_csi_storage_capacity(
+    namespace: &str,
+    name: &str,
+    storage_class_name: &str,
+    capacity_bytes: i64,
+    node_topology: Option<&BTreeMap<String, String>>,
+) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSIStorageCapacity",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": provisioner_labels(),
+        },
+        "storageClassName": storage_class_name,
+        "capacity": format!("{capacity_bytes}"),
+    });
+    if let Some(topo) = node_topology {
+        doc["nodeTopology"] = serde_json::json!({
+            "matchLabels": topo
+        });
+    }
+    doc
+}
+
+/// Generate a `VolumeAttachment` object.
+#[must_use]
+pub fn generate_volume_attachment(
+    name: &str,
+    attacher: &str,
+    node_name: &str,
+    pv_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "VolumeAttachment",
+        "metadata": {
+            "name": name,
+            "labels": provisioner_labels(),
+        },
+        "spec": {
+            "attacher": attacher,
+            "nodeName": node_name,
+            "source": {
+                "persistentVolumeName": pv_name
+            }
+        },
+        "status": {
+            "attached": false
+        }
+    })
+}
+
+/// Generate a `VolumeAttributesClass` object.
+#[must_use]
+pub fn generate_volume_attributes_class(
+    name: &str,
+    driver_name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "VolumeAttributesClass",
+        "metadata": {
+            "name": name,
+            "labels": provisioner_labels(),
+        },
+        "driverName": driver_name,
+        "parameters": parameters,
     })
 }

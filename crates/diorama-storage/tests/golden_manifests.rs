@@ -1,14 +1,18 @@
 use serde_json::Value;
 
 use diorama_storage::{
-    DEFAULT_APP_LABEL_KEY, DEFAULT_APP_LABEL_VALUE, DEFAULT_BASE_STORAGE_PATH, DEFAULT_CPU_REQUEST,
-    DEFAULT_HELPER_IMAGE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_PROVISIONER_IMAGE,
-    DEFAULT_RECLAIM_POLICY, DEFAULT_STORAGE_DIR_NAME, DEFAULT_VOLUME_BINDING_MODE,
+    DEFAULT_ALLOW_VOLUME_EXPANSION, DEFAULT_APP_LABEL_KEY, DEFAULT_APP_LABEL_VALUE,
+    DEFAULT_BASE_STORAGE_PATH, DEFAULT_CPU_REQUEST, DEFAULT_HELPER_IMAGE, DEFAULT_MEMORY_LIMIT,
+    DEFAULT_MEMORY_REQUEST, DEFAULT_PROVISIONER_IMAGE, DEFAULT_RECLAIM_POLICY,
+    DEFAULT_STORAGE_DIR_NAME, DEFAULT_VOLUME_BINDING_MODE, IS_DEFAULT_CLASS_ANNOTATION,
     LOCAL_PATH_CLUSTER_ROLE_BINDING_NAME, LOCAL_PATH_CLUSTER_ROLE_NAME, LOCAL_PATH_CONFIGMAP_NAME,
     LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LOCAL_PATH_PROVISIONER_NAME,
     LOCAL_PATH_ROLE_BINDING_NAME, LOCAL_PATH_ROLE_NAME, LOCAL_PATH_SERVICE_ACCOUNT_NAME,
-    LOCAL_PATH_STORAGE_CLASS_NAME, LocalPathConfig, LocalPathManifests, generate_config_json,
-    generate_helper_pod_yaml, generate_storage_class, provisioner_labels,
+    LOCAL_PATH_STORAGE_CLASS_NAME, LocalPathConfig, LocalPathManifests, PV_PROTECTION_FINALIZER,
+    PVC_PROTECTION_FINALIZER, STORAGE_PROVISIONED_BY_ANNOTATION, VOLUME_SELECTED_NODE_ANNOTATION,
+    generate_config_json, generate_csi_driver, generate_csi_node, generate_csi_storage_capacity,
+    generate_helper_pod_yaml, generate_storage_class, generate_volume_attachment,
+    generate_volume_attributes_class, provisioner_labels,
 };
 
 fn load_golden_fixtures() -> Value {
@@ -501,4 +505,95 @@ fn test_invalid_volume_binding_mode_rejected() {
     assert!(
         matches!(err, diorama_storage::StorageError::InvalidConfiguration(ref msg) if msg.contains("unsupported volume binding mode"))
     );
+}
+
+#[test]
+fn test_constants_and_annotations() {
+    const { assert!(DEFAULT_ALLOW_VOLUME_EXPANSION) };
+    assert_eq!(PVC_PROTECTION_FINALIZER, "kubernetes.io/pvc-protection");
+    assert_eq!(PV_PROTECTION_FINALIZER, "kubernetes.io/pv-protection");
+    assert_eq!(
+        STORAGE_PROVISIONED_BY_ANNOTATION,
+        "pv.kubernetes.io/provisioned-by"
+    );
+    assert_eq!(
+        VOLUME_SELECTED_NODE_ANNOTATION,
+        "volume.kubernetes.io/selected-node"
+    );
+    assert_eq!(
+        IS_DEFAULT_CLASS_ANNOTATION,
+        "storageclass.kubernetes.io/is-default-class"
+    );
+}
+
+#[test]
+fn test_csi_manifest_generators() {
+    let driver = generate_csi_driver("rancher.io/local-path", true, false, true);
+    assert_eq!(driver["apiVersion"], "storage.k8s.io/v1");
+    assert_eq!(driver["kind"], "CSIDriver");
+    assert_eq!(driver["metadata"]["name"], "rancher.io/local-path");
+    assert_eq!(driver["spec"]["attachRequired"], true);
+    assert_eq!(driver["spec"]["podInfoOnMount"], false);
+    assert_eq!(driver["spec"]["storageCapacity"], true);
+
+    let topo_keys = vec!["kubernetes.io/hostname"];
+    let node = generate_csi_node(
+        "worker-1",
+        "rancher.io/local-path",
+        "node-uuid-1",
+        &topo_keys,
+    );
+    assert_eq!(node["apiVersion"], "storage.k8s.io/v1");
+    assert_eq!(node["kind"], "CSINode");
+    assert_eq!(node["metadata"]["name"], "worker-1");
+    let drivers = node["spec"]["drivers"].as_array().unwrap();
+    assert_eq!(drivers[0]["name"], "rancher.io/local-path");
+    assert_eq!(drivers[0]["nodeID"], "node-uuid-1");
+    assert_eq!(drivers[0]["topologyKeys"][0], "kubernetes.io/hostname");
+
+    let mut topo = std::collections::BTreeMap::new();
+    topo.insert("kubernetes.io/hostname".to_string(), "worker-1".to_string());
+    let cap = generate_csi_storage_capacity(
+        "cap-1",
+        "default",
+        "local-path",
+        10_737_418_240,
+        Some(&topo),
+    );
+    assert_eq!(cap["apiVersion"], "storage.k8s.io/v1");
+    assert_eq!(cap["kind"], "CSIStorageCapacity");
+    assert_eq!(cap["storageClassName"], "local-path");
+    assert_eq!(cap["capacity"], "10737418240");
+    assert_eq!(
+        cap["nodeTopology"]["matchLabels"]["kubernetes.io/hostname"],
+        "worker-1"
+    );
+
+    let va = generate_volume_attachment("va-test", "rancher.io/local-path", "worker-1", "pvc-123");
+    assert_eq!(va["apiVersion"], "storage.k8s.io/v1");
+    assert_eq!(va["kind"], "VolumeAttachment");
+    assert_eq!(va["spec"]["attacher"], "rancher.io/local-path");
+    assert_eq!(va["spec"]["nodeName"], "worker-1");
+    assert_eq!(va["spec"]["source"]["persistentVolumeName"], "pvc-123");
+
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("iops".to_string(), "3000".to_string());
+    let vac = generate_volume_attributes_class("silver-vac", "rancher.io/local-path", &params);
+    assert_eq!(vac["apiVersion"], "storage.k8s.io/v1");
+    assert_eq!(vac["kind"], "VolumeAttributesClass");
+    assert_eq!(vac["metadata"]["name"], "silver-vac");
+    assert_eq!(vac["driverName"], "rancher.io/local-path");
+    assert_eq!(vac["parameters"]["iops"], "3000");
+}
+
+#[test]
+fn test_allow_volume_expansion_and_csi_enabled_config() {
+    let config = LocalPathConfig::new()
+        .with_allow_volume_expansion(true)
+        .with_csi_enabled(true);
+    assert!(config.allow_volume_expansion);
+    assert!(config.csi_enabled);
+
+    let sc = generate_storage_class(&config);
+    assert_eq!(sc.allow_volume_expansion, Some(true));
 }

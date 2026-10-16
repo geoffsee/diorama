@@ -48,6 +48,28 @@ pub const DEFAULT_STORAGE_DIR_NAME: &str = "local-path-storage";
 /// Standard fallback host storage directory when no explicit base path is set.
 pub const DEFAULT_BASE_STORAGE_PATH: &str = "/var/lib/diorama/local-path-storage";
 
+/// Default whether the `StorageClass` allows volume expansion.
+pub const DEFAULT_ALLOW_VOLUME_EXPANSION: bool = true;
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Standard finalizer for PVC protection against deletion while in use.
+pub const PVC_PROTECTION_FINALIZER: &str = "kubernetes.io/pvc-protection";
+
+/// Standard finalizer for PV protection against deletion while bound or in use.
+pub const PV_PROTECTION_FINALIZER: &str = "kubernetes.io/pv-protection";
+
+/// Standard annotation set on PVC when a consumer Pod is scheduled to a node.
+pub const VOLUME_SELECTED_NODE_ANNOTATION: &str = "volume.kubernetes.io/selected-node";
+
+/// Standard annotation set on dynamically provisioned `PersistentVolumes`.
+pub const STORAGE_PROVISIONED_BY_ANNOTATION: &str = "pv.kubernetes.io/provisioned-by";
+
+/// Standard annotation for marking default `StorageClass`.
+pub const IS_DEFAULT_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
+
 /// Default `PersistentVolume` reclaim policy for the `local-path` `StorageClass`.
 pub const DEFAULT_RECLAIM_POLICY: &str = "Retain";
 
@@ -87,6 +109,7 @@ pub const DEFAULT_TEARDOWN_SCRIPT: &str = "#!/bin/sh\nset -eu\nrm -rf \"$VOL_DIR
 /// Storage configuration for local-path provisioner and `StorageClass` generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct LocalPathConfig {
     /// Whether local-path storage component is enabled (defaults to true per D04).
     pub enabled: bool,
@@ -113,6 +136,14 @@ pub struct LocalPathConfig {
     /// Whether to mark this class as the default `StorageClass`.
     pub default_class: bool,
 
+    /// Whether volume expansion is allowed for this `StorageClass`.
+    #[serde(default = "default_true")]
+    pub allow_volume_expansion: bool,
+
+    /// Whether CSI resources (`CSIDriver`, etc.) are reconciled.
+    #[serde(default = "default_true")]
+    pub csi_enabled: bool,
+
     /// Timeout for deployment readiness polling.
     #[serde(default = "default_readiness_timeout")]
     pub readiness_timeout: Duration,
@@ -129,6 +160,8 @@ impl Default for LocalPathConfig {
             reclaim_policy: DEFAULT_RECLAIM_POLICY.to_string(),
             volume_binding_mode: DEFAULT_VOLUME_BINDING_MODE.to_string(),
             default_class: true,
+            allow_volume_expansion: DEFAULT_ALLOW_VOLUME_EXPANSION,
+            csi_enabled: true,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
     }
@@ -207,6 +240,20 @@ impl LocalPathConfig {
         self
     }
 
+    /// Set whether volume expansion is allowed.
+    #[must_use]
+    pub fn with_allow_volume_expansion(mut self, allow: bool) -> Self {
+        self.allow_volume_expansion = allow;
+        self
+    }
+
+    /// Set whether CSI resources (`CSIDriver`, etc.) are reconciled.
+    #[must_use]
+    pub fn with_csi_enabled(mut self, enabled: bool) -> Self {
+        self.csi_enabled = enabled;
+        self
+    }
+
     /// Construct `LocalPathConfig` from a cluster-wide `diorama_config::Config`.
     #[must_use]
     pub fn from_diorama_config(config: &diorama_config::Config) -> Self {
@@ -230,6 +277,8 @@ impl LocalPathConfig {
             reclaim_policy: DEFAULT_RECLAIM_POLICY.to_string(),
             volume_binding_mode: DEFAULT_VOLUME_BINDING_MODE.to_string(),
             default_class: true,
+            allow_volume_expansion: DEFAULT_ALLOW_VOLUME_EXPANSION,
+            csi_enabled: true,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
     }
