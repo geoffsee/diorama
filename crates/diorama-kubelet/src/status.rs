@@ -15,6 +15,33 @@ pub struct CpuAssignment {
     pub exclusive: bool,
 }
 
+/// Status of an in-place pod vertical scaling / resize operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PodResizeStatus {
+    Proposed,
+    InProgress,
+    Deferred,
+    Infeasible,
+}
+
+impl PodResizeStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proposed => "Proposed",
+            Self::InProgress => "InProgress",
+            Self::Deferred => "Deferred",
+            Self::Infeasible => "Infeasible",
+        }
+    }
+}
+
+impl std::fmt::Display for PodResizeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Everything the status builder needs about one spec container.
 #[derive(Debug, Clone)]
 pub struct ContainerView<'a> {
@@ -131,16 +158,32 @@ pub fn pod_status(
         PodQoSClass::BestEffort => "BestEffort",
     };
     let pod_ip = pod_ip.filter(|ip| !ip.is_empty()).unwrap_or(node_ip);
+    let pod_ips =
+        if let Some(existing_ips) = pod.pointer("/status/podIPs").and_then(Value::as_array) {
+            if !existing_ips.is_empty()
+                && existing_ips[0].get("ip").and_then(Value::as_str) == Some(pod_ip)
+            {
+                existing_ips.clone()
+            } else {
+                vec![json!({ "ip": pod_ip })]
+            }
+        } else {
+            vec![json!({ "ip": pod_ip })]
+        };
     let mut status = json!({
         "phase": phase,
         "qosClass": qos,
         "hostIP": node_ip,
+        "hostIPs": [{ "ip": node_ip }],
         "podIP": pod_ip,
-        "podIPs": [{ "ip": pod_ip }],
+        "podIPs": pod_ips,
         "startTime": start_time,
         "conditions": conditions,
         "containerStatuses": container_statuses
     });
+    if let Some(resize_status) = determine_resize_status(pod, &container_statuses) {
+        status["resize"] = json!(resize_status.as_str());
+    }
     let has_spec_inits = pod
         .pointer("/spec/initContainers")
         .and_then(Value::as_array)
@@ -464,10 +507,26 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
         "phase": "Pending",
         "qosClass": qos,
         "hostIP": node_ip,
+        "hostIPs": [{ "ip": node_ip }],
         "startTime": pod.pointer("/status/startTime").cloned().unwrap_or_else(|| json!(now_rfc3339())),
         "conditions": observed_conditions(pod, "Pending", &unready, false, !has_inits, &unready_inits),
         "containerStatuses": statuses
     });
+    if let Some(pip) = pod
+        .pointer("/status/podIP")
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty())
+    {
+        status["podIP"] = json!(pip);
+        if let Some(pips) = pod.pointer("/status/podIPs").cloned() {
+            status["podIPs"] = pips;
+        } else {
+            status["podIPs"] = json!([{ "ip": pip }]);
+        }
+    }
+    if let Some(resize_status) = determine_resize_status(pod, &statuses) {
+        status["resize"] = json!(resize_status.as_str());
+    }
     if has_inits {
         status["initContainerStatuses"] = json!(init_statuses);
     }
@@ -495,4 +554,226 @@ pub fn attempts_by_name(
         attempts.sort_by_key(|s| attempt_of(s));
     }
     map
+}
+
+/// Evaluates in-place pod resize status by comparing spec container resources
+/// with reported container resources and allocatedResources.
+#[must_use]
+pub fn determine_resize_status(
+    pod: &Value,
+    container_statuses: &[Value],
+) -> Option<PodResizeStatus> {
+    let existing_resize = pod.pointer("/status/resize").and_then(Value::as_str);
+
+    let spec_containers = pod.pointer("/spec/containers").and_then(Value::as_array)?;
+    let mut any_pending = false;
+
+    for spec_c in spec_containers {
+        let name = spec_c.get("name").and_then(Value::as_str).unwrap_or("");
+        let spec_res = spec_c.get("resources");
+        let reported_c = container_statuses
+            .iter()
+            .find(|s| s["name"].as_str() == Some(name));
+        let reported_res = reported_c.and_then(|s| s.get("resources"));
+
+        if let Some(spec_res_obj) = spec_res.and_then(Value::as_object)
+            && !spec_res_obj.is_empty()
+            && spec_res != reported_res
+        {
+            any_pending = true;
+            break;
+        }
+    }
+
+    if !any_pending {
+        return None;
+    }
+
+    match existing_resize {
+        Some("Infeasible") => Some(PodResizeStatus::Infeasible),
+        Some("Deferred") => Some(PodResizeStatus::Deferred),
+        _ => Some(PodResizeStatus::InProgress),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_observed_conditions_sandbox_and_inits() {
+        let pod = json!({
+            "metadata": { "name": "test-pod" },
+            "spec": { "containers": [{ "name": "app" }] }
+        });
+
+        // Sandbox ready = false, inits complete = false
+        let conds = observed_conditions(&pod, "Pending", &["app"], false, false, &["init-1"]);
+        let cond_map: BTreeMap<String, String> = conds
+            .iter()
+            .map(|c| {
+                (
+                    c["type"].as_str().unwrap().to_string(),
+                    c["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(cond_map["PodReadyToStartContainers"], "False");
+        assert_eq!(cond_map["Initialized"], "False");
+        assert_eq!(cond_map["Ready"], "False");
+        assert_eq!(cond_map["ContainersReady"], "False");
+        assert_eq!(cond_map["PodScheduled"], "True");
+
+        // Sandbox ready = true, inits complete = true, unready = empty
+        let conds_ready = observed_conditions(&pod, "Running", &[], true, true, &[]);
+        let cond_map_ready: BTreeMap<String, String> = conds_ready
+            .iter()
+            .map(|c| {
+                (
+                    c["type"].as_str().unwrap().to_string(),
+                    c["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(cond_map_ready["PodReadyToStartContainers"], "True");
+        assert_eq!(cond_map_ready["Initialized"], "True");
+        assert_eq!(cond_map_ready["Ready"], "True");
+        assert_eq!(cond_map_ready["ContainersReady"], "True");
+    }
+
+    #[test]
+    fn test_observed_conditions_terminal_phase() {
+        let pod = json!({});
+        let conds = observed_conditions(&pod, "Succeeded", &[], true, true, &[]);
+        let ready_cond = conds.iter().find(|c| c["type"] == "Ready").unwrap();
+        assert_eq!(ready_cond["status"], "False");
+        assert_eq!(ready_cond["reason"], "PodCompleted");
+    }
+
+    #[test]
+    fn test_pod_status_ip_and_qos() {
+        let pod = json!({
+            "metadata": { "name": "qos-pod" },
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "limits": { "cpu": "1", "memory": "256Mi" },
+                        "requests": { "cpu": "1", "memory": "256Mi" }
+                    }
+                }]
+            }
+        });
+
+        let views = PodViews::default();
+        let status = pod_status(
+            &pod,
+            "mock",
+            "192.168.1.10",
+            Some("10.244.0.15"),
+            true,
+            RestartPolicy::Always,
+            views,
+        );
+
+        assert_eq!(status["qosClass"], "Guaranteed");
+        assert_eq!(status["hostIP"], "192.168.1.10");
+        assert_eq!(status["hostIPs"], json!([{ "ip": "192.168.1.10" }]));
+        assert_eq!(status["podIP"], "10.244.0.15");
+        assert_eq!(status["podIPs"], json!([{ "ip": "10.244.0.15" }]));
+        assert!(status["startTime"].is_string());
+    }
+
+    #[test]
+    fn test_pending_status_preserves_start_time_and_ips() {
+        let pod = json!({
+            "metadata": { "name": "pending-pod" },
+            "spec": {
+                "containers": [{ "name": "app" }]
+            },
+            "status": {
+                "startTime": "2026-10-15T12:00:00Z",
+                "podIP": "10.244.1.20",
+                "podIPs": [{ "ip": "10.244.1.20" }, { "ip": "fd00::20" }]
+            }
+        });
+
+        let status = pending_status(&pod, "192.168.1.5", "ContainerCreating", None);
+        assert_eq!(status["phase"], "Pending");
+        assert_eq!(status["startTime"], "2026-10-15T12:00:00Z");
+        assert_eq!(status["hostIP"], "192.168.1.5");
+        assert_eq!(status["hostIPs"], json!([{ "ip": "192.168.1.5" }]));
+        assert_eq!(status["podIP"], "10.244.1.20");
+        assert_eq!(
+            status["podIPs"],
+            json!([{ "ip": "10.244.1.20" }, { "ip": "fd00::20" }])
+        );
+    }
+
+    #[test]
+    fn test_in_place_resize_status_transitions() {
+        let spec_pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "worker",
+                    "resources": {
+                        "requests": { "cpu": "2", "memory": "512Mi" }
+                    }
+                }]
+            }
+        });
+
+        // 1. Initial / matching container status: resize should be None
+        let container_statuses_matching = vec![json!({
+            "name": "worker",
+            "resources": {
+                "requests": { "cpu": "2", "memory": "512Mi" }
+            },
+            "allocatedResources": { "cpu": "2", "memory": "512Mi" }
+        })];
+        assert_eq!(
+            determine_resize_status(&spec_pod, &container_statuses_matching),
+            None
+        );
+
+        // 2. Unmatched resources without existing status.resize defaults to InProgress
+        let container_statuses_old = vec![json!({
+            "name": "worker",
+            "resources": {
+                "requests": { "cpu": "1", "memory": "256Mi" }
+            },
+            "allocatedResources": { "cpu": "1", "memory": "256Mi" }
+        })];
+        assert_eq!(
+            determine_resize_status(&spec_pod, &container_statuses_old),
+            Some(PodResizeStatus::InProgress)
+        );
+
+        // 3. Proposed transitions to InProgress
+        let mut pod_proposed = spec_pod.clone();
+        pod_proposed["status"] = json!({ "resize": "Proposed" });
+        assert_eq!(
+            determine_resize_status(&pod_proposed, &container_statuses_old),
+            Some(PodResizeStatus::InProgress)
+        );
+
+        // 4. Deferred is preserved
+        let mut pod_deferred = spec_pod.clone();
+        pod_deferred["status"] = json!({ "resize": "Deferred" });
+        assert_eq!(
+            determine_resize_status(&pod_deferred, &container_statuses_old),
+            Some(PodResizeStatus::Deferred)
+        );
+
+        // 5. Infeasible is preserved
+        let mut pod_infeasible = spec_pod.clone();
+        pod_infeasible["status"] = json!({ "resize": "Infeasible" });
+        assert_eq!(
+            determine_resize_status(&pod_infeasible, &container_statuses_old),
+            Some(PodResizeStatus::Infeasible)
+        );
+    }
 }

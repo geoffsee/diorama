@@ -2,8 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::KubeletError;
+use crate::workload::cri;
 
 /// Supported Cgroup versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,9 +445,246 @@ fn enable_subtree_controllers(
     }
 }
 
+/// Effective security context attributes resolved across pod and container layers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveSecurityContext {
+    pub run_as_user: Option<i64>,
+    pub run_as_group: Option<i64>,
+    pub run_as_non_root: bool,
+    pub supplemental_groups: Vec<i64>,
+    pub fs_group: Option<i64>,
+    pub read_only_root_filesystem: bool,
+    pub privileged: bool,
+    pub allow_privilege_escalation: Option<bool>,
+    pub capabilities_add: Vec<String>,
+    pub capabilities_drop: Vec<String>,
+    pub sysctls: Vec<(String, String)>,
+    pub seccomp_profile_type: Option<String>,
+    pub seccomp_localhost_profile: Option<String>,
+}
+
+fn parse_non_negative_id(val: Option<&Value>, field: &str) -> Result<Option<i64>, KubeletError> {
+    let Some(v) = val else { return Ok(None) };
+    if let Some(n) = v.as_i64() {
+        if n < 0 {
+            return Err(KubeletError::InvalidConfiguration {
+                field: field.to_string(),
+                reason: format!("{field} cannot be negative: {n}"),
+            });
+        }
+        return Ok(Some(n));
+    }
+    Ok(None)
+}
+
+fn extract_capabilities(container_sc: Option<&Value>) -> (Vec<String>, Vec<String>) {
+    let mut add = Vec::new();
+    let mut drop = Vec::new();
+    if let Some(caps) = container_sc.and_then(|sc| sc.get("capabilities")) {
+        if let Some(add_arr) = caps.get("add").and_then(Value::as_array) {
+            add.extend(
+                add_arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+        if let Some(drop_arr) = caps.get("drop").and_then(Value::as_array) {
+            drop.extend(
+                drop_arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    (add, drop)
+}
+
+fn extract_sysctls(pod_sc: Option<&Value>) -> Vec<(String, String)> {
+    let mut sysctls = Vec::new();
+    if let Some(arr) = pod_sc
+        .and_then(|sc| sc.get("sysctls"))
+        .and_then(Value::as_array)
+    {
+        for s in arr {
+            if let (Some(name), Some(val)) = (
+                s.get("name").and_then(Value::as_str),
+                s.get("value").and_then(Value::as_str),
+            ) {
+                sysctls.push((name.to_string(), val.to_string()));
+            }
+        }
+    }
+    sysctls
+}
+
+impl EffectiveSecurityContext {
+    /// Resolves and validates the effective security context for a container within a pod.
+    ///
+    /// Container-level settings take precedence over pod-level defaults.
+    /// Returns `Err(KubeletError::InvalidConfiguration)` if constraints such as
+    /// `runAsNonRoot` are violated or if negative IDs are specified.
+    pub fn resolve(pod: &Value, container: &Value) -> Result<Self, KubeletError> {
+        let pod_sc = pod.pointer("/spec/securityContext");
+        let container_sc = container.get("securityContext");
+
+        let run_as_user = match parse_non_negative_id(
+            container_sc.and_then(|sc| sc.get("runAsUser")),
+            "securityContext.runAsUser",
+        )? {
+            Some(u) => Some(u),
+            None => parse_non_negative_id(
+                pod_sc.and_then(|sc| sc.get("runAsUser")),
+                "securityContext.runAsUser",
+            )?,
+        };
+
+        let run_as_group = match parse_non_negative_id(
+            container_sc.and_then(|sc| sc.get("runAsGroup")),
+            "securityContext.runAsGroup",
+        )? {
+            Some(g) => Some(g),
+            None => parse_non_negative_id(
+                pod_sc.and_then(|sc| sc.get("runAsGroup")),
+                "securityContext.runAsGroup",
+            )?,
+        };
+
+        let run_as_non_root = container_sc
+            .and_then(|sc| sc.get("runAsNonRoot"))
+            .or_else(|| pod_sc.and_then(|sc| sc.get("runAsNonRoot")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if run_as_non_root && run_as_user == Some(0) {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "securityContext.runAsNonRoot".to_string(),
+                reason: "container would run as root (UID 0)".to_string(),
+            });
+        }
+
+        let fs_group = parse_non_negative_id(
+            pod_sc.and_then(|sc| sc.get("fsGroup")),
+            "securityContext.fsGroup",
+        )?;
+
+        let mut supplemental_groups = Vec::new();
+        if let Some(arr) = pod_sc
+            .and_then(|sc| sc.get("supplementalGroups"))
+            .and_then(Value::as_array)
+        {
+            for g in arr {
+                if let Some(gid) =
+                    parse_non_negative_id(Some(g), "securityContext.supplementalGroups")?
+                    && !supplemental_groups.contains(&gid)
+                {
+                    supplemental_groups.push(gid);
+                }
+            }
+        }
+        if let Some(fsg) = fs_group
+            && !supplemental_groups.contains(&fsg)
+        {
+            supplemental_groups.push(fsg);
+        }
+
+        let read_only_root_filesystem = container_sc
+            .and_then(|sc| sc.get("readOnlyRootFilesystem"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let privileged = container_sc
+            .and_then(|sc| sc.get("privileged"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let allow_privilege_escalation = container_sc
+            .and_then(|sc| sc.get("allowPrivilegeEscalation"))
+            .and_then(Value::as_bool);
+
+        let (capabilities_add, capabilities_drop) = extract_capabilities(container_sc);
+        let sysctls = extract_sysctls(pod_sc);
+
+        let seccomp = container_sc
+            .and_then(|sc| sc.get("seccompProfile"))
+            .or_else(|| pod_sc.and_then(|sc| sc.get("seccompProfile")));
+        let seccomp_profile_type = seccomp
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let seccomp_localhost_profile = seccomp
+            .and_then(|p| p.get("localhostProfile"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        Ok(Self {
+            run_as_user,
+            run_as_group,
+            run_as_non_root,
+            supplemental_groups,
+            fs_group,
+            read_only_root_filesystem,
+            privileged,
+            allow_privilege_escalation,
+            capabilities_add,
+            capabilities_drop,
+            sysctls,
+            seccomp_profile_type,
+            seccomp_localhost_profile,
+        })
+    }
+
+    /// Converts into CRI `LinuxContainerSecurityContext`.
+    #[must_use]
+    pub fn to_cri_security_context(&self) -> Option<cri::LinuxContainerSecurityContext> {
+        let has_any = self.run_as_user.is_some()
+            || self.run_as_group.is_some()
+            || !self.supplemental_groups.is_empty()
+            || self.privileged
+            || self.read_only_root_filesystem
+            || !self.capabilities_add.is_empty()
+            || !self.capabilities_drop.is_empty();
+
+        if !has_any {
+            return None;
+        }
+
+        let run_as_user = self.run_as_user.map(|uid| cri::Int64Value { value: uid });
+        let run_as_group = self.run_as_group.map(|gid| cri::Int64Value { value: gid });
+        let capabilities = if self.capabilities_add.is_empty() && self.capabilities_drop.is_empty()
+        {
+            None
+        } else {
+            Some(cri::Capability {
+                add_capabilities: self.capabilities_add.clone(),
+                drop_capabilities: self.capabilities_drop.clone(),
+                ..cri::Capability::default()
+            })
+        };
+
+        let mut sc = cri::LinuxContainerSecurityContext {
+            run_as_user,
+            run_as_group,
+            supplemental_groups: self.supplemental_groups.clone(),
+            privileged: self.privileged,
+            readonly_rootfs: self.read_only_root_filesystem,
+            capabilities,
+            no_new_privs: self.allow_privilege_escalation.is_some_and(|esc| !esc),
+            ..cri::LinuxContainerSecurityContext::default()
+        };
+        #[allow(deprecated)]
+        {
+            sc.seccomp_profile_path = self.seccomp_localhost_profile.clone().unwrap_or_default();
+        }
+        Some(sc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_prepare_pod_egress_when_host_mutations_disallowed() {
@@ -467,5 +706,100 @@ mod tests {
         let result = env.prepare_pod_egress("10.42.0.0/16").unwrap();
         assert_eq!(result, Some(diorama_network::MasqueradeBackend::IpTables));
         assert!(env.is_snat_ready());
+    }
+
+    #[test]
+    fn test_security_context_override_and_effective_ids() {
+        let pod = json!({
+            "spec": {
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "runAsGroup": 1000,
+                    "fsGroup": 2000,
+                    "supplementalGroups": [3000]
+                }
+            }
+        });
+        let container = json!({
+            "securityContext": {
+                "runAsUser": 1001,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {
+                    "add": ["NET_ADMIN"],
+                    "drop": ["ALL"]
+                }
+            }
+        });
+
+        let effective = EffectiveSecurityContext::resolve(&pod, &container).unwrap();
+        // Container overrides pod runAsUser (1001 vs 1000)
+        assert_eq!(effective.run_as_user, Some(1001));
+        // Container inherits pod runAsGroup (1000)
+        assert_eq!(effective.run_as_group, Some(1000));
+        assert_eq!(effective.fs_group, Some(2000));
+        // Supplemental groups include both 3000 and fsGroup 2000
+        assert_eq!(effective.supplemental_groups, vec![3000, 2000]);
+        assert!(effective.read_only_root_filesystem);
+        assert_eq!(effective.capabilities_add, vec!["NET_ADMIN".to_string()]);
+        assert_eq!(effective.capabilities_drop, vec!["ALL".to_string()]);
+
+        let cri_sc = effective.to_cri_security_context().unwrap();
+        assert_eq!(cri_sc.run_as_user.unwrap().value, 1001);
+        assert_eq!(cri_sc.run_as_group.unwrap().value, 1000);
+        assert!(cri_sc.readonly_rootfs);
+    }
+
+    #[test]
+    fn test_security_context_run_as_non_root_validation() {
+        let pod = json!({
+            "spec": {
+                "securityContext": { "runAsNonRoot": true }
+            }
+        });
+
+        // UID 0 with runAsNonRoot must fail
+        let container_root = json!({
+            "securityContext": { "runAsUser": 0 }
+        });
+        assert!(EffectiveSecurityContext::resolve(&pod, &container_root).is_err());
+
+        // Non-root UID must succeed
+        let container_non_root = json!({
+            "securityContext": { "runAsUser": 1000 }
+        });
+        assert!(EffectiveSecurityContext::resolve(&pod, &container_non_root).is_ok());
+
+        // Negative UID must fail
+        let container_negative = json!({
+            "securityContext": { "runAsUser": -1 }
+        });
+        assert!(EffectiveSecurityContext::resolve(&pod, &container_negative).is_err());
+    }
+
+    #[test]
+    fn test_security_context_sysctls_and_seccomp() {
+        let pod = json!({
+            "spec": {
+                "securityContext": {
+                    "sysctls": [
+                        { "name": "net.ipv4.ip_forward", "value": "1" }
+                    ],
+                    "seccompProfile": {
+                        "type": "RuntimeDefault"
+                    }
+                }
+            }
+        });
+        let container = json!({});
+
+        let effective = EffectiveSecurityContext::resolve(&pod, &container).unwrap();
+        assert_eq!(
+            effective.sysctls,
+            vec![("net.ipv4.ip_forward".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            effective.seccomp_profile_type.as_deref(),
+            Some("RuntimeDefault")
+        );
     }
 }
