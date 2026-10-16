@@ -21,9 +21,56 @@ pub struct CniOrderingInspection {
 }
 
 /// Generates the standard CNI configuration data structure.
+///
+/// Supports single IPv4 CIDR, comma-separated dual-stack CIDRs, or defaults to `DEFAULT_POD_CIDR`.
 #[must_use]
 pub fn generate_cni_config(mtu: u32, pod_cidr: Option<&str>) -> serde_json::Value {
-    let subnet = pod_cidr.unwrap_or(DEFAULT_POD_CIDR);
+    let subnet_input = pod_cidr.unwrap_or(DEFAULT_POD_CIDR);
+    let cidrs: Vec<&str> = subnet_input
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    generate_cni_config_from_cidrs(mtu, &cidrs)
+}
+
+/// Generates dual-stack CNI configuration with explicit IPv4 and optional IPv6 CIDR.
+#[must_use]
+pub fn generate_cni_config_dual_stack(
+    mtu: u32,
+    ipv4_cidr: Option<&str>,
+    ipv6_cidr: Option<&str>,
+) -> serde_json::Value {
+    let mut cidrs = Vec::new();
+    let v4 = ipv4_cidr.unwrap_or(DEFAULT_POD_CIDR);
+    cidrs.push(v4);
+    if let Some(v6) = ipv6_cidr {
+        cidrs.push(v6);
+    }
+    generate_cni_config_from_cidrs(mtu, &cidrs)
+}
+
+/// Generates CNI configuration from a slice of CIDR subnets (IPv4 and/or IPv6).
+#[must_use]
+pub fn generate_cni_config_from_cidrs(mtu: u32, cidrs: &[&str]) -> serde_json::Value {
+    let mut ranges = Vec::new();
+    let mut routes = Vec::new();
+
+    let effective_cidrs = if cidrs.is_empty() {
+        vec![DEFAULT_POD_CIDR]
+    } else {
+        cidrs.to_vec()
+    };
+
+    for cidr in effective_cidrs {
+        ranges.push(vec![serde_json::json!({ "subnet": cidr })]);
+        if cidr.contains(':') {
+            routes.push(serde_json::json!({ "dst": "::/0" }));
+        } else {
+            routes.push(serde_json::json!({ "dst": "0.0.0.0/0" }));
+        }
+    }
+
     serde_json::json!({
         "cniVersion": "1.0.0",
         "name": "kubesolo-net",
@@ -41,18 +88,8 @@ pub fn generate_cni_config(mtu: u32, pod_cidr: Option<&str>) -> serde_json::Valu
                 },
                 "ipam": {
                     "type": "host-local",
-                    "ranges": [
-                        [
-                            {
-                                "subnet": subnet
-                            }
-                        ]
-                    ],
-                    "routes": [
-                        {
-                            "dst": "0.0.0.0/0"
-                        }
-                    ]
+                    "ranges": ranges,
+                    "routes": routes
                 }
             },
             {
@@ -360,6 +397,32 @@ mod tests {
             value["plugins"][0]["ipam"]["ranges"][0][0]["subnet"],
             "10.244.0.0/16"
         );
+    }
+
+    #[test]
+    fn test_generate_cni_config_dual_stack() {
+        let value =
+            generate_cni_config_dual_stack(1500, Some("10.42.0.0/16"), Some("fd00:10:42::/64"));
+        let plugins = value["plugins"].as_array().expect("plugins array");
+        let bridge = &plugins[0];
+
+        assert_eq!(bridge["hairpinMode"], true);
+        assert_eq!(bridge["isGateway"], true);
+        assert_eq!(bridge["ipMasq"], false);
+
+        let ranges = bridge["ipam"]["ranges"].as_array().expect("ranges array");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0][0]["subnet"], "10.42.0.0/16");
+        assert_eq!(ranges[1][0]["subnet"], "fd00:10:42::/64");
+
+        let routes = bridge["ipam"]["routes"].as_array().expect("routes array");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0]["dst"], "0.0.0.0/0");
+        assert_eq!(routes[1]["dst"], "::/0");
+
+        // Comma-separated also works identically
+        let value_csv = generate_cni_config(1500, Some("10.42.0.0/16, fd00:10:42::/64"));
+        assert_eq!(value, value_csv);
     }
 
     #[test]

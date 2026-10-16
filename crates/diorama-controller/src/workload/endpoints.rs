@@ -109,8 +109,18 @@ impl EndpointsReconciler {
             return Ok(None);
         }
 
+        let publish_not_ready = service
+            .pointer("/spec/publishNotReadyAddresses")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                service
+                    .pointer("/metadata/annotations/service.alpha.kubernetes.io~1tolerate-unready-endpoints")
+                    .and_then(Value::as_str)
+                    == Some("true")
+            });
+
         let (ready_addrs, not_ready_addrs, matching_pods) = self
-            .extract_matching_pod_addresses(namespace, selector)
+            .extract_matching_pod_addresses(namespace, selector, publish_not_ready)
             .await?;
         let subsets = build_subsets(service, &ready_addrs, &not_ready_addrs, &matching_pods);
 
@@ -145,6 +155,7 @@ impl EndpointsReconciler {
         &self,
         namespace: &str,
         selector: &Map<String, Value>,
+        publish_not_ready: bool,
     ) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>), ControllerError> {
         let pod_list = self.client.list_pods(namespace).await.map_err(|e| {
             ControllerError::ReconciliationFailed {
@@ -179,7 +190,9 @@ impl EndpointsReconciler {
                 continue;
             }
 
-            if let Some((addr_obj, is_ready)) = build_endpoint_address(namespace, &pod) {
+            if let Some((addr_obj, is_ready)) =
+                build_endpoint_address(namespace, &pod, publish_not_ready)
+            {
                 if is_ready {
                     ready_addresses.push(addr_obj);
                 } else {
@@ -257,7 +270,21 @@ impl EndpointsReconciler {
     }
 }
 
-fn build_endpoint_address(namespace: &str, pod: &Value) -> Option<(Value, bool)> {
+fn build_endpoint_address(
+    namespace: &str,
+    pod: &Value,
+    publish_not_ready: bool,
+) -> Option<(Value, bool)> {
+    let phase = pod
+        .get("status")
+        .and_then(|s| s.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("Pending");
+
+    if phase == "Failed" || phase == "Succeeded" {
+        return None;
+    }
+
     let pname = pod
         .get("metadata")
         .and_then(|m| m.get("name"))
@@ -285,20 +312,12 @@ fn build_endpoint_address(namespace: &str, pod: &Value) -> Option<(Value, bool)>
                 .and_then(Value::as_str)
         })?;
 
-    let phase = pod
-        .get("status")
-        .and_then(|s| s.get("phase"))
-        .and_then(Value::as_str)
-        .unwrap_or("Pending");
-
     let is_terminating = pod
         .get("metadata")
         .and_then(|m| m.get("deletionTimestamp"))
         .is_some();
 
-    let is_ready = if is_terminating {
-        false
-    } else if let Some(conditions) = pod
+    let has_ready_condition = if let Some(conditions) = pod
         .get("status")
         .and_then(|s| s.get("conditions"))
         .and_then(Value::as_array)
@@ -309,6 +328,14 @@ fn build_endpoint_address(namespace: &str, pod: &Value) -> Option<(Value, bool)>
         })
     } else {
         phase == "Running"
+    };
+
+    let is_ready = if publish_not_ready {
+        true
+    } else if is_terminating {
+        false
+    } else {
+        has_ready_condition
     };
 
     let addr_obj = json!({
@@ -411,7 +438,9 @@ fn extract_service_endpoints_ports(service: &Value, pods: &[Value]) -> Vec<Value
         let mut port_obj = Map::new();
         port_obj.insert("port".to_string(), json!(port_num));
         port_obj.insert("protocol".to_string(), json!(protocol));
-        if let Some(pn) = port_name {
+        if let Some(pn) = port_name
+            && !pn.is_empty()
+        {
             port_obj.insert("name".to_string(), json!(pn));
         }
         if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
@@ -420,4 +449,159 @@ fn extract_service_endpoints_ports(service: &Value, pods: &[Value]) -> Vec<Value
         ports.push(Value::Object(port_obj));
     }
     ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_endpoint_address_ready_and_not_ready() {
+        let ready_pod = json!({
+            "metadata": { "name": "pod-1", "uid": "uid-1" },
+            "spec": { "nodeName": "node-1" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.10",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        let unready_pod = json!({
+            "metadata": { "name": "pod-2", "uid": "uid-2" },
+            "spec": { "nodeName": "node-1" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.11",
+                "conditions": [{ "type": "Ready", "status": "False" }]
+            }
+        });
+        let terminating_pod = json!({
+            "metadata": {
+                "name": "pod-3",
+                "uid": "uid-3",
+                "deletionTimestamp": "2026-10-15T00:00:00Z"
+            },
+            "spec": { "nodeName": "node-1" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.12",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+
+        let (addr1, ready1) = build_endpoint_address("default", &ready_pod, false).expect("pod 1");
+        assert!(ready1);
+        assert_eq!(addr1["ip"], "10.42.0.10");
+
+        let (addr2, ready2) =
+            build_endpoint_address("default", &unready_pod, false).expect("pod 2");
+        assert!(!ready2);
+        assert_eq!(addr2["ip"], "10.42.0.11");
+
+        let (addr3, ready3) =
+            build_endpoint_address("default", &terminating_pod, false).expect("pod 3");
+        assert!(!ready3);
+        assert_eq!(addr3["ip"], "10.42.0.12");
+    }
+
+    #[test]
+    fn test_build_endpoint_address_publish_not_ready_addresses() {
+        let unready_pod = json!({
+            "metadata": { "name": "pod-unready", "uid": "uid-unready" },
+            "spec": { "nodeName": "node-1" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.20",
+                "conditions": [{ "type": "Ready", "status": "False" }]
+            }
+        });
+
+        // When publish_not_ready is true, even unready pods are marked ready
+        let (addr, is_ready) = build_endpoint_address("default", &unready_pod, true).expect("pod");
+        assert!(is_ready);
+        assert_eq!(addr["ip"], "10.42.0.20");
+    }
+
+    #[test]
+    fn test_build_endpoint_address_skips_terminal_pods() {
+        let succeeded_pod = json!({
+            "metadata": { "name": "pod-succeeded", "uid": "uid-s" },
+            "status": { "phase": "Succeeded", "podIP": "10.42.0.30" }
+        });
+        let failed_pod = json!({
+            "metadata": { "name": "pod-failed", "uid": "uid-f" },
+            "status": { "phase": "Failed", "podIP": "10.42.0.31" }
+        });
+
+        assert!(build_endpoint_address("default", &succeeded_pod, false).is_none());
+        assert!(build_endpoint_address("default", &failed_pod, false).is_none());
+    }
+
+    #[test]
+    fn test_build_subsets_partitioning_and_publish_not_ready() {
+        let svc = json!({
+            "metadata": { "name": "svc-test" },
+            "spec": {
+                "ports": [{ "name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP" }]
+            }
+        });
+
+        let ready_addrs = vec![json!({
+            "ip": "10.42.0.50",
+            "targetRef": { "kind": "Pod", "name": "pod-ready", "namespace": "default" }
+        })];
+        let not_ready_addrs = vec![json!({
+            "ip": "10.42.0.51",
+            "targetRef": { "kind": "Pod", "name": "pod-unready", "namespace": "default" }
+        })];
+        let pods = vec![
+            json!({
+                "metadata": { "name": "pod-ready" },
+                "spec": { "containers": [{ "ports": [{ "containerPort": 8080 }] }] }
+            }),
+            json!({
+                "metadata": { "name": "pod-unready" },
+                "spec": { "containers": [{ "ports": [{ "containerPort": 8080 }] }] }
+            }),
+        ];
+
+        let subsets = build_subsets(&svc, &ready_addrs, &not_ready_addrs, &pods);
+        assert_eq!(subsets.len(), 1);
+        let subset = &subsets[0];
+        assert_eq!(subset["addresses"].as_array().unwrap().len(), 1);
+        assert_eq!(subset["notReadyAddresses"].as_array().unwrap().len(), 1);
+        assert_eq!(subset["ports"][0]["port"], 8080);
+        assert_eq!(subset["ports"][0]["name"], "http");
+    }
+
+    #[test]
+    fn test_extract_service_endpoints_ports_named_targetport() {
+        let svc = json!({
+            "metadata": { "name": "svc-named" },
+            "spec": {
+                "ports": [
+                    { "name": "http", "port": 80, "targetPort": "http-web", "protocol": "TCP" },
+                    { "name": "metrics", "port": 9090, "targetPort": 9090, "protocol": "TCP" }
+                ]
+            }
+        });
+        let pods = vec![json!({
+            "metadata": { "name": "pod-named" },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "ports": [
+                        { "name": "http-web", "containerPort": 8088, "protocol": "TCP" }
+                    ]
+                }]
+            }
+        })];
+
+        let ports = extract_service_endpoints_ports(&svc, &pods);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0]["name"], "http");
+        assert_eq!(ports[0]["port"], 8088);
+        assert_eq!(ports[1]["name"], "metrics");
+        assert_eq!(ports[1]["port"], 9090);
+    }
 }
