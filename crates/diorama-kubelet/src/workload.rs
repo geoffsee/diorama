@@ -797,13 +797,35 @@ pub(crate) fn write_volume_file(path: &Path, content: &[u8]) -> std::io::Result<
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // If the file already exists on disk and is read-only (e.g. 0400 from a previous sync pass),
+    // opening it for writing with fs::write fails with PermissionDenied.
+    // Unlinking the existing file or temporarily making it writable ensures re-syncing succeeds.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     std::fs::write(path, content)
 }
 
 /// Applies a Kubernetes file `mode` (decimal, e.g. `420` for `0644`) to a staged file.
 pub(crate) fn chmod_volume_file(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
 }
 
 /// Mount points from `/proc/self/mountinfo` (field 5), with octal escapes decoded.
@@ -854,14 +876,37 @@ pub(crate) fn unmount_tmpfs_under(pod_dir: &Path) {
     }
 }
 
+fn parse_mode_value(v: &Value) -> Option<u32> {
+    if let Some(n) = v.as_u64() {
+        return u32::try_from(n).ok();
+    }
+    if let Some(n) = v.as_i64()
+        && n >= 0
+    {
+        return u32::try_from(n).ok();
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if let Some(oct) = s.strip_prefix("0o") {
+            return u32::from_str_radix(oct, 8).ok();
+        }
+        if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| ('0'..='7').contains(&c)) {
+            return u32::from_str_radix(s, 8).ok();
+        }
+        if let Ok(dec) = s.parse::<u32>() {
+            return Some(dec);
+        }
+    }
+    None
+}
+
 /// Effective mode for one staged file: per-item `mode`, else the volume
 /// `defaultMode`, else the Kubernetes default (`0644` for config/secret data).
 pub(crate) fn volume_file_mode(item: Option<&Value>, vol_spec: &Value) -> u32 {
     item.and_then(|item| item.get("mode"))
         .or_else(|| vol_spec.get("defaultMode"))
-        .and_then(Value::as_u64)
-        .and_then(|mode| u32::try_from(mode).ok())
-        .map_or(0o644, |mode| mode & 0o777)
+        .and_then(parse_mode_value)
+        .map_or(0o644, |mode| mode & 0o7777)
 }
 
 /// Reads `pod.spec.securityContext.fsGroup` as a gid, if valid.
@@ -1372,6 +1417,386 @@ pub(crate) fn stage_projected_downward_api(
     Ok(written)
 }
 
+/// Validates that a volume `subPath` or expanded `subPathExpr` is relative,
+/// contains no path traversal components (`..`), null bytes, or backticks.
+pub fn validate_sub_path(sub_path: &str) -> Result<(), KubeletError> {
+    if sub_path.is_empty() {
+        return Ok(());
+    }
+    if sub_path.contains('\0') {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} contains null bytes"),
+        });
+    }
+    if sub_path.contains('`') {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} must not contain backticks"),
+        });
+    }
+    let path = Path::new(sub_path);
+    if path.is_absolute() || sub_path.starts_with('/') || sub_path.starts_with('\\') {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} must not be an absolute path"),
+        });
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volumeMounts.subPath".to_string(),
+            reason: format!("subPath {sub_path:?} must not contain '..'"),
+        });
+    }
+    Ok(())
+}
+
+/// Expands `$(VAR)` references from a list of environment key-values.
+/// Double `$$` escapes to `$`.
+pub fn expand_k8s_env(input: &str, envs: &[cri::KeyValue]) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len()
+                && bytes[i + 1] == b'('
+                && let Some(rel_end) = input[i + 2..].find(')')
+            {
+                let var_name = &input[i + 2..i + 2 + rel_end];
+                if !var_name.is_empty()
+                    && let Some(kv) = envs.iter().rfind(|kv| kv.key == var_name)
+                {
+                    out.push_str(&String::from_utf8_lossy(&kv.value));
+                } else {
+                    out.push_str(&input[i..=i + 2 + rel_end]);
+                }
+                i += 3 + rel_end;
+                continue;
+            }
+        }
+        let ch = input[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Expands `$(VAR)` references in `expr` from the container's effective environment
+/// and validates the resulting path (rejecting `..`, absolute paths, backticks, etc.).
+pub fn expand_subpath_expr(expr: &str, envs: &[cri::KeyValue]) -> Result<String, KubeletError> {
+    let expanded = expand_k8s_env(expr, envs);
+    validate_sub_path(&expanded)?;
+    Ok(expanded)
+}
+
+/// Expands `$(VAR)` references in `expr` from an environment map.
+pub fn expand_subpath_expr_with_env(
+    expr: &str,
+    envs: &std::collections::BTreeMap<String, String>,
+) -> Result<String, KubeletError> {
+    let kv: Vec<cri::KeyValue> = envs
+        .iter()
+        .map(|(k, v)| cri::KeyValue {
+            key: k.clone(),
+            value: v.as_bytes().to_vec(),
+        })
+        .collect();
+    expand_subpath_expr(expr, &kv)
+}
+
+fn append_cm_key_values(cm: &Value, prefix: &str, envs: &mut Vec<cri::KeyValue>) {
+    if let Some(data) = cm.get("data").and_then(Value::as_object) {
+        for (k, v) in data {
+            if let Some(val_str) = v.as_str() {
+                envs.push(cri::KeyValue {
+                    key: format!("{prefix}{k}"),
+                    value: val_str.as_bytes().to_vec(),
+                });
+            }
+        }
+    }
+}
+
+fn append_sec_key_values(sec: &Value, prefix: &str, envs: &mut Vec<cri::KeyValue>) {
+    if let Some(data) = sec.get("data").and_then(Value::as_object) {
+        for (k, v) in data {
+            if let Some(val_str) = v.as_str() {
+                let decoded = diorama_pki::base64_decode(val_str.trim())
+                    .unwrap_or_else(|_| val_str.as_bytes().to_vec());
+                envs.push(cri::KeyValue {
+                    key: format!("{prefix}{k}"),
+                    value: decoded,
+                });
+            }
+        }
+    }
+    if let Some(sdata) = sec.get("stringData").and_then(Value::as_object) {
+        for (k, v) in sdata {
+            if let Some(val_str) = v.as_str() {
+                envs.push(cri::KeyValue {
+                    key: format!("{prefix}{k}"),
+                    value: val_str.as_bytes().to_vec(),
+                });
+            }
+        }
+    }
+}
+
+fn resolve_env_from_source(
+    env_from: &[Value],
+    configmaps: Option<&BTreeMap<String, Value>>,
+    secrets: Option<&BTreeMap<String, Value>>,
+    container_name: &str,
+    envs: &mut Vec<cri::KeyValue>,
+) -> Result<(), KubeletError> {
+    for source in env_from {
+        let prefix = source.get("prefix").and_then(Value::as_str).unwrap_or("");
+        if let Some(cm_ref) = source.get("configMapRef") {
+            let cm_name = cm_ref.get("name").and_then(Value::as_str).unwrap_or("");
+            let optional = cm_ref
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(cm) = configmaps.and_then(|m| m.get(cm_name)) {
+                append_cm_key_values(cm, prefix, envs);
+            } else if !optional {
+                return Err(KubeletError::InvalidConfiguration {
+                    field: format!("spec.containers[{container_name}].envFrom"),
+                    reason: format!("configMap '{cm_name}' not found"),
+                });
+            }
+        }
+        if let Some(sec_ref) = source.get("secretRef") {
+            let sec_name = sec_ref.get("name").and_then(Value::as_str).unwrap_or("");
+            let optional = sec_ref
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(sec) = secrets.and_then(|m| m.get(sec_name)) {
+                append_sec_key_values(sec, prefix, envs);
+            } else if !optional {
+                return Err(KubeletError::InvalidConfiguration {
+                    field: format!("spec.containers[{container_name}].envFrom"),
+                    reason: format!("secret '{sec_name}' not found"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_single_env_value(
+    entry: &Value,
+    pod: &Value,
+    container_name: &str,
+    namespace: &str,
+    envs: &[cri::KeyValue],
+    configmaps: Option<&BTreeMap<String, Value>>,
+    secrets: Option<&BTreeMap<String, Value>>,
+) -> Result<String, KubeletError> {
+    let key = entry.get("name").and_then(Value::as_str).unwrap_or("");
+    if let Some(val_str) = entry.get("value").and_then(Value::as_str) {
+        return Ok(expand_k8s_env(val_str, envs));
+    }
+    let Some(source) = entry.get("valueFrom") else {
+        return Ok(String::new());
+    };
+
+    if let Some(field_ref) = source.get("fieldRef") {
+        let field_path = field_ref
+            .get("fieldPath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return resolve_downward_field_path(pod, namespace, field_path).ok_or_else(|| {
+            KubeletError::InvalidConfiguration {
+                field: format!("spec.containers[{container_name}].env[{key}]"),
+                reason: format!("fieldRef {field_path} is not supported"),
+            }
+        });
+    }
+
+    if let Some(res_ref) = source.get("resourceFieldRef") {
+        return resolve_downward_resource_field(pod, Some(container_name), res_ref).ok_or_else(
+            || KubeletError::InvalidConfiguration {
+                field: format!("spec.containers[{container_name}].env[{key}]"),
+                reason: "invalid resourceFieldRef".to_string(),
+            },
+        );
+    }
+
+    if let Some(cm_ref) = source.get("configMapKeyRef") {
+        let name = cm_ref.get("name").and_then(Value::as_str).unwrap_or("");
+        let cm_key = cm_ref.get("key").and_then(Value::as_str).unwrap_or("");
+        let optional = cm_ref
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let found = configmaps
+            .and_then(|m| m.get(name))
+            .and_then(|cm| {
+                cm.pointer(&format!("/data/{cm_key}"))
+                    .or_else(|| cm.pointer(&format!("/binaryData/{cm_key}")))
+            })
+            .and_then(Value::as_str);
+        return match (found, optional) {
+            (Some(v), _) => Ok(v.to_string()),
+            (None, true) => Ok(String::new()),
+            (None, false) => Err(KubeletError::InvalidConfiguration {
+                field: format!("spec.containers[{container_name}].env[{key}]"),
+                reason: format!("configMapKeyRef '{name}.{cm_key}' not found"),
+            }),
+        };
+    }
+
+    if let Some(sec_ref) = source.get("secretKeyRef") {
+        let name = sec_ref.get("name").and_then(Value::as_str).unwrap_or("");
+        let sec_key = sec_ref.get("key").and_then(Value::as_str).unwrap_or("");
+        let optional = sec_ref
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sec_obj = secrets.and_then(|m| m.get(name));
+        let val_str = sec_obj.and_then(|s| {
+            if let Some(sd) = s
+                .pointer(&format!("/stringData/{sec_key}"))
+                .and_then(Value::as_str)
+            {
+                Some(sd.to_string())
+            } else if let Some(d) = s
+                .pointer(&format!("/data/{sec_key}"))
+                .and_then(Value::as_str)
+            {
+                let bytes =
+                    diorama_pki::base64_decode(d.trim()).unwrap_or_else(|_| d.as_bytes().to_vec());
+                Some(String::from_utf8_lossy(&bytes).to_string())
+            } else {
+                None
+            }
+        });
+        return match (val_str, optional) {
+            (Some(v), _) => Ok(v),
+            (None, true) => Ok(String::new()),
+            (None, false) => Err(KubeletError::InvalidConfiguration {
+                field: format!("spec.containers[{container_name}].env[{key}]"),
+                reason: format!("secretKeyRef '{name}.{sec_key}' not found"),
+            }),
+        };
+    }
+
+    Ok(String::new())
+}
+
+/// Resolves the effective environment variable list for a container,
+/// honoring `envFrom` (ConfigMap/Secret) and `env` sources (`value` with
+/// variable expansion, `fieldRef`, `resourceFieldRef`, `configMapKeyRef`, `secretKeyRef`).
+pub fn resolve_container_effective_env(
+    pod: &Value,
+    container: &Value,
+    configmaps: Option<&BTreeMap<String, Value>>,
+    secrets: Option<&BTreeMap<String, Value>>,
+) -> Result<Vec<cri::KeyValue>, KubeletError> {
+    let mut envs: Vec<cri::KeyValue> = Vec::new();
+    let namespace = pod
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let container_name = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    if let Some(env_from) = container.get("envFrom").and_then(Value::as_array) {
+        resolve_env_from_source(env_from, configmaps, secrets, container_name, &mut envs)?;
+    }
+
+    if let Some(env_entries) = container.get("env").and_then(Value::as_array) {
+        for entry in env_entries {
+            let Some(key) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let val = resolve_single_env_value(
+                entry,
+                pod,
+                container_name,
+                namespace,
+                &envs,
+                configmaps,
+                secrets,
+            )?;
+            if let Some(existing) = envs.iter_mut().find(|item| item.key == key) {
+                existing.value = val.into_bytes();
+            } else {
+                envs.push(cri::KeyValue {
+                    key: key.to_string(),
+                    value: val.into_bytes(),
+                });
+            }
+        }
+    }
+
+    Ok(envs)
+}
+
+/// Prepares a host volume subpath directory or file under `vol_dir`.
+/// Validates the subpath, cleans up any stale broken symlinks or conflicting
+/// artifacts from prior failed states, and ensures the target directory path exists.
+pub fn prepare_subpath_target(vol_dir: &Path, sub_path: &str) -> Result<PathBuf, KubeletError> {
+    validate_sub_path(sub_path)?;
+    if sub_path.is_empty() {
+        return Ok(vol_dir.to_path_buf());
+    }
+    let target = vol_dir.join(sub_path);
+
+    // If target exists as a symlink (stale or broken), remove it so recovery can create the real path.
+    if let Ok(meta) = std::fs::symlink_metadata(&target)
+        && meta.file_type().is_symlink()
+    {
+        let _ = std::fs::remove_file(&target);
+    }
+
+    // If target doesn't exist, create it as a directory.
+    if !target.exists() {
+        std::fs::create_dir_all(&target).map_err(KubeletError::Io)?;
+    }
+
+    Ok(target)
+}
+
+/// Expands `sub_path_expr` against `envs`, validates the resulting path,
+/// and prepares the host directory under `vol_dir`, cleanly recovering from
+/// any previous failed state.
+pub fn resolve_and_prepare_subpath(
+    vol_dir: &Path,
+    sub_path_expr: &str,
+    envs: &[cri::KeyValue],
+) -> Result<PathBuf, KubeletError> {
+    let sub_path = expand_subpath_expr(sub_path_expr, envs)?;
+    prepare_subpath_target(vol_dir, &sub_path)
+}
+
+/// Resolves effective environment variables for `container` in `pod`,
+/// expands `sub_path_expr`, and prepares the host directory under `vol_dir`.
+pub fn resolve_and_prepare_container_subpath(
+    vol_dir: &Path,
+    pod: &Value,
+    container: &Value,
+    sub_path_expr: &str,
+    configmaps: Option<&BTreeMap<String, Value>>,
+    secrets: Option<&BTreeMap<String, Value>>,
+) -> Result<PathBuf, KubeletError> {
+    let envs = resolve_container_effective_env(pod, container, configmaps, secrets)?;
+    resolve_and_prepare_subpath(vol_dir, sub_path_expr, &envs)
+}
+
 pub(crate) fn check_pod_restart_need(
     pod: &Value,
     node_name: &str,
@@ -1482,5 +1907,281 @@ mod tests {
         // The root already carries the group, so no chown walk runs.
         apply_fs_group_ownership(&dir, gid).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn downwardapi_volume_default_mode_and_resync_read_only() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("diorama-dwmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pod = json!({
+            "metadata": {
+                "name": "mode-pod-initial",
+                "namespace": "default",
+                "labels": { "app": "demo" }
+            }
+        });
+
+        // 256 in decimal is 0o400; 384 in decimal is 0o600.
+        let dw_spec = json!({
+            "defaultMode": 256,
+            "items": [
+                {
+                    "path": "pod-name",
+                    "fieldRef": { "fieldPath": "metadata.name" }
+                },
+                {
+                    "path": "custom-mode",
+                    "fieldRef": { "fieldPath": "metadata.labels['app']" },
+                    "mode": 384
+                }
+            ]
+        });
+
+        let items = dw_spec["items"].as_array().unwrap();
+
+        // Pass 1: Staging creates files with 0o400 and 0o600
+        let staged1 = super::stage_projected_downward_api(&dir, "default", &pod, items, &dw_spec)
+            .expect("pass 1 stage should succeed");
+
+        assert_eq!(staged1.len(), 2);
+        let path1 = dir.join("pod-name");
+        let path2 = dir.join("custom-mode");
+
+        assert_eq!(std::fs::read_to_string(&path1).unwrap(), "mode-pod-initial");
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), "demo");
+
+        #[cfg(unix)]
+        {
+            let meta1 = std::fs::metadata(&path1).unwrap();
+            assert_eq!(meta1.permissions().mode() & 0o777, 0o400);
+
+            let meta2 = std::fs::metadata(&path2).unwrap();
+            assert_eq!(meta2.permissions().mode() & 0o777, 0o600);
+        }
+
+        // Pass 2: Re-syncing while path1 is 0o400 on disk MUST NOT fail with PermissionDenied
+        let updated_pod = json!({
+            "metadata": {
+                "name": "mode-pod-updated",
+                "namespace": "default",
+                "labels": { "app": "demo-v2" }
+            }
+        });
+
+        let staged2 =
+            super::stage_projected_downward_api(&dir, "default", &updated_pod, items, &dw_spec)
+                .expect("pass 2 re-sync with 0400 files on disk should succeed");
+
+        assert_eq!(staged2.len(), 2);
+        assert_eq!(std::fs::read_to_string(&path1).unwrap(), "mode-pod-updated");
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), "demo-v2");
+
+        #[cfg(unix)]
+        {
+            let meta1_post = std::fs::metadata(&path1).unwrap();
+            assert_eq!(meta1_post.permissions().mode() & 0o777, 0o400);
+        }
+
+        // Also test Secret and ConfigMap re-syncing with defaultMode 256
+        let sec_spec = json!({ "defaultMode": 256 });
+        let sec_obj = json!({
+            "data": { "token": "aW5pdGlhbA==" } // "initial"
+        });
+        let sec_files = super::stage_secret_files(&dir, &sec_spec, &sec_obj).unwrap();
+        assert_eq!(sec_files.len(), 1);
+        #[cfg(unix)]
+        {
+            let sec_meta = std::fs::metadata(&sec_files[0]).unwrap();
+            assert_eq!(sec_meta.permissions().mode() & 0o777, 0o400);
+        }
+
+        let updated_sec_obj = json!({
+            "data": { "token": "dXBkYXRlZA==" } // "updated"
+        });
+        let sec_files2 = super::stage_secret_files(&dir, &sec_spec, &updated_sec_obj)
+            .expect("re-syncing secret over 0400 file must succeed");
+        assert_eq!(sec_files2.len(), 1);
+        assert_eq!(std::fs::read_to_string(&sec_files2[0]).unwrap(), "updated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subpathexpr_failing_state_recovery() {
+        let dir =
+            std::env::temp_dir().join(format!("diorama-subpath-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pod = json!({
+            "metadata": {
+                "name": "test-pod",
+                "namespace": "default"
+            }
+        });
+
+        // 1. Initial failing state: SUBPATH_DIR contains '..' path traversal
+        let container_invalid_traversal = json!({
+            "name": "app",
+            "env": [
+                { "name": "SUBPATH_DIR", "value": "logs/../../escaped" }
+            ]
+        });
+
+        let envs_fail1 =
+            super::resolve_container_effective_env(&pod, &container_invalid_traversal, None, None)
+                .unwrap();
+
+        let err1 = super::resolve_and_prepare_subpath(&dir, "$(SUBPATH_DIR)/output", &envs_fail1);
+        assert!(err1.is_err(), "path traversal should be rejected");
+        match err1 {
+            Err(super::KubeletError::InvalidConfiguration { field, reason }) => {
+                assert_eq!(field, "volumeMounts.subPath");
+                assert!(reason.contains("must not contain '..'"));
+            },
+            other => panic!("expected InvalidConfiguration for traversal, got {other:?}"),
+        }
+
+        // 2. Initial failing state: SUBPATH_DIR is an absolute path
+        let container_invalid_abs = json!({
+            "name": "app",
+            "env": [
+                { "name": "SUBPATH_DIR", "value": "/var/log/stolen" }
+            ]
+        });
+        let envs_fail2 =
+            super::resolve_container_effective_env(&pod, &container_invalid_abs, None, None)
+                .unwrap();
+        let err2 = super::resolve_and_prepare_subpath(&dir, "$(SUBPATH_DIR)/output", &envs_fail2);
+        assert!(err2.is_err(), "absolute path should be rejected");
+
+        // 3. Initial failing state: SUBPATH_DIR contains backticks
+        let container_invalid_backtick = json!({
+            "name": "app",
+            "env": [
+                { "name": "SUBPATH_DIR", "value": "`whoami`" }
+            ]
+        });
+        let envs_fail3 =
+            super::resolve_container_effective_env(&pod, &container_invalid_backtick, None, None)
+                .unwrap();
+        let err3 = super::resolve_and_prepare_subpath(&dir, "$(SUBPATH_DIR)/output", &envs_fail3);
+        assert!(err3.is_err(), "backticks should be rejected");
+
+        // Stale artifact simulation: suppose a stale broken symlink was left at the recovered target
+        let recovered_target = dir.join("recovered_logs/output");
+        if let Some(parent) = recovered_target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(dir.join("non_existent_stale"), &recovered_target);
+        }
+
+        // 4. Recovery: environment variable updated to a valid relative subpath during container lifecycle
+        let container_recovered = json!({
+            "name": "app",
+            "env": [
+                { "name": "SUBPATH_DIR", "value": "recovered_logs" }
+            ]
+        });
+        let envs_ok =
+            super::resolve_container_effective_env(&pod, &container_recovered, None, None).unwrap();
+
+        let res = super::resolve_and_prepare_subpath(&dir, "$(SUBPATH_DIR)/output", &envs_ok);
+        assert!(res.is_ok(), "recovered subpath should succeed: {res:?}");
+        let prepared_path = res.unwrap();
+        assert_eq!(prepared_path, recovered_target);
+        assert!(prepared_path.exists());
+        assert!(prepared_path.is_dir());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subpathexpr_effective_env_value_from() {
+        use std::collections::BTreeMap;
+
+        let pod = json!({
+            "metadata": {
+                "name": "my-worker-pod",
+                "namespace": "prod"
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "name": "worker",
+                        "resources": {
+                            "limits": { "cpu": "2" }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let mut configmaps = BTreeMap::new();
+        configmaps.insert(
+            "app-config".to_string(),
+            json!({
+                "data": {
+                    "subpath_key": "from_cm_dir"
+                }
+            }),
+        );
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            "app-secret".to_string(),
+            json!({
+                "stringData": {
+                    "secret_subpath": "from_secret_dir"
+                }
+            }),
+        );
+
+        let container = json!({
+            "name": "worker",
+            "env": [
+                {
+                    "name": "POD_NAME",
+                    "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
+                },
+                {
+                    "name": "CM_DIR",
+                    "valueFrom": { "configMapKeyRef": { "name": "app-config", "key": "subpath_key" } }
+                },
+                {
+                    "name": "SECRET_DIR",
+                    "valueFrom": { "secretKeyRef": { "name": "app-secret", "key": "secret_subpath" } }
+                },
+                {
+                    "name": "CPU_CORES",
+                    "valueFrom": { "resourceFieldRef": { "resource": "limits.cpu", "divisor": "1" } }
+                },
+                {
+                    "name": "COMBINED",
+                    "value": "$(POD_NAME)/$(CM_DIR)/$(SECRET_DIR)/cpu-$(CPU_CORES)"
+                }
+            ]
+        });
+
+        let envs = super::resolve_container_effective_env(
+            &pod,
+            &container,
+            Some(&configmaps),
+            Some(&secrets),
+        )
+        .unwrap();
+
+        let expanded = super::expand_subpath_expr("$(COMBINED)/data", &envs).unwrap();
+        assert_eq!(
+            expanded,
+            "my-worker-pod/from_cm_dir/from_secret_dir/cpu-2/data"
+        );
     }
 }
