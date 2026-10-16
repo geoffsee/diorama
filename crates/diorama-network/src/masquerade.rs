@@ -94,18 +94,59 @@ pub fn ipv4_in_cidr(ip_str: &str, cidr_str: &str) -> bool {
     (ip_u32 & mask) == (net_u32 & mask)
 }
 
+/// Checks if an IPv6 address is within the specified CIDR network.
+#[must_use]
+pub fn ipv6_in_cidr(ip_str: &str, cidr_str: &str) -> bool {
+    let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() else {
+        return false;
+    };
+    let Some((net_str, prefix_str)) = cidr_str.split_once('/') else {
+        return false;
+    };
+    let Ok(net) = net_str.parse::<std::net::Ipv6Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 128 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0u128
+    } else {
+        !((1u128 << (128 - prefix)) - 1)
+    };
+    let ip_u128 = u128::from_be_bytes(ip.octets());
+    let net_u128 = u128::from_be_bytes(net.octets());
+    (ip_u128 & mask) == (net_u128 & mask)
+}
+
+/// Checks if an IP address (IPv4 or IPv6) is within the specified CIDR network.
+#[must_use]
+pub fn ip_in_cidr(ip_str: &str, cidr_str: &str) -> bool {
+    if ipv4_in_cidr(ip_str, cidr_str) {
+        return true;
+    }
+    ipv6_in_cidr(ip_str, cidr_str)
+}
+
 /// Evaluates how a packet from `src_ip` to `dst_ip` is handled by the pod masquerade rule.
 ///
 /// Rules specify `-s <pod_cidr> ! -d <pod_cidr> -j MASQUERADE`:
 /// - Traffic from pod CIDR to external destinations is masqueraded.
 /// - Traffic from pod CIDR to other pod IPs (pod-to-pod) is preserved directly without masquerade.
+///
+/// Supports both single-stack IPv4/IPv6 and comma-separated dual-stack CIDRs.
 #[must_use]
 pub fn evaluate_egress_traffic(src_ip: &str, dst_ip: &str, pod_cidr: &str) -> EgressDecision {
-    if !ipv4_in_cidr(src_ip, pod_cidr) {
+    let in_cidr = |ip: &str| -> bool { pod_cidr.split(',').any(|c| ip_in_cidr(ip, c.trim())) };
+
+    if !in_cidr(src_ip) {
         return EgressDecision::NoMatch;
     }
 
-    if ipv4_in_cidr(dst_ip, pod_cidr) {
+    if in_cidr(dst_ip) {
         EgressDecision::Direct {
             source_ip: src_ip.to_string(),
             destination_ip: dst_ip.to_string(),
@@ -173,9 +214,20 @@ pub fn ensure_pod_masquerade_with_backend_and_executor(
     backend: MasqueradeBackend,
     executor: &dyn CommandExecutor,
 ) -> Result<(), NetworkError> {
+    for cidr in pod_cidr.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        ensure_single_pod_masquerade(cidr, backend, executor)?;
+    }
+    Ok(())
+}
+
+fn ensure_single_pod_masquerade(
+    cidr: &str,
+    backend: MasqueradeBackend,
+    executor: &dyn CommandExecutor,
+) -> Result<(), NetworkError> {
     match backend {
-        MasqueradeBackend::IpTables => ensure_iptables_masquerade(pod_cidr, executor),
-        MasqueradeBackend::Nftables => ensure_nftables_masquerade(pod_cidr, executor),
+        MasqueradeBackend::IpTables => ensure_iptables_masquerade(cidr, executor),
+        MasqueradeBackend::Nftables => ensure_nftables_masquerade(cidr, executor),
     }
 }
 
@@ -183,6 +235,12 @@ fn ensure_iptables_masquerade(
     pod_cidr: &str,
     executor: &dyn CommandExecutor,
 ) -> Result<(), NetworkError> {
+    let program = if pod_cidr.contains(':') {
+        "ip6tables"
+    } else {
+        "iptables"
+    };
+
     // Check if rule already exists: iptables -w 5 -t nat -C POSTROUTING -s <pod_cidr> ! -d <pod_cidr> -m comment --comment ... -j MASQUERADE
     let check_args = [
         "-w",
@@ -206,16 +264,16 @@ fn ensure_iptables_masquerade(
 
     let check_res =
         executor
-            .run("iptables", &check_args)
+            .run(program, &check_args)
             .map_err(|e| NetworkError::MasqueradeError {
-                reason: format!("failed to execute iptables check: {e}"),
+                reason: format!("failed to execute {program} check: {e}"),
             })?;
 
     if check_res.success {
         tracing::debug!(
             component = "network",
             cidr = %pod_cidr,
-            "pod masquerade rule already present (iptables)"
+            "pod masquerade rule already present ({program})"
         );
         return Ok(());
     }
@@ -224,17 +282,16 @@ fn ensure_iptables_masquerade(
     let mut add_args = check_args;
     add_args[4] = "-A";
 
-    let add_res =
-        executor
-            .run("iptables", &add_args)
-            .map_err(|e| NetworkError::MasqueradeError {
-                reason: format!("failed to execute iptables add: {e}"),
-            })?;
+    let add_res = executor
+        .run(program, &add_args)
+        .map_err(|e| NetworkError::MasqueradeError {
+            reason: format!("failed to execute {program} add: {e}"),
+        })?;
 
     if !add_res.success {
         return Err(NetworkError::MasqueradeError {
             reason: format!(
-                "iptables: failed to add pod masquerade rule: {}",
+                "{program}: failed to add pod masquerade rule: {}",
                 add_res.stderr
             ),
         });
@@ -243,7 +300,7 @@ fn ensure_iptables_masquerade(
     tracing::info!(
         component = "network",
         cidr = %pod_cidr,
-        "added pod masquerade rule (iptables)"
+        "added pod masquerade rule ({program})"
     );
 
     Ok(())
@@ -292,20 +349,28 @@ fn ensure_nftables_masquerade(
     pod_cidr: &str,
     executor: &dyn CommandExecutor,
 ) -> Result<(), NetworkError> {
+    let family = if pod_cidr.contains(':') { "ip6" } else { "ip" };
+
     // 1. Ensure table kubesolo-masq
     ensure_nft_object(
-        &["list", "table", "ip", DEFAULT_NFT_MASQ_TABLE],
-        &["add", "table", "ip", DEFAULT_NFT_MASQ_TABLE],
+        &["list", "table", family, DEFAULT_NFT_MASQ_TABLE],
+        &["add", "table", family, DEFAULT_NFT_MASQ_TABLE],
         executor,
     )?;
 
     // 2. Ensure postrouting chain in kubesolo-masq table
     ensure_nft_object(
-        &["list", "chain", "ip", DEFAULT_NFT_MASQ_TABLE, "postrouting"],
+        &[
+            "list",
+            "chain",
+            family,
+            DEFAULT_NFT_MASQ_TABLE,
+            "postrouting",
+        ],
         &[
             "add",
             "chain",
-            "ip",
+            family,
             DEFAULT_NFT_MASQ_TABLE,
             "postrouting",
             "{ type nat hook postrouting priority srcnat; policy accept; }",
@@ -317,13 +382,19 @@ fn ensure_nftables_masquerade(
     let chain_out = executor
         .run(
             "nft",
-            &["list", "chain", "ip", DEFAULT_NFT_MASQ_TABLE, "postrouting"],
+            &[
+                "list",
+                "chain",
+                family,
+                DEFAULT_NFT_MASQ_TABLE,
+                "postrouting",
+            ],
         )
         .map_err(|e| NetworkError::MasqueradeError {
             reason: format!("failed to list nft chain: {e}"),
         })?;
 
-    let expected_cidr_match = format!("ip saddr {pod_cidr} ip daddr != {pod_cidr}");
+    let expected_cidr_match = format!("{family} saddr {pod_cidr} {family} daddr != {pod_cidr}");
     if chain_out.stdout.contains(MASQUERADE_COMMENT)
         && chain_out.stdout.contains(&expected_cidr_match)
     {
@@ -335,18 +406,18 @@ fn ensure_nftables_masquerade(
         return Ok(());
     }
 
-    // 4. Add rule: nft add rule ip kubesolo-masq postrouting ip saddr <pod_cidr> ip daddr != <pod_cidr> masquerade comment "\"kubesolo: pod masquerade\""
+    // 4. Add rule: nft add rule <family> kubesolo-masq postrouting <family> saddr <pod_cidr> <family> daddr != <pod_cidr> masquerade comment "\"kubesolo: pod masquerade\""
     let comment_arg = format!("\"{MASQUERADE_COMMENT}\"");
     let add_rule_args = [
         "add",
         "rule",
-        "ip",
+        family,
         DEFAULT_NFT_MASQ_TABLE,
         "postrouting",
-        "ip",
+        family,
         "saddr",
         pod_cidr,
-        "ip",
+        family,
         "daddr",
         "!=",
         pod_cidr,
@@ -400,8 +471,24 @@ pub fn clean_pod_masquerade_with_backend_and_executor(
     backend: MasqueradeBackend,
     executor: &dyn CommandExecutor,
 ) -> Result<(), NetworkError> {
+    for cidr in pod_cidr.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        clean_single_pod_masquerade(cidr, backend, executor)?;
+    }
+    Ok(())
+}
+
+fn clean_single_pod_masquerade(
+    pod_cidr: &str,
+    backend: MasqueradeBackend,
+    executor: &dyn CommandExecutor,
+) -> Result<(), NetworkError> {
     match backend {
         MasqueradeBackend::IpTables => {
+            let program = if pod_cidr.contains(':') {
+                "ip6tables"
+            } else {
+                "iptables"
+            };
             let del_args = [
                 "-w",
                 IPTABLES_WAIT_SECONDS,
@@ -424,11 +511,11 @@ pub fn clean_pod_masquerade_with_backend_and_executor(
 
             // Loop to delete any duplicate rules that may exist, stopping when none remain
             loop {
-                let out = match executor.run("iptables", &del_args) {
+                let out = match executor.run(program, &del_args) {
                     Ok(out) => out,
                     Err(e) => {
                         return Err(NetworkError::MasqueradeError {
-                            reason: format!("failed to execute iptables delete: {e}"),
+                            reason: format!("failed to execute {program} delete: {e}"),
                         });
                     },
                 };
@@ -443,15 +530,16 @@ pub fn clean_pod_masquerade_with_backend_and_executor(
                     break;
                 }
                 return Err(NetworkError::MasqueradeError {
-                    reason: format!("iptables delete failed: {}", out.stderr),
+                    reason: format!("{program} delete failed: {}", out.stderr),
                 });
             }
             Ok(())
         },
         MasqueradeBackend::Nftables => {
-            // Delete our dedicated table `ip kubesolo-masq`.
+            let family = if pod_cidr.contains(':') { "ip6" } else { "ip" };
+            // Delete our dedicated table `ip/ip6 kubesolo-masq`.
             // Crucial: this never flushes or touches system tables such as `table ip nat` or Podman netavark.
-            let del_args = ["delete", "table", "ip", DEFAULT_NFT_MASQ_TABLE];
+            let del_args = ["delete", "table", family, DEFAULT_NFT_MASQ_TABLE];
             let out =
                 executor
                     .run("nft", &del_args)
@@ -998,7 +1086,7 @@ impl CommandExecutor for MockCommandExecutor {
         self.command_log.lock().unwrap().push(cmd_str.clone());
 
         match program {
-            "iptables" => self.handle_iptables(args, &cmd_str),
+            "iptables" | "ip6tables" => self.handle_iptables(args, &cmd_str),
             "iptables-save" => self.handle_iptables_save(),
             "nft" => self.handle_nft(args, &cmd_str),
             _ => Err(std::io::Error::new(
@@ -1021,6 +1109,66 @@ mod tests {
         assert!(!ipv4_in_cidr("1.1.1.1", "10.42.0.0/16"));
         assert!(ipv4_in_cidr("192.168.1.50", "192.168.1.0/24"));
         assert!(!ipv4_in_cidr("192.168.2.50", "192.168.1.0/24"));
+    }
+
+    #[test]
+    fn test_ipv6_and_ip_in_cidr() {
+        assert!(ipv6_in_cidr("fd00:10:42::1", "fd00:10:42::/64"));
+        assert!(ipv6_in_cidr("fd00:10:42::ffff", "fd00:10:42::/64"));
+        assert!(!ipv6_in_cidr("fd00:10:43::1", "fd00:10:42::/64"));
+        assert!(!ipv6_in_cidr("2001:db8::1", "fd00:10:42::/64"));
+
+        assert!(ip_in_cidr("10.42.0.1", "10.42.0.0/16"));
+        assert!(ip_in_cidr("fd00:10:42::1", "fd00:10:42::/64"));
+        assert!(!ip_in_cidr("192.168.1.1", "10.42.0.0/16"));
+        assert!(!ip_in_cidr("2001:db8::1", "fd00:10:42::/64"));
+    }
+
+    #[test]
+    fn test_evaluate_egress_traffic_dual_stack() {
+        let dual_cidr = "10.42.0.0/16, fd00:10:42::/64";
+
+        // IPv4 pod to external
+        assert_eq!(
+            evaluate_egress_traffic("10.42.0.10", "1.1.1.1", dual_cidr),
+            EgressDecision::Masquerade {
+                source_ip: "10.42.0.10".to_string(),
+                destination_ip: "1.1.1.1".to_string(),
+            }
+        );
+
+        // IPv6 pod to external
+        assert_eq!(
+            evaluate_egress_traffic("fd00:10:42::10", "2001:4860:4860::8888", dual_cidr),
+            EgressDecision::Masquerade {
+                source_ip: "fd00:10:42::10".to_string(),
+                destination_ip: "2001:4860:4860::8888".to_string(),
+            }
+        );
+
+        // IPv4 pod to pod
+        assert_eq!(
+            evaluate_egress_traffic("10.42.0.10", "10.42.1.25", dual_cidr),
+            EgressDecision::Direct {
+                source_ip: "10.42.0.10".to_string(),
+                destination_ip: "10.42.1.25".to_string(),
+            }
+        );
+
+        // IPv6 pod to pod
+        assert_eq!(
+            evaluate_egress_traffic("fd00:10:42::10", "fd00:10:42::25", dual_cidr),
+            EgressDecision::Direct {
+                source_ip: "fd00:10:42::10".to_string(),
+                destination_ip: "fd00:10:42::25".to_string(),
+            }
+        );
+
+        // Non-pod traffic
+        assert_eq!(
+            evaluate_egress_traffic("192.168.1.100", "8.8.8.8", dual_cidr),
+            EgressDecision::NoMatch
+        );
     }
 
     #[test]

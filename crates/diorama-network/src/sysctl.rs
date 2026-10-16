@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::error::NetworkError;
 
 pub const IP_FORWARD_SYSCTL_REL_PATH: &str = "net/ipv4/ip_forward";
+pub const IPV6_FORWARD_SYSCTL_REL_PATH: &str = "net/ipv6/conf/all/forwarding";
 
 /// Returns true if an IO error on sysctl read/write can be safely ignored.
 #[must_use]
@@ -132,6 +133,16 @@ pub fn ensure_ip_forward_in_root(root: &Path) -> Result<(), NetworkError> {
     ensure_sysctl_value(root, IP_FORWARD_SYSCTL_REL_PATH, "1")
 }
 
+/// Ensures `net.ipv6.conf.all.forwarding` is enabled (`1`) on the host system.
+pub fn ensure_ipv6_forward() -> Result<(), NetworkError> {
+    ensure_ipv6_forward_in_root(Path::new("/proc/sys"))
+}
+
+/// Ensures `net.ipv6.conf.all.forwarding` is enabled (`1`) relative to `root`.
+pub fn ensure_ipv6_forward_in_root(root: &Path) -> Result<(), NetworkError> {
+    ensure_sysctl_value(root, IPV6_FORWARD_SYSCTL_REL_PATH, "1")
+}
+
 /// Allows DNAT toward `127.0.0.0/8` on the host.
 ///
 /// The apiserver listens on loopback. Pod traffic to the `kubernetes` Service is
@@ -222,5 +233,17 @@ mod tests {
 
         let absent = read_sysctl(dir.path(), "nonexistent/sysctl").unwrap();
         assert_eq!(absent, None);
+    }
+
+    #[test]
+    fn test_ensure_ipv6_forward() {
+        let dir = tempdir().expect("tempdir");
+        let sysctl_path = dir.path().join(IPV6_FORWARD_SYSCTL_REL_PATH);
+        fs::create_dir_all(sysctl_path.parent().unwrap()).unwrap();
+        fs::write(&sysctl_path, b"0\n").unwrap();
+
+        assert!(ensure_ipv6_forward_in_root(dir.path()).is_ok());
+        let val = fs::read_to_string(&sysctl_path).unwrap();
+        assert_eq!(val.trim(), "1");
     }
 }

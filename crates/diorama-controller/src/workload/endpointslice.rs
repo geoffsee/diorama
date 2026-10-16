@@ -17,6 +17,12 @@ pub struct EndpointSliceReconciler {
     batch_period: Duration,
 }
 
+pub const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
+pub const LABEL_MANAGED_BY: &str = "endpointslice.kubernetes.io/managed-by";
+pub const LABEL_SKIP_MIRROR: &str = "endpointslice.kubernetes.io/skip-mirror";
+pub const MANAGED_BY_CONTROLLER: &str = "endpointslice-controller.k8s.io";
+pub const MANAGED_BY_MIRROR: &str = "endpointslicemirroring-controller.k8s.io";
+
 impl EndpointSliceReconciler {
     #[must_use]
     pub fn new(client: Arc<KubernetesApiClient>) -> Self {
@@ -39,7 +45,8 @@ impl EndpointSliceReconciler {
         self.batch_period
     }
 
-    /// Reconciles all `EndpointSlices` for Services in the specified namespace.
+    /// Reconciles all `EndpointSlices` for Services in the specified namespace,
+    /// as well as mirrored `EndpointSlices` for custom `Endpoints`.
     pub async fn reconcile_all(
         &self,
         namespace: &str,
@@ -65,6 +72,11 @@ impl EndpointSliceReconciler {
                 Ok(None) => {},
                 Err(err) => errors.push(err.to_string()),
             }
+        }
+
+        match self.reconcile_mirrored_endpoints(namespace).await {
+            Ok(mirrored) => count += mirrored,
+            Err(err) => errors.push(err.to_string()),
         }
 
         Ok(ReconcileOutcome {
@@ -108,8 +120,18 @@ impl EndpointSliceReconciler {
             return Ok(None);
         }
 
+        let publish_not_ready = service
+            .pointer("/spec/publishNotReadyAddresses")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                service
+                    .pointer("/metadata/annotations/service.alpha.kubernetes.io~1tolerate-unready-endpoints")
+                    .and_then(Value::as_str)
+                    == Some("true")
+            });
+
         let (endpoints, matching_pods) = self
-            .extract_matching_pod_endpoints(namespace, selector)
+            .extract_matching_pod_endpoints(namespace, selector, publish_not_ready)
             .await?;
         let slice_ports = extract_service_slice_ports(service, &matching_pods);
 
@@ -146,8 +168,8 @@ impl EndpointSliceReconciler {
                 "name": slice_name,
                 "namespace": namespace,
                 "labels": {
-                    "kubernetes.io/service-name": name,
-                    "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+                    LABEL_SERVICE_NAME: name,
+                    LABEL_MANAGED_BY: MANAGED_BY_CONTROLLER,
                 },
                 "ownerReferences": [
                     {
@@ -169,10 +191,222 @@ impl EndpointSliceReconciler {
             .await
     }
 
+    /// Reconciles all mirrored `EndpointSlice` objects for custom `Endpoints` resources.
+    pub async fn reconcile_mirrored_endpoints(
+        &self,
+        namespace: &str,
+    ) -> Result<usize, ControllerError> {
+        let ep_list = match self.client.list_endpoints(namespace).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(ControllerError::ReconciliationFailed {
+                    resource: "endpoints".to_string(),
+                    reason: e.to_string(),
+                });
+            },
+        };
+
+        let ep_items = ep_list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let svc_list = self.client.list_services(namespace).await.map_err(|e| {
+            ControllerError::ReconciliationFailed {
+                resource: "services".to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        let svc_items = svc_list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        // Track services with non-empty selectors
+        let mut selector_services = std::collections::HashSet::new();
+        for svc in &svc_items {
+            let name = svc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let has_selector = svc
+                .pointer("/spec/selector")
+                .and_then(Value::as_object)
+                .is_some_and(|sel| !sel.is_empty());
+            if has_selector {
+                selector_services.insert(name.to_string());
+            }
+        }
+
+        let mut mirrored_count = 0;
+        let mut active_mirrored_names = std::collections::HashSet::new();
+
+        for ep in &ep_items {
+            let ep_name = ep
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if ep_name.is_empty() || selector_services.contains(ep_name) {
+                continue;
+            }
+
+            // Skip mirror label check
+            let skip_mirror = ep
+                .pointer("/metadata/labels/endpointslice.kubernetes.io~1skip-mirror")
+                .and_then(Value::as_str)
+                == Some("true");
+            if skip_mirror {
+                continue;
+            }
+
+            // Leader election annotation check
+            let is_leader_election = ep
+                .pointer("/metadata/annotations/control-plane.alpha.kubernetes.io~1leader")
+                .is_some();
+            if is_leader_election {
+                continue;
+            }
+
+            if self
+                .reconcile_endpoints_mirror(namespace, ep)
+                .await?
+                .is_some()
+            {
+                mirrored_count += 1;
+                active_mirrored_names.insert(ep_name.to_string());
+            }
+        }
+
+        // Clean up orphaned mirrored EndpointSlices whose parent Endpoints no longer exist or skip-mirror
+        if let Ok(slice_list) = self.client.list_endpointslices(namespace).await
+            && let Some(slices) = slice_list.get("items").and_then(Value::as_array)
+        {
+            for slice in slices {
+                let managed_by = slice
+                    .pointer("/metadata/labels/endpointslice.kubernetes.io~1managed-by")
+                    .and_then(Value::as_str);
+                if managed_by != Some(MANAGED_BY_MIRROR) {
+                    continue;
+                }
+                let svc_name = slice
+                    .pointer("/metadata/labels/kubernetes.io~1service-name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let slice_name = slice
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                if !active_mirrored_names.contains(svc_name) && !slice_name.is_empty() {
+                    let _ = self
+                        .client
+                        .delete_endpointslice(namespace, slice_name)
+                        .await;
+                }
+            }
+        }
+
+        Ok(mirrored_count)
+    }
+
+    /// Reconciles an individual custom `Endpoints` resource into a mirrored `EndpointSlice`.
+    pub async fn reconcile_endpoints_mirror(
+        &self,
+        namespace: &str,
+        endpoints: &Value,
+    ) -> Result<Option<Value>, ControllerError> {
+        let ep_name = endpoints
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ControllerError::InvalidConfiguration {
+                field: "metadata.name".to_string(),
+                reason: "Endpoints missing metadata.name".to_string(),
+            })?;
+        let ep_uid = endpoints
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let subsets = endpoints
+            .get("subsets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let ports = extract_subset_ports(&subsets);
+        let slice_endpoints = extract_subset_endpoints(&subsets);
+
+        let existing_slices = self
+            .client
+            .list_endpointslices(namespace)
+            .await
+            .map_err(|e| ControllerError::ReconciliationFailed {
+                resource: "endpointslices".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let existing_items = existing_slices
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let matching_existing = existing_items.into_iter().find(|es| {
+            let labels = es.get("metadata").and_then(|m| m.get("labels"));
+            let is_svc = labels
+                .and_then(|l| l.get(LABEL_SERVICE_NAME))
+                .and_then(Value::as_str)
+                == Some(ep_name);
+            let is_mirror = labels
+                .and_then(|l| l.get(LABEL_MANAGED_BY))
+                .and_then(Value::as_str)
+                == Some(MANAGED_BY_MIRROR);
+            is_svc && is_mirror
+        });
+
+        let slice_name = matching_existing
+            .as_ref()
+            .and_then(|es| es.pointer("/metadata/name"))
+            .and_then(Value::as_str)
+            .map_or_else(|| format!("{ep_name}-1"), ToString::to_string);
+
+        let desired_slice = json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": slice_name,
+                "namespace": namespace,
+                "labels": {
+                    LABEL_SERVICE_NAME: ep_name,
+                    LABEL_MANAGED_BY: MANAGED_BY_MIRROR,
+                },
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Endpoints",
+                        "name": ep_name,
+                        "uid": ep_uid,
+                        "controller": true,
+                        "blockOwnerDeletion": true,
+                    }
+                ]
+            },
+            "addressType": "IPv4",
+            "ports": ports,
+            "endpoints": slice_endpoints,
+        });
+
+        self.apply_endpointslice(namespace, &slice_name, matching_existing, desired_slice)
+            .await
+    }
+
     async fn extract_matching_pod_endpoints(
         &self,
         namespace: &str,
         selector: &Map<String, Value>,
+        publish_not_ready: bool,
     ) -> Result<(Vec<Value>, Vec<Value>), ControllerError> {
         let pod_list = self.client.list_pods(namespace).await.map_err(|e| {
             ControllerError::ReconciliationFailed {
@@ -205,7 +439,7 @@ impl EndpointSliceReconciler {
                 continue;
             }
 
-            if let Some(ep) = build_endpoint_from_pod(namespace, &pod) {
+            if let Some(ep) = build_endpoint_from_pod(namespace, &pod, publish_not_ready) {
                 endpoints.push(ep);
                 matching_pods.push(pod);
             }
@@ -280,7 +514,17 @@ impl EndpointSliceReconciler {
     }
 }
 
-fn build_endpoint_from_pod(namespace: &str, pod: &Value) -> Option<Value> {
+fn build_endpoint_from_pod(namespace: &str, pod: &Value, publish_not_ready: bool) -> Option<Value> {
+    let phase = pod
+        .get("status")
+        .and_then(|s| s.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("Pending");
+
+    if phase == "Failed" || phase == "Succeeded" {
+        return None;
+    }
+
     let pname = pod
         .get("metadata")
         .and_then(|m| m.get("name"))
@@ -308,20 +552,12 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value) -> Option<Value> {
                 .and_then(Value::as_str)
         })?;
 
-    let phase = pod
-        .get("status")
-        .and_then(|s| s.get("phase"))
-        .and_then(Value::as_str)
-        .unwrap_or("Pending");
-
     let is_terminating = pod
         .get("metadata")
         .and_then(|m| m.get("deletionTimestamp"))
         .is_some();
 
-    let is_ready = if is_terminating {
-        false
-    } else if let Some(conditions) = pod
+    let has_ready_condition = if let Some(conditions) = pod
         .get("status")
         .and_then(|s| s.get("conditions"))
         .and_then(Value::as_array)
@@ -334,11 +570,25 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value) -> Option<Value> {
         phase == "Running"
     };
 
+    let is_ready = if publish_not_ready {
+        true
+    } else if is_terminating {
+        false
+    } else {
+        has_ready_condition
+    };
+
+    let is_serving = if publish_not_ready {
+        true
+    } else {
+        has_ready_condition
+    };
+
     Some(json!({
         "addresses": [pod_ip],
         "conditions": {
             "ready": is_ready,
-            "serving": is_ready,
+            "serving": is_serving,
             "terminating": is_terminating,
         },
         "targetRef": {
@@ -353,6 +603,7 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value) -> Option<Value> {
 
 pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
     let fallback = sp.get("port").and_then(Value::as_i64).unwrap_or(80);
+    let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
     let Some(tp) = sp.get("targetPort") else {
         return fallback;
     };
@@ -366,7 +617,7 @@ pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
         if let Ok(n) = s.parse::<i64>() {
             return if n > 0 { n } else { fallback };
         }
-        if let Some(cp) = find_named_container_port(pods, s) {
+        if let Some(cp) = find_named_container_port(pods, s, protocol) {
             return cp;
         }
     }
@@ -385,7 +636,7 @@ pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
             {
                 return n;
             }
-            if let Some(cp) = find_named_container_port(pods, s) {
+            if let Some(cp) = find_named_container_port(pods, s, protocol) {
                 return cp;
             }
         }
@@ -393,20 +644,34 @@ pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
     fallback
 }
 
-fn find_named_container_port(pods: &[Value], name: &str) -> Option<i64> {
+fn match_container_port(p: &Value, name: &str, protocol: &str) -> Option<i64> {
+    if p.get("name").and_then(Value::as_str) != Some(name) {
+        return None;
+    }
+    let p_proto = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+    if !p_proto.eq_ignore_ascii_case(protocol) {
+        return None;
+    }
+    p.get("containerPort")
+        .and_then(Value::as_i64)
+        .filter(|&cp| cp > 0)
+}
+
+fn find_named_container_port(pods: &[Value], name: &str, protocol: &str) -> Option<i64> {
     for pod in pods {
-        let Some(containers) = pod.pointer("/spec/containers").and_then(Value::as_array) else {
-            continue;
-        };
-        for c in containers {
+        let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+        let init_containers = pod
+            .pointer("/spec/initContainers")
+            .and_then(Value::as_array);
+
+        let all_containers = containers.into_iter().chain(init_containers).flatten();
+
+        for c in all_containers {
             let Some(ports) = c.get("ports").and_then(Value::as_array) else {
                 continue;
             };
             for p in ports {
-                if p.get("name").and_then(Value::as_str) == Some(name)
-                    && let Some(cp) = p.get("containerPort").and_then(Value::as_i64)
-                    && cp > 0
-                {
+                if let Some(cp) = match_container_port(p, name, protocol) {
                     return Some(cp);
                 }
             }
@@ -426,11 +691,13 @@ fn extract_service_slice_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
     let mut slice_ports = Vec::new();
     for sp in service_ports {
         let port_num = resolve_service_target_port(&sp, pods);
-        let port_name = sp.get("name").and_then(Value::as_str).unwrap_or("");
+        let port_name = sp.get("name").and_then(Value::as_str);
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
         let mut port_obj = Map::new();
-        port_obj.insert("name".to_string(), json!(port_name));
+        if let Some(pn) = port_name.filter(|s| !s.is_empty()) {
+            port_obj.insert("name".to_string(), json!(pn));
+        }
         port_obj.insert("port".to_string(), json!(port_num));
         port_obj.insert("protocol".to_string(), json!(protocol));
         if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
@@ -441,16 +708,105 @@ fn extract_service_slice_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
     slice_ports
 }
 
+fn parse_subset_port(p: &Value) -> (String, Value) {
+    let port_name = p.get("name").and_then(Value::as_str).unwrap_or("");
+    let protocol = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+    let port_num = p.get("port").and_then(Value::as_i64).unwrap_or(80);
+    let key = format!("{port_name}:{protocol}");
+
+    let mut p_obj = Map::new();
+    if !port_name.is_empty() {
+        p_obj.insert("name".to_string(), json!(port_name));
+    }
+    p_obj.insert("port".to_string(), json!(port_num));
+    p_obj.insert("protocol".to_string(), json!(protocol));
+    if let Some(ap) = p.get("appProtocol").and_then(Value::as_str) {
+        p_obj.insert("appProtocol".to_string(), json!(ap));
+    }
+    (key, Value::Object(p_obj))
+}
+
+fn extract_subset_ports(subsets: &[Value]) -> Vec<Value> {
+    let mut ports_map: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
+    for subset in subsets {
+        let Some(ports) = subset.get("ports").and_then(Value::as_array) else {
+            continue;
+        };
+        for p in ports {
+            let (key, val) = parse_subset_port(p);
+            ports_map.insert(key, val);
+        }
+    }
+    ports_map.into_values().collect()
+}
+
+fn make_mirror_endpoint(addr: &Value, ready: bool) -> Option<Value> {
+    let ip = addr.get("ip").and_then(Value::as_str)?;
+    let mut ep_obj = Map::new();
+    ep_obj.insert("addresses".to_string(), json!([ip]));
+    ep_obj.insert(
+        "conditions".to_string(),
+        json!({
+            "ready": ready,
+            "serving": ready,
+            "terminating": false,
+        }),
+    );
+    if let Some(nn) = addr.get("nodeName") {
+        ep_obj.insert("nodeName".to_string(), nn.clone());
+    }
+    if let Some(tr) = addr.get("targetRef") {
+        ep_obj.insert("targetRef".to_string(), tr.clone());
+    }
+    if let Some(hn) = addr.get("hostname") {
+        ep_obj.insert("hostname".to_string(), hn.clone());
+    }
+    Some(Value::Object(ep_obj))
+}
+
+fn extract_subset_endpoints(subsets: &[Value]) -> Vec<Value> {
+    let mut slice_endpoints = Vec::new();
+    for subset in subsets {
+        if let Some(addresses) = subset.get("addresses").and_then(Value::as_array) {
+            for addr in addresses {
+                if let Some(ep) = make_mirror_endpoint(addr, true) {
+                    slice_endpoints.push(ep);
+                }
+            }
+        }
+        if let Some(not_ready) = subset.get("notReadyAddresses").and_then(Value::as_array) {
+            for addr in not_ready {
+                if let Some(ep) = make_mirror_endpoint(addr, false) {
+                    slice_endpoints.push(ep);
+                }
+            }
+        }
+    }
+    slice_endpoints.sort_by(|a, b| {
+        let a_ip = a
+            .pointer("/addresses/0")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let b_ip = b
+            .pointer("/addresses/0")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        a_ip.cmp(b_ip)
+    });
+    slice_endpoints
+}
+
 fn is_matching_endpointslice(es: &Value, name: &str, uid: &str) -> bool {
     let labels = es.get("metadata").and_then(|m| m.get("labels"));
     let is_svc = labels
-        .and_then(|l| l.get("kubernetes.io/service-name"))
+        .and_then(|l| l.get(LABEL_SERVICE_NAME))
         .and_then(Value::as_str)
         == Some(name);
     let is_managed = labels
-        .and_then(|l| l.get("endpointslice.kubernetes.io/managed-by"))
+        .and_then(|l| l.get(LABEL_MANAGED_BY))
         .and_then(Value::as_str)
-        == Some("endpointslice-controller.k8s.io");
+        == Some(MANAGED_BY_CONTROLLER);
 
     let is_owner = if uid.is_empty() {
         true
@@ -467,4 +823,182 @@ fn is_matching_endpointslice(es: &Value, name: &str, uid: &str) -> bool {
     };
 
     is_svc && is_managed && is_owner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_endpoint_conditions_ready_serving_terminating() {
+        let ready_pod = json!({
+            "metadata": { "name": "pod-1", "uid": "uid-1" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.10",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        let unready_pod = json!({
+            "metadata": { "name": "pod-2", "uid": "uid-2" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.11",
+                "conditions": [{ "type": "Ready", "status": "False" }]
+            }
+        });
+        let terminating_ready_pod = json!({
+            "metadata": {
+                "name": "pod-3",
+                "uid": "uid-3",
+                "deletionTimestamp": "2026-10-15T00:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.12",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+
+        let ep1 = build_endpoint_from_pod("default", &ready_pod, false).expect("ep1");
+        assert_eq!(ep1["conditions"]["ready"], true);
+        assert_eq!(ep1["conditions"]["serving"], true);
+        assert_eq!(ep1["conditions"]["terminating"], false);
+
+        let ep2 = build_endpoint_from_pod("default", &unready_pod, false).expect("ep2");
+        assert_eq!(ep2["conditions"]["ready"], false);
+        assert_eq!(ep2["conditions"]["serving"], false);
+        assert_eq!(ep2["conditions"]["terminating"], false);
+
+        // Terminating pod: ready=false, serving=true (while gracefully shutting down), terminating=true
+        let ep3 = build_endpoint_from_pod("default", &terminating_ready_pod, false).expect("ep3");
+        assert_eq!(ep3["conditions"]["ready"], false);
+        assert_eq!(ep3["conditions"]["serving"], true);
+        assert_eq!(ep3["conditions"]["terminating"], true);
+    }
+
+    #[test]
+    fn test_build_endpoint_publish_not_ready_addresses() {
+        let unready_pod = json!({
+            "metadata": { "name": "pod-unready", "uid": "uid-unready" },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.15",
+                "conditions": [{ "type": "Ready", "status": "False" }]
+            }
+        });
+
+        let ep = build_endpoint_from_pod("default", &unready_pod, true).expect("ep");
+        assert_eq!(ep["conditions"]["ready"], true);
+        assert_eq!(ep["conditions"]["serving"], true);
+        assert_eq!(ep["conditions"]["terminating"], false);
+    }
+
+    #[test]
+    fn test_resolve_service_target_port_protocol_and_named() {
+        let pods = vec![json!({
+            "metadata": { "name": "pod-app" },
+            "spec": {
+                "containers": [{
+                    "name": "server",
+                    "ports": [
+                        { "name": "dns-tcp", "containerPort": 5353, "protocol": "TCP" },
+                        { "name": "dns-udp", "containerPort": 53, "protocol": "UDP" },
+                        { "name": "web", "containerPort": 8080 }
+                    ]
+                }]
+            }
+        })];
+
+        // 1. Numeric target port
+        let sp_num = json!({ "port": 80, "targetPort": 9000, "protocol": "TCP" });
+        assert_eq!(resolve_service_target_port(&sp_num, &pods), 9000);
+
+        // 2. Named target port TCP
+        let sp_tcp = json!({ "port": 53, "targetPort": "dns-tcp", "protocol": "TCP" });
+        assert_eq!(resolve_service_target_port(&sp_tcp, &pods), 5353);
+
+        // 3. Named target port UDP
+        let sp_udp = json!({ "port": 53, "targetPort": "dns-udp", "protocol": "UDP" });
+        assert_eq!(resolve_service_target_port(&sp_udp, &pods), 53);
+
+        // 4. Default container port protocol is TCP
+        let sp_web = json!({ "port": 80, "targetPort": "web", "protocol": "TCP" });
+        assert_eq!(resolve_service_target_port(&sp_web, &pods), 8080);
+
+        // 5. Unmatched named port falls back to service port
+        let sp_missing = json!({ "port": 7777, "targetPort": "nonexistent", "protocol": "TCP" });
+        assert_eq!(resolve_service_target_port(&sp_missing, &pods), 7777);
+    }
+
+    #[test]
+    fn test_extract_service_slice_ports_multi_port() {
+        let svc = json!({
+            "spec": {
+                "ports": [
+                    { "name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP", "appProtocol": "http" },
+                    { "name": "https", "port": 443, "targetPort": 8443, "protocol": "TCP" }
+                ]
+            }
+        });
+
+        let ports = extract_service_slice_ports(&svc, &[]);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0]["name"], "http");
+        assert_eq!(ports[0]["port"], 8080);
+        assert_eq!(ports[0]["appProtocol"], "http");
+        assert_eq!(ports[1]["name"], "https");
+        assert_eq!(ports[1]["port"], 8443);
+    }
+
+    #[test]
+    fn test_custom_endpoints_mirroring_constants_and_label_parity() {
+        assert_eq!(LABEL_SERVICE_NAME, "kubernetes.io/service-name");
+        assert_eq!(LABEL_MANAGED_BY, "endpointslice.kubernetes.io/managed-by");
+        assert_eq!(LABEL_SKIP_MIRROR, "endpointslice.kubernetes.io/skip-mirror");
+        assert_eq!(MANAGED_BY_CONTROLLER, "endpointslice-controller.k8s.io");
+        assert_eq!(
+            MANAGED_BY_MIRROR,
+            "endpointslicemirroring-controller.k8s.io"
+        );
+    }
+
+    #[test]
+    fn test_is_matching_endpointslice_identifies_controller_and_service() {
+        let matching = json!({
+            "metadata": {
+                "name": "svc-1",
+                "labels": {
+                    "kubernetes.io/service-name": "svc",
+                    "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+                },
+                "ownerReferences": [{
+                    "kind": "Service",
+                    "uid": "uid-100"
+                }]
+            }
+        });
+        assert!(is_matching_endpointslice(&matching, "svc", "uid-100"));
+        assert!(!is_matching_endpointslice(
+            &matching,
+            "other-svc",
+            "uid-100"
+        ));
+        assert!(!is_matching_endpointslice(
+            &matching,
+            "svc",
+            "different-uid"
+        ));
+
+        let non_managed = json!({
+            "metadata": {
+                "name": "svc-1",
+                "labels": {
+                    "kubernetes.io/service-name": "svc",
+                    "endpointslice.kubernetes.io/managed-by": "custom-controller.k8s.io",
+                }
+            }
+        });
+        assert!(!is_matching_endpointslice(&non_managed, "svc", ""));
+    }
 }

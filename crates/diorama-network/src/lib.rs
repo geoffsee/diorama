@@ -14,7 +14,8 @@ pub mod sysctl;
 pub use cni::{
     CNI_CONFIG_EXTENSIONS, CniOrderingInspection, DEFAULT_BRIDGE_NAME, DEFAULT_CNI_CONFIG_NAME,
     DEFAULT_POD_CIDR, DEFAULT_STANDARD_CNI_BIN_DIR, DEFAULT_STANDARD_CNI_CONF_DIR,
-    REQUIRED_CNI_PLUGINS, generate_cni_config, generate_cni_config_json, inspect_cni_dir_ordering,
+    REQUIRED_CNI_PLUGINS, generate_cni_config, generate_cni_config_dual_stack,
+    generate_cni_config_from_cidrs, generate_cni_config_json, inspect_cni_dir_ordering,
     remove_if_symlink, warn_missing_cni_plugins, write_cni_config_file, write_external_cni_config,
     write_managed_cni_config,
 };
@@ -30,7 +31,7 @@ pub use masquerade::{
     MASQUERADE_COMMENT, MasqueradeBackend, MockCommandExecutor, NetworkPreparationReport,
     SystemCommandExecutor, clean_pod_masquerade, clean_pod_masquerade_with_backend_and_executor,
     detect_backend, ensure_pod_masquerade, ensure_pod_masquerade_with_backend_and_executor,
-    evaluate_egress_traffic, ipv4_in_cidr, prepare_node_network,
+    evaluate_egress_traffic, ip_in_cidr, ipv4_in_cidr, ipv6_in_cidr, prepare_node_network,
 };
 pub use model::{
     DEFAULT_MTU, FALLBACK_NAMESERVERS, INSTANCE_METADATA_SERVICE_IP, InterfaceCandidate,
@@ -42,6 +43,7 @@ pub use resolver::{
     sanitize_resolv_conf,
 };
 pub use sysctl::{
-    IP_FORWARD_SYSCTL_REL_PATH, ensure_ip_forward, ensure_ip_forward_in_root,
+    IP_FORWARD_SYSCTL_REL_PATH, IPV6_FORWARD_SYSCTL_REL_PATH, ensure_ip_forward,
+    ensure_ip_forward_in_root, ensure_ipv6_forward, ensure_ipv6_forward_in_root,
     ensure_route_localnet, ensure_route_localnet_in_root, ensure_sysctl_value, read_sysctl,
 };
