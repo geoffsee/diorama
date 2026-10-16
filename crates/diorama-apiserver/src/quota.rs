@@ -89,45 +89,95 @@ fn is_terminal(pod: &Value) -> bool {
     )
 }
 
-fn container_resources(pod: &Value, kind: &str) -> BTreeMap<String, i128> {
-    let mut sum: BTreeMap<String, i128> = BTreeMap::new();
-    let mut init_max: BTreeMap<String, i128> = BTreeMap::new();
-    let collect = |list: Option<&Value>, out: &mut BTreeMap<String, i128>, add: bool| {
-        for c in list.and_then(Value::as_array).into_iter().flatten() {
-            let Some(map) = c
-                .pointer(&format!("/resources/{kind}"))
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            for (k, v) in map {
-                let Some(q) = quantity(v) else { continue };
-                let e = out.entry(k.clone()).or_insert(0);
-                if add {
-                    *e += q;
-                } else {
-                    *e = (*e).max(q);
+fn collect_quantity_map(map: Option<&Map<String, Value>>, out: &mut BTreeMap<String, i128>) {
+    let Some(map) = map else { return };
+    for (k, v) in map {
+        if let Some(q) = quantity(v) {
+            out.insert(k.clone(), q);
+        }
+    }
+}
+
+fn extract_container_resources(c: &Value, kind: &str) -> BTreeMap<String, i128> {
+    let mut res_map = BTreeMap::new();
+    if kind == "requests" {
+        collect_quantity_map(
+            c.pointer("/resources/requests").and_then(Value::as_object),
+            &mut res_map,
+        );
+        if let Some(limits) = c.pointer("/resources/limits").and_then(Value::as_object) {
+            for (k, v) in limits {
+                if !res_map.contains_key(k)
+                    && let Some(q) = quantity(v)
+                {
+                    res_map.insert(k.clone(), q);
                 }
             }
         }
+    } else {
+        collect_quantity_map(
+            c.pointer("/resources/limits").and_then(Value::as_object),
+            &mut res_map,
+        );
+    }
+    res_map
+}
+
+fn container_resources(pod: &Value, kind: &str) -> BTreeMap<String, i128> {
+    let mut sum: BTreeMap<String, i128> = BTreeMap::new();
+    let mut init_max: BTreeMap<String, i128> = BTreeMap::new();
+
+    let process_container = |c: &Value, out: &mut BTreeMap<String, i128>, add: bool| {
+        let res_map = extract_container_resources(c, kind);
+        for (k, q) in res_map {
+            let e = out.entry(k).or_insert(0);
+            if add {
+                *e += q;
+            } else {
+                *e = (*e).max(q);
+            }
+        }
     };
-    collect(pod.pointer("/spec/containers"), &mut sum, true);
-    collect(pod.pointer("/spec/initContainers"), &mut init_max, false);
+
+    if let Some(containers) = pod.pointer("/spec/containers").and_then(Value::as_array) {
+        for c in containers {
+            process_container(c, &mut sum, true);
+        }
+    }
+
+    if let Some(init_containers) = pod
+        .pointer("/spec/initContainers")
+        .and_then(Value::as_array)
+    {
+        for c in init_containers {
+            let is_sidecar = c.pointer("/restartPolicy").and_then(Value::as_str) == Some("Always");
+            if is_sidecar {
+                process_container(c, &mut sum, true);
+            } else {
+                process_container(c, &mut init_max, false);
+            }
+        }
+    }
+
     for (k, v) in init_max {
         let e = sum.entry(k).or_insert(0);
         *e = (*e).max(v);
     }
-    if let Some(overhead) = pod.pointer("/spec/overhead").and_then(Value::as_object) {
+
+    if kind == "requests"
+        && let Some(overhead) = pod.pointer("/spec/overhead").and_then(Value::as_object)
+    {
         for (k, v) in overhead {
             if let Some(q) = quantity(v) {
                 *sum.entry(k.clone()).or_insert(0) += q;
             }
         }
     }
+
     sum
 }
 
-/// Returns true when a pod declares no requests or limits at all.
+/// Returns true when a pod declares no CPU or memory requests or limits at all.
 #[must_use]
 pub fn is_best_effort(pod: &Value) -> bool {
     ["/spec/containers", "/spec/initContainers"]
@@ -139,9 +189,13 @@ pub fn is_best_effort(pod: &Value) -> bool {
                 .flatten()
                 .all(|c| {
                     ["requests", "limits"].iter().all(|k| {
-                        c.pointer(&format!("/resources/{k}"))
+                        let Some(map) = c
+                            .pointer(&format!("/resources/{k}"))
                             .and_then(Value::as_object)
-                            .is_none_or(Map::is_empty)
+                        else {
+                            return true;
+                        };
+                        !map.contains_key("cpu") && !map.contains_key("memory")
                     })
                 })
         })
@@ -156,8 +210,90 @@ pub fn pod_matches_scopes(pod: &Value, scopes: &[&str]) -> bool {
         "NotBestEffort" => !is_best_effort(pod),
         "Terminating" => terminating,
         "NotTerminating" => !terminating,
+        "PriorityClass" => pod
+            .pointer("/spec/priorityClassName")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
         _ => true,
     })
+}
+
+fn match_bool_scope(matches: bool, operator: &str, values: &[&str]) -> bool {
+    match operator {
+        "Exists" => matches,
+        "DoesNotExist" => !matches,
+        "In" => {
+            if matches {
+                values.is_empty() || values.iter().any(|v| v.eq_ignore_ascii_case("true"))
+            } else {
+                values.iter().any(|v| v.eq_ignore_ascii_case("false"))
+            }
+        },
+        "NotIn" => {
+            if matches {
+                !values.iter().any(|v| v.eq_ignore_ascii_case("true"))
+            } else {
+                !values.iter().any(|v| v.eq_ignore_ascii_case("false"))
+            }
+        },
+        _ => false,
+    }
+}
+
+fn eval_scope_expression(
+    expr: &Value,
+    terminating: bool,
+    best_effort: bool,
+    priority_class: &str,
+) -> bool {
+    let Some(scope_name) = expr.get("scopeName").and_then(Value::as_str) else {
+        return true;
+    };
+    let operator = expr
+        .get("operator")
+        .and_then(Value::as_str)
+        .unwrap_or("Exists");
+    let values: Vec<&str> = expr
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    match scope_name {
+        "PriorityClass" => match operator {
+            "In" => !priority_class.is_empty() && values.contains(&priority_class),
+            "NotIn" => !values.contains(&priority_class),
+            "Exists" => !priority_class.is_empty(),
+            "DoesNotExist" => priority_class.is_empty(),
+            _ => true,
+        },
+        "Terminating" => match_bool_scope(terminating, operator, &values),
+        "NotTerminating" => match_bool_scope(!terminating, operator, &values),
+        "BestEffort" => match_bool_scope(best_effort, operator, &values),
+        "NotBestEffort" => match_bool_scope(!best_effort, operator, &values),
+        _ => true,
+    }
+}
+
+/// Evaluates `spec.scopeSelector` matchExpressions for a pod.
+#[must_use]
+pub fn pod_matches_scope_selector(pod: &Value, scope_selector: &Value) -> bool {
+    let Some(match_exprs) = scope_selector
+        .pointer("/matchExpressions")
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    let terminating = pod.pointer("/spec/activeDeadlineSeconds").is_some();
+    let best_effort = is_best_effort(pod);
+    let priority_class = pod
+        .pointer("/spec/priorityClassName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    match_exprs
+        .iter()
+        .all(|expr| eval_scope_expression(expr, terminating, best_effort, priority_class))
 }
 
 /// Per-resource usage a live pod charges against a quota.
@@ -192,6 +328,7 @@ pub fn pvc_usage(pvc: &Value) -> BTreeMap<String, i128> {
         .and_then(quantity)
         .unwrap_or(0);
     usage.insert("requests.storage".to_string(), storage);
+    usage.insert("storage".to_string(), storage);
     if let Some(class) = pvc
         .pointer("/spec/storageClassName")
         .and_then(Value::as_str)
@@ -240,11 +377,12 @@ pub fn service_usage(svc: &Value) -> BTreeMap<String, i128> {
 #[must_use]
 pub fn object_count_usage(group: &str, plural: &str) -> BTreeMap<String, i128> {
     let mut usage = BTreeMap::new();
+    usage.insert(format!("count/{plural}"), 1000);
     if group.is_empty() {
         usage.insert(plural.to_string(), 1000);
-        usage.insert(format!("count/{plural}"), 1000);
     } else {
         usage.insert(format!("count/{plural}.{group}"), 1000);
+        usage.insert(format!("{plural}.{group}"), 1000);
     }
     usage
 }
@@ -274,10 +412,35 @@ pub fn quota_scopes(quota: &Value) -> Vec<&str> {
 #[must_use]
 pub fn object_in_scope(quota: &Value, group: &str, plural: &str, obj: &Value) -> bool {
     let scopes = quota_scopes(quota);
-    if scopes.is_empty() {
+    let scope_selector = quota.pointer("/spec/scopeSelector");
+    let has_scopes = !scopes.is_empty();
+    let has_selector = scope_selector.is_some_and(|s| {
+        s.pointer("/matchExpressions")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+    });
+
+    if !has_scopes && !has_selector {
         return true;
     }
-    group.is_empty() && plural == "pods" && pod_matches_scopes(obj, &scopes)
+
+    // Scoped quotas only match Pods
+    if !(group.is_empty() && plural == "pods") {
+        return false;
+    }
+
+    if has_scopes && !pod_matches_scopes(obj, &scopes) {
+        return false;
+    }
+
+    if has_selector
+        && let Some(sel) = scope_selector
+        && !pod_matches_scope_selector(obj, sel)
+    {
+        return false;
+    }
+
+    true
 }
 
 /// Builds `status` (`hard` + `used`) from per-object usages.
@@ -351,6 +514,11 @@ pub async fn list_counted(
         ("", "secrets") => client.list_secrets(namespace).await,
         ("", "services") => client.list_services(namespace).await,
         ("", "persistentvolumeclaims") => client.list_pvcs(namespace).await,
+        ("", "limitranges") => {
+            client
+                .list_namespaced_objects("", "LimitRangeList", "limitranges", namespace)
+                .await
+        },
         ("apps", "deployments") => client.list_deployments(namespace).await,
         ("apps", "replicasets") => client.list_replicasets(namespace).await,
         ("apps", "statefulsets") => client.list_statefulsets(namespace).await,
@@ -409,6 +577,7 @@ pub const COUNTED_RESOURCES: &[(&str, &str, &str)] = &[
     ("", "SecretList", "secrets"),
     ("", "ReplicationControllerList", "replicationcontrollers"),
     ("", "ResourceQuotaList", "resourcequotas"),
+    ("", "LimitRangeList", "limitranges"),
     ("apps", "ReplicaSetList", "replicasets"),
     ("apps", "DeploymentList", "deployments"),
     ("apps", "StatefulSetList", "statefulsets"),
@@ -437,8 +606,13 @@ pub fn quota_tracks(quota: &Value, group: &str, plural: &str) -> bool {
                 && k != "requests.storage");
         (group.is_empty() && k == plural)
             || *k == count_key
+            || *k == format!("count/{plural}")
+            || (!group.is_empty() && *k == format!("{plural}.{group}"))
             || (compute && compute_key)
-            || (pvc && (k == "requests.storage" || k.contains(".storageclass.storage.k8s.io/")))
+            || (pvc
+                && (k == "requests.storage"
+                    || k == "storage"
+                    || k.contains(".storageclass.storage.k8s.io/")))
             || (svc && k.starts_with("services."))
     })
 }
@@ -456,6 +630,7 @@ mod tests {
         assert_eq!(parse_quantity_milli("1e3"), Some(1_000_000));
         assert_eq!(format_milli(500), "500m");
         assert_eq!(format_milli(2000), "2");
+        assert_eq!(format_milli(0), "0");
     }
 
     #[test]
@@ -471,6 +646,23 @@ mod tests {
     }
 
     #[test]
+    fn pod_usage_defaults_requests_from_limits() {
+        let pod = json!({
+            "spec": {
+                "containers": [
+                    { "resources": { "limits": { "cpu": "2", "memory": "1Gi" } } }
+                ]
+            }
+        });
+        let u = pod_usage(&pod);
+        assert_eq!(u["requests.cpu"], 2000);
+        assert_eq!(u["cpu"], 2000);
+        assert_eq!(u["requests.memory"], 1000 << 30);
+        assert_eq!(u["limits.cpu"], 2000);
+        assert_eq!(u["limits.memory"], 1000 << 30);
+    }
+
+    #[test]
     fn detects_exceeded_quota() {
         let quota = json!({ "metadata": { "name": "q" }, "spec": { "hard": { "pods": "1" } } });
         let totals = BTreeMap::from([("pods".to_string(), 1000)]);
@@ -480,5 +672,224 @@ mod tests {
                 .unwrap()
                 .contains("exceeded quota: q")
         );
+    }
+
+    #[test]
+    fn quota_scopes_terminating_and_not_terminating() {
+        let pod_terminating = json!({ "spec": { "activeDeadlineSeconds": 60 } });
+        let pod_not_terminating = json!({ "spec": {} });
+
+        let quota_terminating =
+            json!({ "spec": { "scopes": ["Terminating"], "hard": { "pods": "2" } } });
+        let quota_not_terminating =
+            json!({ "spec": { "scopes": ["NotTerminating"], "hard": { "pods": "2" } } });
+
+        assert!(object_in_scope(
+            &quota_terminating,
+            "",
+            "pods",
+            &pod_terminating
+        ));
+        assert!(!object_in_scope(
+            &quota_terminating,
+            "",
+            "pods",
+            &pod_not_terminating
+        ));
+
+        assert!(!object_in_scope(
+            &quota_not_terminating,
+            "",
+            "pods",
+            &pod_terminating
+        ));
+        assert!(object_in_scope(
+            &quota_not_terminating,
+            "",
+            "pods",
+            &pod_not_terminating
+        ));
+    }
+
+    #[test]
+    fn quota_scopes_best_effort_and_not_best_effort() {
+        let be_pod = json!({
+            "spec": {
+                "containers": [{ "name": "nginx", "image": "nginx" }]
+            }
+        });
+        let not_be_pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "nginx",
+                    "image": "nginx",
+                    "resources": { "requests": { "cpu": "100m" } }
+                }]
+            }
+        });
+
+        assert!(is_best_effort(&be_pod));
+        assert!(!is_best_effort(&not_be_pod));
+
+        let quota_be = json!({ "spec": { "scopes": ["BestEffort"], "hard": { "pods": "5" } } });
+        let quota_not_be =
+            json!({ "spec": { "scopes": ["NotBestEffort"], "hard": { "pods": "5" } } });
+
+        assert!(object_in_scope(&quota_be, "", "pods", &be_pod));
+        assert!(!object_in_scope(&quota_be, "", "pods", &not_be_pod));
+
+        assert!(!object_in_scope(&quota_not_be, "", "pods", &be_pod));
+        assert!(object_in_scope(&quota_not_be, "", "pods", &not_be_pod));
+    }
+
+    #[test]
+    fn quota_scope_selector_priority_class() {
+        let pod_high = json!({
+            "spec": {
+                "priorityClassName": "high-priority",
+                "containers": [{ "name": "c", "image": "img" }]
+            }
+        });
+        let pod_low = json!({
+            "spec": {
+                "priorityClassName": "low-priority",
+                "containers": [{ "name": "c", "image": "img" }]
+            }
+        });
+        let pod_none = json!({
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }]
+            }
+        });
+
+        let quota_high = json!({
+            "spec": {
+                "hard": { "pods": "10" },
+                "scopeSelector": {
+                    "matchExpressions": [
+                        {
+                            "scopeName": "PriorityClass",
+                            "operator": "In",
+                            "values": ["high-priority", "system-cluster-critical"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let quota_exists = json!({
+            "spec": {
+                "hard": { "pods": "10" },
+                "scopeSelector": {
+                    "matchExpressions": [
+                        {
+                            "scopeName": "PriorityClass",
+                            "operator": "Exists"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let quota_does_not_exist = json!({
+            "spec": {
+                "hard": { "pods": "10" },
+                "scopeSelector": {
+                    "matchExpressions": [
+                        {
+                            "scopeName": "PriorityClass",
+                            "operator": "DoesNotExist"
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(object_in_scope(&quota_high, "", "pods", &pod_high));
+        assert!(!object_in_scope(&quota_high, "", "pods", &pod_low));
+        assert!(!object_in_scope(&quota_high, "", "pods", &pod_none));
+
+        assert!(object_in_scope(&quota_exists, "", "pods", &pod_high));
+        assert!(object_in_scope(&quota_exists, "", "pods", &pod_low));
+        assert!(!object_in_scope(&quota_exists, "", "pods", &pod_none));
+
+        assert!(!object_in_scope(
+            &quota_does_not_exist,
+            "",
+            "pods",
+            &pod_high
+        ));
+        assert!(object_in_scope(
+            &quota_does_not_exist,
+            "",
+            "pods",
+            &pod_none
+        ));
+    }
+
+    #[test]
+    fn scoped_quota_does_not_match_non_pod_resources() {
+        let quota = json!({
+            "spec": {
+                "scopes": ["BestEffort"],
+                "hard": { "count/services": "5", "pods": "5" }
+            }
+        });
+        let svc = json!({ "spec": {} });
+        let secret = json!({ "data": {} });
+
+        assert!(!object_in_scope(&quota, "", "services", &svc));
+        assert!(!object_in_scope(&quota, "", "secrets", &secret));
+    }
+
+    #[test]
+    fn object_count_usage_and_tracking() {
+        let u_deploy = object_count_usage("apps", "deployments");
+        assert_eq!(u_deploy["count/deployments.apps"], 1000);
+        assert_eq!(u_deploy["count/deployments"], 1000);
+        assert_eq!(u_deploy["deployments.apps"], 1000);
+
+        let quota_deploy = json!({
+            "spec": { "hard": { "count/deployments.apps": "3" } }
+        });
+        assert!(quota_tracks(&quota_deploy, "apps", "deployments"));
+
+        let quota_deploy_short = json!({
+            "spec": { "hard": { "count/deployments": "3" } }
+        });
+        assert!(quota_tracks(&quota_deploy_short, "apps", "deployments"));
+
+        let u_cm = object_count_usage("", "configmaps");
+        assert_eq!(u_cm["count/configmaps"], 1000);
+        assert_eq!(u_cm["configmaps"], 1000);
+
+        let quota_cm = json!({
+            "spec": { "hard": { "count/configmaps": "10" } }
+        });
+        assert!(quota_tracks(&quota_cm, "", "configmaps"));
+    }
+
+    #[test]
+    fn status_from_usage_calculation() {
+        let quota = json!({
+            "spec": {
+                "hard": {
+                    "requests.cpu": "2",
+                    "requests.memory": "1Gi",
+                    "pods": "10",
+                    "count/services": "5"
+                }
+            }
+        });
+        let totals = BTreeMap::from([
+            ("requests.cpu".to_string(), 500),
+            ("requests.memory".to_string(), 500 << 20),
+            ("pods".to_string(), 2000),
+        ]);
+        let status = status_from_usage(&quota, &totals);
+        assert_eq!(status["hard"]["pods"], "10");
+        assert_eq!(status["used"]["requests.cpu"], "500m");
+        assert_eq!(status["used"]["pods"], "2");
+        assert_eq!(status["used"]["count/services"], "0");
     }
 }

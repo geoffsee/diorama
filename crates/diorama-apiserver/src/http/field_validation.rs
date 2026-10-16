@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{LazyLock, RwLock};
 
 use saphyr_parser::{BufferedInput, Event, Parser, ScalarStyle, Span};
 use serde_json::Value;
@@ -7,16 +8,130 @@ use crate::error::ApiserverError;
 use crate::http::query;
 use crate::http::route::ResourcePath;
 
+/// Server-side field validation directive (`Strict`, `Warn`, `Ignore`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FieldValidationDirective {
+    #[default]
+    Ignore,
+    Warn,
+    Strict,
+}
+
+std::thread_local! {
+    static CURRENT_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CURRENT_DIRECTIVE: std::cell::Cell<Option<FieldValidationDirective>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets the current field validation directive for the executing thread.
+pub(crate) fn set_current_directive(directive: FieldValidationDirective) {
+    CURRENT_DIRECTIVE.set(Some(directive));
+}
+
+/// Returns the current directive in the thread-local context, or default `Ignore`.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn current_directive() -> FieldValidationDirective {
+    CURRENT_DIRECTIVE.get().unwrap_or_default()
+}
+
+/// Clears the current directive from the thread-local context.
+#[allow(dead_code)]
+pub(crate) fn clear_current_directive() {
+    CURRENT_DIRECTIVE.set(None);
+}
+
+/// Takes and clears all recorded warnings for the current thread.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn take_warnings() -> Vec<String> {
+    CURRENT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+/// Returns all recorded warnings for the current thread without clearing.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn current_warnings() -> Vec<String> {
+    CURRENT_WARNINGS.with(|w| w.borrow().clone())
+}
+
+/// Adds a warning to the thread-local warning store.
+pub(crate) fn add_warning(warning: impl Into<String>) {
+    CURRENT_WARNINGS.with(|w| w.borrow_mut().push(warning.into()));
+}
+
+/// Clears any recorded warnings for the current thread.
+pub(crate) fn clear_warnings() {
+    CURRENT_WARNINGS.with(|w| w.borrow_mut().clear());
+}
+
+/// Parses the `fieldValidation` query parameter from the request query string.
+#[must_use]
+pub(crate) fn parse_validation_directive(query: Option<&str>) -> FieldValidationDirective {
+    match query::parse(query)
+        .get("fieldValidation")
+        .map(String::as_str)
+    {
+        Some(v) if v.eq_ignore_ascii_case("strict") => FieldValidationDirective::Strict,
+        Some(v) if v.eq_ignore_ascii_case("warn") => FieldValidationDirective::Warn,
+        Some(v) if v.eq_ignore_ascii_case("ignore") => FieldValidationDirective::Ignore,
+        _ => FieldValidationDirective::Ignore,
+    }
+}
+
 /// Returns true if query parameter `fieldValidation` is present and equals "Strict" (case-insensitive).
+/// Also sets the thread-local validation directive for downstream decode steps.
 #[must_use]
 pub(crate) fn is_strict(query: Option<&str>) -> bool {
-    query::parse(query)
-        .get("fieldValidation")
-        .is_some_and(|v| v.eq_ignore_ascii_case("strict"))
+    let directive = parse_validation_directive(query);
+    set_current_directive(directive);
+    directive == FieldValidationDirective::Strict
+}
+
+static CRD_SCHEMAS: LazyLock<RwLock<BTreeMap<String, Value>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+
+/// Registers a CRD `OpenAPI` v3 schema for field validation.
+#[allow(dead_code)]
+pub(crate) fn register_crd_schema(group: &str, plural: &str, openapi_v3_schema: Value) {
+    let key = if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{group}/{plural}")
+    };
+    CRD_SCHEMAS.write().unwrap().insert(key, openapi_v3_schema);
+}
+
+/// Unregisters a CRD `OpenAPI` v3 schema.
+#[allow(dead_code)]
+pub(crate) fn unregister_crd_schema(group: &str, plural: &str) {
+    let key = if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{group}/{plural}")
+    };
+    CRD_SCHEMAS.write().unwrap().remove(&key);
+}
+
+/// Clears all registered CRD schemas.
+#[allow(dead_code)]
+pub(crate) fn clear_crd_schemas() {
+    CRD_SCHEMAS.write().unwrap().clear();
+}
+
+/// Returns a copy of the registered CRD schema if present.
+#[must_use]
+pub(crate) fn get_crd_schema(group: &str, plural: &str) -> Option<Value> {
+    let key = if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{group}/{plural}")
+    };
+    CRD_SCHEMAS.read().unwrap().get(&key).cloned()
 }
 
 /// Checks strict decoding constraints on a JSON request payload.
-/// Detects duplicate keys at any depth and unknown fields under `metadata` or `spec`.
+/// Detects duplicate keys at any depth and unknown fields.
+#[allow(dead_code)]
 pub(crate) fn check_strict_json(body: &[u8], path: &ResourcePath) -> Result<(), ApiserverError> {
     let Ok(text) = std::str::from_utf8(body) else {
         return Err(ApiserverError::BadRequest {
@@ -24,21 +139,39 @@ pub(crate) fn check_strict_json(body: &[u8], path: &ResourcePath) -> Result<(), 
         });
     };
     let kind = kind_from_path(path);
-    let mut checker = JsonStrictChecker::new(text, kind);
+    let crd_schema = get_crd_schema(&path.group, &path.resource);
+    let mut checker = JsonStrictChecker::new(text, kind, crd_schema.as_ref());
     checker.check()
 }
 
-/// Decodes request body bytes as JSON or YAML, enforcing strict field validation rules
-/// when `is_strict` is true.
+/// Decodes request body bytes as JSON or YAML, enforcing field validation rules
+/// based on `is_strict` or the currently active `FieldValidationDirective`.
 pub(crate) fn decode_body_with_validation(
     body: &[u8],
     content_type: Option<&str>,
     is_strict: bool,
     path: &ResourcePath,
 ) -> Result<Value, ApiserverError> {
+    let directive = CURRENT_DIRECTIVE.get().unwrap_or(if is_strict {
+        FieldValidationDirective::Strict
+    } else {
+        FieldValidationDirective::Ignore
+    });
+    decode_body_with_directive(body, content_type, directive, path)
+}
+
+/// Decodes request body bytes enforcing the given `FieldValidationDirective`.
+pub(crate) fn decode_body_with_directive(
+    body: &[u8],
+    content_type: Option<&str>,
+    directive: FieldValidationDirective,
+    path: &ResourcePath,
+) -> Result<Value, ApiserverError> {
     if body.is_empty() {
         return Ok(Value::Null);
     }
+    clear_warnings();
+
     let is_yaml = content_type.is_some_and(|ct| ct.contains("yaml") || ct.contains("apply-patch"));
     let trimmed = body
         .iter()
@@ -48,25 +181,95 @@ pub(crate) fn decode_body_with_validation(
     let looks_like_json = trimmed.first() == Some(&b'{') || trimmed.first() == Some(&b'[');
 
     if !is_yaml && looks_like_json {
-        if is_strict {
-            check_strict_json(body, path)?;
-        }
+        decode_json_with_directive(body, directive, path)
+    } else {
+        decode_yaml_with_directive(body, directive, Some(path))
+    }
+}
+
+fn decode_json_with_directive(
+    body: &[u8],
+    directive: FieldValidationDirective,
+    path: &ResourcePath,
+) -> Result<Value, ApiserverError> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Err(ApiserverError::BadRequest {
+            message: "request body is not valid UTF-8".to_string(),
+        });
+    };
+
+    let crd_schema = get_crd_schema(&path.group, &path.resource);
+    let kind = kind_from_path(path);
+
+    let mut checker = JsonStrictChecker::new(text, kind, crd_schema.as_ref());
+    let (unknown_fields, duplicate_fields) = checker.analyze()?;
+
+    match directive {
+        FieldValidationDirective::Strict => {
+            if !unknown_fields.is_empty() || !duplicate_fields.is_empty() {
+                let mut all_errors = unknown_fields;
+                all_errors.extend(duplicate_fields);
+                return Err(ApiserverError::BadRequest {
+                    message: format!("strict decoding error: {}", all_errors.join(", ")),
+                });
+            }
+        },
+        FieldValidationDirective::Warn => {
+            for unk in &unknown_fields {
+                let field_path = unk
+                    .strip_prefix("unknown field \"")
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| unk.strip_prefix("unknown field "))
+                    .unwrap_or(unk);
+                add_warning(format!(r#"299 - "Unknown field \"{field_path}\"""#));
+            }
+            for dup in &duplicate_fields {
+                let field_path = dup
+                    .strip_prefix("duplicate field \"")
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| dup.strip_prefix("duplicate field "))
+                    .unwrap_or(dup);
+                add_warning(format!(r#"299 - "duplicate field \"{field_path}\"""#));
+            }
+        },
+        FieldValidationDirective::Ignore => {},
+    }
+
+    let mut val: Value =
         serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
             message: format!("request body is not valid JSON: {err}"),
-        })
-    } else {
-        decode_yaml(body, is_strict)
+        })?;
+
+    if directive == FieldValidationDirective::Ignore {
+        strip_unknown_fields(&mut val, kind, crd_schema.as_ref());
     }
+
+    Ok(val)
 }
 
 /// Decodes YAML into `serde_json::Value`, detecting duplicate keys when `is_strict` is true.
 pub(crate) fn decode_yaml(body: &[u8], is_strict: bool) -> Result<Value, ApiserverError> {
+    let directive = if is_strict {
+        FieldValidationDirective::Strict
+    } else {
+        FieldValidationDirective::Ignore
+    };
+    decode_yaml_with_directive(body, directive, None)
+}
+
+/// Decodes YAML into `serde_json::Value`, enforcing field validation directive.
+pub(crate) fn decode_yaml_with_directive(
+    body: &[u8],
+    directive: FieldValidationDirective,
+    path: Option<&ResourcePath>,
+) -> Result<Value, ApiserverError> {
     let text = std::str::from_utf8(body).map_err(|err| ApiserverError::BadRequest {
         message: format!("request body is not valid UTF-8: {err}"),
     })?;
     let mut parser = Parser::new(BufferedInput::new(text.chars()));
     let mut anchors = BTreeMap::new();
     let mut root_val = Value::Null;
+    let mut duplicate_fields = Vec::new();
 
     loop {
         let event_opt =
@@ -85,18 +288,72 @@ pub(crate) fn decode_yaml(body: &[u8], is_strict: bool) -> Result<Value, Apiserv
             | Event::DocumentStart(_)
             | Event::DocumentEnd => {},
             _ => {
-                root_val = decode_yaml_node(&mut parser, event, span, &mut anchors, is_strict, 0)?;
+                root_val = decode_yaml_node(
+                    &mut parser,
+                    event,
+                    span,
+                    &mut anchors,
+                    directive,
+                    &mut duplicate_fields,
+                    0,
+                )?;
                 break;
             },
         }
     }
+
+    if let Some(path) = path {
+        let crd_schema = get_crd_schema(&path.group, &path.resource);
+        let kind = kind_from_path(path);
+        let mut unknown_fields = Vec::new();
+        collect_unknown_fields(
+            &root_val,
+            kind,
+            crd_schema.as_ref(),
+            "",
+            &mut unknown_fields,
+        );
+
+        match directive {
+            FieldValidationDirective::Strict => {
+                if !unknown_fields.is_empty() {
+                    return Err(ApiserverError::BadRequest {
+                        message: format!("strict decoding error: {}", unknown_fields.join(", ")),
+                    });
+                }
+            },
+            FieldValidationDirective::Warn => {
+                for unk in &unknown_fields {
+                    let field_path = unk
+                        .strip_prefix("unknown field \"")
+                        .and_then(|s| s.strip_suffix('"'))
+                        .or_else(|| unk.strip_prefix("unknown field "))
+                        .unwrap_or(unk);
+                    add_warning(format!(r#"299 - "Unknown field \"{field_path}\"""#));
+                }
+                for dup in &duplicate_fields {
+                    let field_path = dup
+                        .strip_prefix("duplicate field \"")
+                        .and_then(|s| s.strip_suffix('"'))
+                        .or_else(|| dup.strip_prefix("duplicate field "))
+                        .unwrap_or(dup);
+                    add_warning(format!(r#"299 - "duplicate field \"{field_path}\"""#));
+                }
+            },
+            FieldValidationDirective::Ignore => {
+                strip_unknown_fields(&mut root_val, kind, crd_schema.as_ref());
+            },
+        }
+    }
+
     Ok(root_val)
 }
 
 fn decode_yaml_sequence<'a>(
     parser: &mut Parser<'a, BufferedInput<std::str::Chars<'a>>>,
     anchors: &mut BTreeMap<usize, Value>,
-    is_strict: bool,
+    directive: FieldValidationDirective,
+    duplicate_fields: &mut Vec<String>,
     depth: usize,
 ) -> Result<Value, ApiserverError> {
     let mut list = Vec::new();
@@ -119,7 +376,8 @@ fn decode_yaml_sequence<'a>(
             next_event,
             next_span,
             anchors,
-            is_strict,
+            directive,
+            duplicate_fields,
             depth + 1,
         )?);
     }
@@ -129,7 +387,8 @@ fn decode_yaml_sequence<'a>(
 fn decode_yaml_mapping<'a>(
     parser: &mut Parser<'a, BufferedInput<std::str::Chars<'a>>>,
     anchors: &mut BTreeMap<usize, Value>,
-    is_strict: bool,
+    directive: FieldValidationDirective,
+    duplicate_fields: &mut Vec<String>,
     depth: usize,
 ) -> Result<Value, ApiserverError> {
     let mut map = serde_json::Map::new();
@@ -156,14 +415,22 @@ fn decode_yaml_mapping<'a>(
                 });
             },
         };
-        if is_strict && !seen_keys.insert(key_str.clone()) {
-            return Err(ApiserverError::BadRequest {
-                message: format!(
-                    "error unmarshaling JSON: while decoding JSON: line {}: key \"{}\" already set in map",
-                    key_span.start.line(),
-                    key_str
-                ),
-            });
+        if !seen_keys.insert(key_str.clone()) {
+            match directive {
+                FieldValidationDirective::Strict => {
+                    return Err(ApiserverError::BadRequest {
+                        message: format!(
+                            "error unmarshaling JSON: while decoding JSON: line {}: key \"{}\" already set in map",
+                            key_span.start.line(),
+                            key_str
+                        ),
+                    });
+                },
+                FieldValidationDirective::Warn => {
+                    duplicate_fields.push(format!("duplicate field \"{key_str}\""));
+                },
+                FieldValidationDirective::Ignore => {},
+            }
         }
         let val_opt =
             parser
@@ -175,7 +442,15 @@ fn decode_yaml_mapping<'a>(
         let (val_event, val_span) = val_opt.ok_or_else(|| ApiserverError::BadRequest {
             message: "unexpected EOF in YAML mapping value".to_string(),
         })?;
-        let val = decode_yaml_node(parser, val_event, val_span, anchors, is_strict, depth + 1)?;
+        let val = decode_yaml_node(
+            parser,
+            val_event,
+            val_span,
+            anchors,
+            directive,
+            duplicate_fields,
+            depth + 1,
+        )?;
         map.insert(key_str, val);
     }
     Ok(Value::Object(map))
@@ -186,7 +461,8 @@ fn decode_yaml_node<'a>(
     event: Event<'a>,
     _span: Span,
     anchors: &mut BTreeMap<usize, Value>,
-    is_strict: bool,
+    directive: FieldValidationDirective,
+    duplicate_fields: &mut Vec<String>,
     depth: usize,
 ) -> Result<Value, ApiserverError> {
     if depth > 128 {
@@ -209,11 +485,11 @@ fn decode_yaml_node<'a>(
             return Ok(val);
         },
         Event::SequenceStart(anchor, _) => {
-            let seq = decode_yaml_sequence(parser, anchors, is_strict, depth)?;
+            let seq = decode_yaml_sequence(parser, anchors, directive, duplicate_fields, depth)?;
             (anchor, seq)
         },
         Event::MappingStart(anchor, _) => {
-            let map = decode_yaml_mapping(parser, anchors, is_strict, depth)?;
+            let map = decode_yaml_mapping(parser, anchors, directive, duplicate_fields, depth)?;
             (anchor, map)
         },
         _ => return Ok(Value::Null),
@@ -250,27 +526,37 @@ fn parse_yaml_scalar(text: &str, style: ScalarStyle) -> Value {
 struct JsonStrictChecker<'a> {
     chars: std::iter::Peekable<std::str::CharIndices<'a>>,
     kind: Option<&'a str>,
+    crd_schema: Option<&'a Value>,
     unknown_fields: Vec<String>,
     duplicate_fields: Vec<String>,
 }
 
 impl<'a> JsonStrictChecker<'a> {
-    fn new(src: &'a str, kind: Option<&'a str>) -> Self {
+    fn new(src: &'a str, kind: Option<&'a str>, crd_schema: Option<&'a Value>) -> Self {
         Self {
             chars: src.char_indices().peekable(),
             kind,
+            crd_schema,
             unknown_fields: Vec::new(),
             duplicate_fields: Vec::new(),
         }
     }
 
-    fn check(&mut self) -> Result<(), ApiserverError> {
+    fn analyze(&mut self) -> Result<(Vec<String>, Vec<String>), ApiserverError> {
         self.parse_value("")?;
-        if self.unknown_fields.is_empty() && self.duplicate_fields.is_empty() {
+        Ok((
+            std::mem::take(&mut self.unknown_fields),
+            std::mem::take(&mut self.duplicate_fields),
+        ))
+    }
+
+    fn check(&mut self) -> Result<(), ApiserverError> {
+        let (unknown_fields, duplicate_fields) = self.analyze()?;
+        if unknown_fields.is_empty() && duplicate_fields.is_empty() {
             Ok(())
         } else {
-            let mut all_errors = std::mem::take(&mut self.unknown_fields);
-            all_errors.extend(std::mem::take(&mut self.duplicate_fields));
+            let mut all_errors = unknown_fields;
+            all_errors.extend(duplicate_fields);
             Err(ApiserverError::BadRequest {
                 message: format!("strict decoding error: {}", all_errors.join(", ")),
             })
@@ -347,7 +633,6 @@ impl<'a> JsonStrictChecker<'a> {
                 Ok(())
             },
             _ => {
-                // Primitives (number, boolean, null)
                 while let Some(&(_, ch)) = self.chars.peek() {
                     if ch.is_ascii_whitespace() || ch == ',' || ch == '}' || ch == ']' {
                         break;
@@ -360,7 +645,7 @@ impl<'a> JsonStrictChecker<'a> {
     }
 
     fn parse_array(&mut self, prefix: &str) -> Result<(), ApiserverError> {
-        self.chars.next(); // consume '['
+        self.chars.next();
         let mut idx = 0;
         loop {
             self.skip_whitespace();
@@ -385,7 +670,7 @@ impl<'a> JsonStrictChecker<'a> {
     }
 
     fn parse_object(&mut self, prefix: &str) -> Result<(), ApiserverError> {
-        self.chars.next(); // consume '{'
+        self.chars.next();
         let mut seen_keys = HashSet::new();
         loop {
             self.skip_whitespace();
@@ -405,8 +690,21 @@ impl<'a> JsonStrictChecker<'a> {
                 self.duplicate_fields
                     .push(format!("duplicate field \"{field_path}\""));
             }
-            let is_unknown = (prefix == "metadata" && !is_known_metadata_key(&key))
-                || (prefix == "spec" && !is_known_spec_key(self.kind, &key));
+
+            let is_unknown = if let Some(schema) = self.crd_schema {
+                is_unknown_crd_field(schema, prefix, &key)
+            } else {
+                let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
+                let is_spec = prefix == "spec";
+                let is_pod_spec = prefix == "spec.template.spec";
+                let is_root = prefix.is_empty();
+
+                (is_meta && !is_known_metadata_key(&key))
+                    || (is_spec && !is_known_spec_key(self.kind, &key))
+                    || (is_pod_spec && !is_known_pod_spec_key(&key))
+                    || (is_root && !is_known_root_key(self.kind, &key))
+            };
+
             if is_unknown {
                 self.unknown_fields
                     .push(format!("unknown field \"{field_path}\""));
@@ -431,6 +729,172 @@ impl<'a> JsonStrictChecker<'a> {
     }
 }
 
+fn is_unknown_crd_field(schema: &Value, prefix: &str, key: &str) -> bool {
+    let subschema = resolve_subschema(schema, prefix);
+    let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
+    if is_meta && !is_known_metadata_key(key) {
+        return true;
+    }
+    if prefix.is_empty() && matches!(key, "apiVersion" | "kind" | "metadata") {
+        return false;
+    }
+    let Some(sub) = subschema else {
+        return false;
+    };
+    let preserve_unknown = sub
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || sub.get("additionalProperties").is_some();
+    if preserve_unknown {
+        return false;
+    }
+    if let Some(props) = sub.get("properties").and_then(Value::as_object) {
+        !props.contains_key(key)
+    } else {
+        sub.get("type").and_then(Value::as_str) == Some("object")
+    }
+}
+
+fn resolve_subschema<'a>(schema: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(schema);
+    }
+    let mut curr = schema;
+    for part in path.split('.') {
+        let clean_part = part.split('[').next().unwrap_or(part);
+        if clean_part.is_empty() {
+            continue;
+        }
+        let props = curr.get("properties").and_then(Value::as_object)?;
+        let next = props.get(clean_part)?;
+        curr = next;
+        if part.contains('[') {
+            curr = curr.get("items").unwrap_or(curr);
+        }
+    }
+    Some(curr)
+}
+
+fn collect_unknown_fields(
+    val: &Value,
+    kind: Option<&str>,
+    crd_schema: Option<&Value>,
+    prefix: &str,
+    unknowns: &mut Vec<String>,
+) {
+    let Some(obj) = val.as_object() else {
+        if let Some(arr) = val.as_array() {
+            for (i, item) in arr.iter().enumerate() {
+                let item_prefix = format!("{prefix}[{i}]");
+                collect_unknown_fields(item, kind, crd_schema, &item_prefix, unknowns);
+            }
+        }
+        return;
+    };
+
+    for (k, v) in obj {
+        let field_path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+
+        let is_unknown = if let Some(schema) = crd_schema {
+            is_unknown_crd_field(schema, prefix, k)
+        } else {
+            let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
+            let is_spec = prefix == "spec";
+            let is_pod_spec = prefix == "spec.template.spec";
+            let is_root = prefix.is_empty();
+
+            (is_meta && !is_known_metadata_key(k))
+                || (is_spec && !is_known_spec_key(kind, k))
+                || (is_pod_spec && !is_known_pod_spec_key(k))
+                || (is_root && !is_known_root_key(kind, k))
+        };
+
+        if is_unknown {
+            unknowns.push(format!("unknown field \"{field_path}\""));
+        }
+
+        collect_unknown_fields(v, kind, crd_schema, &field_path, unknowns);
+    }
+}
+
+fn strip_unknown_fields(val: &mut Value, kind: Option<&str>, crd_schema: Option<&Value>) {
+    strip_node(val, kind, crd_schema, "");
+}
+
+fn strip_node(val: &mut Value, kind: Option<&str>, crd_schema: Option<&Value>, prefix: &str) {
+    let Some(obj) = val.as_object_mut() else {
+        if let Some(arr) = val.as_array_mut() {
+            for (i, item) in arr.iter_mut().enumerate() {
+                let item_prefix = format!("{prefix}[{i}]");
+                strip_node(item, kind, crd_schema, &item_prefix);
+            }
+        }
+        return;
+    };
+
+    if let Some(schema) = crd_schema {
+        let subschema = resolve_subschema(schema, prefix);
+        let preserve_unknown = subschema
+            .and_then(|s| s.get("x-kubernetes-preserve-unknown-fields"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            || subschema
+                .and_then(|s| s.get("additionalProperties"))
+                .is_some();
+
+        let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
+        if is_meta {
+            obj.retain(|k, _| is_known_metadata_key(k));
+        } else if !preserve_unknown {
+            if let Some(props) = subschema
+                .and_then(|s| s.get("properties"))
+                .and_then(Value::as_object)
+            {
+                obj.retain(|k, _| {
+                    props.contains_key(k)
+                        || (prefix.is_empty()
+                            && matches!(k.as_str(), "apiVersion" | "kind" | "metadata"))
+                });
+            } else if subschema
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                == Some("object")
+            {
+                obj.clear();
+            }
+        }
+    } else {
+        let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
+        let is_spec = prefix == "spec";
+        let is_pod_spec = prefix == "spec.template.spec";
+        let is_root = prefix.is_empty();
+
+        if is_meta {
+            obj.retain(|k, _| is_known_metadata_key(k));
+        } else if is_spec && kind.is_some() {
+            obj.retain(|k, _| is_known_spec_key(kind, k));
+        } else if is_pod_spec {
+            obj.retain(|k, _| is_known_pod_spec_key(k));
+        } else if is_root && kind.is_some() {
+            obj.retain(|k, _| is_known_root_key(kind, k));
+        }
+    }
+
+    for (k, v) in obj.iter_mut() {
+        let next_prefix = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        strip_node(v, kind, crd_schema, &next_prefix);
+    }
+}
+
 fn kind_from_path(path: &ResourcePath) -> Option<&'static str> {
     match path.resource.as_str() {
         "deployments" => Some("Deployment"),
@@ -441,7 +905,54 @@ fn kind_from_path(path: &ResourcePath) -> Option<&'static str> {
         "daemonsets" => Some("DaemonSet"),
         "replicasets" => Some("ReplicaSet"),
         "replicationcontrollers" => Some("ReplicationController"),
+        "configmaps" => Some("ConfigMap"),
+        "secrets" => Some("Secret"),
+        "persistentvolumeclaims" => Some("PersistentVolumeClaim"),
+        "persistentvolumes" => Some("PersistentVolume"),
+        "resourcequotas" => Some("ResourceQuota"),
+        "limitranges" => Some("LimitRange"),
+        "cronjobs" => Some("CronJob"),
+        "ingresses" => Some("Ingress"),
+        "networkpolicies" => Some("NetworkPolicy"),
+        "namespaces" => Some("Namespace"),
+        "serviceaccounts" => Some("ServiceAccount"),
         _ => None,
+    }
+}
+
+fn is_known_root_key(kind: Option<&str>, key: &str) -> bool {
+    let Some(kind) = kind else {
+        return true;
+    };
+    if matches!(key, "apiVersion" | "kind" | "metadata" | "status") {
+        return true;
+    }
+    match kind {
+        "Deployment"
+        | "Pod"
+        | "Service"
+        | "Job"
+        | "StatefulSet"
+        | "DaemonSet"
+        | "ReplicaSet"
+        | "ReplicationController"
+        | "CronJob"
+        | "PersistentVolumeClaim"
+        | "PersistentVolume"
+        | "ResourceQuota"
+        | "LimitRange"
+        | "Ingress"
+        | "NetworkPolicy"
+        | "Namespace" => key == "spec",
+        "ConfigMap" => matches!(key, "data" | "binaryData" | "immutable"),
+        "Secret" => matches!(key, "data" | "stringData" | "type" | "immutable"),
+        "ServiceAccount" => {
+            matches!(
+                key,
+                "secrets" | "imagePullSecrets" | "automountServiceAccountToken"
+            )
+        },
+        _ => true,
     }
 }
 
@@ -511,6 +1022,7 @@ fn is_known_pod_spec_key(key: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn is_known_spec_key(kind: Option<&str>, key: &str) -> bool {
     let Some(kind) = kind else {
         return true;
@@ -589,6 +1101,54 @@ fn is_known_spec_key(kind: Option<&str>, key: &str) -> bool {
             key,
             "replicas" | "minReadySeconds" | "selector" | "template"
         ),
+        "CronJob" => matches!(
+            key,
+            "schedule"
+                | "startingDeadlineSeconds"
+                | "concurrencyPolicy"
+                | "suspend"
+                | "jobTemplate"
+                | "successfulJobsHistoryLimit"
+                | "failedJobsHistoryLimit"
+                | "timeZone"
+        ),
+        "PersistentVolumeClaim" => matches!(
+            key,
+            "accessModes"
+                | "selector"
+                | "resources"
+                | "volumeName"
+                | "storageClassName"
+                | "volumeMode"
+                | "dataSource"
+                | "dataSourceRef"
+        ),
+        "PersistentVolume" => matches!(
+            key,
+            "capacity"
+                | "accessModes"
+                | "claimRef"
+                | "persistentVolumeReclaimPolicy"
+                | "storageClassName"
+                | "mountOptions"
+                | "volumeMode"
+                | "nodeAffinity"
+                | "hostPath"
+                | "nfs"
+                | "csi"
+                | "iscsi"
+                | "fc"
+                | "local"
+                | "awsElasticBlockStore"
+                | "gcePersistentDisk"
+                | "azureDisk"
+                | "azureFile"
+        ),
+        "ResourceQuota" => matches!(key, "hard" | "scopes" | "scopeSelector"),
+        "LimitRange" => matches!(key, "limits"),
+        "Ingress" => matches!(key, "ingressClassName" | "defaultBackend" | "tls" | "rules"),
+        "NetworkPolicy" => matches!(key, "podSelector" | "ingress" | "egress" | "policyTypes"),
+        "Namespace" => matches!(key, "finalizers"),
         _ => true,
     }
 }
@@ -683,5 +1243,394 @@ mod tests {
         assert_eq!(val["kind"], "ConfigMap");
         assert_eq!(val["metadata"]["name"], "test-cm");
         assert_eq!(val["data"]["key"], "value");
+    }
+
+    #[test]
+    fn test_validation_directive_parsing() {
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=Strict")),
+            FieldValidationDirective::Strict
+        );
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=strict")),
+            FieldValidationDirective::Strict
+        );
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=Warn")),
+            FieldValidationDirective::Warn
+        );
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=warn")),
+            FieldValidationDirective::Warn
+        );
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=Ignore")),
+            FieldValidationDirective::Ignore
+        );
+        assert_eq!(
+            parse_validation_directive(Some("fieldValidation=ignore")),
+            FieldValidationDirective::Ignore
+        );
+        assert_eq!(
+            parse_validation_directive(None),
+            FieldValidationDirective::Ignore
+        );
+        assert_eq!(
+            parse_validation_directive(Some("foo=bar")),
+            FieldValidationDirective::Ignore
+        );
+    }
+
+    #[test]
+    fn test_warn_produces_299_warnings() {
+        let json_body = br#"{
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-dep",
+                "badMeta": "val"
+            },
+            "spec": {
+                "badSpec": "val",
+                "replicas": 1,
+                "replicas": 2,
+                "selector": {"matchLabels": {"app": "test"}},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}, "badTmplMeta": "val"},
+                    "spec": {"containers": [{"name": "c", "image": "img"}]}
+                }
+            }
+        }"#;
+
+        let path = ResourcePath {
+            group: "apps".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "deployments".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        let val = decode_body_with_directive(
+            json_body,
+            Some("application/json"),
+            FieldValidationDirective::Warn,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["metadata"]["name"], "my-dep");
+        let warnings = take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"metadata.badMeta\"""#))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"spec.badSpec\"""#))
+        );
+        assert!(warnings.iter().any(|w| {
+            w.contains(r#"299 - "Unknown field \"spec.template.metadata.badTmplMeta\"""#)
+        }));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "duplicate field \"spec.replicas\"""#))
+        );
+    }
+
+    #[test]
+    fn test_ignore_strips_unknown_fields() {
+        let json_body = br#"{
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-dep",
+                "badMeta": "val",
+                "labels": {"app": "test"}
+            },
+            "spec": {
+                "badSpec": "val",
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": "test"}},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}, "badTmplMeta": "val"},
+                    "spec": {"containers": [{"name": "c", "image": "img"}]}
+                }
+            }
+        }"#;
+
+        let path = ResourcePath {
+            group: "apps".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "deployments".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        let val = decode_body_with_directive(
+            json_body,
+            Some("application/json"),
+            FieldValidationDirective::Ignore,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["metadata"]["name"], "my-dep");
+        assert_eq!(val["metadata"]["labels"]["app"], "test");
+        assert_eq!(val["metadata"].get("badMeta"), None);
+        assert_eq!(val["spec"].get("badSpec"), None);
+        assert_eq!(val["spec"]["template"]["metadata"].get("badTmplMeta"), None);
+        assert_eq!(val["spec"]["replicas"], 1);
+        assert_eq!(take_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_crd_schema_validation_strict_warn_ignore() {
+        let crd_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "cronSpec": { "type": "string" },
+                        "image": { "type": "string" }
+                    }
+                }
+            }
+        });
+        register_crd_schema("example.com", "noxus", crd_schema);
+
+        let path = ResourcePath {
+            group: "example.com".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "noxus".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        let cr_json = br#"{
+            "apiVersion": "example.com/v1",
+            "kind": "Noxu",
+            "metadata": { "name": "my-noxu", "extraMeta": "foo" },
+            "spec": {
+                "cronSpec": "* * * * *",
+                "unknownSpec": "bad"
+            }
+        }"#;
+
+        // 1. Strict rejects
+        let err = decode_body_with_directive(
+            cr_json,
+            Some("application/json"),
+            FieldValidationDirective::Strict,
+            &path,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field \"metadata.extraMeta\""),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown field \"spec.unknownSpec\""),
+            "got: {msg}"
+        );
+
+        // 2. Warn succeeds and emits 299 warnings
+        let val = decode_body_with_directive(
+            cr_json,
+            Some("application/json"),
+            FieldValidationDirective::Warn,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["kind"], "Noxu");
+        let warnings = take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"metadata.extraMeta\"""#))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"spec.unknownSpec\"""#))
+        );
+
+        // 3. Ignore succeeds and strips unknown fields
+        let val = decode_body_with_directive(
+            cr_json,
+            Some("application/json"),
+            FieldValidationDirective::Ignore,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["metadata"]["name"], "my-noxu");
+        assert_eq!(val["metadata"].get("extraMeta"), None);
+        assert_eq!(val["spec"]["cronSpec"], "* * * * *");
+        assert_eq!(val["spec"].get("unknownSpec"), None);
+        assert_eq!(take_warnings(), Vec::<String>::new());
+
+        unregister_crd_schema("example.com", "noxus");
+    }
+
+    #[test]
+    fn test_crd_without_schema_succeeds_with_unknown_fields() {
+        let path = ResourcePath {
+            group: "custom.io".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "foos".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        let cr_json = br#"{
+            "apiVersion": "custom.io/v1",
+            "kind": "Foo",
+            "metadata": { "name": "my-foo" },
+            "spec": { "arbitraryField": 123 }
+        }"#;
+
+        let val = decode_body_with_directive(
+            cr_json,
+            Some("application/json"),
+            FieldValidationDirective::Strict,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["spec"]["arbitraryField"], 123);
+    }
+
+    #[test]
+    fn test_crd_preserve_unknown_fields_still_rejects_duplicates_on_strict() {
+        let crd_schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true
+        });
+        register_crd_schema("example.com", "noxus2", crd_schema);
+
+        let path = ResourcePath {
+            group: "example.com".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "noxus2".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        // Unknown fields should be accepted when preserve-unknown-fields is true
+        let valid_cr = br#"{
+            "apiVersion": "example.com/v1",
+            "kind": "Noxu",
+            "metadata": { "name": "my-noxu" },
+            "spec": { "preservedField": "val" }
+        }"#;
+        let val = decode_body_with_directive(
+            valid_cr,
+            Some("application/json"),
+            FieldValidationDirective::Strict,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(val["spec"]["preservedField"], "val");
+
+        // But duplicates must still be rejected on strict!
+        let dup_cr = br#"{
+            "apiVersion": "example.com/v1",
+            "kind": "Noxu",
+            "metadata": { "name": "my-noxu" },
+            "spec": { "foo": 1, "foo": 2 }
+        }"#;
+        let err = decode_body_with_directive(
+            dup_cr,
+            Some("application/json"),
+            FieldValidationDirective::Strict,
+            &path,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate field \"spec.foo\""));
+
+        unregister_crd_schema("example.com", "noxus2");
+    }
+
+    #[test]
+    fn test_yaml_warn_and_ignore() {
+        let yaml_dup = b"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: dep\nspec:\n  replicas: 1\n  replicas: 2\n  unknownField: bad\n";
+        let path = ResourcePath {
+            group: "apps".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "deployments".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        // Warn produces 299 warnings for unknown and duplicate fields
+        let val = decode_yaml_with_directive(yaml_dup, FieldValidationDirective::Warn, Some(&path))
+            .unwrap();
+        assert_eq!(val["metadata"]["name"], "dep");
+        let warnings = take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "duplicate field \"replicas\"""#))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"spec.unknownField\"""#))
+        );
+
+        // Ignore strips unknown field
+        let val_ignore =
+            decode_yaml_with_directive(yaml_dup, FieldValidationDirective::Ignore, Some(&path))
+                .unwrap();
+        assert_eq!(val_ignore["spec"]["replicas"], 2);
+        assert_eq!(val_ignore["spec"].get("unknownField"), None);
+        assert_eq!(take_warnings(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_decode_body_with_validation_picks_up_is_strict_context() {
+        let path = ResourcePath {
+            group: "apps".to_string(),
+            namespace: Some("default".to_string()),
+            resource: "deployments".to_string(),
+            subresource: None,
+            name: None,
+        };
+
+        let json_body = br#"{
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "dep", "unknown": "foo" }
+        }"#;
+
+        // 1. When is_strict is called with fieldValidation=Warn:
+        assert!(!is_strict(Some("fieldValidation=Warn")));
+        let val =
+            decode_body_with_validation(json_body, Some("application/json"), false, &path).unwrap();
+        assert_eq!(val["metadata"]["name"], "dep");
+        let warnings = take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(r#"299 - "Unknown field \"metadata.unknown\"""#))
+        );
+
+        // 2. When is_strict is called with fieldValidation=Strict:
+        assert!(is_strict(Some("fieldValidation=Strict")));
+        let err = decode_body_with_validation(json_body, Some("application/json"), true, &path)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("strict decoding error: unknown field \"metadata.unknown\"")
+        );
+
+        // 3. When is_strict is called with fieldValidation=Ignore:
+        assert!(!is_strict(Some("fieldValidation=Ignore")));
+        let val =
+            decode_body_with_validation(json_body, Some("application/json"), false, &path).unwrap();
+        assert_eq!(val["metadata"]["name"], "dep");
+        assert_eq!(val["metadata"].get("unknown"), None);
+        assert_eq!(take_warnings(), Vec::<String>::new());
     }
 }
