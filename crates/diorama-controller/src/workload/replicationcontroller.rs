@@ -141,27 +141,13 @@ impl ReplicationControllerReconciler {
         Ok(())
     }
 
-    /// Reconciles a single `ReplicationController` by adopting/releasing and scaling child Pods.
-    pub async fn reconcile_rc(
+    async fn sync_rc_pods(
         &self,
         namespace: &str,
-        rc: &Value,
-    ) -> Result<Value, ControllerError> {
-        let cfg = parse_rc_config(rc)?;
-
-        let owned_pods = adopt_and_release_pods(
-            &self.client,
-            namespace,
-            "v1",
-            "ReplicationController",
-            cfg.name,
-            cfg.uid,
-            cfg.deleting,
-            cfg.selector,
-        )
-        .await?;
+        cfg: &RcConfig<'_>,
+        owned_pods: Vec<Value>,
+    ) -> Result<Vec<Value>, ControllerError> {
         let current_count = owned_pods.len();
-
         if !cfg.deleting {
             if current_count < cfg.desired_replicas {
                 self.scale_up_pods(
@@ -179,8 +165,8 @@ impl ReplicationControllerReconciler {
             }
         }
 
-        let updated_owned_pods = if current_count == cfg.desired_replicas || cfg.deleting {
-            owned_pods
+        if current_count == cfg.desired_replicas || cfg.deleting {
+            Ok(owned_pods)
         } else {
             adopt_and_release_pods(
                 &self.client,
@@ -190,15 +176,35 @@ impl ReplicationControllerReconciler {
                 cfg.name,
                 cfg.uid,
                 cfg.deleting,
-                cfg.selector,
+                cfg.selector.as_ref(),
             )
-            .await?
-        };
-        let actual_replicas = updated_owned_pods.len();
-        let ready_replicas = updated_owned_pods
-            .iter()
-            .filter(|p| super::is_pod_ready(p))
-            .count();
+            .await
+        }
+    }
+
+    /// Reconciles a single `ReplicationController` by adopting/releasing and scaling child Pods.
+    pub async fn reconcile_rc(
+        &self,
+        namespace: &str,
+        rc: &Value,
+    ) -> Result<Value, ControllerError> {
+        let cfg = parse_rc_config(rc)?;
+
+        let initial_pods = adopt_and_release_pods(
+            &self.client,
+            namespace,
+            "v1",
+            "ReplicationController",
+            cfg.name,
+            cfg.uid,
+            cfg.deleting,
+            cfg.selector.as_ref(),
+        )
+        .await?;
+
+        let updated_owned_pods = self.sync_rc_pods(namespace, &cfg, initial_pods).await?;
+        let (actual_replicas, fully_labeled_replicas, ready_replicas) =
+            compute_rc_metrics(&updated_owned_pods, &cfg.template);
         let observed_gen = rc
             .pointer("/metadata/generation")
             .and_then(Value::as_i64)
@@ -206,14 +212,23 @@ impl ReplicationControllerReconciler {
             .max(1);
 
         let mut updated_rc = rc.clone();
+        if cfg.selector_defaulted
+            && !cfg.deleting
+            && let Some(ref sel) = cfg.selector
+            && let Some(spec) = updated_rc.get_mut("spec").and_then(Value::as_object_mut)
+        {
+            spec.insert("selector".to_string(), sel.clone());
+        }
         apply_rc_status(
             &mut updated_rc,
             actual_replicas,
+            fully_labeled_replicas,
+            ready_replicas,
             ready_replicas,
             observed_gen,
         );
 
-        if updated_rc.get("status") == rc.get("status") {
+        if updated_rc == *rc {
             return Ok(updated_rc);
         }
 
@@ -227,13 +242,36 @@ impl ReplicationControllerReconciler {
     }
 }
 
+fn compute_rc_metrics(pods: &[Value], template: &Value) -> (usize, usize, usize) {
+    let actual = pods.len();
+    let ready = pods.iter().filter(|p| super::is_pod_ready(p)).count();
+    let tpl_labels = template
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object);
+    let fully_labeled = pods
+        .iter()
+        .filter(|p| {
+            if let Some(expected) = tpl_labels {
+                let p_labels = p.pointer("/metadata/labels").and_then(Value::as_object);
+                expected
+                    .iter()
+                    .all(|(k, v)| p_labels.and_then(|l| l.get(k)) == Some(v))
+            } else {
+                true
+            }
+        })
+        .count();
+    (actual, fully_labeled, ready)
+}
+
 struct RcConfig<'a> {
     name: &'a str,
     uid: &'a str,
     deleting: bool,
     desired_replicas: usize,
-    selector: Option<&'a Value>,
+    selector: Option<Value>,
     template: Value,
+    selector_defaulted: bool,
 }
 
 fn parse_rc_config(rc: &Value) -> Result<RcConfig<'_>, ControllerError> {
@@ -260,12 +298,15 @@ fn parse_rc_config(rc: &Value) -> Result<RcConfig<'_>, ControllerError> {
         .and_then(Value::as_i64)
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(1);
-    let selector = rc.pointer("/spec/selector");
     let template = rc
         .get("spec")
         .and_then(|s| s.get("template"))
         .cloned()
         .unwrap_or_else(|| json!({ "spec": { "containers": [] } }));
+    let (selector, selector_defaulted) = match rc.pointer("/spec/selector") {
+        Some(s) if s.is_object() && !s.as_object().unwrap().is_empty() => (Some(s.clone()), false),
+        _ => (template.pointer("/metadata/labels").cloned(), true),
+    };
     Ok(RcConfig {
         name,
         uid,
@@ -273,29 +314,35 @@ fn parse_rc_config(rc: &Value) -> Result<RcConfig<'_>, ControllerError> {
         desired_replicas,
         selector,
         template,
+        selector_defaulted,
     })
 }
 
 fn apply_rc_status(
     updated_rc: &mut Value,
     actual_replicas: usize,
+    fully_labeled_replicas: usize,
     ready_replicas: usize,
+    available_replicas: usize,
     observed_gen: i64,
 ) {
     if let Some(status) = updated_rc.get_mut("status").and_then(Value::as_object_mut) {
         status.insert("replicas".to_string(), json!(actual_replicas));
-        status.insert("fullyLabeledReplicas".to_string(), json!(actual_replicas));
+        status.insert(
+            "fullyLabeledReplicas".to_string(),
+            json!(fully_labeled_replicas),
+        );
         status.insert("readyReplicas".to_string(), json!(ready_replicas));
-        status.insert("availableReplicas".to_string(), json!(ready_replicas));
+        status.insert("availableReplicas".to_string(), json!(available_replicas));
         status.insert("observedGeneration".to_string(), json!(observed_gen));
     } else if let Some(rc_obj) = updated_rc.as_object_mut() {
         rc_obj.insert(
             "status".to_string(),
             json!({
                 "replicas": actual_replicas,
-                "fullyLabeledReplicas": actual_replicas,
+                "fullyLabeledReplicas": fully_labeled_replicas,
                 "readyReplicas": ready_replicas,
-                "availableReplicas": ready_replicas,
+                "availableReplicas": available_replicas,
                 "observedGeneration": observed_gen
             }),
         );
