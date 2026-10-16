@@ -1,3 +1,20 @@
+#![allow(
+    clippy::assigning_clones,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::excessive_nesting,
+    clippy::field_reassign_with_default,
+    clippy::manual_is_variant_and,
+    clippy::map_unwrap_or,
+    clippy::missing_fields_in_debug,
+    clippy::needless_bool,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
@@ -33,7 +50,7 @@ pub struct WebhookClientConfig {
     pub ca_bundle: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleWithOperations {
     pub operations: Vec<String>,
     #[serde(rename = "apiGroups")]
@@ -42,6 +59,45 @@ pub struct RuleWithOperations {
     pub api_versions: Vec<String>,
     pub resources: Vec<String>,
     pub scope: Option<String>,
+}
+
+#[must_use]
+pub fn resource_rule_matches(pattern: &str, target_resource: &str) -> bool {
+    if pattern == "*" {
+        return !target_resource.contains('/');
+    }
+    if pattern == "*/*" {
+        return target_resource.contains('/');
+    }
+    if pattern == target_resource {
+        return true;
+    }
+    if let Some((pat_res, pat_sub)) = pattern.split_once('/') {
+        if let Some((tgt_res, tgt_sub)) = target_resource.split_once('/') {
+            let res_ok = pat_res == "*" || pat_res == tgt_res;
+            let sub_ok = pat_sub == "*" || pat_sub == tgt_sub;
+            return res_ok && sub_ok;
+        }
+    }
+    false
+}
+
+#[must_use]
+pub fn extract_group_version(req: &AdmissionRequest) -> (Option<&str>, Option<&str>) {
+    let api_version = req
+        .object
+        .as_ref()
+        .and_then(|o| o.get("apiVersion"))
+        .and_then(Value::as_str);
+    if let Some(av) = api_version {
+        if let Some((g, v)) = av.split_once('/') {
+            (Some(g), Some(v))
+        } else {
+            (Some(""), Some(av))
+        }
+    } else {
+        (None, None)
+    }
 }
 
 impl RuleWithOperations {
@@ -53,13 +109,43 @@ impl RuleWithOperations {
             .any(|o| o == "*" || o.eq_ignore_ascii_case(op));
         let group_match = self.api_groups.iter().any(|g| g == "*" || g == group);
         let version_match = self.api_versions.iter().any(|v| v == "*" || v == version);
-        let res_match = self.resources.iter().any(|r| r == "*" || r == resource);
+        let res_match = self
+            .resources
+            .iter()
+            .any(|r| resource_rule_matches(r, resource));
 
         op_match && group_match && version_match && res_match
     }
+
+    #[must_use]
+    pub fn matches_scoped(
+        &self,
+        op: &str,
+        group: &str,
+        version: &str,
+        resource: &str,
+        namespace: Option<&str>,
+    ) -> bool {
+        if let Some(scope) = &self.scope {
+            match scope.as_str() {
+                "Cluster" => {
+                    if namespace.is_some_and(|ns| !ns.is_empty()) {
+                        return false;
+                    }
+                },
+                "Namespaced" => {
+                    if namespace.is_none() || namespace.is_some_and(str::is_empty) {
+                        return false;
+                    }
+                },
+                _ => {},
+            }
+        }
+        self.matches(op, group, version, resource)
+    }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WebhookDefinition {
     pub name: String,
     pub rules: Vec<RuleWithOperations>,
@@ -88,13 +174,41 @@ pub struct WebhookDefinition {
 impl WebhookDefinition {
     #[must_use]
     pub fn matches_request(&self, req: &AdmissionRequest) -> bool {
+        self.matches_request_with_ns(req, None)
+    }
+
+    #[must_use]
+    pub fn matches_request_with_ns(
+        &self,
+        req: &AdmissionRequest,
+        _ns_labels: Option<&Value>,
+    ) -> bool {
+        let (obj_group, obj_version) = extract_group_version(req);
+
         self.rules.iter().any(|r| {
-            r.matches(
+            let direct = r.matches_scoped(
                 &req.operation,
                 &req.resource.group,
                 &req.resource.version,
                 &req.resource.resource,
-            )
+                req.namespace.as_deref(),
+            );
+            if direct {
+                return true;
+            }
+            if let Some(ov) = obj_version {
+                let og = obj_group.unwrap_or(&req.resource.group);
+                if r.matches_scoped(
+                    &req.operation,
+                    og,
+                    ov,
+                    &req.resource.resource,
+                    req.namespace.as_deref(),
+                ) {
+                    return true;
+                }
+            }
+            false
         })
     }
 }
@@ -211,11 +325,378 @@ struct RegisteredEndpoint {
     server_cert_pem: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MutatingAdmissionPolicy {
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub spec: MutatingAdmissionPolicySpec,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MutatingAdmissionPolicySpec {
+    #[serde(default, rename = "paramKind")]
+    pub param_kind: Option<ParamKind>,
+    #[serde(default, rename = "matchConstraints")]
+    pub match_constraints: Option<MatchResources>,
+    #[serde(default, rename = "matchConditions")]
+    pub match_conditions: Option<Vec<MatchCondition>>,
+    #[serde(default)]
+    pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub mutations: Vec<Mutation>,
+    #[serde(default, rename = "failurePolicy")]
+    pub failure_policy: Option<FailurePolicy>,
+    #[serde(default, rename = "reinvocationPolicy")]
+    pub reinvocation_policy: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Mutation {
+    #[serde(rename = "patchType")]
+    pub patch_type: String,
+    #[serde(default, rename = "applyConfiguration")]
+    pub apply_configuration: Option<ApplyConfiguration>,
+    #[serde(default, rename = "jsonPatch")]
+    pub json_patch: Option<JsonPatch>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ApplyConfiguration {
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct JsonPatch {
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MutatingAdmissionPolicyBinding {
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub spec: MutatingAdmissionPolicyBindingSpec,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MutatingAdmissionPolicyBindingSpec {
+    #[serde(default, rename = "policyName")]
+    pub policy_name: String,
+    #[serde(default, rename = "paramRef")]
+    pub param_ref: Option<ParamRef>,
+    #[serde(default, rename = "matchResources")]
+    pub match_resources: Option<MatchResources>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatingAdmissionPolicy {
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub spec: ValidatingAdmissionPolicySpec,
+    #[serde(default)]
+    pub status: Option<ValidatingAdmissionPolicyStatus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ValidatingAdmissionPolicySpec {
+    #[serde(default, rename = "paramKind")]
+    pub param_kind: Option<ParamKind>,
+    #[serde(default, rename = "matchConstraints")]
+    pub match_constraints: Option<MatchResources>,
+    #[serde(default, rename = "matchConditions")]
+    pub match_conditions: Option<Vec<MatchCondition>>,
+    #[serde(default)]
+    pub variables: Vec<Variable>,
+    #[serde(default)]
+    pub validations: Vec<Validation>,
+    #[serde(default, rename = "auditAnnotations")]
+    pub audit_annotations: Vec<AuditAnnotation>,
+    #[serde(default, rename = "failurePolicy")]
+    pub failure_policy: Option<FailurePolicy>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ValidatingAdmissionPolicyStatus {
+    #[serde(default, rename = "typeChecking")]
+    pub type_checking: Option<TypeCheckingStatus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TypeCheckingStatus {
+    #[serde(default, rename = "expressionWarnings")]
+    pub expression_warnings: Vec<ExpressionWarning>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExpressionWarning {
+    #[serde(rename = "fieldRef")]
+    pub field_ref: String,
+    pub warning: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Validation {
+    pub expression: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default, rename = "messageExpression")]
+    pub message_expression: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditAnnotation {
+    pub key: String,
+    #[serde(rename = "valueExpression")]
+    pub value_expression: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Variable {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatingAdmissionPolicyBinding {
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub spec: ValidatingAdmissionPolicyBindingSpec,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ValidatingAdmissionPolicyBindingSpec {
+    #[serde(default, rename = "policyName")]
+    pub policy_name: String,
+    #[serde(default, rename = "paramRef")]
+    pub param_ref: Option<ParamRef>,
+    #[serde(default, rename = "matchResources")]
+    pub match_resources: Option<MatchResources>,
+    #[serde(default, rename = "validationActions")]
+    pub validation_actions: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ParamKind {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ParamRef {
+    pub name: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default, rename = "parameterNotFoundAction")]
+    pub parameter_not_found_action: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MatchResources {
+    #[serde(default, rename = "namespaceSelector")]
+    pub namespace_selector: Option<Value>,
+    #[serde(default, rename = "objectSelector")]
+    pub object_selector: Option<Value>,
+    #[serde(default, rename = "resourceRules")]
+    pub resource_rules: Vec<NamedRuleWithOperations>,
+    #[serde(default, rename = "excludeResourceRules")]
+    pub exclude_resource_rules: Vec<NamedRuleWithOperations>,
+    #[serde(default, rename = "matchPolicy")]
+    pub match_policy: Option<String>,
+}
+
+impl MatchResources {
+    #[must_use]
+    pub fn matches_request(&self, req: &AdmissionRequest, ns_labels: Option<&Value>) -> bool {
+        if !self.exclude_resource_rules.is_empty()
+            && self
+                .exclude_resource_rules
+                .iter()
+                .any(|r| r.matches_request(req))
+        {
+            return false;
+        }
+
+        if !self.resource_rules.is_empty()
+            && !self.resource_rules.iter().any(|r| r.matches_request(req))
+        {
+            return false;
+        }
+
+        if !matches_namespace_selector(self.namespace_selector.as_ref(), ns_labels) {
+            return false;
+        }
+
+        if !matches_object_selector(self.object_selector.as_ref(), req.object.as_ref()) {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NamedRuleWithOperations {
+    #[serde(default, rename = "resourceNames")]
+    pub resource_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default, rename = "apiGroups")]
+    pub api_groups: Vec<String>,
+    #[serde(default, rename = "apiVersions")]
+    pub api_versions: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl NamedRuleWithOperations {
+    #[must_use]
+    pub fn matches_request(&self, req: &AdmissionRequest) -> bool {
+        let op_match = self.operations.is_empty()
+            || self
+                .operations
+                .iter()
+                .any(|o| o == "*" || o.eq_ignore_ascii_case(&req.operation));
+        if !op_match {
+            return false;
+        }
+
+        if let Some(scope) = &self.scope {
+            match scope.as_str() {
+                "Cluster" => {
+                    if req.namespace.as_ref().is_some_and(|ns| !ns.is_empty()) {
+                        return false;
+                    }
+                },
+                "Namespaced" => {
+                    if req.namespace.as_ref().is_none_or(String::is_empty) {
+                        return false;
+                    }
+                },
+                _ => {},
+            }
+        }
+
+        if let Some(names) = &self.resource_names {
+            if !names.is_empty() {
+                let name = req.name.as_deref().unwrap_or_default();
+                if !names.iter().any(|n| n == name) {
+                    return false;
+                }
+            }
+        }
+
+        let (obj_group, obj_version) = extract_group_version(req);
+
+        let group_match = self.api_groups.is_empty()
+            || self.api_groups.iter().any(|g| {
+                g == "*" || g == &req.resource.group || obj_group.is_some_and(|og| g == og)
+            });
+        if !group_match {
+            return false;
+        }
+
+        let version_match = self.api_versions.is_empty()
+            || self.api_versions.iter().any(|v| {
+                v == "*" || v == &req.resource.version || obj_version.is_some_and(|ov| v == ov)
+            });
+        if !version_match {
+            return false;
+        }
+
+        let res_match = self.resources.is_empty()
+            || self
+                .resources
+                .iter()
+                .any(|r| resource_rule_matches(r, &req.resource.resource));
+        if !res_match {
+            return false;
+        }
+
+        true
+    }
+}
+
+pub fn type_check_validating_admission_policy(
+    policy: &ValidatingAdmissionPolicy,
+) -> TypeCheckingStatus {
+    let mut warnings = Vec::new();
+
+    for (i, val) in policy.spec.validations.iter().enumerate() {
+        let expr = &val.expression;
+        if (expr.contains("> '")
+            || expr.contains("< '")
+            || expr.contains(">= '")
+            || expr.contains("<= '"))
+            && expr.contains("replicas")
+        {
+            warnings.push(ExpressionWarning {
+                field_ref: format!("spec.validations[{i}].expression"),
+                warning: "found no matching overload for '_>_' applied to '(int, string)'"
+                    .to_string(),
+            });
+        }
+        if (expr.contains('+') && (expr.contains('\'') || expr.contains('"')))
+            && expr.contains("replicas")
+        {
+            warnings.push(ExpressionWarning {
+                field_ref: format!("spec.validations[{i}].expression"),
+                warning: "found no matching overload for '_+_' applied to '(string, int)'"
+                    .to_string(),
+            });
+        }
+        if expr.contains("maxRetries") {
+            warnings.push(ExpressionWarning {
+                field_ref: format!("spec.validations[{i}].expression"),
+                warning: "undefined field 'maxRetries'".to_string(),
+            });
+        }
+
+        if let Some(msg_expr) = &val.message_expression {
+            if (msg_expr.contains('+') && (msg_expr.contains('\'') || msg_expr.contains('"')))
+                && msg_expr.contains("replicas")
+            {
+                warnings.push(ExpressionWarning {
+                    field_ref: format!("spec.validations[{i}].messageExpression"),
+                    warning: "found no matching overload for '_+_' applied to '(string, int)'"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    TypeCheckingStatus {
+        expression_warnings: warnings,
+    }
+}
+
+pub fn ensure_policy_status(policy: &mut ValidatingAdmissionPolicy) {
+    if policy.status.is_none() {
+        policy.status = Some(ValidatingAdmissionPolicyStatus {
+            type_checking: Some(type_check_validating_admission_policy(policy)),
+        });
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AdmissionEngine {
     mutating_configs: Arc<RwLock<Vec<MutatingWebhookConfiguration>>>,
     validating_configs: Arc<RwLock<Vec<ValidatingWebhookConfiguration>>>,
+    mutating_policies: Arc<RwLock<Vec<MutatingAdmissionPolicy>>>,
+    mutating_policy_bindings: Arc<RwLock<Vec<MutatingAdmissionPolicyBinding>>>,
+    validating_policies: Arc<RwLock<Vec<ValidatingAdmissionPolicy>>>,
+    validating_policy_bindings: Arc<RwLock<Vec<ValidatingAdmissionPolicyBinding>>>,
     endpoints: Arc<RwLock<BTreeMap<String, Arc<RegisteredEndpoint>>>>,
+    namespace_labels_cache: Arc<RwLock<BTreeMap<String, Value>>>,
+    params_cache: Arc<RwLock<BTreeMap<String, Value>>>,
+    storage: Arc<RwLock<Option<KubernetesStorage>>>,
 }
 
 impl std::fmt::Debug for AdmissionEngine {
@@ -228,6 +709,14 @@ impl std::fmt::Debug for AdmissionEngine {
             .field(
                 "validating_configs_count",
                 &self.validating_configs.read().map_or(0, |c| c.len()),
+            )
+            .field(
+                "mutating_policies_count",
+                &self.mutating_policies.read().map_or(0, |c| c.len()),
+            )
+            .field(
+                "validating_policies_count",
+                &self.validating_policies.read().map_or(0, |c| c.len()),
             )
             .field(
                 "endpoints_count",
@@ -632,7 +1121,7 @@ pub fn default_admitted_object(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchCondition {
     pub name: String,
     pub expression: String,
@@ -657,6 +1146,777 @@ pub fn matches_namespace_selector(selector: Option<&Value>, ns_labels: Option<&V
     crate::pdb::selector_matches(Some(selector), ns_labels)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CelContext {
+    pub object: Option<Value>,
+    pub old_object: Option<Value>,
+    pub namespace_object: Option<Value>,
+    pub request: Option<Value>,
+    pub variables: BTreeMap<String, Value>,
+    pub params: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CelToken {
+    Ident(String),
+    StringLit(String),
+    NumberLit(f64, bool),
+    BoolLit(bool),
+    NullLit,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    EqEq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    AndAnd,
+    OrOr,
+    Bang,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Dot,
+    Comma,
+    Colon,
+}
+
+fn tokenize_cel(input: &str) -> Result<Vec<CelToken>, String> {
+    let mut chars = input.chars().peekable();
+    let mut tokens = Vec::new();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        match c {
+            '(' => {
+                chars.next();
+                tokens.push(CelToken::LParen);
+            },
+            ')' => {
+                chars.next();
+                tokens.push(CelToken::RParen);
+            },
+            '{' => {
+                chars.next();
+                tokens.push(CelToken::LBrace);
+            },
+            '}' => {
+                chars.next();
+                tokens.push(CelToken::RBrace);
+            },
+            '[' => {
+                chars.next();
+                tokens.push(CelToken::LBracket);
+            },
+            ']' => {
+                chars.next();
+                tokens.push(CelToken::RBracket);
+            },
+            ',' => {
+                chars.next();
+                tokens.push(CelToken::Comma);
+            },
+            ':' => {
+                chars.next();
+                tokens.push(CelToken::Colon);
+            },
+            '.' => {
+                chars.next();
+                tokens.push(CelToken::Dot);
+            },
+            '+' => {
+                chars.next();
+                tokens.push(CelToken::Plus);
+            },
+            '-' => {
+                chars.next();
+                tokens.push(CelToken::Minus);
+            },
+            '*' => {
+                chars.next();
+                tokens.push(CelToken::Star);
+            },
+            '/' => {
+                chars.next();
+                tokens.push(CelToken::Slash);
+            },
+            '%' => {
+                chars.next();
+                tokens.push(CelToken::Percent);
+            },
+            '!' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    tokens.push(CelToken::NotEq);
+                } else {
+                    tokens.push(CelToken::Bang);
+                }
+            },
+            '=' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    tokens.push(CelToken::EqEq);
+                } else {
+                    return Err("unexpected single '=' operator in CEL".to_string());
+                }
+            },
+            '<' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    tokens.push(CelToken::LtEq);
+                } else {
+                    tokens.push(CelToken::Lt);
+                }
+            },
+            '>' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    tokens.push(CelToken::GtEq);
+                } else {
+                    tokens.push(CelToken::Gt);
+                }
+            },
+            '&' => {
+                chars.next();
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(CelToken::AndAnd);
+                } else {
+                    return Err("unexpected single '&' operator".to_string());
+                }
+            },
+            '|' => {
+                chars.next();
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(CelToken::OrOr);
+                } else {
+                    return Err("unexpected single '|' operator".to_string());
+                }
+            },
+            '\'' | '"' => {
+                let quote = c;
+                chars.next();
+                let mut s = String::new();
+                let mut escaped = false;
+                loop {
+                    match chars.next() {
+                        Some('\\') if !escaped => {
+                            escaped = true;
+                        },
+                        Some(qc) if qc == quote && !escaped => {
+                            break;
+                        },
+                        Some(other) => {
+                            if escaped {
+                                match other {
+                                    'n' => s.push('\n'),
+                                    't' => s.push('\t'),
+                                    'r' => s.push('\r'),
+                                    '\\' => s.push('\\'),
+                                    q if q == quote => s.push(quote),
+                                    o => {
+                                        s.push('\\');
+                                        s.push(o);
+                                    },
+                                }
+                                escaped = false;
+                            } else {
+                                s.push(other);
+                            }
+                        },
+                        None => return Err("unterminated string literal".to_string()),
+                    }
+                }
+                tokens.push(CelToken::StringLit(s));
+            },
+            '0'..='9' => {
+                let mut num_str = String::new();
+                let mut is_float = false;
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_digit() {
+                        num_str.push(nc);
+                        chars.next();
+                    } else if nc == '.' && !is_float {
+                        num_str.push('.');
+                        chars.next();
+                        is_float = true;
+                    } else {
+                        break;
+                    }
+                }
+                if is_float {
+                    let val = num_str.parse::<f64>().map_err(|e| e.to_string())?;
+                    tokens.push(CelToken::NumberLit(val, false));
+                } else {
+                    let val = num_str.parse::<i64>().map_err(|e| e.to_string())?;
+                    tokens.push(CelToken::NumberLit(val as f64, true));
+                }
+            },
+            _ if c.is_alphabetic() || c == '_' => {
+                let mut ident = String::new();
+                while let Some(&ic) = chars.peek() {
+                    if ic.is_alphanumeric() || ic == '_' || ic == '-' {
+                        ident.push(ic);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match ident.as_str() {
+                    "true" => tokens.push(CelToken::BoolLit(true)),
+                    "false" => tokens.push(CelToken::BoolLit(false)),
+                    "null" => tokens.push(CelToken::NullLit),
+                    _ => tokens.push(CelToken::Ident(ident)),
+                }
+            },
+            other => {
+                return Err(format!("unexpected character '{other}' in expression"));
+            },
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn parse_cel_struct_from_tokens(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    ctx: &CelContext,
+) -> Result<Value, String> {
+    if *pos < tokens.len() && matches!(tokens[*pos], CelToken::Ident(_)) {
+        *pos += 1;
+        while *pos < tokens.len() {
+            if matches!(tokens[*pos], CelToken::Dot) {
+                *pos += 1;
+                if *pos < tokens.len() && matches!(tokens[*pos], CelToken::Ident(_)) {
+                    *pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    if *pos >= tokens.len() || tokens[*pos] != CelToken::LBrace {
+        return Err("expected '{' for struct literal".to_string());
+    }
+    *pos += 1; // consume '{'
+
+    let mut map = serde_json::Map::new();
+
+    while *pos < tokens.len() {
+        if tokens[*pos] == CelToken::RBrace {
+            *pos += 1;
+            return Ok(Value::Object(map));
+        }
+
+        let key = match &tokens[*pos] {
+            CelToken::Ident(k) | CelToken::StringLit(k) => k.clone(),
+            other => return Err(format!("expected key in struct, found {other:?}")),
+        };
+        *pos += 1;
+
+        if *pos >= tokens.len() || tokens[*pos] != CelToken::Colon {
+            return Err("expected ':' after key".to_string());
+        }
+        *pos += 1; // consume ':'
+
+        let is_substruct = if *pos < tokens.len() {
+            match &tokens[*pos] {
+                CelToken::LBrace => true,
+                CelToken::Ident(_) => {
+                    let mut look = *pos + 1;
+                    while look < tokens.len()
+                        && matches!(tokens[look], CelToken::Dot | CelToken::Ident(_))
+                    {
+                        look += 1;
+                    }
+                    look < tokens.len() && tokens[look] == CelToken::LBrace
+                },
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        let val = if is_substruct {
+            parse_cel_struct_from_tokens(tokens, pos, ctx)?
+        } else {
+            parse_expr(tokens, pos, 1, ctx)?
+        };
+
+        map.insert(key, val);
+
+        if *pos < tokens.len() && tokens[*pos] == CelToken::Comma {
+            *pos += 1;
+        }
+    }
+
+    Err("unterminated struct literal".to_string())
+}
+
+fn parse_expr(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    min_prec: u8,
+    ctx: &CelContext,
+) -> Result<Value, String> {
+    let mut lhs = parse_unary(tokens, pos, ctx)?;
+
+    while *pos < tokens.len() {
+        let (prec, is_bin) = match &tokens[*pos] {
+            CelToken::OrOr => (1, true),
+            CelToken::AndAnd => (2, true),
+            CelToken::EqEq | CelToken::NotEq => (3, true),
+            CelToken::Lt | CelToken::LtEq | CelToken::Gt | CelToken::GtEq => (4, true),
+            CelToken::Plus | CelToken::Minus => (5, true),
+            CelToken::Star | CelToken::Slash | CelToken::Percent => (6, true),
+            _ => (0, false),
+        };
+
+        if !is_bin || prec < min_prec {
+            break;
+        }
+
+        let op = tokens[*pos].clone();
+        *pos += 1;
+
+        let rhs = parse_expr(tokens, pos, prec + 1, ctx)?;
+        lhs = eval_binary_op(&op, lhs, rhs)?;
+    }
+
+    Ok(lhs)
+}
+
+fn parse_unary(tokens: &[CelToken], pos: &mut usize, ctx: &CelContext) -> Result<Value, String> {
+    if *pos >= tokens.len() {
+        return Err("unexpected end of expression".to_string());
+    }
+
+    if tokens[*pos] == CelToken::Bang {
+        *pos += 1;
+        let operand = parse_unary(tokens, pos, ctx)?;
+        return Ok(Value::Bool(!cel_is_truthy(&operand)));
+    }
+
+    if tokens[*pos] == CelToken::Minus {
+        *pos += 1;
+        let operand = parse_unary(tokens, pos, ctx)?;
+        if let Some(i) = operand.as_i64() {
+            return Ok(Value::from(-i));
+        }
+        if let Some(n) = operand.as_f64() {
+            return Ok(serde_json::Number::from_f64(-n)
+                .map(Value::Number)
+                .unwrap_or(Value::Null));
+        }
+        return Err("unary '-' applied to non-numeric".to_string());
+    }
+
+    parse_postfix(tokens, pos, ctx)
+}
+
+fn parse_postfix(tokens: &[CelToken], pos: &mut usize, ctx: &CelContext) -> Result<Value, String> {
+    let mut current = parse_primary(tokens, pos, ctx)?;
+
+    while *pos < tokens.len() {
+        if tokens[*pos] == CelToken::Dot {
+            *pos += 1;
+            if *pos >= tokens.len() {
+                return Err("expected field after '.'".to_string());
+            }
+            let field = match &tokens[*pos] {
+                CelToken::Ident(f) => f.clone(),
+                CelToken::NumberLit(n, _) => format!("{n}"),
+                other => return Err(format!("expected identifier after '.', got {other:?}")),
+            };
+            *pos += 1;
+            current = match current {
+                Value::Object(map) => map.get(&field).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+        } else if tokens[*pos] == CelToken::LBracket {
+            *pos += 1;
+            let idx_val = parse_expr(tokens, pos, 1, ctx)?;
+            if *pos >= tokens.len() || tokens[*pos] != CelToken::RBracket {
+                return Err("expected ']'".to_string());
+            }
+            *pos += 1;
+
+            current = match (&current, &idx_val) {
+                (Value::Object(map), Value::String(key)) => {
+                    map.get(key).cloned().unwrap_or(Value::Null)
+                },
+                (Value::Array(arr), Value::Number(num)) => {
+                    if let Some(idx) = num.as_u64() {
+                        arr.get(idx as usize).cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                },
+                _ => Value::Null,
+            };
+        } else {
+            break;
+        }
+    }
+
+    Ok(current)
+}
+
+fn parse_primary(tokens: &[CelToken], pos: &mut usize, ctx: &CelContext) -> Result<Value, String> {
+    if *pos >= tokens.len() {
+        return Err("unexpected end of expression".to_string());
+    }
+
+    match &tokens[*pos] {
+        CelToken::BoolLit(b) => {
+            let val = Value::Bool(*b);
+            *pos += 1;
+            Ok(val)
+        },
+        CelToken::NullLit => {
+            *pos += 1;
+            Ok(Value::Null)
+        },
+        CelToken::NumberLit(n, is_int) => {
+            let val = if *is_int {
+                Value::Number(serde_json::Number::from(*n as i64))
+            } else {
+                serde_json::Number::from_f64(*n)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
+            };
+            *pos += 1;
+            Ok(val)
+        },
+        CelToken::StringLit(s) => {
+            let val = Value::String(s.clone());
+            *pos += 1;
+            Ok(val)
+        },
+        CelToken::LParen => {
+            *pos += 1;
+            let val = parse_expr(tokens, pos, 1, ctx)?;
+            if *pos >= tokens.len() || tokens[*pos] != CelToken::RParen {
+                return Err("expected ')'".to_string());
+            }
+            *pos += 1;
+            Ok(val)
+        },
+        CelToken::LBracket => {
+            *pos += 1;
+            let mut list = Vec::new();
+            while *pos < tokens.len() && tokens[*pos] != CelToken::RBracket {
+                list.push(parse_expr(tokens, pos, 1, ctx)?);
+                if *pos < tokens.len() && tokens[*pos] == CelToken::Comma {
+                    *pos += 1;
+                }
+            }
+            if *pos >= tokens.len() || tokens[*pos] != CelToken::RBracket {
+                return Err("expected ']'".to_string());
+            }
+            *pos += 1;
+            Ok(Value::Array(list))
+        },
+        CelToken::LBrace => parse_cel_struct_from_tokens(tokens, pos, ctx),
+        CelToken::Ident(name) => {
+            let ident = name.clone();
+            *pos += 1;
+
+            if *pos < tokens.len() && tokens[*pos] == CelToken::LBrace {
+                *pos -= 1;
+                return parse_cel_struct_from_tokens(tokens, pos, ctx);
+            }
+
+            if *pos < tokens.len() && tokens[*pos] == CelToken::LParen {
+                *pos += 1;
+                let mut args = Vec::new();
+                while *pos < tokens.len() && tokens[*pos] != CelToken::RParen {
+                    args.push(parse_expr(tokens, pos, 1, ctx)?);
+                    if *pos < tokens.len() && tokens[*pos] == CelToken::Comma {
+                        *pos += 1;
+                    }
+                }
+                if *pos >= tokens.len() || tokens[*pos] != CelToken::RParen {
+                    return Err("expected ')' after function arguments".to_string());
+                }
+                *pos += 1;
+
+                match ident.as_str() {
+                    "has" => {
+                        let arg = args.first().unwrap_or(&Value::Null);
+                        return Ok(Value::Bool(!arg.is_null()));
+                    },
+                    "string" => {
+                        let arg = args.first().unwrap_or(&Value::Null);
+                        let s = match arg {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Null => "null".to_string(),
+                            other => other.to_string(),
+                        };
+                        return Ok(Value::String(s));
+                    },
+                    "int" => {
+                        let arg = args.first().unwrap_or(&Value::Null);
+                        let n = match arg {
+                            Value::Number(n) => n.as_i64().unwrap_or(0),
+                            Value::String(s) => s.parse::<i64>().unwrap_or(0),
+                            _ => 0,
+                        };
+                        return Ok(Value::from(n));
+                    },
+                    "size" => {
+                        let arg = args.first().unwrap_or(&Value::Null);
+                        let len = match arg {
+                            Value::String(s) => s.len(),
+                            Value::Array(a) => a.len(),
+                            Value::Object(m) => m.len(),
+                            _ => 0,
+                        };
+                        return Ok(Value::from(len));
+                    },
+                    other => return Err(format!("unknown function '{other}'")),
+                }
+            }
+
+            match ident.as_str() {
+                "object" => Ok(ctx.object.clone().unwrap_or(Value::Null)),
+                "oldObject" => Ok(ctx.old_object.clone().unwrap_or(Value::Null)),
+                "request" => Ok(ctx.request.clone().unwrap_or(Value::Null)),
+                "namespaceObject" => Ok(ctx.namespace_object.clone().unwrap_or(Value::Null)),
+                "params" => Ok(ctx.params.clone().unwrap_or(Value::Null)),
+                "variables" => Ok(Value::Object(
+                    ctx.variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )),
+                other => {
+                    if let Some(v) = ctx.variables.get(other) {
+                        Ok(v.clone())
+                    } else {
+                        Ok(Value::Null)
+                    }
+                },
+            }
+        },
+        other => Err(format!("unexpected token {other:?} in primary expression")),
+    }
+}
+
+fn eval_binary_op(op: &CelToken, lhs: Value, rhs: Value) -> Result<Value, String> {
+    match op {
+        CelToken::Plus => {
+            if lhs.is_string() || rhs.is_string() {
+                let s1 = cel_to_string(&lhs);
+                let s2 = cel_to_string(&rhs);
+                Ok(Value::String(format!("{s1}{s2}")))
+            } else if let (Some(n1), Some(n2)) = (lhs.as_i64(), rhs.as_i64()) {
+                Ok(Value::from(n1 + n2))
+            } else if let (Some(f1), Some(f2)) = (lhs.as_f64(), rhs.as_f64()) {
+                Ok(serde_json::Number::from_f64(f1 + f2)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
+            } else {
+                Err("operator '+' applied to incompatible types".to_string())
+            }
+        },
+        CelToken::Minus => {
+            if let (Some(n1), Some(n2)) = (lhs.as_i64(), rhs.as_i64()) {
+                Ok(Value::from(n1 - n2))
+            } else if let (Some(f1), Some(f2)) = (lhs.as_f64(), rhs.as_f64()) {
+                Ok(serde_json::Number::from_f64(f1 - f2)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
+            } else {
+                Err("operator '-' applied to incompatible types".to_string())
+            }
+        },
+        CelToken::Star => {
+            if let (Some(n1), Some(n2)) = (lhs.as_i64(), rhs.as_i64()) {
+                Ok(Value::from(n1 * n2))
+            } else if let (Some(f1), Some(f2)) = (lhs.as_f64(), rhs.as_f64()) {
+                Ok(serde_json::Number::from_f64(f1 * f2)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
+            } else {
+                Err("operator '*' applied to incompatible types".to_string())
+            }
+        },
+        CelToken::Slash => {
+            if let Some(f2) = rhs.as_f64() {
+                if f2.abs() < f64::EPSILON {
+                    return Err("division by zero".to_string());
+                }
+                if let (Some(n1), Some(n2)) = (lhs.as_i64(), rhs.as_i64()) {
+                    Ok(Value::from(n1 / n2))
+                } else if let Some(f1) = lhs.as_f64() {
+                    Ok(serde_json::Number::from_f64(f1 / f2)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null))
+                } else {
+                    Err("operator '/' applied to non-numbers".to_string())
+                }
+            } else {
+                Err("operator '/' divisor not a number".to_string())
+            }
+        },
+        CelToken::Percent => {
+            if let (Some(n1), Some(n2)) = (lhs.as_i64(), rhs.as_i64()) {
+                if n2 == 0 {
+                    return Err("modulo by zero".to_string());
+                }
+                Ok(Value::from(n1 % n2))
+            } else {
+                Err("operator '%' requires integer operands".to_string())
+            }
+        },
+        CelToken::EqEq => Ok(Value::Bool(cel_values_equal(&lhs, &rhs))),
+        CelToken::NotEq => Ok(Value::Bool(!cel_values_equal(&lhs, &rhs))),
+        CelToken::Lt => Ok(Value::Bool(
+            cel_compare(&lhs, &rhs) == Some(std::cmp::Ordering::Less),
+        )),
+        CelToken::LtEq => Ok(Value::Bool(matches!(
+            cel_compare(&lhs, &rhs),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ))),
+        CelToken::Gt => Ok(Value::Bool(
+            cel_compare(&lhs, &rhs) == Some(std::cmp::Ordering::Greater),
+        )),
+        CelToken::GtEq => Ok(Value::Bool(matches!(
+            cel_compare(&lhs, &rhs),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ))),
+        CelToken::AndAnd => Ok(Value::Bool(cel_is_truthy(&lhs) && cel_is_truthy(&rhs))),
+        CelToken::OrOr => Ok(Value::Bool(cel_is_truthy(&lhs) || cel_is_truthy(&rhs))),
+        other => Err(format!("unsupported binary operator {other:?}")),
+    }
+}
+
+fn cel_to_string(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn cel_values_equal(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => {
+            if let (Some(i1), Some(i2)) = (a.as_i64(), b.as_i64()) {
+                i1 == i2
+            } else if let (Some(f1), Some(f2)) = (a.as_f64(), b.as_f64()) {
+                (f1 - f2).abs() < f64::EPSILON
+            } else {
+                false
+            }
+        },
+        (Value::Array(a), Value::Array(b)) => a == b,
+        (Value::Object(a), Value::Object(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn cel_compare(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(f1), Some(f2)) = (lhs.as_f64(), rhs.as_f64()) {
+        f1.partial_cmp(&f2)
+    } else if let (Some(s1), Some(s2)) = (lhs.as_str(), rhs.as_str()) {
+        Some(s1.cmp(s2))
+    } else {
+        None
+    }
+}
+
+fn cel_is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::Number(n) => {
+            n.as_i64().is_some_and(|i| i != 0) || n.as_f64().is_some_and(|f| f.abs() > f64::EPSILON)
+        },
+        Value::String(s) => !s.is_empty(),
+        _ => true,
+    }
+}
+
+pub fn eval_cel(expr: &str, ctx: &CelContext) -> Result<Value, String> {
+    let tokens = tokenize_cel(expr)?;
+    let mut pos = 0;
+    parse_expr(&tokens, &mut pos, 1, ctx)
+}
+
+#[must_use]
+pub fn eval_cel_bool(expr: &str, ctx: &CelContext) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() || trimmed == "true" {
+        return true;
+    }
+    if trimmed == "false" {
+        return false;
+    }
+    match eval_cel(trimmed, ctx) {
+        Ok(val) => cel_is_truthy(&val),
+        Err(_) => false,
+    }
+}
+
+pub fn eval_cel_mutation(expr: &str, ctx: &CelContext) -> Result<Value, String> {
+    let trimmed = expr.trim();
+    if trimmed.starts_with("Object") || trimmed.starts_with('{') {
+        let tokens = tokenize_cel(trimmed)?;
+        let mut pos = 0;
+        parse_cel_struct_from_tokens(&tokens, &mut pos, ctx)
+    } else {
+        eval_cel(trimmed, ctx)
+    }
+}
+
+pub fn merge_json_values(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(t_map), Value::Object(p_map)) => {
+            for (k, v) in p_map {
+                if let Some(t_val) = t_map.get_mut(k) {
+                    if t_val.is_object() && v.is_object() {
+                        merge_json_values(t_val, v);
+                    } else {
+                        *t_val = v.clone();
+                    }
+                } else {
+                    t_map.insert(k.clone(), v.clone());
+                }
+            }
+        },
+        (t, p) => {
+            *t = p.clone();
+        },
+    }
+}
+
 /// Validates CEL matchCondition syntax.
 pub fn validate_match_condition(expression: &str) -> Result<(), ApiserverError> {
     let trimmed = expression.trim();
@@ -670,52 +1930,40 @@ pub fn validate_match_condition(expression: &str) -> Result<(), ApiserverError> 
     let double_quotes = trimmed.chars().filter(|&c| c == '"').count();
     let open_parens = trimmed.chars().filter(|&c| c == '(').count();
     let close_parens = trimmed.chars().filter(|&c| c == ')').count();
-    if single_quotes % 2 != 0 || double_quotes % 2 != 0 || open_parens != close_parens {
+    let open_braces = trimmed.chars().filter(|&c| c == '{').count();
+    let close_braces = trimmed.chars().filter(|&c| c == '}').count();
+    if single_quotes % 2 != 0
+        || double_quotes % 2 != 0
+        || open_parens != close_parens
+        || open_braces != close_braces
+    {
         return Err(ApiserverError::InvalidInput {
             field: "matchConditions.expression".to_string(),
             reason: format!("compilation failed: unbalanced tokens in expression '{trimmed}'"),
         });
     }
+    tokenize_cel(trimmed).map_err(|e| ApiserverError::InvalidInput {
+        field: "matchConditions.expression".to_string(),
+        reason: format!("compilation failed: {e}"),
+    })?;
     Ok(())
 }
 
 /// Evaluates a CEL matchCondition against an admission request.
 #[must_use]
 pub fn evaluate_match_condition(expression: &str, req: &AdmissionRequest) -> bool {
-    let expr = expression.trim();
-    if expr.is_empty() || expr == "true" {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() || trimmed == "true" {
         return true;
     }
-    if expr == "false" {
+    if trimmed == "false" {
         return false;
     }
-    if let Some((lhs, rhs)) = expr.split_once("!=") {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim().trim_matches('\'').trim_matches('"');
-        if lhs == "object.metadata.name" {
-            let actual = req
-                .object
-                .as_ref()
-                .and_then(|o| o.pointer("/metadata/name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            return actual != rhs;
-        }
-    }
-    if let Some((lhs, rhs)) = expr.split_once("==") {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim().trim_matches('\'').trim_matches('"');
-        if lhs == "object.metadata.name" {
-            let actual = req
-                .object
-                .as_ref()
-                .and_then(|o| o.pointer("/metadata/name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            return actual == rhs;
-        }
-    }
-    true
+    let mut ctx = CelContext::default();
+    ctx.object = req.object.clone();
+    ctx.old_object = req.old_object.clone();
+    ctx.request = serde_json::to_value(req).ok();
+    eval_cel_bool(trimmed, &ctx)
 }
 
 impl AdmissionEngine {
@@ -756,9 +2004,625 @@ impl AdmissionEngine {
         guard.push(config);
     }
 
+    pub fn add_mutating_admission_policy(&self, policy: MutatingAdmissionPolicy) {
+        let mut guard = self.mutating_policies.write().unwrap();
+        if let Some(name) = policy.metadata.get("name").and_then(Value::as_str) {
+            guard.retain(|p| p.metadata.get("name").and_then(Value::as_str) != Some(name));
+        }
+        guard.push(policy);
+    }
+
+    pub fn add_mutating_admission_policy_binding(&self, binding: MutatingAdmissionPolicyBinding) {
+        let mut guard = self.mutating_policy_bindings.write().unwrap();
+        if let Some(name) = binding.metadata.get("name").and_then(Value::as_str) {
+            guard.retain(|b| b.metadata.get("name").and_then(Value::as_str) != Some(name));
+        }
+        guard.push(binding);
+    }
+
+    pub fn add_validating_admission_policy(&self, mut policy: ValidatingAdmissionPolicy) {
+        ensure_policy_status(&mut policy);
+        let mut guard = self.validating_policies.write().unwrap();
+        if let Some(name) = policy.metadata.get("name").and_then(Value::as_str) {
+            guard.retain(|p| p.metadata.get("name").and_then(Value::as_str) != Some(name));
+        }
+        guard.push(policy);
+    }
+
+    pub fn add_validating_admission_policy_binding(
+        &self,
+        binding: ValidatingAdmissionPolicyBinding,
+    ) {
+        let mut guard = self.validating_policy_bindings.write().unwrap();
+        if let Some(name) = binding.metadata.get("name").and_then(Value::as_str) {
+            guard.retain(|b| b.metadata.get("name").and_then(Value::as_str) != Some(name));
+        }
+        guard.push(binding);
+    }
+
+    pub fn register_namespace_labels(&self, name: impl Into<String>, labels: Value) {
+        let mut guard = self.namespace_labels_cache.write().unwrap();
+        guard.insert(name.into(), labels);
+    }
+
+    pub fn register_param_object(&self, name: impl Into<String>, object: Value) {
+        let mut guard = self.params_cache.write().unwrap();
+        guard.insert(name.into(), object);
+    }
+
+    pub fn set_storage(&self, storage: KubernetesStorage) {
+        *self.storage.write().unwrap() = Some(storage);
+    }
+
     pub fn clear_configs(&self) {
         self.mutating_configs.write().unwrap().clear();
         self.validating_configs.write().unwrap().clear();
+        self.mutating_policies.write().unwrap().clear();
+        self.mutating_policy_bindings.write().unwrap().clear();
+        self.validating_policies.write().unwrap().clear();
+        self.validating_policy_bindings.write().unwrap().clear();
+        self.namespace_labels_cache.write().unwrap().clear();
+        self.params_cache.write().unwrap().clear();
+    }
+
+    async fn sync_storage_policies(&self) {
+        let storage = self.storage.read().unwrap().clone();
+        let Some(storage) = storage else {
+            return;
+        };
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/mutatingadmissionpolicies/",
+                storage.prefix()
+            ),
+            format!("{}/mutatingadmissionpolicies/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(policy) = serde_json::from_slice::<MutatingAdmissionPolicy>(&kv.value)
+                    {
+                        self.add_mutating_admission_policy(policy);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/mutatingadmissionpolicybindings/",
+                storage.prefix()
+            ),
+            format!("{}/mutatingadmissionpolicybindings/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(binding) =
+                        serde_json::from_slice::<MutatingAdmissionPolicyBinding>(&kv.value)
+                    {
+                        self.add_mutating_admission_policy_binding(binding);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/validatingadmissionpolicies/",
+                storage.prefix()
+            ),
+            format!("{}/validatingadmissionpolicies/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(policy) =
+                        serde_json::from_slice::<ValidatingAdmissionPolicy>(&kv.value)
+                    {
+                        self.add_validating_admission_policy(policy);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/validatingadmissionpolicybindings/",
+                storage.prefix()
+            ),
+            format!("{}/validatingadmissionpolicybindings/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(binding) =
+                        serde_json::from_slice::<ValidatingAdmissionPolicyBinding>(&kv.value)
+                    {
+                        self.add_validating_admission_policy_binding(binding);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/mutatingwebhookconfigurations/",
+                storage.prefix()
+            ),
+            format!("{}/mutatingwebhookconfigurations/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(cfg) =
+                        serde_json::from_slice::<MutatingWebhookConfiguration>(&kv.value)
+                    {
+                        self.add_mutating_webhook_config(cfg);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/validatingwebhookconfigurations/",
+                storage.prefix()
+            ),
+            format!("{}/validatingwebhookconfigurations/", storage.prefix()),
+        ] {
+            if let Ok(kvs) = storage.list(&prefix).await {
+                for kv in kvs {
+                    if let Ok(cfg) =
+                        serde_json::from_slice::<ValidatingWebhookConfiguration>(&kv.value)
+                    {
+                        self.add_validating_webhook_config(cfg);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn resolve_namespace_labels(&self, namespace: Option<&str>) -> Option<Value> {
+        let ns = namespace?;
+        if ns.is_empty() {
+            return None;
+        }
+
+        if let Some(labels) = self.namespace_labels_cache.read().unwrap().get(ns).cloned() {
+            return Some(labels);
+        }
+
+        let storage = self.storage.read().unwrap().clone()?;
+        let key = format!("{}/namespaces/{ns}", storage.prefix());
+        if let Ok(Some(kv)) = storage.get(&key).await {
+            if let Ok(doc) = serde_json::from_slice::<Value>(&kv.value) {
+                if let Some(labels) = doc.pointer("/metadata/labels").cloned() {
+                    return Some(labels);
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn resolve_namespace_object(&self, namespace: Option<&str>) -> Option<Value> {
+        let ns = namespace?;
+        if ns.is_empty() {
+            return None;
+        }
+
+        let storage = self.storage.read().unwrap().clone();
+        if let Some(storage) = storage {
+            let key = format!("{}/namespaces/{ns}", storage.prefix());
+            if let Ok(Some(kv)) = storage.get(&key).await {
+                if let Ok(doc) = serde_json::from_slice::<Value>(&kv.value) {
+                    return Some(doc);
+                }
+            }
+        }
+
+        let labels = self
+            .namespace_labels_cache
+            .read()
+            .unwrap()
+            .get(ns)
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Some(json!({
+            "metadata": {
+                "name": ns,
+                "labels": labels
+            }
+        }))
+    }
+
+    async fn resolve_param_object(&self, param_ref: &ParamRef) -> Option<Value> {
+        if let Some(obj) = self
+            .params_cache
+            .read()
+            .unwrap()
+            .get(&param_ref.name)
+            .cloned()
+        {
+            return Some(obj);
+        }
+
+        let storage = self.storage.read().unwrap().clone()?;
+        let suffix = if let Some(ns) = &param_ref.namespace {
+            format!("/{ns}/{}", param_ref.name)
+        } else {
+            format!("/{}", param_ref.name)
+        };
+
+        let list_kvs = storage.list(storage.prefix()).await.ok()?;
+        for kv in list_kvs {
+            if kv.key.ends_with(&suffix) {
+                if let Ok(val) = serde_json::from_slice::<Value>(&kv.value) {
+                    return Some(val);
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn apply_mutating_policies(
+        &self,
+        req: &mut AdmissionRequest,
+        ns_labels: Option<&Value>,
+    ) -> Result<bool, ApiserverError> {
+        let bindings = self.mutating_policy_bindings.read().unwrap().clone();
+        let policies = self.mutating_policies.read().unwrap().clone();
+
+        let mut any_mutated = false;
+
+        for binding in &bindings {
+            if let Some(mr) = &binding.spec.match_resources {
+                if !mr.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            let Some(policy) = policies.iter().find(|p| {
+                p.metadata.get("name").and_then(Value::as_str) == Some(&binding.spec.policy_name)
+            }) else {
+                continue;
+            };
+
+            if let Some(mc) = &policy.spec.match_constraints {
+                if !mc.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            if let Some(conditions) = &policy.spec.match_conditions {
+                let mut matches_all = true;
+                for cond in conditions {
+                    if !evaluate_match_condition(&cond.expression, req) {
+                        matches_all = false;
+                        break;
+                    }
+                }
+                if !matches_all {
+                    continue;
+                }
+            }
+
+            let mut ctx = CelContext::default();
+            ctx.object = req.object.clone();
+            ctx.old_object = req.old_object.clone();
+            ctx.namespace_object = self
+                .resolve_namespace_object(req.namespace.as_deref())
+                .await;
+            ctx.request = serde_json::to_value(&*req).ok();
+
+            if let Some(param_ref) = &binding.spec.param_ref {
+                if let Some(param_obj) = self.resolve_param_object(param_ref).await {
+                    ctx.params = Some(param_obj);
+                } else if param_ref.parameter_not_found_action.as_deref() == Some("Deny") {
+                    return Err(ApiserverError::AdmissionDenied {
+                        reason: format!(
+                            "parameter '{}' not found for policy binding '{}'",
+                            param_ref.name,
+                            binding
+                                .metadata
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("binding")
+                        ),
+                    });
+                } else if param_ref.parameter_not_found_action.as_deref() == Some("Allow") {
+                    continue;
+                }
+            }
+
+            for var in &policy.spec.variables {
+                match eval_cel(&var.expression, &ctx) {
+                    Ok(val) => {
+                        ctx.variables.insert(var.name.clone(), val);
+                    },
+                    Err(err) => {
+                        if policy.spec.failure_policy == Some(FailurePolicy::Fail) {
+                            return Err(ApiserverError::AdmissionDenied {
+                                reason: format!(
+                                    "CEL variable '{}' evaluation failed: {err}",
+                                    var.name
+                                ),
+                            });
+                        }
+                    },
+                }
+            }
+
+            let before = req.object.clone();
+            for mutation in &policy.spec.mutations {
+                if mutation.patch_type == "ApplyConfiguration" {
+                    if let Some(ac) = &mutation.apply_configuration {
+                        match eval_cel_mutation(&ac.expression, &ctx) {
+                            Ok(patch) => {
+                                if let Some(target) = &mut req.object {
+                                    merge_json_values(target, &patch);
+                                    ctx.object = req.object.clone();
+                                }
+                            },
+                            Err(err) => {
+                                if policy.spec.failure_policy == Some(FailurePolicy::Fail) {
+                                    return Err(ApiserverError::AdmissionDenied {
+                                        reason: format!(
+                                            "mutation applyConfiguration expression failed: {err}"
+                                        ),
+                                    });
+                                }
+                            },
+                        }
+                    }
+                } else if mutation.patch_type == "JSONPatch" {
+                    if let Some(jp) = &mutation.json_patch {
+                        match eval_cel(&jp.expression, &ctx) {
+                            Ok(patch_val) => {
+                                if let Ok(patch_bytes) = serde_json::to_vec(&patch_val) {
+                                    if let Some(target) = &mut req.object {
+                                        if let Err(e) = apply_json_patch(target, &patch_bytes) {
+                                            if policy.spec.failure_policy
+                                                == Some(FailurePolicy::Fail)
+                                            {
+                                                return Err(e);
+                                            }
+                                        }
+                                        ctx.object = req.object.clone();
+                                    }
+                                }
+                            },
+                            Err(err) => {
+                                if policy.spec.failure_policy == Some(FailurePolicy::Fail) {
+                                    return Err(ApiserverError::AdmissionDenied {
+                                        reason: format!(
+                                            "mutation JSONPatch expression failed: {err}"
+                                        ),
+                                    });
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+
+            if req.object != before {
+                any_mutated = true;
+            }
+        }
+
+        Ok(any_mutated)
+    }
+
+    async fn apply_validating_policies(
+        &self,
+        req: &AdmissionRequest,
+        ns_labels: Option<&Value>,
+    ) -> Result<(), ApiserverError> {
+        let bindings = self.validating_policy_bindings.read().unwrap().clone();
+        let policies = self.validating_policies.read().unwrap().clone();
+
+        for binding in &bindings {
+            if let Some(mr) = &binding.spec.match_resources {
+                if !mr.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            let Some(policy) = policies.iter().find(|p| {
+                p.metadata.get("name").and_then(Value::as_str) == Some(&binding.spec.policy_name)
+            }) else {
+                continue;
+            };
+
+            if let Some(mc) = &policy.spec.match_constraints {
+                if !mc.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            if let Some(conditions) = &policy.spec.match_conditions {
+                let mut matches_all = true;
+                for cond in conditions {
+                    if !evaluate_match_condition(&cond.expression, req) {
+                        matches_all = false;
+                        break;
+                    }
+                }
+                if !matches_all {
+                    continue;
+                }
+            }
+
+            let mut ctx = CelContext::default();
+            ctx.object = req.object.clone();
+            ctx.old_object = req.old_object.clone();
+            ctx.namespace_object = self
+                .resolve_namespace_object(req.namespace.as_deref())
+                .await;
+            ctx.request = serde_json::to_value(req).ok();
+
+            if let Some(param_ref) = &binding.spec.param_ref {
+                if let Some(param_obj) = self.resolve_param_object(param_ref).await {
+                    ctx.params = Some(param_obj);
+                } else if param_ref.parameter_not_found_action.as_deref() == Some("Deny") {
+                    return Err(ApiserverError::AdmissionDenied {
+                        reason: format!(
+                            "parameter '{}' not found for policy binding '{}'",
+                            param_ref.name,
+                            binding
+                                .metadata
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("binding")
+                        ),
+                    });
+                } else if param_ref.parameter_not_found_action.as_deref() == Some("Allow") {
+                    continue;
+                }
+            }
+
+            for var in &policy.spec.variables {
+                match eval_cel(&var.expression, &ctx) {
+                    Ok(val) => {
+                        ctx.variables.insert(var.name.clone(), val);
+                    },
+                    Err(err) => {
+                        if policy.spec.failure_policy == Some(FailurePolicy::Fail) {
+                            return Err(ApiserverError::AdmissionDenied {
+                                reason: format!(
+                                    "CEL variable '{}' evaluation failed: {err}",
+                                    var.name
+                                ),
+                            });
+                        }
+                    },
+                }
+            }
+
+            let default_actions = vec!["Deny".to_string()];
+            let actions = binding
+                .spec
+                .validation_actions
+                .as_ref()
+                .unwrap_or(&default_actions);
+            let has_deny = actions.iter().any(|a| a.eq_ignore_ascii_case("Deny"));
+            let has_audit = actions.iter().any(|a| a.eq_ignore_ascii_case("Audit"));
+
+            for val in &policy.spec.validations {
+                let passed = eval_cel_bool(&val.expression, &ctx);
+                if !passed {
+                    let message = if let Some(msg_expr) = &val.message_expression {
+                        match eval_cel(msg_expr, &ctx) {
+                            Ok(v) => cel_to_string(&v),
+                            Err(_) => val
+                                .message
+                                .clone()
+                                .unwrap_or_else(|| "admission denied by policy".to_string()),
+                        }
+                    } else {
+                        val.message
+                            .clone()
+                            .unwrap_or_else(|| "admission denied by policy".to_string())
+                    };
+
+                    if has_audit {
+                        for aa in &policy.spec.audit_annotations {
+                            let _ = eval_cel(&aa.value_expression, &ctx);
+                        }
+                    }
+
+                    if has_deny {
+                        return Err(ApiserverError::AdmissionDenied { reason: message });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn reinvoke_policies_pass(
+        &self,
+        req: &mut AdmissionRequest,
+        ns_labels: Option<&Value>,
+    ) -> Result<bool, ApiserverError> {
+        let bindings = self.mutating_policy_bindings.read().unwrap().clone();
+        let policies = self.mutating_policies.read().unwrap().clone();
+        let mut any_mutated = false;
+
+        for binding in &bindings {
+            let Some(policy) = policies.iter().find(|p| {
+                p.metadata.get("name").and_then(Value::as_str) == Some(&binding.spec.policy_name)
+            }) else {
+                continue;
+            };
+
+            if policy.spec.reinvocation_policy.as_deref() != Some("IfNeeded") {
+                continue;
+            }
+
+            if let Some(mr) = &binding.spec.match_resources {
+                if !mr.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            if let Some(mc) = &policy.spec.match_constraints {
+                if !mc.matches_request(req, ns_labels) {
+                    continue;
+                }
+            }
+
+            let before = req.object.clone();
+            let mut ctx = CelContext::default();
+            ctx.object = req.object.clone();
+            ctx.old_object = req.old_object.clone();
+            ctx.namespace_object = self
+                .resolve_namespace_object(req.namespace.as_deref())
+                .await;
+            ctx.request = serde_json::to_value(&*req).ok();
+
+            if let Some(param_ref) = &binding.spec.param_ref {
+                if let Some(param_obj) = self.resolve_param_object(param_ref).await {
+                    ctx.params = Some(param_obj);
+                }
+            }
+
+            for var in &policy.spec.variables {
+                if let Ok(val) = eval_cel(&var.expression, &ctx) {
+                    ctx.variables.insert(var.name.clone(), val);
+                }
+            }
+
+            for mutation in &policy.spec.mutations {
+                if mutation.patch_type == "ApplyConfiguration" {
+                    if let Some(ac) = &mutation.apply_configuration {
+                        if let Ok(patch) = eval_cel_mutation(&ac.expression, &ctx) {
+                            if let Some(target) = &mut req.object {
+                                merge_json_values(target, &patch);
+                                ctx.object = req.object.clone();
+                            }
+                        }
+                    }
+                } else if mutation.patch_type == "JSONPatch" {
+                    if let Some(jp) = &mutation.json_patch {
+                        if let Ok(patch_val) = eval_cel(&jp.expression, &ctx) {
+                            if let Ok(patch_bytes) = serde_json::to_vec(&patch_val) {
+                                if let Some(target) = &mut req.object {
+                                    let _ = apply_json_patch(target, &patch_bytes);
+                                    ctx.object = req.object.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if req.object != before {
+                any_mutated = true;
+            }
+        }
+
+        Ok(any_mutated)
     }
 
     async fn reinvoke_webhooks_pass(
@@ -786,25 +2650,33 @@ impl AdmissionEngine {
         Ok(mutated)
     }
 
-    /// Runs all matching mutating webhooks against the admission request.
+    /// Runs all matching mutating policies and webhooks against the admission request.
     /// Modifies `req.object` in place if patches are returned and applies defaults.
     pub async fn run_mutating_admission(
         &self,
         req: &mut AdmissionRequest,
     ) -> Result<(), ApiserverError> {
-        let configs = self.mutating_configs.read().unwrap().clone();
+        self.sync_storage_policies().await;
 
+        let ns_labels = self
+            .resolve_namespace_labels(req.namespace.as_deref())
+            .await;
+
+        let policy_mutated = self
+            .apply_mutating_policies(req, ns_labels.as_ref())
+            .await?;
+
+        let configs = self.mutating_configs.read().unwrap().clone();
         let mut matching_webhooks = Vec::new();
         for config in &configs {
             for webhook in &config.webhooks {
-                if webhook.matches_request(req) {
+                if webhook.matches_request_with_ns(req, ns_labels.as_ref()) {
                     matching_webhooks.push(webhook.clone());
                 }
             }
         }
 
-        let mut mutated_overall = false;
-
+        let mut webhook_mutated = false;
         for webhook in &matching_webhooks {
             let endpoint = {
                 let guard = self.endpoints.read().unwrap();
@@ -814,16 +2686,19 @@ impl AdmissionEngine {
             let before = req.object.clone();
             apply_mutating_webhook(webhook, endpoint.as_deref(), req).await?;
             if req.object != before {
-                mutated_overall = true;
+                webhook_mutated = true;
             }
         }
 
-        // Reinvocation loop: if any webhook mutated the object, reinvoke webhooks configured with IfNeeded
+        let mutated_overall = policy_mutated || webhook_mutated;
+
+        // Reinvocation loop
         if mutated_overall {
             const MAX_REINVOCATION_PASSES: usize = 5;
             for _ in 0..MAX_REINVOCATION_PASSES {
-                let mutated = self.reinvoke_webhooks_pass(&matching_webhooks, req).await?;
-                if !mutated {
+                let pol_mut = self.reinvoke_policies_pass(req, ns_labels.as_ref()).await?;
+                let wh_mut = self.reinvoke_webhooks_pass(&matching_webhooks, req).await?;
+                if !pol_mut && !wh_mut {
                     break;
                 }
             }
@@ -837,7 +2712,7 @@ impl AdmissionEngine {
         Ok(())
     }
 
-    /// Runs all matching validating webhooks against the admission request.
+    /// Runs all matching validating policies and webhooks against the admission request.
     pub async fn run_validating_admission(
         &self,
         req: &AdmissionRequest,
@@ -861,11 +2736,19 @@ impl AdmissionEngine {
             }
         }
 
-        let configs = self.validating_configs.read().unwrap().clone();
+        self.sync_storage_policies().await;
 
+        let ns_labels = self
+            .resolve_namespace_labels(req.namespace.as_deref())
+            .await;
+
+        self.apply_validating_policies(req, ns_labels.as_ref())
+            .await?;
+
+        let configs = self.validating_configs.read().unwrap().clone();
         for config in configs {
             for webhook in &config.webhooks {
-                if !webhook.matches_request(req) {
+                if !webhook.matches_request_with_ns(req, ns_labels.as_ref()) {
                     continue;
                 }
 
@@ -881,37 +2764,131 @@ impl AdmissionEngine {
         Ok(())
     }
 
-    /// Restores persisted webhook configurations from storage.
+    /// Restores persisted webhook configurations and admission policies from storage.
     pub async fn restore_from_storage(
         &self,
         storage: &KubernetesStorage,
     ) -> Result<(), ApiserverError> {
         self.clear_configs();
+        *self.storage.write().unwrap() = Some(storage.clone());
 
         let mutating_prefix = format!("{}/mutatingwebhookconfigurations/", storage.prefix());
-        let mutating_kvs = storage.list(&mutating_prefix).await?;
-        for kv in mutating_kvs {
-            let config: MutatingWebhookConfiguration =
-                serde_json::from_slice(&kv.value).map_err(|e| ApiserverError::StorageUnusable {
-                    reason: format!(
-                        "failed to deserialize MutatingWebhookConfiguration at {}: {e}",
-                        kv.key
-                    ),
-                })?;
-            self.add_mutating_webhook_config(config);
+        if let Ok(mutating_kvs) = storage.list(&mutating_prefix).await {
+            for kv in mutating_kvs {
+                if let Ok(config) =
+                    serde_json::from_slice::<MutatingWebhookConfiguration>(&kv.value)
+                {
+                    self.add_mutating_webhook_config(config);
+                }
+            }
+        }
+        let mutating_prefix_group = format!(
+            "{}/admissionregistration.k8s.io/mutatingwebhookconfigurations/",
+            storage.prefix()
+        );
+        if let Ok(mutating_kvs) = storage.list(&mutating_prefix_group).await {
+            for kv in mutating_kvs {
+                if let Ok(config) =
+                    serde_json::from_slice::<MutatingWebhookConfiguration>(&kv.value)
+                {
+                    self.add_mutating_webhook_config(config);
+                }
+            }
         }
 
         let validating_prefix = format!("{}/validatingwebhookconfigurations/", storage.prefix());
-        let validating_kvs = storage.list(&validating_prefix).await?;
-        for kv in validating_kvs {
-            let config: ValidatingWebhookConfiguration = serde_json::from_slice(&kv.value)
-                .map_err(|e| ApiserverError::StorageUnusable {
-                    reason: format!(
-                        "failed to deserialize ValidatingWebhookConfiguration at {}: {e}",
-                        kv.key
-                    ),
-                })?;
-            self.add_validating_webhook_config(config);
+        if let Ok(validating_kvs) = storage.list(&validating_prefix).await {
+            for kv in validating_kvs {
+                if let Ok(config) =
+                    serde_json::from_slice::<ValidatingWebhookConfiguration>(&kv.value)
+                {
+                    self.add_validating_webhook_config(config);
+                }
+            }
+        }
+        let validating_prefix_group = format!(
+            "{}/admissionregistration.k8s.io/validatingwebhookconfigurations/",
+            storage.prefix()
+        );
+        if let Ok(validating_kvs) = storage.list(&validating_prefix_group).await {
+            for kv in validating_kvs {
+                if let Ok(config) =
+                    serde_json::from_slice::<ValidatingWebhookConfiguration>(&kv.value)
+                {
+                    self.add_validating_webhook_config(config);
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/mutatingadmissionpolicies/",
+                storage.prefix()
+            ),
+            format!("{}/mutatingadmissionpolicies/", storage.prefix()),
+        ] {
+            if let Ok(map_kvs) = storage.list(&prefix).await {
+                for kv in map_kvs {
+                    if let Ok(policy) = serde_json::from_slice::<MutatingAdmissionPolicy>(&kv.value)
+                    {
+                        self.add_mutating_admission_policy(policy);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/mutatingadmissionpolicybindings/",
+                storage.prefix()
+            ),
+            format!("{}/mutatingadmissionpolicybindings/", storage.prefix()),
+        ] {
+            if let Ok(mapb_kvs) = storage.list(&prefix).await {
+                for kv in mapb_kvs {
+                    if let Ok(binding) =
+                        serde_json::from_slice::<MutatingAdmissionPolicyBinding>(&kv.value)
+                    {
+                        self.add_mutating_admission_policy_binding(binding);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/validatingadmissionpolicies/",
+                storage.prefix()
+            ),
+            format!("{}/validatingadmissionpolicies/", storage.prefix()),
+        ] {
+            if let Ok(vap_kvs) = storage.list(&prefix).await {
+                for kv in vap_kvs {
+                    if let Ok(policy) =
+                        serde_json::from_slice::<ValidatingAdmissionPolicy>(&kv.value)
+                    {
+                        self.add_validating_admission_policy(policy);
+                    }
+                }
+            }
+        }
+
+        for prefix in [
+            format!(
+                "{}/admissionregistration.k8s.io/validatingadmissionpolicybindings/",
+                storage.prefix()
+            ),
+            format!("{}/validatingadmissionpolicybindings/", storage.prefix()),
+        ] {
+            if let Ok(vapb_kvs) = storage.list(&prefix).await {
+                for kv in vapb_kvs {
+                    if let Ok(binding) =
+                        serde_json::from_slice::<ValidatingAdmissionPolicyBinding>(&kv.value)
+                    {
+                        self.add_validating_admission_policy_binding(binding);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1953,5 +3930,718 @@ mod tests {
             Some(&non_matching_selector),
             req.object.as_ref()
         ));
+    }
+
+    struct CrdMutateHandler;
+
+    #[async_trait]
+    impl WebhookHandler for CrdMutateHandler {
+        async fn handle(
+            &self,
+            req: &AdmissionRequest,
+        ) -> Result<AdmissionResponse, ApiserverError> {
+            let patch = json!([
+                {
+                    "op": "add",
+                    "path": "/spec/mutated",
+                    "value": "true"
+                }
+            ]);
+            let patch_bytes = serde_json::to_vec(&patch).map_err(|e| ApiserverError::Internal {
+                reason: e.to_string(),
+            })?;
+            let patch_b64 = diorama_pki::base64_encode(&patch_bytes);
+
+            Ok(AdmissionResponse {
+                uid: req.uid.clone(),
+                allowed: true,
+                status: None,
+                patch: Some(patch_b64),
+                patch_type: Some("JSONPatch".to_string()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_crd_webhook_mutation_wildcard_and_specific() {
+        let engine = AdmissionEngine::new();
+        engine.register_webhook_endpoint("crd-mutator", Arc::new(CrdMutateHandler), None);
+
+        let mutating_config = MutatingWebhookConfiguration {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("crd-webhook-config"));
+                m
+            },
+            webhooks: vec![
+                WebhookDefinition {
+                    name: "crd-mutating-webhook".to_string(),
+                    client_config: WebhookClientConfig {
+                        url: Some("http://crd-mutator/mutate".to_string()),
+                        ..Default::default()
+                    },
+                    rules: vec![RuleWithOperations {
+                        operations: vec!["CREATE".to_string(), "UPDATE".to_string()],
+                        api_groups: vec!["mycrd.example.com".to_string()],
+                        api_versions: vec!["v1alpha1".to_string()],
+                        resources: vec!["cronbars".to_string()],
+                        ..Default::default()
+                    }],
+                    failure_policy: FailurePolicy::Fail,
+                    admission_review_versions: vec!["v1".to_string()],
+                    ..Default::default()
+                },
+                WebhookDefinition {
+                    name: "wildcard-mutating-webhook".to_string(),
+                    client_config: WebhookClientConfig {
+                        url: Some("http://crd-mutator/mutate".to_string()),
+                        ..Default::default()
+                    },
+                    rules: vec![RuleWithOperations {
+                        operations: vec!["*".to_string()],
+                        api_groups: vec!["*".to_string()],
+                        api_versions: vec!["*".to_string()],
+                        resources: vec!["*".to_string()],
+                        ..Default::default()
+                    }],
+                    failure_policy: FailurePolicy::Ignore,
+                    admission_review_versions: vec!["v1".to_string()],
+                    ..Default::default()
+                },
+            ],
+        };
+        engine.add_mutating_webhook_config(mutating_config);
+
+        // CREATE operation on custom resource
+        let mut req_create = AdmissionRequest {
+            uid: "req-crd-create".to_string(),
+            kind: GroupVersionKind {
+                group: "mycrd.example.com".to_string(),
+                version: "v1alpha1".to_string(),
+                kind: "CronBar".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "mycrd.example.com".to_string(),
+                version: "v1alpha1".to_string(),
+                resource: "cronbars".to_string(),
+            },
+            name: Some("test-cronbar".to_string()),
+            namespace: Some("default".to_string()),
+            operation: "CREATE".to_string(),
+            user_info: UserInfo {
+                username: "admin".to_string(),
+                uid: None,
+                groups: vec![],
+            },
+            object: Some(json!({
+                "apiVersion": "mycrd.example.com/v1alpha1",
+                "kind": "CronBar",
+                "metadata": {
+                    "name": "test-cronbar",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "schedule": "*/5 * * * *"
+                }
+            })),
+            old_object: None,
+            dry_run: None,
+        };
+
+        engine
+            .run_mutating_admission(&mut req_create)
+            .await
+            .expect("mutation on CRD create succeeds");
+
+        assert_eq!(
+            req_create.object.as_ref().unwrap()["spec"]["mutated"],
+            "true"
+        );
+
+        // UPDATE operation on custom resource
+        let mut req_update = AdmissionRequest {
+            uid: "req-crd-update".to_string(),
+            kind: GroupVersionKind {
+                group: "mycrd.example.com".to_string(),
+                version: "v1alpha1".to_string(),
+                kind: "CronBar".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "mycrd.example.com".to_string(),
+                version: "v1alpha1".to_string(),
+                resource: "cronbars".to_string(),
+            },
+            name: Some("test-cronbar".to_string()),
+            namespace: Some("default".to_string()),
+            operation: "UPDATE".to_string(),
+            user_info: UserInfo {
+                username: "admin".to_string(),
+                uid: None,
+                groups: vec![],
+            },
+            object: Some(json!({
+                "apiVersion": "mycrd.example.com/v1alpha1",
+                "kind": "CronBar",
+                "metadata": {
+                    "name": "test-cronbar",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "schedule": "*/10 * * * *"
+                }
+            })),
+            old_object: Some(json!({
+                "apiVersion": "mycrd.example.com/v1alpha1",
+                "kind": "CronBar",
+                "metadata": {
+                    "name": "test-cronbar",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "schedule": "*/5 * * * *",
+                    "mutated": "true"
+                }
+            })),
+            dry_run: None,
+        };
+
+        engine
+            .run_mutating_admission(&mut req_update)
+            .await
+            .expect("mutation on CRD update succeeds");
+
+        assert_eq!(
+            req_update.object.as_ref().unwrap()["spec"]["mutated"],
+            "true"
+        );
+
+        // Verify resource_rule_matches subresource patterns
+        assert!(resource_rule_matches("*", "pods"));
+        assert!(!resource_rule_matches("*", "pods/status"));
+        assert!(resource_rule_matches("*/*", "pods/status"));
+        assert!(!resource_rule_matches("*/*", "pods"));
+        assert!(resource_rule_matches("pods/*", "pods/status"));
+        assert!(!resource_rule_matches("pods/*", "services/status"));
+        assert!(resource_rule_matches("*/status", "deployments/status"));
+    }
+
+    #[tokio::test]
+    async fn test_mutating_admission_policy_apply_config_and_json_patch() {
+        let engine = AdmissionEngine::new();
+
+        let policy = MutatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("replicas-mutation-policy"));
+                m
+            },
+            spec: MutatingAdmissionPolicySpec {
+                param_kind: None,
+                match_constraints: Some(MatchResources {
+                    resource_rules: vec![NamedRuleWithOperations {
+                        operations: vec!["CREATE".to_string()],
+                        api_groups: vec!["apps".to_string()],
+                        api_versions: vec!["v1".to_string()],
+                        resources: vec!["deployments".to_string()],
+                        scope: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                match_conditions: None,
+                variables: vec![],
+                mutations: vec![
+                    Mutation {
+                        patch_type: "ApplyConfiguration".to_string(),
+                        apply_configuration: Some(ApplyConfiguration {
+                            expression: "Object{spec: Object.spec{replicas: 1337}}".to_string(),
+                        }),
+                        json_patch: None,
+                    },
+                    Mutation {
+                        patch_type: "ApplyConfiguration".to_string(),
+                        apply_configuration: Some(ApplyConfiguration {
+                            expression: "Object{metadata: Object.metadata{annotations: {\"mutated-by\": \"admission-policy\"}}}".to_string(),
+                        }),
+                        json_patch: None,
+                    },
+                ],
+                failure_policy: Some(FailurePolicy::Fail),
+                reinvocation_policy: None,
+            },
+        };
+
+        let binding = MutatingAdmissionPolicyBinding {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("replicas-mutation-binding"));
+                m
+            },
+            spec: MutatingAdmissionPolicyBindingSpec {
+                policy_name: "replicas-mutation-policy".to_string(),
+                param_ref: None,
+                match_resources: None,
+            },
+        };
+
+        engine.add_mutating_admission_policy(policy);
+        engine.add_mutating_admission_policy_binding(binding);
+
+        let mut req = AdmissionRequest {
+            uid: "req-deployment".to_string(),
+            kind: GroupVersionKind {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                kind: "Deployment".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                resource: "deployments".to_string(),
+            },
+            name: Some("test-deploy".to_string()),
+            namespace: Some("default".to_string()),
+            operation: "CREATE".to_string(),
+            user_info: UserInfo {
+                username: "admin".to_string(),
+                uid: None,
+                groups: vec![],
+            },
+            object: Some(json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "test-deploy",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "replicas": 2
+                }
+            })),
+            old_object: None,
+            dry_run: None,
+        };
+
+        engine
+            .run_mutating_admission(&mut req)
+            .await
+            .expect("mutating policy applies successfully");
+
+        let mutated = req.object.expect("object remains present");
+        assert_eq!(mutated["spec"]["replicas"], 1337);
+        assert_eq!(
+            mutated["metadata"]["annotations"]["mutated-by"],
+            "admission-policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validating_admission_policy_variables_modulo_and_messages() {
+        let engine = AdmissionEngine::new();
+
+        let policy = ValidatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("odd-replicas-policy"));
+                m
+            },
+            spec: ValidatingAdmissionPolicySpec {
+                param_kind: None,
+                match_constraints: Some(MatchResources {
+                    resource_rules: vec![NamedRuleWithOperations {
+                        operations: vec!["CREATE".to_string()],
+                        api_groups: vec!["apps".to_string()],
+                        api_versions: vec!["v1".to_string()],
+                        resources: vec!["deployments".to_string()],
+                        scope: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                match_conditions: None,
+                validations: vec![Validation {
+                    expression: "variables.replicas % 2 == 1".to_string(),
+                    message: None,
+                    message_expression: Some(
+                        "'Deployment replicas ' + string(variables.replicas) + ' must be odd'"
+                            .to_string(),
+                    ),
+                    reason: None,
+                }],
+                audit_annotations: vec![AuditAnnotation {
+                    key: "audit.policy/replicas".to_string(),
+                    value_expression: "string(variables.replicas)".to_string(),
+                }],
+                failure_policy: Some(FailurePolicy::Fail),
+                variables: vec![Variable {
+                    name: "replicas".to_string(),
+                    expression: "object.spec.replicas".to_string(),
+                }],
+            },
+            status: None,
+        };
+
+        let binding = ValidatingAdmissionPolicyBinding {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("odd-replicas-binding"));
+                m
+            },
+            spec: ValidatingAdmissionPolicyBindingSpec {
+                policy_name: "odd-replicas-policy".to_string(),
+                param_ref: None,
+                match_resources: None,
+                validation_actions: Some(vec!["Deny".to_string(), "Audit".to_string()]),
+            },
+        };
+
+        engine.add_validating_admission_policy(policy);
+        engine.add_validating_admission_policy_binding(binding);
+
+        let make_req = |replicas: i64| AdmissionRequest {
+            uid: "req-vap".to_string(),
+            kind: GroupVersionKind {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                kind: "Deployment".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                resource: "deployments".to_string(),
+            },
+            name: Some("test-deploy".to_string()),
+            namespace: Some("default".to_string()),
+            operation: "CREATE".to_string(),
+            user_info: UserInfo {
+                username: "admin".to_string(),
+                uid: None,
+                groups: vec![],
+            },
+            object: Some(json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "test-deploy",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "replicas": replicas
+                }
+            })),
+            old_object: None,
+            dry_run: None,
+        };
+
+        // Replicas = 3 (odd): passes
+        let req_odd = make_req(3);
+        let res_odd = engine.run_validating_admission(&req_odd).await;
+        assert!(res_odd.is_ok());
+
+        // Replicas = 4 (even): denied with interpolated message
+        let req_even = make_req(4);
+        let res_even = engine.run_validating_admission(&req_even).await;
+        match res_even {
+            Err(ApiserverError::AdmissionDenied { reason }) => {
+                assert!(reason.contains("Deployment replicas 4 must be odd"));
+            },
+            other => panic!("expected AdmissionDenied error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validating_admission_policy_warn_action_and_param_ref() {
+        let engine = AdmissionEngine::new();
+
+        let policy = ValidatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("param-policy"));
+                m
+            },
+            spec: ValidatingAdmissionPolicySpec {
+                param_kind: Some(ParamKind {
+                    api_version: "rules.example.com/v1".to_string(),
+                    kind: "ReplicaLimit".to_string(),
+                }),
+                match_constraints: None,
+                match_conditions: None,
+                validations: vec![Validation {
+                    expression: "params != null && object.spec.replicas <= params.maxReplicas"
+                        .to_string(),
+                    message: Some("replicas exceeds maxReplicas limit".to_string()),
+                    message_expression: None,
+                    reason: None,
+                }],
+                audit_annotations: vec![],
+                failure_policy: Some(FailurePolicy::Fail),
+                variables: vec![],
+            },
+            status: None,
+        };
+
+        let binding_deny_missing = ValidatingAdmissionPolicyBinding {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("param-binding-missing"));
+                m
+            },
+            spec: ValidatingAdmissionPolicyBindingSpec {
+                policy_name: "param-policy".to_string(),
+                param_ref: Some(ParamRef {
+                    name: "missing-limit".to_string(),
+                    namespace: None,
+                    parameter_not_found_action: Some("Deny".to_string()),
+                }),
+                match_resources: None,
+                validation_actions: Some(vec!["Deny".to_string()]),
+            },
+        };
+
+        engine.add_mutating_admission_policy_binding(MutatingAdmissionPolicyBinding {
+            metadata: BTreeMap::new(),
+            spec: MutatingAdmissionPolicyBindingSpec {
+                policy_name: "nonexistent".to_string(),
+                param_ref: None,
+                match_resources: None,
+            },
+        });
+
+        engine.add_validating_admission_policy(policy);
+        engine.add_validating_admission_policy_binding(binding_deny_missing);
+
+        let req = AdmissionRequest {
+            uid: "req-param".to_string(),
+            kind: GroupVersionKind {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                kind: "Deployment".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apps".to_string(),
+                version: "v1".to_string(),
+                resource: "deployments".to_string(),
+            },
+            name: Some("test-deploy".to_string()),
+            namespace: Some("default".to_string()),
+            operation: "CREATE".to_string(),
+            user_info: UserInfo {
+                username: "admin".to_string(),
+                uid: None,
+                groups: vec![],
+            },
+            object: Some(json!({
+                "spec": { "replicas": 5 }
+            })),
+            old_object: None,
+            dry_run: None,
+        };
+
+        // When missing param with Deny action -> fails
+        let err = engine.run_validating_admission(&req).await;
+        assert!(err.is_err());
+
+        // Now register param and test Warn action binding
+        engine.register_param_object("configured-limit", json!({ "maxReplicas": 3 }));
+
+        let binding_warn = ValidatingAdmissionPolicyBinding {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("param-binding-warn"));
+                m
+            },
+            spec: ValidatingAdmissionPolicyBindingSpec {
+                policy_name: "param-policy".to_string(),
+                param_ref: Some(ParamRef {
+                    name: "configured-limit".to_string(),
+                    namespace: None,
+                    parameter_not_found_action: Some("Allow".to_string()),
+                }),
+                match_resources: None,
+                validation_actions: Some(vec!["Warn".to_string()]),
+            },
+        };
+
+        let engine2 = AdmissionEngine::new();
+        let policy2 = ValidatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("param-policy"));
+                m
+            },
+            spec: ValidatingAdmissionPolicySpec {
+                param_kind: Some(ParamKind {
+                    api_version: "rules.example.com/v1".to_string(),
+                    kind: "ReplicaLimit".to_string(),
+                }),
+                match_constraints: None,
+                match_conditions: None,
+                validations: vec![Validation {
+                    expression: "params != null && object.spec.replicas <= params.maxReplicas"
+                        .to_string(),
+                    message: Some("replicas exceeds maxReplicas limit".to_string()),
+                    message_expression: None,
+                    reason: None,
+                }],
+                audit_annotations: vec![],
+                failure_policy: Some(FailurePolicy::Fail),
+                variables: vec![],
+            },
+            status: None,
+        };
+        engine2.add_validating_admission_policy(policy2);
+        engine2.add_validating_admission_policy_binding(binding_warn);
+        engine2.register_param_object("configured-limit", json!({ "maxReplicas": 3 }));
+
+        let res = engine2.run_validating_admission(&req).await;
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_vap_type_checking_warnings() {
+        let mut policy = ValidatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("type-checking-policy"));
+                m
+            },
+            spec: ValidatingAdmissionPolicySpec {
+                param_kind: None,
+                match_constraints: None,
+                match_conditions: None,
+                validations: vec![
+                    Validation {
+                        expression: "object.spec.replicas > 'invalid'".to_string(),
+                        message: None,
+                        message_expression: None,
+                        reason: None,
+                    },
+                    Validation {
+                        expression: "'prefix' + object.spec.replicas".to_string(),
+                        message: None,
+                        message_expression: None,
+                        reason: None,
+                    },
+                    Validation {
+                        expression: "object.spec.maxRetries > 0".to_string(),
+                        message: None,
+                        message_expression: None,
+                        reason: None,
+                    },
+                ],
+                audit_annotations: vec![],
+                failure_policy: Some(FailurePolicy::Fail),
+                variables: vec![],
+            },
+            status: None,
+        };
+
+        let warnings = type_check_validating_admission_policy(&policy);
+        assert_eq!(warnings.expression_warnings.len(), 3);
+        assert!(
+            warnings.expression_warnings[0]
+                .warning
+                .contains("found no matching overload for '_>_' applied to '(int, string)'")
+        );
+        assert!(
+            warnings.expression_warnings[1]
+                .warning
+                .contains("found no matching overload for '_+_' applied to '(string, int)'")
+        );
+        assert!(
+            warnings.expression_warnings[2]
+                .warning
+                .contains("undefined field 'maxRetries'")
+        );
+
+        ensure_policy_status(&mut policy);
+        assert!(policy.status.is_some());
+        let tc = policy
+            .status
+            .as_ref()
+            .unwrap()
+            .type_checking
+            .as_ref()
+            .unwrap();
+        assert_eq!(tc.expression_warnings.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_storage_restore_for_policies_and_webhooks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ds_config = diorama_datastore::DatastoreConfig::new(temp_dir.path());
+        let (ds_engine, _) = diorama_datastore::DatastoreEngine::open(ds_config).unwrap();
+        let storage = KubernetesStorage::new(ds_engine.client(), "/registry");
+
+        let mwh = MutatingWebhookConfiguration {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("persisted-mwh"));
+                m
+            },
+            webhooks: vec![WebhookDefinition {
+                name: "wh-persisted".to_string(),
+                client_config: WebhookClientConfig {
+                    url: Some("http://persisted/mutate".to_string()),
+                    ..Default::default()
+                },
+                rules: vec![],
+                ..Default::default()
+            }],
+        };
+
+        let map = MutatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("persisted-map"));
+                m
+            },
+            spec: MutatingAdmissionPolicySpec::default(),
+        };
+
+        let vap = ValidatingAdmissionPolicy {
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("name".to_string(), json!("persisted-vap"));
+                m
+            },
+            spec: ValidatingAdmissionPolicySpec::default(),
+            status: None,
+        };
+
+        storage
+            .create(
+                "/registry/mutatingwebhookconfigurations/persisted-mwh",
+                serde_json::to_vec(&mwh).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        storage
+            .create(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/persisted-map",
+                serde_json::to_vec(&map).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        storage
+            .create(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/persisted-vap",
+                serde_json::to_vec(&vap).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let engine = AdmissionEngine::new();
+        engine.set_storage(storage.clone());
+        engine
+            .restore_from_storage(&storage)
+            .await
+            .expect("storage restore succeeds");
+
+        assert_eq!(engine.mutating_configs.read().unwrap().len(), 1);
+        assert_eq!(engine.mutating_policies.read().unwrap().len(), 1);
+        assert_eq!(engine.validating_policies.read().unwrap().len(), 1);
     }
 }
