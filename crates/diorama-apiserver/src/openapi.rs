@@ -270,23 +270,25 @@ pub fn v3_group_with_crds(group: &str, version: &str, crds: &[Value]) -> Value {
                 format!("/apis/{group}/{version}/{plural}")
             };
             let item_path = format!("{path}/{{name}}");
+            let def_key = format!("{reversed_group}.{version}.{kind}");
+            let op = v3_crd_operation(group, version, kind, &def_key);
+            let get_op = group_operation(group, version, kind);
             paths.insert(
                 path,
                 json!({
-                    "get": group_operation(group, version, kind),
-                    "post": group_operation(group, version, kind)
+                    "get": get_op.clone(),
+                    "post": op.clone()
                 }),
             );
             paths.insert(
                 item_path,
                 json!({
-                    "get": group_operation(group, version, kind),
-                    "put": group_operation(group, version, kind),
-                    "patch": group_operation(group, version, kind),
+                    "get": get_op,
+                    "put": op.clone(),
+                    "patch": op,
                     "delete": group_operation(group, version, kind)
                 }),
             );
-            let def_key = format!("{reversed_group}.{version}.{kind}");
             let raw_schema = v.pointer("/schema/openAPIV3Schema");
             schemas.insert(
                 def_key,
@@ -386,14 +388,21 @@ pub fn v2_with_crds(crds: &[Value]) -> Value {
             };
             let item_path = format!("{path}/{{name}}");
             let op = v2_group_operation(group, v_name, kind, &def_key);
-            paths.insert(path, json!({ "get": op.clone(), "post": op.clone() }));
+            let read_op = v2_group_read_operation(group, v_name, kind);
+            paths.insert(
+                path,
+                json!({
+                    "get": read_op.clone(),
+                    "post": op.clone()
+                }),
+            );
             paths.insert(
                 item_path,
                 json!({
-                    "get": op.clone(),
+                    "get": read_op.clone(),
                     "put": op.clone(),
-                    "patch": op.clone(),
-                    "delete": op
+                    "patch": op,
+                    "delete": read_op
                 }),
             );
         }
@@ -516,7 +525,9 @@ fn v2_transform_schema(schema: &mut Value) {
     if preserve_unknown && !has_props {
         obj.remove("type");
     }
-    obj.retain(|k, _| !k.starts_with("x-kubernetes-"));
+    obj.retain(|k, _| {
+        !k.starts_with("x-kubernetes-") || k == "x-kubernetes-preserve-unknown-fields"
+    });
     if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
         for val in props.values_mut() {
             v2_transform_schema(val);
@@ -592,6 +603,31 @@ fn build_crd_schema(
     schema
 }
 
+fn v2_group_read_operation(group: &str, version: &str, kind: &str) -> Value {
+    json!({
+        "parameters": [
+            {
+                "name": "fieldValidation",
+                "in": "query",
+                "type": "string",
+                "uniqueItems": true
+            },
+            {
+                "name": "dryRun",
+                "in": "query",
+                "type": "string",
+                "uniqueItems": true
+            }
+        ],
+        "responses": {
+            "200": {
+                "description": "OK"
+            }
+        },
+        "x-kubernetes-group-version-kind": { "group": group, "version": version, "kind": kind }
+    })
+}
+
 fn v2_group_operation(group: &str, version: &str, kind: &str, def_key: &str) -> Value {
     json!({
         "parameters": [
@@ -618,6 +654,45 @@ fn v2_group_operation(group: &str, version: &str, kind: &str, def_key: &str) -> 
             "200": {
                 "description": "OK",
                 "schema": { "$ref": format!("#/definitions/{def_key}") }
+            }
+        },
+        "x-kubernetes-group-version-kind": { "group": group, "version": version, "kind": kind }
+    })
+}
+
+fn v3_crd_operation(group: &str, version: &str, kind: &str, def_key: &str) -> Value {
+    json!({
+        "parameters": [
+            {
+                "name": "fieldValidation",
+                "in": "query",
+                "schema": { "type": "string", "uniqueItems": true }
+            },
+            {
+                "name": "dryRun",
+                "in": "query",
+                "schema": { "type": "string", "uniqueItems": true }
+            }
+        ],
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": format!("#/components/schemas/{def_key}")
+                    }
+                }
+            }
+        },
+        "responses": {
+            "200": {
+                "description": "OK",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "$ref": format!("#/components/schemas/{def_key}")
+                        }
+                    }
+                }
             }
         },
         "x-kubernetes-group-version-kind": { "group": group, "version": version, "kind": kind }
@@ -757,7 +832,7 @@ mod tests {
     use super::{
         CORE_HASH, OPENAPI_V2_PROTO_BYTES, STORAGE_HASH, v3_core, v3_index, v3_storage_v1,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     #[test]
     fn index_points_at_core_and_storage_documents() {
@@ -844,5 +919,90 @@ mod tests {
         );
         assert_eq!(&info[12..14], &[0x12, 0x07]);
         assert_eq!(&info[14..], crate::KUBERNETES_VERSION.as_bytes());
+    }
+
+    #[test]
+    fn openapi_v2_and_v3_with_crds() {
+        let crd = json!({
+            "spec": {
+                "group": "example.com",
+                "names": {
+                    "kind": "CronTab",
+                    "plural": "crontabs",
+                    "singular": "crontab"
+                },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cronSpec": { "type": "string" },
+                                        "image": { "type": "string" },
+                                        "extraData": {
+                                            "type": "object",
+                                            "x-kubernetes-preserve-unknown-fields": true
+                                        }
+                                    },
+                                    "required": ["cronSpec", "image"]
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+
+        // Test OpenAPI v2
+        let v2 = super::v2_with_crds(std::slice::from_ref(&crd));
+        let v2_def = &v2["definitions"]["com.example.v1.CronTab"];
+        assert_eq!(v2_def["type"], "object");
+        let v2_props = &v2_def["properties"]["spec"]["properties"];
+        assert_eq!(v2_props["cronSpec"]["type"], "string");
+        assert_eq!(v2_props["image"]["type"], "string");
+        assert_eq!(
+            v2_props["extraData"]["x-kubernetes-preserve-unknown-fields"],
+            true
+        );
+        let v2_post = &v2["paths"]["/apis/example.com/v1/namespaces/{namespace}/crontabs"]["post"];
+        let v2_param_names: Vec<&str> = v2_post["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(v2_param_names.contains(&"body"));
+        assert!(v2_param_names.contains(&"fieldValidation"));
+        assert!(v2_param_names.contains(&"dryRun"));
+
+        // Test OpenAPI v3
+        let v3 = super::v3_group_with_crds("example.com", "v1", &[crd]);
+        let v3_schema = &v3["components"]["schemas"]["com.example.v1.CronTab"];
+        assert_eq!(v3_schema["type"], "object");
+        let v3_props = &v3_schema["properties"]["spec"]["properties"];
+        assert_eq!(v3_props["cronSpec"]["type"], "string");
+        assert_eq!(
+            v3_props["extraData"]["x-kubernetes-preserve-unknown-fields"],
+            true
+        );
+        let v3_post = &v3["paths"]["/apis/example.com/v1/namespaces/{namespace}/crontabs"]["post"];
+        assert_eq!(
+            v3_post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/com.example.v1.CronTab"
+        );
+        let v3_param_names: Vec<&str> = v3_post["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(v3_param_names.contains(&"fieldValidation"));
+        assert!(v3_param_names.contains(&"dryRun"));
     }
 }
