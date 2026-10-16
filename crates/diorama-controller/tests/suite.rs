@@ -687,3 +687,427 @@ mod deployment_and_rc_lifecycle {
         assert_eq!(adopted_owners[0]["kind"], "ReplicationController");
     }
 }
+
+mod workload_conformance_lane_t07 {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    use diorama_apiserver::{ApiserverConfig, ApiserverService, KubernetesStorage};
+    use diorama_controller::{ControllerManagerConfig, ControllerManagerService};
+    use diorama_datastore::{DatastoreConfig, DatastoreEngine};
+    use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn setup_controller(dir: &TempDir) -> ControllerManagerService {
+        let node_ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let pki_dir = dir.path().join("pki");
+        std::fs::create_dir_all(&pki_dir).unwrap();
+        let datastore_dir = dir.path().join("datastore");
+
+        let pki_config = ClusterPkiConfig::new(pki_dir.clone(), "test-node".to_string(), node_ip);
+        let pki = ClusterPki::new(pki_config);
+        pki.reconcile().expect("PKI reconcile");
+
+        let (engine, _) = DatastoreEngine::open(DatastoreConfig::new(datastore_dir)).unwrap();
+        let storage = KubernetesStorage::new(engine.client(), "/registry");
+
+        let apiserver_config = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+        let apiserver_service = ApiserverService::new(apiserver_config, storage);
+
+        let controller_config = ControllerManagerConfig::default_for_pki(&pki_dir, node_ip);
+        let apiserver_arc = Arc::new(apiserver_service);
+
+        ControllerManagerService::new(controller_config, apiserver_arc)
+    }
+
+    #[tokio::test]
+    async fn test_daemonset_node_selection_dynamic_label_addition_and_removal() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-selection-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        // Create 2 nodes
+        let node1 = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "node-1",
+                "labels": { "zone": "east", "tier": "frontend" }
+            }
+        });
+        client.create_node(node1).await.unwrap();
+
+        let node2 = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "node-2",
+                "labels": { "zone": "west", "tier": "frontend" }
+            }
+        });
+        client.create_node(node2).await.unwrap();
+
+        // Create DaemonSet targeting zone: east
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "complex-ds", "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": "complex-ds" } },
+                "template": {
+                    "metadata": { "labels": { "app": "complex-ds" } },
+                    "spec": {
+                        "nodeSelector": { "zone": "east" },
+                        "containers": [{ "name": "c", "image": "busybox:latest" }]
+                    }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Only node-1 matches
+        assert!(client.get_pod(ns, "complex-ds-node-1").await.is_ok());
+        assert!(client.get_pod(ns, "complex-ds-node-2").await.is_err());
+
+        let ds_obj = client.get_daemonset(ns, "complex-ds").await.unwrap();
+        assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 1);
+        assert_eq!(ds_obj["status"]["currentNumberScheduled"], 1);
+        assert_eq!(ds_obj["status"]["updatedNumberScheduled"], 1);
+
+        // Dynamically add label zone: east to node-2
+        let mut node2_obj = client.get_node("node-2").await.unwrap();
+        node2_obj["metadata"]["labels"]["zone"] = json!("east");
+        client.update_node("node-2", node2_obj).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Now both node-1 and node-2 should have a pod
+        assert!(client.get_pod(ns, "complex-ds-node-1").await.is_ok());
+        assert!(client.get_pod(ns, "complex-ds-node-2").await.is_ok());
+
+        let ds_obj2 = client.get_daemonset(ns, "complex-ds").await.unwrap();
+        assert_eq!(ds_obj2["status"]["desiredNumberScheduled"], 2);
+        assert_eq!(ds_obj2["status"]["currentNumberScheduled"], 2);
+        assert_eq!(ds_obj2["status"]["updatedNumberScheduled"], 2);
+
+        // Dynamically mutate/remove label from node-1
+        let mut node1_obj = client.get_node("node-1").await.unwrap();
+        node1_obj["metadata"]["labels"]["zone"] = json!("north");
+        client.update_node("node-1", node1_obj).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Pod on node-1 must be deleted
+        assert!(client.get_pod(ns, "complex-ds-node-1").await.is_err());
+        assert!(client.get_pod(ns, "complex-ds-node-2").await.is_ok());
+
+        let ds_obj3 = client.get_daemonset(ns, "complex-ds").await.unwrap();
+        assert_eq!(ds_obj3["status"]["desiredNumberScheduled"], 1);
+        assert_eq!(ds_obj3["status"]["currentNumberScheduled"], 1);
+        assert_eq!(ds_obj3["status"]["updatedNumberScheduled"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_daemonset_node_affinity_and_unschedulable_node() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-affinity-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let node_gpu = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "node-gpu",
+                "labels": { "accelerator": "nvidia-h100" }
+            }
+        });
+        client.create_node(node_gpu).await.unwrap();
+
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "gpu-monitor", "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": "gpu-monitor" } },
+                "template": {
+                    "metadata": { "labels": { "app": "gpu-monitor" } },
+                    "spec": {
+                        "affinity": {
+                            "nodeAffinity": {
+                                "requiredDuringSchedulingIgnoredDuringExecution": {
+                                    "nodeSelectorTerms": [{
+                                        "matchExpressions": [{
+                                            "key": "accelerator",
+                                            "operator": "In",
+                                            "values": ["nvidia-h100", "nvidia-a100"]
+                                        }]
+                                    }]
+                                }
+                            }
+                        },
+                        "containers": [{ "name": "c", "image": "nvidia/cuda:latest" }]
+                    }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        assert!(client.get_pod(ns, "gpu-monitor-node-gpu").await.is_ok());
+
+        // Mark node as unschedulable
+        let mut node_obj = client.get_node("node-gpu").await.unwrap();
+        node_obj["spec"] = json!({ "unschedulable": true });
+        client.update_node("node-gpu", node_obj).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        assert!(client.get_pod(ns, "gpu-monitor-node-gpu").await.is_err());
+
+        let ds_obj = client.get_daemonset(ns, "gpu-monitor").await.unwrap();
+        assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 0);
+        assert_eq!(ds_obj["status"]["currentNumberScheduled"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_concurrency_policies_and_suspend() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "cj-conformance-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        // 1. Suspended CronJob must not schedule jobs
+        let cj_suspended = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "cj-susp", "namespace": ns },
+            "spec": {
+                "suspend": true,
+                "schedule": "*/1 * * * *",
+                "jobTemplate": {
+                    "spec": { "template": { "spec": { "containers": [{ "name": "c", "image": "busybox" }] } } }
+                }
+            }
+        });
+        client.create_cronjob(ns, cj_suspended).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let jobs_list = client.list_jobs(ns).await.unwrap();
+        assert_eq!(
+            jobs_list["items"].as_array().unwrap().len(),
+            0,
+            "Suspended CronJob must not create jobs"
+        );
+
+        // 2. Unsuspend with ForbidConcurrent
+        let mut cj_forbid = client.get_cronjob(ns, "cj-susp").await.unwrap();
+        cj_forbid["spec"]["suspend"] = json!(false);
+        cj_forbid["spec"]["concurrencyPolicy"] = json!("Forbid");
+        client
+            .update_cronjob(ns, "cj-susp", cj_forbid)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let child1 = client.get_job(ns, "cj-susp-scheduled").await.unwrap();
+        assert_eq!(child1["metadata"]["name"], "cj-susp-scheduled");
+
+        let cj_after_sched = client.get_cronjob(ns, "cj-susp").await.unwrap();
+        let active = cj_after_sched["status"]["active"].as_array().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["name"], "cj-susp-scheduled");
+
+        // Reconcile again: Forbid policy must not schedule another job while child is active
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let jobs_after_forbid = client.list_jobs(ns).await.unwrap();
+        assert_eq!(jobs_after_forbid["items"].as_array().unwrap().len(), 1);
+
+        // 3. Update to Replace policy
+        let mut cj_replace = client.get_cronjob(ns, "cj-susp").await.unwrap();
+        cj_replace["spec"]["concurrencyPolicy"] = json!("Replace");
+        client
+            .update_cronjob(ns, "cj-susp", cj_replace)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Old child should be replaced
+        let cj_after_replace = client.get_cronjob(ns, "cj-susp").await.unwrap();
+        let active_replace = cj_after_replace["status"]["active"].as_array().unwrap();
+        assert_eq!(active_replace.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_job_suspend_resume_and_indexed_hostname() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "job-conformance-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        // 1. Create suspended Job
+        let job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "suspend-job", "namespace": ns },
+            "spec": {
+                "suspend": true,
+                "parallelism": 2,
+                "template": {
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        client.create_job(ns, job).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pods_during_suspend = client.list_pods(ns).await.unwrap();
+        assert_eq!(pods_during_suspend["items"].as_array().unwrap().len(), 0);
+
+        let suspended_job = client.get_job(ns, "suspend-job").await.unwrap();
+        assert_eq!(suspended_job["status"]["active"], 0);
+        let conds = suspended_job["status"]["conditions"].as_array().unwrap();
+        let susp_cond = conds.iter().find(|c| c["type"] == "Suspended").unwrap();
+        assert_eq!(susp_cond["status"], "True");
+        assert_eq!(susp_cond["reason"], "JobSuspended");
+
+        // Resume Job
+        let mut job_resumed = suspended_job.clone();
+        job_resumed["spec"]["suspend"] = json!(false);
+        client
+            .update_job(ns, "suspend-job", job_resumed)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let pods_resumed = client.list_pods(ns).await.unwrap();
+        assert_eq!(pods_resumed["items"].as_array().unwrap().len(), 2);
+
+        let active_job = client.get_job(ns, "suspend-job").await.unwrap();
+        assert_eq!(active_job["status"]["active"], 2);
+
+        // 2. Indexed Job creates pods with completion index and hostname
+        let indexed_job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "indexed-job", "namespace": ns },
+            "spec": {
+                "completionMode": "Indexed",
+                "completions": 2,
+                "parallelism": 2,
+                "template": {
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        client.create_job(ns, indexed_job).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let p0 = client.get_pod(ns, "indexed-job-0").await.unwrap();
+        assert_eq!(
+            p0["metadata"]["labels"]["batch.kubernetes.io/job-completion-index"],
+            "0"
+        );
+        assert_eq!(p0["spec"]["hostname"], "indexed-job-0");
+
+        let p1 = client.get_pod(ns, "indexed-job-1").await.unwrap();
+        assert_eq!(
+            p1["metadata"]["labels"]["batch.kubernetes.io/job-completion-index"],
+            "1"
+        );
+        assert_eq!(p1["spec"]["hostname"], "indexed-job-1");
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_pvc_retention_policy_and_scaling() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ss-retention-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "pvc-ss", "namespace": ns },
+            "spec": {
+                "replicas": 2,
+                "podManagementPolicy": "Parallel",
+                "persistentVolumeClaimRetentionPolicy": {
+                    "whenDeleted": "Delete",
+                    "whenScaled": "Delete"
+                },
+                "volumeClaimTemplates": [{
+                    "metadata": { "name": "data" },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": { "requests": { "storage": "1Gi" } }
+                    }
+                }],
+                "template": {
+                    "metadata": { "labels": { "app": "pvc-ss" } },
+                    "spec": {
+                        "containers": [{ "name": "c", "image": "redis:7" }]
+                    }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Verify ordinal pods and PVCs created
+        let pvc0 = client.get_pvc(ns, "data-pvc-ss-0").await.unwrap();
+        let pvc1 = client.get_pvc(ns, "data-pvc-ss-1").await.unwrap();
+        assert_eq!(pvc0["metadata"]["name"], "data-pvc-ss-0");
+        assert_eq!(pvc1["metadata"]["name"], "data-pvc-ss-1");
+
+        let owner_refs = pvc0["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(owner_refs[0]["kind"], "StatefulSet");
+
+        let pod0 = client.get_pod(ns, "pvc-ss-0").await.unwrap();
+        let vols = pod0["spec"]["volumes"].as_array().unwrap();
+        let data_vol = vols.iter().find(|v| v["name"] == "data").unwrap();
+        assert_eq!(
+            data_vol["persistentVolumeClaim"]["claimName"],
+            "data-pvc-ss-0"
+        );
+
+        // Scale down to 1: whenScaled=Delete must delete PVC 1
+        let mut ss_scale = client.get_statefulset(ns, "pvc-ss").await.unwrap();
+        ss_scale["spec"]["replicas"] = json!(1);
+        client
+            .update_statefulset(ns, "pvc-ss", ss_scale)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        assert!(client.get_pod(ns, "pvc-ss-0").await.is_ok());
+        assert!(client.get_pod(ns, "pvc-ss-1").await.is_err());
+
+        assert!(client.get_pvc(ns, "data-pvc-ss-0").await.is_ok());
+        assert!(
+            client.get_pvc(ns, "data-pvc-ss-1").await.is_err(),
+            "PVC for pruned ordinal must be deleted under whenScaled: Delete"
+        );
+    }
+}
