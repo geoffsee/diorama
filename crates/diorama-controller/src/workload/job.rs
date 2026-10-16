@@ -82,6 +82,11 @@ impl JobReconciler {
                 );
             }
             inject_completion_index_env(&mut spec, &idx_str);
+            if let Some(spec_obj) = spec.as_object_mut() {
+                spec_obj
+                    .entry("hostname".to_string())
+                    .or_insert_with(|| json!(format!("{name}-{idx}")));
+            }
         }
 
         let new_pod = json!({
@@ -181,7 +186,32 @@ impl JobReconciler {
             if !active_pods.is_empty() {
                 self.terminate_active_pods(namespace, &active_pods).await;
             }
-            return Ok(job.clone());
+            let now = diorama_apiserver::time::now_rfc3339();
+            let conditions = json!([
+                {
+                    "type": "Suspended",
+                    "status": "True",
+                    "lastProbeTime": now,
+                    "lastTransitionTime": now,
+                    "reason": "JobSuspended",
+                    "message": "Job suspended"
+                }
+            ]);
+            return self
+                .update_job_status(
+                    namespace,
+                    name,
+                    job,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(conditions),
+                    false,
+                )
+                .await;
         }
 
         if is_job_finished(job) {
@@ -521,12 +551,19 @@ impl JobReconciler {
         conditions: Option<Value>,
         completed: bool,
     ) -> Result<Value, ControllerError> {
+        let is_suspended = job
+            .pointer("/spec/suspend")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         let now = diorama_apiserver::time::now_rfc3339();
-        let start_time = job
-            .pointer("/status/startTime")
-            .and_then(Value::as_str)
-            .unwrap_or(&now)
-            .to_string();
+        let existing_start_time = job.pointer("/status/startTime").and_then(Value::as_str);
+
+        let start_time = if existing_start_time.is_none() && is_suspended {
+            None
+        } else {
+            Some(existing_start_time.unwrap_or(&now).to_string())
+        };
 
         let mut updated_job = job.clone();
         let status_obj = updated_job.as_object_mut().and_then(|obj| {
@@ -536,7 +573,9 @@ impl JobReconciler {
         });
 
         if let Some(status) = status_obj {
-            status.insert("startTime".to_string(), json!(start_time));
+            if let Some(st) = start_time {
+                status.insert("startTime".to_string(), json!(st));
+            }
             status.insert("active".to_string(), json!(active));
             status.insert("ready".to_string(), json!(ready));
             status.insert("succeeded".to_string(), json!(succeeded));
@@ -550,6 +589,10 @@ impl JobReconciler {
             }
             if let Some(conds) = conditions {
                 status.insert("conditions".to_string(), conds);
+            } else if let Some(existing_conds) =
+                status.get_mut("conditions").and_then(Value::as_array_mut)
+            {
+                resume_suspended_conditions(existing_conds, &now);
             }
             if completed {
                 status
@@ -957,4 +1000,15 @@ fn format_index_set(indexes: &BTreeSet<usize>) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn resume_suspended_conditions(conds: &mut [Value], now: &str) {
+    for c in conds {
+        if c.get("type").and_then(Value::as_str) == Some("Suspended") {
+            c["status"] = json!("False");
+            c["reason"] = json!("JobResumed");
+            c["message"] = json!("Job resumed");
+            c["lastTransitionTime"] = json!(now);
+        }
+    }
 }
