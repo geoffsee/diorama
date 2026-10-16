@@ -139,6 +139,12 @@ impl KubeletConfigOptions {
         }
     }
 
+    /// Returns the companion worker node name for this configuration's node.
+    #[must_use]
+    pub fn companion_node_name(&self) -> String {
+        companion_node_name(&self.node_name)
+    }
+
     /// Resolves the cgroup driver to use.
     ///
     /// Precedence matches upstream `KubeSolo`:
@@ -507,6 +513,12 @@ impl KubeletConfigOptions {
 
         Ok(())
     }
+}
+
+/// Returns the companion worker node name for a given primary node name.
+#[must_use]
+pub fn companion_node_name(node_name: &str) -> String {
+    format!("{node_name}-worker")
 }
 
 fn validate_policy_options(options: &BTreeMap<String, String>) -> Result<(), KubeletError> {

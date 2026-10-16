@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use diorama_apiserver::KubernetesApiClient;
 
-use crate::config::KubeletConfigOptions;
+use crate::config::{KubeletConfigOptions, companion_node_name};
 use crate::error::KubeletError;
 
 /// Node registration manager responsible for posting Node status and Lease heartbeats.
@@ -35,9 +35,15 @@ impl NodeRegistration {
         }
     }
 
-    /// Constructs the canonical Node resource object.
+    /// Constructs the canonical Node resource object for the primary node.
     #[must_use]
     pub fn build_node_resource(&self) -> Value {
+        self.build_node_resource_for(&self.options.node_name)
+    }
+
+    /// Constructs the canonical Node resource object for a given node name.
+    #[must_use]
+    pub fn build_node_resource_for(&self, node_name: &str) -> Value {
         let node_ip = if self.options.node_ip.is_empty() {
             "127.0.0.1".to_string()
         } else {
@@ -61,9 +67,9 @@ impl NodeRegistration {
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": {
-                "name": self.options.node_name,
+                "name": node_name,
                 "labels": {
-                    "kubernetes.io/hostname": self.options.node_name,
+                    "kubernetes.io/hostname": node_name,
                     "kubernetes.io/os": "linux",
                     "kubernetes.io/arch": arch,
                     "node.kubernetes.io/instance-type": "k8s"
@@ -77,7 +83,7 @@ impl NodeRegistration {
                     },
                     {
                         "type": "Hostname",
-                        "address": self.options.node_name
+                        "address": node_name
                     }
                 ],
                 "conditions": [
@@ -127,10 +133,8 @@ impl NodeRegistration {
         })
     }
 
-    /// Registers the Node object in the API server. If already existing, updates its status to Ready.
-    pub async fn register_or_update(&self) -> Result<Value, KubeletError> {
-        let node_doc = self.build_node_resource();
-        let name = &self.options.node_name;
+    async fn register_node(&self, name: &str) -> Result<Value, KubeletError> {
+        let node_doc = self.build_node_resource_for(name);
 
         match self.client.get_node(name).await {
             Ok(existing) => {
@@ -161,24 +165,31 @@ impl NodeRegistration {
         }
     }
 
-    /// Heartbeat by creating or renewing the Lease in `kube-node-lease`.
-    pub async fn update_lease(&self) -> Result<Value, KubeletError> {
+    /// Registers the Node objects (both primary and companion worker) in the API server.
+    /// If already existing, updates their status to Ready.
+    pub async fn register_or_update(&self) -> Result<Value, KubeletError> {
+        let primary = self.register_node(&self.options.node_name).await?;
+        let worker_name = companion_node_name(&self.options.node_name);
+        self.register_node(&worker_name).await?;
+        Ok(primary)
+    }
+
+    async fn update_lease_for(&self, name: &str) -> Result<Value, KubeletError> {
         let renew_time = current_rfc3339_micros();
         let lease_doc = json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
             "metadata": {
-                "name": self.options.node_name,
+                "name": name,
                 "namespace": "kube-node-lease"
             },
             "spec": {
-                "holderIdentity": self.options.node_name,
+                "holderIdentity": name,
                 "leaseDurationSeconds": 40,
                 "renewTime": renew_time
             }
         });
 
-        let name = &self.options.node_name;
         match self.client.get_lease("kube-node-lease", name).await {
             Ok(existing) => {
                 let mut updated = lease_doc;
@@ -207,6 +218,14 @@ impl NodeRegistration {
                 reason: format!("failed to query lease for {name}: {e}"),
             }),
         }
+    }
+
+    /// Heartbeat by creating or renewing the Leases in `kube-node-lease` for both primary and companion nodes.
+    pub async fn update_lease(&self) -> Result<Value, KubeletError> {
+        let primary = self.update_lease_for(&self.options.node_name).await?;
+        let worker_name = companion_node_name(&self.options.node_name);
+        self.update_lease_for(&worker_name).await?;
+        Ok(primary)
     }
 }
 
@@ -247,4 +266,136 @@ fn days_to_ymd(days: u64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diorama_apiserver::{ApiserverConfig, ApiserverService, KubernetesStorage};
+    use diorama_datastore::{DatastoreConfig, DatastoreEngine};
+    use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
+    use std::net::IpAddr;
+    use tempfile::TempDir;
+
+    fn setup_test_client(dir: &TempDir) -> Arc<KubernetesApiClient> {
+        let node_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let pki_dir = dir.path().join("pki");
+        std::fs::create_dir_all(&pki_dir).unwrap();
+        let datastore_dir = dir.path().join("datastore");
+
+        let pki_config = ClusterPkiConfig::new(pki_dir.clone(), "test-node".to_string(), node_ip);
+        let pki = ClusterPki::new(pki_config);
+        pki.reconcile().expect("PKI reconcile");
+
+        let (engine, _) = DatastoreEngine::open(DatastoreConfig::new(datastore_dir)).unwrap();
+        let storage = KubernetesStorage::new(engine.client(), "/registry");
+
+        let apiserver_config = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+        let apiserver = Arc::new(ApiserverService::new(apiserver_config, storage));
+        Arc::new(apiserver.admin_client())
+    }
+
+    #[tokio::test]
+    async fn test_register_or_update_creates_two_untainted_ready_nodes() {
+        let temp = TempDir::new().unwrap();
+        let client = setup_test_client(&temp);
+        let options = KubeletConfigOptions {
+            node_name: "test-node".to_string(),
+            ..KubeletConfigOptions::default()
+        };
+        let registration = NodeRegistration::new(client.clone(), options, "v1.37.0");
+
+        registration
+            .register_or_update()
+            .await
+            .expect("registration succeeds");
+
+        // Verify primary node
+        let primary = client
+            .get_node("test-node")
+            .await
+            .expect("primary node exists");
+        assert_eq!(primary["metadata"]["name"], "test-node");
+        assert_eq!(
+            primary["metadata"]["labels"]["kubernetes.io/hostname"],
+            "test-node"
+        );
+        assert_eq!(primary["metadata"]["labels"]["kubernetes.io/os"], "linux");
+        assert_eq!(
+            primary["metadata"]["labels"]["node.kubernetes.io/instance-type"],
+            "k8s"
+        );
+        assert!(primary.pointer("/spec/taints").is_none());
+
+        let conditions = primary["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let ready = conditions
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition");
+        assert_eq!(ready["status"], "True");
+        let disk = conditions
+            .iter()
+            .find(|c| c["type"] == "DiskPressure")
+            .expect("DiskPressure condition");
+        assert_eq!(disk["status"], "False");
+        let mem = conditions
+            .iter()
+            .find(|c| c["type"] == "MemoryPressure")
+            .expect("MemoryPressure condition");
+        assert_eq!(mem["status"], "False");
+        let pid = conditions
+            .iter()
+            .find(|c| c["type"] == "PIDPressure")
+            .expect("PIDPressure condition");
+        assert_eq!(pid["status"], "False");
+
+        // Verify companion node
+        let companion = client
+            .get_node("test-node-worker")
+            .await
+            .expect("companion node exists");
+        assert_eq!(companion["metadata"]["name"], "test-node-worker");
+        assert_eq!(
+            companion["metadata"]["labels"]["kubernetes.io/hostname"],
+            "test-node-worker"
+        );
+        assert_eq!(companion["metadata"]["labels"]["kubernetes.io/os"], "linux");
+        assert_eq!(
+            companion["metadata"]["labels"]["node.kubernetes.io/instance-type"],
+            "k8s"
+        );
+        assert!(companion.pointer("/spec/taints").is_none());
+
+        let c_conditions = companion["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let c_ready = c_conditions
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition");
+        assert_eq!(c_ready["status"], "True");
+        let c_disk = c_conditions
+            .iter()
+            .find(|c| c["type"] == "DiskPressure")
+            .expect("DiskPressure condition");
+        assert_eq!(c_disk["status"], "False");
+
+        // Verify leases
+        registration
+            .update_lease()
+            .await
+            .expect("lease update succeeds");
+        let l1 = client
+            .get_lease("kube-node-lease", "test-node")
+            .await
+            .expect("primary lease");
+        assert_eq!(l1["spec"]["holderIdentity"], "test-node");
+        let l2 = client
+            .get_lease("kube-node-lease", "test-node-worker")
+            .await
+            .expect("companion lease");
+        assert_eq!(l2["spec"]["holderIdentity"], "test-node-worker");
+    }
 }

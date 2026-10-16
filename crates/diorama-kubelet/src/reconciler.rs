@@ -155,6 +155,229 @@ fn pod_fits_node(
     Ok(())
 }
 
+/// Declared container or initContainer hostPort mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HostPortRequest {
+    pub host_port: i32,
+    pub protocol: String,
+    pub host_ip: String,
+}
+
+/// Extracts all requested hostPorts from a pod's spec (containers and initContainers).
+#[must_use]
+pub fn pod_host_ports(pod: &Value) -> Vec<HostPortRequest> {
+    let mut ports = Vec::new();
+    let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+    let init_containers = pod
+        .pointer("/spec/initContainers")
+        .and_then(Value::as_array);
+    for c in containers
+        .into_iter()
+        .flatten()
+        .chain(init_containers.into_iter().flatten())
+    {
+        if let Some(c_ports) = c.get("ports").and_then(Value::as_array) {
+            for port in c_ports {
+                let host_port = port.get("hostPort").and_then(Value::as_i64).unwrap_or(0);
+                let host_port = i32::try_from(host_port).unwrap_or(0);
+                if host_port <= 0 {
+                    continue;
+                }
+                let proto_str = port
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("TCP");
+                let protocol = match proto_str.to_uppercase().as_str() {
+                    "UDP" => "UDP".to_string(),
+                    "SCTP" => "SCTP".to_string(),
+                    _ => "TCP".to_string(),
+                };
+                let host_ip = port
+                    .get("hostIP")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                ports.push(HostPortRequest {
+                    host_port,
+                    protocol,
+                    host_ip,
+                });
+            }
+        }
+    }
+    ports
+}
+
+/// Determines whether two hostPort declarations conflict.
+///
+/// Upstream contract: two ports conflict if they share the same hostPort > 0 and
+/// normalized protocol, and either port specifies a wildcard hostIP ("" or "0.0.0.0")
+/// or both specify identical hostIPs.
+#[must_use]
+pub fn host_ports_conflict(a: &HostPortRequest, b: &HostPortRequest) -> bool {
+    if a.host_port != b.host_port || a.protocol != b.protocol {
+        return false;
+    }
+    a.host_ip.is_empty()
+        || a.host_ip == "0.0.0.0"
+        || b.host_ip.is_empty()
+        || b.host_ip == "0.0.0.0"
+        || a.host_ip == b.host_ip
+}
+
+/// Determines whether two pods declare conflicting hostPorts.
+#[must_use]
+pub fn pods_have_host_port_conflict(pod1: &Value, pod2: &Value) -> bool {
+    let ports1 = pod_host_ports(pod1);
+    if ports1.is_empty() {
+        return false;
+    }
+    let ports2 = pod_host_ports(pod2);
+    if ports2.is_empty() {
+        return false;
+    }
+    for p1 in &ports1 {
+        for p2 in &ports2 {
+            if host_ports_conflict(p1, p2) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_same_pod(a: &Value, b: &Value) -> bool {
+    if let (Some(uid_a), Some(uid_b)) = (
+        a.pointer("/metadata/uid").and_then(Value::as_str),
+        b.pointer("/metadata/uid").and_then(Value::as_str),
+    ) {
+        return uid_a == uid_b;
+    }
+    let ns_a = a
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let ns_b = b
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let name_a = a
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let name_b = b
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    ns_a == ns_b && name_a == name_b
+}
+
+fn is_active_pod(pod: &Value) -> bool {
+    !matches!(
+        pod.pointer("/status/phase").and_then(Value::as_str),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+fn is_pod_unschedulable(pod: &Value) -> bool {
+    pod.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("PodScheduled")
+                    && c.get("status").and_then(Value::as_str) == Some("False")
+                    && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
+            })
+        })
+}
+
+fn is_earlier_active_pod(existing: &Value, candidate: &Value) -> bool {
+    let existing_phase = existing.pointer("/status/phase").and_then(Value::as_str);
+    let candidate_phase = candidate.pointer("/status/phase").and_then(Value::as_str);
+
+    let existing_running = existing_phase == Some("Running");
+    let candidate_running = candidate_phase == Some("Running");
+
+    if existing_running && !candidate_running {
+        return true;
+    }
+    if !existing_running && candidate_running {
+        return false;
+    }
+
+    let existing_time = existing
+        .pointer("/metadata/creationTimestamp")
+        .and_then(Value::as_str);
+    let candidate_time = candidate
+        .pointer("/metadata/creationTimestamp")
+        .and_then(Value::as_str);
+
+    match (existing_time, candidate_time) {
+        (Some(t1), Some(t2)) if t1 != t2 => t1 < t2,
+        _ => {
+            let id1 = existing
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let id2 = candidate
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !id1.is_empty() && !id2.is_empty() && id1 != id2 {
+                id1 < id2
+            } else {
+                let name1 = (
+                    existing
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    existing
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                let name2 = (
+                    candidate
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    candidate
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                name1 < name2
+            }
+        },
+    }
+}
+
+fn has_conflicting_pod_on_node(candidate: &Value, node_name: &str, all_pods: &[Value]) -> bool {
+    all_pods.iter().any(|other| {
+        other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
+            && is_active_pod(other)
+            && !is_same_pod(other, candidate)
+            && !is_pod_unschedulable(other)
+            && pods_have_host_port_conflict(candidate, other)
+    })
+}
+
+fn has_conflicting_earlier_pod_on_node(
+    candidate: &Value,
+    node_name: &str,
+    all_pods: &[Value],
+) -> bool {
+    all_pods.iter().any(|other| {
+        other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
+            && is_active_pod(other)
+            && !is_same_pod(other, candidate)
+            && !is_pod_unschedulable(other)
+            && is_earlier_active_pod(other, candidate)
+            && pods_have_host_port_conflict(candidate, other)
+    })
+}
+
 fn pod_name(pod: &Value) -> &str {
     pod.pointer("/metadata/name")
         .and_then(Value::as_str)
@@ -1704,6 +1927,37 @@ impl PodReconciler {
         self.runtime.exec_sync(&id, cmd, EXEC_TIMEOUT_SECS).await
     }
 
+    /// Returns the companion worker node name for this reconciler's primary node.
+    #[must_use]
+    pub fn companion_node_name(&self) -> String {
+        crate::config::companion_node_name(&self.node_name)
+    }
+
+    /// Checks if a node name matches either the primary node or companion node.
+    #[must_use]
+    pub fn is_managed_node(&self, name: &str) -> bool {
+        name == self.node_name || name == self.companion_node_name()
+    }
+
+    /// Selects the appropriate target node for an unscheduled or selector-targeted pod.
+    #[must_use]
+    pub fn select_target_node_for_pod(&self, pod: &Value) -> String {
+        if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str)
+            && self.is_managed_node(node)
+        {
+            return node.to_string();
+        }
+        if let Some(selector) = pod.pointer("/spec/nodeSelector").and_then(Value::as_object)
+            && let Some(hostname) = selector
+                .get("kubernetes.io/hostname")
+                .and_then(Value::as_str)
+            && self.is_managed_node(hostname)
+        {
+            return hostname.to_string();
+        }
+        self.node_name.clone()
+    }
+
     /// Reports workload-restart needs for surviving external-runtime containers when
     /// the CPU manager checkpoint was invalidated.
     pub async fn report_workload_restart_needs(
@@ -1715,6 +1969,7 @@ impl PodReconciler {
             return Ok(reports);
         }
         let pod_list = self.client.list_pods(namespace).await?;
+        let companion_name = self.companion_node_name();
         for pod in pod_list
             .get("items")
             .and_then(Value::as_array)
@@ -1727,21 +1982,39 @@ impl PodReconciler {
                 self.runtime.provider_name(),
                 namespace,
             ));
+            reports.extend(check_pod_restart_need(
+                pod,
+                &companion_name,
+                self.runtime.provider_name(),
+                namespace,
+            ));
         }
         Ok(reports)
     }
 
-    /// Reconciles all pods in the specified namespace assigned to this node.
+    /// Reconciles all pods in the specified namespace assigned to locally managed nodes.
     pub async fn reconcile_namespace(&self, namespace: &str) -> Result<usize, KubeletError> {
         let pod_list = self.client.list_pods(namespace).await?;
         let mut reconciled = 0;
-        for pod in pod_list
+        let items = pod_list
             .get("items")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if pod.pointer("/spec/nodeName").and_then(Value::as_str) != Some(&self.node_name) {
+            .cloned()
+            .unwrap_or_default();
+        for pod in &items {
+            let assigned_node = match pod.pointer("/spec/nodeName").and_then(Value::as_str) {
+                Some(n) if self.is_managed_node(n) => n,
+                _ => continue,
+            };
+            if pod.pointer("/metadata/deletionTimestamp").is_none()
+                && has_conflicting_earlier_pod_on_node(pod, assigned_node, &items)
+            {
+                self.mark_unschedulable(
+                    namespace,
+                    pod,
+                    "node(s) didn't have free ports for the requested pod ports",
+                )
+                .await;
                 continue;
             }
             let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
@@ -1763,62 +2036,159 @@ impl PodReconciler {
         }
     }
 
-    /// Reconciles every pod in the cluster: binds unscheduled pods to this node,
+    fn find_node_for_pod(
+        &self,
+        pod: &Value,
+        primary_node: Option<&Value>,
+        companion_node: Option<&Value>,
+        committed_primary: &BTreeMap<String, i128>,
+        committed_companion: &BTreeMap<String, i128>,
+        all_pods: &[Value],
+    ) -> Result<String, String> {
+        let primary_name = self.node_name.as_str();
+        let companion_name = self.companion_node_name();
+
+        let candidates = [
+            (primary_name, primary_node, committed_primary),
+            (companion_name.as_str(), companion_node, committed_companion),
+        ];
+
+        let mut port_conflict = false;
+        let mut other_reason = None;
+
+        for (c_name, c_node_opt, c_committed) in candidates {
+            let Some(node_doc) = c_node_opt else {
+                continue;
+            };
+            if let Err(reason) = pod_fits_node(node_doc, c_committed, pod) {
+                if other_reason.is_none() {
+                    other_reason = Some(reason);
+                }
+                continue;
+            }
+            if has_conflicting_pod_on_node(pod, c_name, all_pods) {
+                port_conflict = true;
+                continue;
+            }
+            return Ok(c_name.to_string());
+        }
+
+        if port_conflict {
+            Err("node(s) didn't have free ports for the requested pod ports".to_string())
+        } else {
+            Err(other_reason.unwrap_or_else(|| {
+                "node(s) didn't have free ports for the requested pod ports".to_string()
+            }))
+        }
+    }
+
+    fn update_known_pod(all_pods: &mut Vec<Value>, pod: Value) {
+        if let Some(pos) = all_pods.iter().position(|p| is_same_pod(p, &pod)) {
+            all_pods[pos] = pod;
+        } else {
+            all_pods.push(pod);
+        }
+    }
+
+    /// Reconciles every pod in the cluster: binds unscheduled pods across managed nodes,
     /// syncs or terminates the pods assigned here, and removes sandboxes whose Pod is gone.
     pub async fn reconcile_all(&self) -> Result<ReconcileReport, KubeletError> {
         let pod_list = self.client.list_all_pods().await?;
         let mut report = ReconcileReport::default();
         let mut live_uids = BTreeSet::new();
-        let node = self.client.get_node(&self.node_name).await.ok();
-        let mut committed = self.committed_usage(&pod_list);
-        for pod in pod_list
+
+        let primary_name = self.node_name.clone();
+        let companion_name = self.companion_node_name();
+
+        let primary_node = self.client.get_node(&primary_name).await.ok();
+        let companion_node = self.client.get_node(&companion_name).await.ok();
+
+        let mut committed_primary = self.committed_usage_for_node(&pod_list, &primary_name);
+        let mut committed_companion = self.committed_usage_for_node(&pod_list, &companion_name);
+
+        let items = pod_list
             .get("items")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+            .cloned()
+            .unwrap_or_default();
+
+        let mut all_current_pods = items.clone();
+
+        for pod in &items {
             if let Some(uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) {
                 live_uids.insert(uid.to_string());
             }
             let namespace = pod
                 .pointer("/metadata/namespace")
                 .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_string();
-            let name = pod_name(pod).to_string();
-            let pod = match pod
+                .unwrap_or("default");
+            let name = pod_name(pod);
+
+            let pod_to_sync = if let Some(assigned) = pod
                 .pointer("/spec/nodeName")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                Some(node) if node == self.node_name => pod.clone(),
-                Some(_) => continue,
-                None => {
-                    if pod.pointer("/metadata/deletionTimestamp").is_none()
-                        && let Some(node) = &node
-                        && let Err(reason) = pod_fits_node(node, &committed, pod)
-                    {
-                        self.mark_unschedulable(&namespace, pod, &reason).await;
-                        continue;
-                    }
-                    match self.bind_pod_to_node(&namespace, pod).await {
-                        Ok(bound) => {
-                            report.bound += 1;
-                            Self::record_committed_quota(&mut committed, &bound);
-                            bound
-                        },
-                        Err(e) => {
-                            report.failed += 1;
-                            eprintln!("Failed to bind pod {namespace}/{name}: {e}");
-                            continue;
-                        },
-                    }
-                },
-            };
-            let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
-                self.terminate_pod(&namespace, &pod).await
+                if !self.is_managed_node(assigned) {
+                    continue;
+                }
+                if pod.pointer("/metadata/deletionTimestamp").is_none()
+                    && has_conflicting_earlier_pod_on_node(pod, assigned, &all_current_pods)
+                {
+                    self.mark_unschedulable(
+                        namespace,
+                        pod,
+                        "node(s) didn't have free ports for the requested pod ports",
+                    )
+                    .await;
+                    continue;
+                }
+                pod.clone()
             } else {
-                self.sync_pod(&namespace, &pod).await
+                if pod.pointer("/metadata/deletionTimestamp").is_some() {
+                    continue;
+                }
+                let target_node = match self.find_node_for_pod(
+                    pod,
+                    primary_node.as_ref(),
+                    companion_node.as_ref(),
+                    &committed_primary,
+                    &committed_companion,
+                    &all_current_pods,
+                ) {
+                    Ok(node) => node,
+                    Err(reason) => {
+                        self.mark_unschedulable(namespace, pod, &reason).await;
+                        continue;
+                    },
+                };
+
+                let bound = match self
+                    .bind_pod_to_specific_node(namespace, pod, &target_node)
+                    .await
+                {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        report.failed += 1;
+                        eprintln!("Failed to bind pod {namespace}/{name}: {e}");
+                        continue;
+                    },
+                };
+
+                report.bound += 1;
+                if target_node == primary_name {
+                    Self::record_committed_quota(&mut committed_primary, &bound);
+                } else {
+                    Self::record_committed_quota(&mut committed_companion, &bound);
+                }
+                Self::update_known_pod(&mut all_current_pods, bound.clone());
+                bound
+            };
+
+            let outcome = if pod_to_sync.pointer("/metadata/deletionTimestamp").is_some() {
+                self.terminate_pod(namespace, &pod_to_sync).await
+            } else {
+                self.sync_pod(namespace, &pod_to_sync).await
             };
             match outcome {
                 Ok(()) => report.synced += 1,
@@ -1832,8 +2202,9 @@ impl PodReconciler {
         Ok(report)
     }
 
-    /// Resource requests already committed by live pods bound to this node.
-    fn committed_usage(&self, pod_list: &Value) -> BTreeMap<String, i128> {
+    /// Resource requests already committed by live pods bound to managed nodes.
+    #[must_use]
+    pub fn committed_usage(&self, pod_list: &Value) -> BTreeMap<String, i128> {
         let mut committed = BTreeMap::new();
         for pod in pod_list
             .get("items")
@@ -1841,8 +2212,32 @@ impl PodReconciler {
             .into_iter()
             .flatten()
             .filter(|p| {
-                p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(&self.node_name)
+                p.pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| self.is_managed_node(n))
             })
+        {
+            for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
+                *committed.entry(k).or_insert(0) += v;
+            }
+        }
+        committed
+    }
+
+    /// Resource requests committed by live pods bound to a specific node.
+    #[must_use]
+    pub fn committed_usage_for_node(
+        &self,
+        pod_list: &Value,
+        node_name: &str,
+    ) -> BTreeMap<String, i128> {
+        let mut committed = BTreeMap::new();
+        for pod in pod_list
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|p| p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name))
         {
             for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
                 *committed.entry(k).or_insert(0) += v;
@@ -1853,13 +2248,21 @@ impl PodReconciler {
 
     /// Records `PodScheduled=False/Unschedulable` once for a pod that cannot fit.
     async fn mark_unschedulable(&self, namespace: &str, pod: &Value, reason: &str) {
-        let message = format!("0/1 nodes are available: 1 {reason}.");
+        let message = if reason.contains("nodes are available") {
+            reason.to_string()
+        } else if pod.pointer("/spec/nodeName").is_some() {
+            format!("0/1 nodes are available: 1 {reason}.")
+        } else {
+            format!("0/2 nodes are available: 2 {reason}.")
+        };
         let already = pod
             .pointer("/status/conditions")
             .and_then(Value::as_array)
             .is_some_and(|conds| {
                 conds.iter().any(|c| {
                     c.get("type").and_then(Value::as_str) == Some("PodScheduled")
+                        && c.get("status").and_then(Value::as_str) == Some("False")
+                        && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
                         && c.get("message").and_then(Value::as_str) == Some(message.as_str())
                 })
             });
@@ -1886,22 +2289,33 @@ impl PodReconciler {
             .await;
     }
 
-    /// Assigns an unscheduled pod to this node. There is no scheduler in a
-    /// single-node distribution, so the kubelet performs the binding itself.
+    /// Assigns an unscheduled pod to a managed node.
     pub async fn bind_pod_to_node(
         &self,
         namespace: &str,
         pod: &Value,
     ) -> Result<Value, KubeletError> {
+        let target_node = self.select_target_node_for_pod(pod);
+        self.bind_pod_to_specific_node(namespace, pod, &target_node)
+            .await
+    }
+
+    /// Assigns an unscheduled pod to a specific node.
+    pub async fn bind_pod_to_specific_node(
+        &self,
+        namespace: &str,
+        pod: &Value,
+        node_name: &str,
+    ) -> Result<Value, KubeletError> {
         let name = pod_name(pod);
         let mut bound = pod.clone();
-        bound["spec"]["nodeName"] = json!(self.node_name);
+        bound["spec"]["nodeName"] = json!(node_name);
         self.client
             .update_pod(namespace, name, bound)
             .await
             .map_err(|e| KubeletError::PodReconciliationFailed {
                 pod: format!("{namespace}/{name}"),
-                reason: format!("failed to bind pod to node {}: {e}", self.node_name),
+                reason: format!("failed to bind pod to node {node_name}: {e}"),
             })
     }
 
@@ -3987,5 +4401,531 @@ mod tests {
         let dns = config.dns_config.expect("dns_config is populated");
         assert_eq!(dns.servers, vec!["10.43.0.10"]);
         assert_eq!(dns.searches[0], "default.svc.cluster.local");
+    }
+
+    #[test]
+    fn test_host_ports_conflict_evaluations() {
+        let p_wildcard = HostPortRequest {
+            host_port: 8080,
+            protocol: "TCP".to_string(),
+            host_ip: "0.0.0.0".to_string(),
+        };
+        let p_empty = HostPortRequest {
+            host_port: 8080,
+            protocol: "TCP".to_string(),
+            host_ip: String::new(),
+        };
+        let p_specific1 = HostPortRequest {
+            host_port: 8080,
+            protocol: "TCP".to_string(),
+            host_ip: "127.0.0.1".to_string(),
+        };
+        let p_specific2 = HostPortRequest {
+            host_port: 8080,
+            protocol: "TCP".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+        };
+        let p_udp = HostPortRequest {
+            host_port: 8080,
+            protocol: "UDP".to_string(),
+            host_ip: "0.0.0.0".to_string(),
+        };
+        let p_diff_port = HostPortRequest {
+            host_port: 9090,
+            protocol: "TCP".to_string(),
+            host_ip: "0.0.0.0".to_string(),
+        };
+
+        // 0.0.0.0 conflicts with any specific IP on same port & proto
+        assert!(host_ports_conflict(&p_wildcard, &p_specific1));
+        assert!(host_ports_conflict(&p_specific1, &p_wildcard));
+
+        // Empty hostIP conflicts with any specific IP
+        assert!(host_ports_conflict(&p_empty, &p_specific1));
+        assert!(host_ports_conflict(&p_specific1, &p_empty));
+
+        // Two identical specific IPs conflict
+        assert!(host_ports_conflict(&p_specific1, &p_specific1));
+
+        // Two distinct specific non-wildcard IPs do not conflict
+        assert!(!host_ports_conflict(&p_specific1, &p_specific2));
+
+        // Different protocols do not conflict
+        assert!(!host_ports_conflict(&p_wildcard, &p_udp));
+
+        // Different ports do not conflict
+        assert!(!host_ports_conflict(&p_wildcard, &p_diff_port));
+    }
+
+    fn setup_reconciler_test(
+        dir: &tempfile::TempDir,
+        node_name: &str,
+    ) -> (
+        Arc<diorama_apiserver::KubernetesApiClient>,
+        PodReconciler,
+        Arc<crate::mock::MockRuntimeProvider>,
+    ) {
+        use diorama_apiserver::{ApiserverConfig, KubernetesStorage};
+        use diorama_datastore::{DatastoreConfig, DatastoreEngine};
+        use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
+        use std::net::IpAddr;
+
+        let node_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let pki_dir = dir.path().join("pki");
+        std::fs::create_dir_all(&pki_dir).unwrap();
+        let datastore_dir = dir.path().join("datastore");
+        let kubelet_dir = dir.path().join("kubelet");
+        std::fs::create_dir_all(&kubelet_dir).unwrap();
+
+        let pki_config = ClusterPkiConfig::new(pki_dir.clone(), node_name.to_string(), node_ip);
+        let pki = ClusterPki::new(pki_config);
+        pki.reconcile().expect("PKI reconcile");
+
+        let (engine, _) = DatastoreEngine::open(DatastoreConfig::new(datastore_dir)).unwrap();
+        let storage = KubernetesStorage::new(engine.client(), "/registry");
+
+        let apiserver_config = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+        let apiserver = Arc::new(ApiserverService::new(apiserver_config, storage));
+        let client = Arc::new(apiserver.admin_client());
+
+        let runtime = Arc::new(crate::mock::MockRuntimeProvider::new("mock"));
+        let reconciler =
+            PodReconciler::new(client.clone(), runtime.clone(), node_name, "127.0.0.1")
+                .with_root_dir(&kubelet_dir)
+                .with_apiserver(apiserver);
+
+        (client, reconciler, runtime)
+    }
+
+    async fn create_test_node(client: &diorama_apiserver::KubernetesApiClient, name: &str) {
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "kubernetes.io/hostname": name,
+                    "kubernetes.io/os": "linux",
+                    "kubernetes.io/arch": "amd64",
+                    "node.kubernetes.io/instance-type": "k8s"
+                }
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "KubeletReady",
+                    "message": "kubelet is posting ready status"
+                }],
+                "allocatable": {
+                    "cpu": "2",
+                    "memory": "4Gi",
+                    "pods": "110"
+                }
+            }
+        });
+        let _ = client.create_node(node).await.expect("create test node");
+    }
+
+    #[tokio::test]
+    async fn test_nodeselector_targeting_second_node_schedules_onto_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        // Create both nodes
+        create_test_node(&client, "diorama-node").await;
+        create_test_node(&client, "diorama-node-worker").await;
+
+        // Pod targeting second node (companion worker)
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "worker-pod", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node-worker"
+                },
+                "containers": [{
+                    "name": "worker-c",
+                    "image": "busybox:latest"
+                }]
+            }
+        });
+        client.create_pod("default", pod).await.expect("create pod");
+
+        // Reconcile
+        let report = reconciler.reconcile_all().await.expect("reconcile");
+        assert_eq!(report.bound, 1);
+        assert_eq!(report.synced, 1);
+
+        let bound_pod = client
+            .get_pod("default", "worker-pod")
+            .await
+            .expect("get pod");
+        assert_eq!(
+            bound_pod.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-node-worker")
+        );
+        assert_eq!(
+            bound_pod.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hostport_conflict_with_wildcard_hostip_marks_second_pod_unschedulable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_test_node(&client, "diorama-node").await;
+        create_test_node(&client, "diorama-node-worker").await;
+
+        // First pod binds hostPort 8080 with 0.0.0.0 on diorama-node
+        let pod1 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod1", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node"
+                },
+                "containers": [{
+                    "name": "c1",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8080,
+                        "protocol": "TCP",
+                        "hostIP": "0.0.0.0"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod1)
+            .await
+            .expect("create pod1");
+
+        // First reconcile runs pod1
+        let report1 = reconciler.reconcile_all().await.expect("reconcile 1");
+        assert_eq!(report1.bound, 1);
+        assert_eq!(report1.synced, 1);
+        let bound1 = client.get_pod("default", "pod1").await.expect("get pod1");
+        assert_eq!(
+            bound1.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-node")
+        );
+        assert_eq!(
+            bound1.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
+
+        // Second pod requests same hostPort 8080 with specific hostIP 127.0.0.1 targeted to diorama-node
+        let pod2 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod2", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node"
+                },
+                "containers": [{
+                    "name": "c2",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8080,
+                        "protocol": "TCP",
+                        "hostIP": "127.0.0.1"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod2)
+            .await
+            .expect("create pod2");
+
+        // Second reconcile should detect conflict and mark pod2 unschedulable
+        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
+        assert_eq!(report2.bound, 0);
+
+        let pod2_state = client.get_pod("default", "pod2").await.expect("get pod2");
+        assert_eq!(
+            pod2_state.pointer("/status/phase").and_then(Value::as_str),
+            Some("Pending")
+        );
+
+        let conds = pod2_state
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions array");
+        let sched_cond = conds
+            .iter()
+            .find(|c| c["type"] == "PodScheduled")
+            .expect("PodScheduled condition");
+        assert_eq!(sched_cond["status"], "False");
+        assert_eq!(sched_cond["reason"], "Unschedulable");
+        let msg = sched_cond["message"].as_str().expect("message string");
+        assert!(
+            msg.contains("node(s) didn't have free ports for the requested pod ports"),
+            "expected free ports message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hostport_conflict_with_omitted_hostip_marks_second_pod_unschedulable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_test_node(&client, "diorama-node").await;
+        create_test_node(&client, "diorama-node-worker").await;
+
+        // Pod 1 omits hostIP (implicit wildcard)
+        let pod1 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "wildcard-pod", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node"
+                },
+                "containers": [{
+                    "name": "c1",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8088,
+                        "protocol": "TCP"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod1)
+            .await
+            .expect("create pod1");
+        reconciler.reconcile_all().await.expect("reconcile 1");
+
+        // Pod 2 has specific hostIP on the same node
+        let pod2 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "specific-pod", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node"
+                },
+                "containers": [{
+                    "name": "c2",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8088,
+                        "protocol": "TCP",
+                        "hostIP": "10.0.0.5"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod2)
+            .await
+            .expect("create pod2");
+        reconciler.reconcile_all().await.expect("reconcile 2");
+
+        let pod2_state = client
+            .get_pod("default", "specific-pod")
+            .await
+            .expect("get pod2");
+        assert_eq!(
+            pod2_state.pointer("/status/phase").and_then(Value::as_str),
+            Some("Pending")
+        );
+        let conds = pod2_state
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions array");
+        let sched_cond = conds
+            .iter()
+            .find(|c| c["type"] == "PodScheduled")
+            .expect("PodScheduled condition");
+        assert_eq!(sched_cond["status"], "False");
+        assert_eq!(sched_cond["reason"], "Unschedulable");
+    }
+
+    #[tokio::test]
+    async fn test_hostport_conflict_with_explicit_spec_nodename_leaves_pending() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_test_node(&client, "diorama-node").await;
+        create_test_node(&client, "diorama-node-worker").await;
+
+        // Pod 1 running on diorama-node
+        let pod1 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "running-pod", "namespace": "default" },
+            "spec": {
+                "nodeName": "diorama-node",
+                "containers": [{
+                    "name": "c1",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8099,
+                        "protocol": "TCP",
+                        "hostIP": "0.0.0.0"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod1)
+            .await
+            .expect("create pod1");
+        reconciler.reconcile_all().await.expect("reconcile 1");
+
+        // Verify pod1 has a running sandbox
+        let filter = cri::PodSandboxFilter::default();
+        let sandboxes_before = runtime.list_pod_sandbox(Some(&filter)).await.unwrap();
+        assert_eq!(sandboxes_before.len(), 1);
+
+        // Pod 2 created with nodeName explicitly set to diorama-node, with conflicting port
+        let pod2 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "conflicting-pod", "namespace": "default" },
+            "spec": {
+                "nodeName": "diorama-node",
+                "containers": [{
+                    "name": "c2",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 8099,
+                        "protocol": "TCP",
+                        "hostIP": "127.0.0.1"
+                    }]
+                }]
+            }
+        });
+        client
+            .create_pod("default", pod2)
+            .await
+            .expect("create pod2");
+        reconciler.reconcile_all().await.expect("reconcile 2");
+
+        // No new sandbox started for pod 2!
+        let sandboxes_after = runtime.list_pod_sandbox(Some(&filter)).await.unwrap();
+        assert_eq!(sandboxes_after.len(), 1);
+
+        let pod2_state = client
+            .get_pod("default", "conflicting-pod")
+            .await
+            .expect("get pod2");
+        assert_eq!(
+            pod2_state.pointer("/status/phase").and_then(Value::as_str),
+            Some("Pending")
+        );
+        let conds = pod2_state
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions array");
+        let sched_cond = conds
+            .iter()
+            .find(|c| c["type"] == "PodScheduled")
+            .expect("PodScheduled condition");
+        assert_eq!(sched_cond["status"], "False");
+        assert_eq!(sched_cond["reason"], "Unschedulable");
+    }
+
+    #[tokio::test]
+    async fn test_hostport_on_different_nodes_no_conflict() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_test_node(&client, "diorama-node").await;
+        create_test_node(&client, "diorama-node-worker").await;
+
+        let pod1 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "node1-pod", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node"
+                },
+                "containers": [{
+                    "name": "c1",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 9100,
+                        "protocol": "TCP",
+                        "hostIP": "0.0.0.0"
+                    }]
+                }]
+            }
+        });
+        let pod2 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "node2-pod", "namespace": "default" },
+            "spec": {
+                "nodeSelector": {
+                    "kubernetes.io/hostname": "diorama-node-worker"
+                },
+                "containers": [{
+                    "name": "c2",
+                    "image": "busybox:latest",
+                    "ports": [{
+                        "containerPort": 80,
+                        "hostPort": 9100,
+                        "protocol": "TCP",
+                        "hostIP": "127.0.0.1"
+                    }]
+                }]
+            }
+        });
+
+        client
+            .create_pod("default", pod1)
+            .await
+            .expect("create pod1");
+        client
+            .create_pod("default", pod2)
+            .await
+            .expect("create pod2");
+
+        let report = reconciler.reconcile_all().await.expect("reconcile");
+        assert_eq!(report.bound, 2);
+        assert_eq!(report.synced, 2);
+
+        let p1 = client
+            .get_pod("default", "node1-pod")
+            .await
+            .expect("get pod1");
+        let p2 = client
+            .get_pod("default", "node2-pod")
+            .await
+            .expect("get pod2");
+        assert_eq!(
+            p1.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-node")
+        );
+        assert_eq!(
+            p2.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-node-worker")
+        );
+        assert_eq!(
+            p1.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
+        assert_eq!(
+            p2.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
     }
 }
