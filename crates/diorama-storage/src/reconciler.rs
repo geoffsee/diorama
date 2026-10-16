@@ -37,6 +37,8 @@ pub struct ReconciliationReport {
     pub storage_class_updated: bool,
     pub deployment_created: bool,
     pub deployment_updated: bool,
+    pub csi_driver_created: bool,
+    pub csi_driver_updated: bool,
 }
 
 impl ReconciliationReport {
@@ -69,6 +71,9 @@ impl ReconciliationReport {
             count += 1;
         }
         if self.deployment_created || self.deployment_updated {
+            count += 1;
+        }
+        if self.csi_driver_created || self.csi_driver_updated {
             count += 1;
         }
         count
@@ -138,6 +143,9 @@ impl LocalPathReconciler {
         // 7. Reconcile Deployment
         self.reconcile_deployment(client, &manifests, &mut report)
             .await?;
+
+        // 8. Reconcile CSIDriver if enabled
+        self.reconcile_csi_driver(client, &mut report).await?;
 
         info!(
             "local-path storage reconciliation completed (total changes: {})",
@@ -437,6 +445,63 @@ impl LocalPathReconciler {
                     .map_err(StorageError::Apiserver)?;
                 report.deployment_created = true;
                 debug!("created Deployment {LOCAL_PATH_DEPLOYMENT_NAME}");
+            },
+            Err(err) => return Err(StorageError::Apiserver(err)),
+        }
+        Ok(())
+    }
+
+    async fn reconcile_csi_driver(
+        &self,
+        client: &KubernetesApiClient,
+        report: &mut ReconciliationReport,
+    ) -> Result<()> {
+        if !self.config.csi_enabled {
+            return Ok(());
+        }
+
+        let driver_doc = crate::manifests::generate_csi_driver(
+            crate::config::LOCAL_PATH_PROVISIONER_NAME,
+            false,
+            true,
+            true,
+        );
+
+        match client
+            .get_cluster_object(
+                "storage.k8s.io",
+                "csidrivers",
+                crate::config::LOCAL_PATH_PROVISIONER_NAME,
+            )
+            .await
+        {
+            Ok(_) => {
+                client
+                    .replace_cluster_object(
+                        "storage.k8s.io",
+                        "CSIDriver",
+                        "csidrivers",
+                        crate::config::LOCAL_PATH_PROVISIONER_NAME,
+                        driver_doc,
+                    )
+                    .await
+                    .map_err(StorageError::Apiserver)?;
+                report.csi_driver_updated = true;
+                debug!(
+                    "updated CSIDriver {}",
+                    crate::config::LOCAL_PATH_PROVISIONER_NAME
+                );
+            },
+            Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
+                client
+                    .create_cluster_object("storage.k8s.io", "CSIDriver", "csidrivers", driver_doc)
+                    .await
+                    .map_err(StorageError::Apiserver)?;
+                report.csi_driver_created = true;
+                debug!(
+                    "created CSIDriver {}",
+                    crate::config::LOCAL_PATH_PROVISIONER_NAME
+                );
             },
             Err(err) => return Err(StorageError::Apiserver(err)),
         }

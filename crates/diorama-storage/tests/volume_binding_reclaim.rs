@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::Path;
 use tempfile::TempDir;
@@ -8,8 +9,10 @@ use diorama_apiserver::{
 use diorama_datastore::{DatastoreConfig, DatastoreEngine};
 use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
 use diorama_storage::{
-    LocalPathConfig, LocalPathReconciler, LocalPathVolumeManager, StorageError,
-    VolumeReclaimAction, safe_resolve_volume_path, safe_teardown_volume_dir,
+    LocalPathConfig, LocalPathReconciler, LocalPathService, LocalPathVolumeManager,
+    PV_PROTECTION_FINALIZER, PVC_PROTECTION_FINALIZER, StorageError,
+    VOLUME_SELECTED_NODE_ANNOTATION, VolumeReclaimAction, safe_resolve_volume_path,
+    safe_teardown_volume_dir,
 };
 use serde_json::json;
 
@@ -635,4 +638,427 @@ async fn test_empty_storage_class_name_disables_dynamic_provisioning() {
         },
         other => panic!("expected VolumeBindingFailed error, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_default_storage_class_dynamic_provisioning_and_verify_binding() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("Immediate")
+        .with_reclaim_policy("Delete");
+
+    // Reconciler creates default StorageClass "local-path" with is-default-class annotation
+    let reconciler = LocalPathReconciler::new(&config);
+    let report = reconciler.reconcile(&client).await.unwrap();
+    assert!(report.storage_class_created);
+
+    let ns = "test-default-sc";
+    client.create_namespace(ns).await.unwrap();
+
+    // Create PVC with NO spec.storageClassName (omitted entirely)
+    let pvc_req = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "omitted-sc-claim", "namespace": ns },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": { "requests": { "storage": "2Gi" } }
+        },
+        "status": { "phase": "Pending" }
+    });
+    let created_pvc = client.create_pvc(ns, pvc_req).await.unwrap();
+    assert!(created_pvc["spec"].get("storageClassName").is_none());
+
+    let volume_mgr = LocalPathVolumeManager::new(config, client.clone());
+    let pv = volume_mgr
+        .provision_volume_for_pvc(ns, "omitted-sc-claim", "node-1")
+        .await
+        .unwrap();
+
+    let pv_name = pv["metadata"]["name"].as_str().unwrap();
+    assert_eq!(pv["spec"]["storageClassName"], "local-path");
+    assert_eq!(pv["status"]["phase"], "Bound");
+
+    let bound_pvc = client.get_pvc(ns, "omitted-sc-claim").await.unwrap();
+    assert_eq!(bound_pvc["status"]["phase"], "Bound");
+    assert_eq!(bound_pvc["spec"]["volumeName"], pv_name);
+
+    // Verify bi-directional binding check
+    let is_bound = volume_mgr
+        .verify_binding(ns, "omitted-sc-claim")
+        .await
+        .unwrap();
+    assert!(
+        is_bound,
+        "verify_binding must confirm bi-directional binding"
+    );
+}
+
+#[tokio::test]
+async fn test_wait_for_first_consumer_delayed_binding_pass() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("WaitForFirstConsumer")
+        .with_reclaim_policy("Delete");
+
+    let reconciler = LocalPathReconciler::new(&config);
+    reconciler.reconcile(&client).await.unwrap();
+
+    let ns = "test-delayed-binding";
+    client.create_namespace(ns).await.unwrap();
+
+    // PVC without selected-node annotation
+    let pvc_req = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "delayed-claim", "namespace": ns },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": "local-path",
+            "resources": { "requests": { "storage": "1Gi" } }
+        },
+        "status": { "phase": "Pending" }
+    });
+    client.create_pvc(ns, pvc_req).await.unwrap();
+
+    let service = LocalPathService::new(config.clone(), std::sync::Arc::new(client.clone()));
+
+    // 1. Binder pass without selected-node annotation: should NOT bind
+    service.bind_pending_volumes().await;
+
+    let pvc = client.get_pvc(ns, "delayed-claim").await.unwrap();
+    assert_eq!(pvc["status"]["phase"], "Pending");
+    assert!(pvc["spec"].get("volumeName").is_none());
+
+    // 2. Pod scheduling annotates PVC with volume.kubernetes.io/selected-node: "worker-node-42"
+    let mut updated_pvc = pvc.clone();
+    let meta = updated_pvc["metadata"].as_object_mut().unwrap();
+    meta.insert(
+        "annotations".to_string(),
+        json!({
+            VOLUME_SELECTED_NODE_ANNOTATION: "worker-node-42"
+        }),
+    );
+    client
+        .update_pvc(ns, "delayed-claim", updated_pvc)
+        .await
+        .unwrap();
+
+    // 3. Binder pass now picks up the annotated PVC
+    service.bind_pending_volumes().await;
+
+    let bound_pvc = client.get_pvc(ns, "delayed-claim").await.unwrap();
+    assert_eq!(bound_pvc["status"]["phase"], "Bound");
+    let pv_name = bound_pvc["spec"]["volumeName"].as_str().unwrap();
+
+    let pv = client.get_pv(pv_name).await.unwrap();
+    assert_eq!(pv["status"]["phase"], "Bound");
+    assert_eq!(
+        pv["metadata"]["annotations"][VOLUME_SELECTED_NODE_ANNOTATION],
+        "worker-node-42"
+    );
+    let node_affinity = &pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"];
+    assert_eq!(
+        node_affinity[0]["matchExpressions"][0]["values"][0],
+        "worker-node-42"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::similar_names)]
+async fn test_pvc_pv_protection_and_in_use() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("Immediate")
+        .with_reclaim_policy("Delete");
+
+    let reconciler = LocalPathReconciler::new(&config);
+    reconciler.reconcile(&client).await.unwrap();
+
+    let ns = "test-protection";
+    client.create_namespace(ns).await.unwrap();
+
+    let pvc_req = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "prot-claim", "namespace": ns },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": "local-path",
+            "resources": { "requests": { "storage": "1Gi" } }
+        },
+        "status": { "phase": "Pending" }
+    });
+    client.create_pvc(ns, pvc_req).await.unwrap();
+
+    let volume_mgr = LocalPathVolumeManager::new(config, client.clone());
+    let pv = volume_mgr
+        .provision_volume_for_pvc(ns, "prot-claim", "node-1")
+        .await
+        .unwrap();
+    let pv_name = pv["metadata"]["name"].as_str().unwrap();
+
+    // Verify protection finalizers were added during provision
+    let pvc_with_fin = client.get_pvc(ns, "prot-claim").await.unwrap();
+    let pvc_fins = pvc_with_fin["metadata"]["finalizers"].as_array().unwrap();
+    assert!(
+        pvc_fins
+            .iter()
+            .any(|f| f.as_str() == Some(PVC_PROTECTION_FINALIZER))
+    );
+
+    let pv_with_fin = client.get_pv(pv_name).await.unwrap();
+    let pv_fins = pv_with_fin["metadata"]["finalizers"].as_array().unwrap();
+    assert!(
+        pv_fins
+            .iter()
+            .any(|f| f.as_str() == Some(PV_PROTECTION_FINALIZER))
+    );
+
+    // Initially no pod uses the PVC
+    let in_use = volume_mgr.is_pvc_in_use(ns, "prot-claim").await.unwrap();
+    assert!(!in_use);
+
+    // Create a Pod referencing this PVC
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "user-pod", "namespace": ns },
+        "spec": {
+            "nodeName": "node-1",
+            "containers": [{ "name": "c", "image": "busybox" }],
+            "volumes": [{
+                "name": "vol",
+                "persistentVolumeClaim": { "claimName": "prot-claim" }
+            }]
+        }
+    });
+    client.create_pod(ns, pod).await.unwrap();
+
+    // Now PVC IS in use
+    let in_use_after = volume_mgr.is_pvc_in_use(ns, "prot-claim").await.unwrap();
+    assert!(
+        in_use_after,
+        "PVC should be detected as in-use while pod exists"
+    );
+
+    // Delete pod
+    client
+        .delete_pod_options(ns, "user-pod", Some(0))
+        .await
+        .unwrap();
+
+    // Now PVC is no longer in use
+    let in_use_done = volume_mgr.is_pvc_in_use(ns, "prot-claim").await.unwrap();
+    assert!(
+        !in_use_done,
+        "PVC should no longer be in use once pod is deleted"
+    );
+
+    // Remove finalizers
+    let pvc_no_fin = volume_mgr
+        .remove_pvc_protection(ns, "prot-claim")
+        .await
+        .unwrap();
+    let pvc_no_fins = pvc_no_fin["metadata"]["finalizers"].as_array().unwrap();
+    assert!(
+        !pvc_no_fins
+            .iter()
+            .any(|f| f.as_str() == Some(PVC_PROTECTION_FINALIZER))
+    );
+
+    let pv_no_fin = volume_mgr.remove_pv_protection(pv_name).await.unwrap();
+    let pv_no_fins = pv_no_fin["metadata"]["finalizers"].as_array().unwrap();
+    assert!(
+        !pv_no_fins
+            .iter()
+            .any(|f| f.as_str() == Some(PV_PROTECTION_FINALIZER))
+    );
+}
+
+#[tokio::test]
+async fn test_csi_resources_lifecycle() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("Immediate")
+        .with_reclaim_policy("Delete");
+
+    let volume_mgr = LocalPathVolumeManager::new(config, client.clone());
+
+    // 1. CSINode registration and query
+    volume_mgr
+        .ensure_csi_node(
+            "test-node-1",
+            "rancher.io/local-path",
+            "uuid-node-1",
+            &["kubernetes.io/hostname"],
+        )
+        .await
+        .unwrap();
+    let csi_node = volume_mgr.get_csi_node("test-node-1").await.unwrap();
+    assert_eq!(csi_node["metadata"]["name"], "test-node-1");
+
+    // 2. CSIStorageCapacity publication and query
+    let mut topo = BTreeMap::new();
+    topo.insert(
+        "kubernetes.io/hostname".to_string(),
+        "test-node-1".to_string(),
+    );
+    volume_mgr
+        .record_storage_capacity(
+            "default",
+            "cap-node-1",
+            "local-path",
+            50_000_000_000,
+            Some(&topo),
+        )
+        .await
+        .unwrap();
+    let cap = volume_mgr
+        .get_storage_capacity("default", "cap-node-1")
+        .await
+        .unwrap();
+    assert_eq!(cap, Some(50_000_000_000));
+
+    // 3. VolumeAttachment create, status update, query
+    volume_mgr
+        .create_volume_attachment(
+            "va-node-1",
+            "rancher.io/local-path",
+            "test-node-1",
+            "pv-test-1",
+        )
+        .await
+        .unwrap();
+    volume_mgr
+        .set_volume_attachment_status("va-node-1", true)
+        .await
+        .unwrap();
+    let va = volume_mgr.get_volume_attachment("va-node-1").await.unwrap();
+    assert_eq!(va["status"]["attached"], true);
+
+    // 4. VolumeAttributesClass create and query
+    let mut params = BTreeMap::new();
+    params.insert("provisioner".to_string(), "local-path".to_string());
+    params.insert("tier".to_string(), "gold".to_string());
+    volume_mgr
+        .create_volume_attributes_class("gold-tier", "rancher.io/local-path", &params)
+        .await
+        .unwrap();
+    let vac = volume_mgr
+        .get_volume_attributes_class("gold-tier")
+        .await
+        .unwrap();
+    assert_eq!(vac["driverName"], "rancher.io/local-path");
+    assert_eq!(vac["parameters"]["tier"], "gold");
+
+    // 5. Cleanup CSI resources
+    volume_mgr
+        .delete_volume_attributes_class("gold-tier")
+        .await
+        .unwrap();
+    volume_mgr
+        .delete_volume_attachment("va-node-1")
+        .await
+        .unwrap();
+    volume_mgr
+        .delete_storage_capacity("default", "cap-node-1")
+        .await
+        .unwrap();
+    volume_mgr.delete_csi_node("test-node-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pvc_condition_and_pv_status_updates() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+
+    let storage_root = temp.path().join("local-path-storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+
+    let config = LocalPathConfig::new()
+        .with_storage_path(storage_root.display().to_string())
+        .with_volume_binding_mode("Immediate")
+        .with_reclaim_policy("Delete");
+
+    let volume_mgr = LocalPathVolumeManager::new(config, client.clone());
+
+    let ns = "test-status-updates";
+    client.create_namespace(ns).await.unwrap();
+    let claim_manifest = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "cond-claim", "namespace": ns },
+        "spec": { "accessModes": ["ReadWriteOnce"] },
+        "status": { "phase": "Bound" }
+    });
+    client.create_pvc(ns, claim_manifest).await.unwrap();
+
+    let updated_pvc = volume_mgr
+        .update_pvc_condition(
+            ns,
+            "cond-claim",
+            "Resizing",
+            "True",
+            "Expanding",
+            "In progress",
+        )
+        .await
+        .unwrap();
+    let cond = &updated_pvc["status"]["conditions"][0];
+    assert_eq!(cond["type"], "Resizing");
+    assert_eq!(cond["status"], "True");
+    assert_eq!(cond["reason"], "Expanding");
+    assert_eq!(cond["message"], "In progress");
+
+    let volume_manifest = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": { "name": "status-pv" },
+        "spec": { "accessModes": ["ReadWriteOnce"] },
+        "status": { "phase": "Available" }
+    });
+    client.create_pv(volume_manifest).await.unwrap();
+
+    let updated_pv = volume_mgr
+        .update_pv_status_details(
+            "status-pv",
+            "Released",
+            Some("ClaimLost"),
+            Some("Claim deleted"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_pv["status"]["phase"], "Released");
+    assert_eq!(updated_pv["status"]["reason"], "ClaimLost");
+    assert_eq!(updated_pv["status"]["message"], "Claim deleted");
 }

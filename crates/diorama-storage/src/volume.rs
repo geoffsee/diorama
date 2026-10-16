@@ -1,13 +1,22 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use diorama_apiserver::KubernetesApiClient;
+use diorama_apiserver::time::now_rfc3339;
 
-use crate::config::{LOCAL_PATH_PROVISIONER_NAME, LOCAL_PATH_STORAGE_CLASS_NAME, LocalPathConfig};
+use crate::config::{
+    IS_DEFAULT_CLASS_ANNOTATION, LOCAL_PATH_PROVISIONER_NAME, LOCAL_PATH_STORAGE_CLASS_NAME,
+    LocalPathConfig, PV_PROTECTION_FINALIZER, PVC_PROTECTION_FINALIZER,
+    STORAGE_PROVISIONED_BY_ANNOTATION, VOLUME_SELECTED_NODE_ANNOTATION,
+};
 use crate::error::{Result, StorageError};
-use crate::manifests::provisioner_labels;
+use crate::manifests::{
+    generate_csi_driver, generate_csi_node, generate_csi_storage_capacity,
+    generate_volume_attachment, generate_volume_attributes_class, provisioner_labels,
+};
 
 /// Action taken during persistent volume claim deletion and reclaim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +214,41 @@ impl LocalPathVolumeManager {
         &self.client
     }
 
+    async fn resolve_default_storage_class(&self) -> (String, String, String) {
+        let mut default_name = LOCAL_PATH_STORAGE_CLASS_NAME.to_string();
+        let mut policy = self.config.reclaim_policy.clone();
+        let mut mode = self.config.volume_binding_mode.clone();
+
+        let Ok(sc_list) = self.client.list_storage_classes().await else {
+            return (default_name, policy, mode);
+        };
+        let Some(items) = sc_list.get("items").and_then(Value::as_array) else {
+            return (default_name, policy, mode);
+        };
+        for item in items {
+            let is_default = item
+                .get("metadata")
+                .and_then(|m| m.get("annotations"))
+                .and_then(|a| a.get(IS_DEFAULT_CLASS_ANNOTATION))
+                .and_then(Value::as_str)
+                == Some("true");
+            if !is_default {
+                continue;
+            }
+            if let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) {
+                default_name = name.to_string();
+            }
+            if let Some(p) = item.get("reclaimPolicy").and_then(Value::as_str) {
+                policy = p.to_string();
+            }
+            if let Some(m) = item.get("volumeBindingMode").and_then(Value::as_str) {
+                mode = m.to_string();
+            }
+            break;
+        }
+        (default_name, policy, mode)
+    }
+
     /// Provision a persistent volume for a PVC, placing it on the designated node.
     #[allow(clippy::too_many_lines, clippy::similar_names, clippy::collapsible_if)]
     pub async fn provision_volume_for_pvc(
@@ -215,12 +259,6 @@ impl LocalPathVolumeManager {
     ) -> Result<Value> {
         if !self.config.enabled {
             return Err(StorageError::Disabled);
-        }
-
-        if node_name.trim().is_empty() {
-            return Err(StorageError::VolumeBindingFailed(
-                "cannot provision volume without node placement".to_string(),
-            ));
         }
 
         let mut pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
@@ -240,29 +278,78 @@ impl LocalPathVolumeManager {
             }
         }
 
-        // Validate storage class:
-        // - None: defaults to default StorageClass (local-path)
-        // - Some("local-path"): supported
+        // Validate and resolve storage class:
         // - Some(""): disables dynamic provisioning in Kubernetes
-        // - Some(other): unsupported
+        // - Some(name): match local-path or custom storage class registered with our provisioner
+        // - None: resolve default StorageClass from cluster, or fallback to configured default
         let requested_sc = pvc
             .get("spec")
             .and_then(|s| s.get("storageClassName"))
             .and_then(Value::as_str);
 
-        match requested_sc {
-            Some(LOCAL_PATH_STORAGE_CLASS_NAME) | None => {},
+        let (effective_sc_name, reclaim_policy, volume_binding_mode) = match requested_sc {
             Some("") => {
                 return Err(StorageError::VolumeBindingFailed(format!(
                     "PVC '{pvc_name}' has empty storageClassName (dynamic provisioning disabled)"
                 )));
             },
-            Some(other) => {
-                return Err(StorageError::VolumeBindingFailed(format!(
-                    "PVC '{pvc_name}' requests unsupported StorageClass '{other}'"
-                )));
+            Some(LOCAL_PATH_STORAGE_CLASS_NAME) => (
+                LOCAL_PATH_STORAGE_CLASS_NAME.to_string(),
+                self.config.reclaim_policy.clone(),
+                self.config.volume_binding_mode.clone(),
+            ),
+            Some(other) => match self.client.get_storage_class(other).await {
+                Ok(sc_doc) => {
+                    let provisioner = sc_doc
+                        .get("provisioner")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if provisioner != LOCAL_PATH_PROVISIONER_NAME {
+                        return Err(StorageError::VolumeBindingFailed(format!(
+                            "PVC '{pvc_name}' requests unsupported StorageClass '{other}' with provisioner '{provisioner}'"
+                        )));
+                    }
+                    let policy = sc_doc
+                        .get("reclaimPolicy")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&self.config.reclaim_policy)
+                        .to_string();
+                    let mode = sc_doc
+                        .get("volumeBindingMode")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&self.config.volume_binding_mode)
+                        .to_string();
+                    (other.to_string(), policy, mode)
+                },
+                Err(_) => {
+                    return Err(StorageError::VolumeBindingFailed(format!(
+                        "PVC '{pvc_name}' requests StorageClass '{other}' which was not found"
+                    )));
+                },
             },
-        }
+            None => self.resolve_default_storage_class().await,
+        };
+
+        // Node placement & WaitForFirstConsumer resolution:
+        // 1. Explicit node_name argument (e.g. from scheduled pod)
+        // 2. Or pre-existing volume.kubernetes.io/selected-node annotation on PVC
+        let effective_node = if !node_name.trim().is_empty() {
+            node_name.trim().to_string()
+        } else if let Some(selected) = pvc
+            .pointer("/metadata/annotations/volume.kubernetes.io~1selected-node")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            selected.to_string()
+        } else if volume_binding_mode == "WaitForFirstConsumer" {
+            return Err(StorageError::VolumeBindingFailed(format!(
+                "cannot provision volume for PVC '{pvc_name}' without node placement (WaitForFirstConsumer waiting)"
+            )));
+        } else {
+            return Err(StorageError::VolumeBindingFailed(
+                "cannot provision volume without node placement".to_string(),
+            ));
+        };
 
         let pvc_uid = pvc
             .get("metadata")
@@ -299,6 +386,27 @@ impl LocalPathVolumeManager {
             if let Some(spec) = pvc.get_mut("spec").and_then(Value::as_object_mut) {
                 spec.insert("volumeName".to_string(), json!(pv_name));
             }
+            if let Some(meta) = pvc.get_mut("metadata").and_then(Value::as_object_mut) {
+                let annotations = meta
+                    .entry("annotations".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(ann) = annotations.as_object_mut() {
+                    ann.insert(
+                        VOLUME_SELECTED_NODE_ANNOTATION.to_string(),
+                        json!(effective_node),
+                    );
+                }
+                let finalizers = meta
+                    .entry("finalizers".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = finalizers.as_array_mut()
+                    && !arr
+                        .iter()
+                        .any(|v| v.as_str() == Some(PVC_PROTECTION_FINALIZER))
+                {
+                    arr.push(json!(PVC_PROTECTION_FINALIZER));
+                }
+            }
             if let Some(status) = pvc.get_mut("status").and_then(Value::as_object_mut) {
                 status.insert("phase".to_string(), json!("Bound"));
             } else if let Some(pvc_obj) = pvc.as_object_mut() {
@@ -331,8 +439,10 @@ impl LocalPathVolumeManager {
             "metadata": {
                 "name": pv_name,
                 "annotations": {
-                    "pv.kubernetes.io/provisioned-by": LOCAL_PATH_PROVISIONER_NAME,
+                    STORAGE_PROVISIONED_BY_ANNOTATION: LOCAL_PATH_PROVISIONER_NAME,
+                    VOLUME_SELECTED_NODE_ANNOTATION: effective_node,
                 },
+                "finalizers": [PV_PROTECTION_FINALIZER],
                 "labels": provisioner_labels(),
             },
             "spec": {
@@ -340,8 +450,8 @@ impl LocalPathVolumeManager {
                     "storage": capacity,
                 },
                 "accessModes": access_modes,
-                "persistentVolumeReclaimPolicy": self.config.reclaim_policy,
-                "storageClassName": LOCAL_PATH_STORAGE_CLASS_NAME,
+                "persistentVolumeReclaimPolicy": reclaim_policy,
+                "storageClassName": effective_sc_name,
                 "local": {
                     "path": vol_dir.display().to_string(),
                 },
@@ -353,7 +463,7 @@ impl LocalPathVolumeManager {
                                     {
                                         "key": "kubernetes.io/hostname",
                                         "operator": "In",
-                                        "values": [node_name]
+                                        "values": [&effective_node]
                                     }
                                 ]
                             }
@@ -361,8 +471,11 @@ impl LocalPathVolumeManager {
                     }
                 },
                 "claimRef": {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
                     "namespace": pvc_namespace,
                     "name": pvc_name,
+                    "uid": pvc_uid,
                 }
             },
             "status": {
@@ -372,9 +485,30 @@ impl LocalPathVolumeManager {
 
         let created_pv = self.client.create_pv(pv_doc).await?;
 
-        // Update PVC to Bound status referencing the newly created PV
+        // Update PVC to Bound status referencing the newly created PV with protection finalizer
         if let Some(spec) = pvc.get_mut("spec").and_then(Value::as_object_mut) {
             spec.insert("volumeName".to_string(), json!(pv_name));
+        }
+        if let Some(meta) = pvc.get_mut("metadata").and_then(Value::as_object_mut) {
+            let annotations = meta
+                .entry("annotations".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(ann) = annotations.as_object_mut() {
+                ann.insert(
+                    VOLUME_SELECTED_NODE_ANNOTATION.to_string(),
+                    json!(effective_node),
+                );
+            }
+            let finalizers = meta
+                .entry("finalizers".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(arr) = finalizers.as_array_mut()
+                && !arr
+                    .iter()
+                    .any(|v| v.as_str() == Some(PVC_PROTECTION_FINALIZER))
+            {
+                arr.push(json!(PVC_PROTECTION_FINALIZER));
+            }
         }
         if let Some(status) = pvc.get_mut("status").and_then(Value::as_object_mut) {
             status.insert("phase".to_string(), json!("Bound"));
@@ -386,7 +520,7 @@ impl LocalPathVolumeManager {
         info!(
             "provisioned and bound volume {} on node {} at {}",
             pv_name,
-            node_name,
+            effective_node,
             vol_dir.display()
         );
 
@@ -460,7 +594,14 @@ impl LocalPathVolumeManager {
             return Err(StorageError::Disabled);
         }
 
-        let pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
+        let mut pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
+
+        // Protect against reclaim/deletion while actively in use by a Pod
+        if self.is_pvc_in_use(pvc_namespace, pvc_name).await? {
+            return Err(StorageError::VolumeBindingFailed(format!(
+                "PVC '{pvc_name}' in namespace '{pvc_namespace}' is currently in use by an active pod (pvc-protection prevents deletion)"
+            )));
+        }
 
         let vol_name = pvc
             .get("spec")
@@ -496,6 +637,14 @@ impl LocalPathVolumeManager {
                 let vol_path = PathBuf::from(&vol_path_str);
                 safe_teardown_volume_dir(&base_dir, &vol_path)?;
             }
+            // Remove pv-protection finalizer if present before deletion
+            if let Some(finalizers) = pv
+                .pointer_mut("/metadata/finalizers")
+                .and_then(Value::as_array_mut)
+            {
+                finalizers.retain(|f| f.as_str() != Some(PV_PROTECTION_FINALIZER));
+                let _ = self.client.update_pv(&vol_name, pv).await;
+            }
             self.client.delete_pv(&vol_name).await?;
             VolumeReclaimAction::Deleted {
                 pv_name: vol_name,
@@ -519,9 +668,506 @@ impl LocalPathVolumeManager {
             }
         };
 
+        // Remove pvc-protection finalizer from PVC before final deletion
+        if let Some(finalizers) = pvc
+            .pointer_mut("/metadata/finalizers")
+            .and_then(Value::as_array_mut)
+        {
+            finalizers.retain(|f| f.as_str() != Some(PVC_PROTECTION_FINALIZER));
+            let _ = self.client.update_pvc(pvc_namespace, pvc_name, pvc).await;
+        }
+
         // Delete the PVC only after the PV reclaim step succeeds
         self.client.delete_pvc(pvc_namespace, pvc_name).await?;
 
         Ok(action)
+    }
+
+    /// Check whether a PVC is actively referenced by any non-completed Pod in the namespace.
+    pub async fn is_pvc_in_use(&self, pvc_namespace: &str, pvc_name: &str) -> Result<bool> {
+        let Ok(pod_list) = self.client.list_pods(pvc_namespace).await else {
+            return Ok(false);
+        };
+        let Some(pods) = pod_list.get("items").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+
+        for pod in pods {
+            let phase = pod
+                .pointer("/status/phase")
+                .and_then(Value::as_str)
+                .unwrap_or("Pending");
+            if phase == "Succeeded" || phase == "Failed" {
+                continue;
+            }
+            let Some(volumes) = pod.pointer("/spec/volumes").and_then(Value::as_array) else {
+                continue;
+            };
+            let in_use = volumes.iter().any(|vol| {
+                vol.pointer("/persistentVolumeClaim/claimName")
+                    .and_then(Value::as_str)
+                    == Some(pvc_name)
+            });
+            if in_use {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Verifies bi-directional binding consistency between a PVC and its bound PV.
+    pub async fn verify_binding(&self, pvc_namespace: &str, pvc_name: &str) -> Result<bool> {
+        let pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
+        let vol_name = pvc
+            .pointer("/spec/volumeName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StorageError::VolumeNotFound(format!("PVC '{pvc_name}' has no volumeName"))
+            })?;
+        let pv = self.client.get_pv(vol_name).await?;
+
+        let pvc_uid = pvc
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let claim_ns = pv
+            .pointer("/spec/claimRef/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let claim_name = pv
+            .pointer("/spec/claimRef/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let claim_uid = pv
+            .pointer("/spec/claimRef/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let claim_phase = pvc.pointer("/status/phase").and_then(Value::as_str);
+        let volume_phase = pv.pointer("/status/phase").and_then(Value::as_str);
+
+        Ok(claim_ns == pvc_namespace
+            && claim_name == pvc_name
+            && (claim_uid.is_empty() || claim_uid == pvc_uid)
+            && claim_phase == Some("Bound")
+            && volume_phase == Some("Bound"))
+    }
+
+    /// Ensures the PVC protection finalizer (`kubernetes.io/pvc-protection`) is present.
+    pub async fn ensure_pvc_protection(
+        &self,
+        pvc_namespace: &str,
+        pvc_name: &str,
+    ) -> Result<Value> {
+        let mut pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
+        if let Some(obj) = pvc.as_object_mut() {
+            let meta = obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(meta_obj) = meta.as_object_mut() {
+                let finalizers = meta_obj
+                    .entry("finalizers".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = finalizers.as_array_mut()
+                    && !arr
+                        .iter()
+                        .any(|v| v.as_str() == Some(PVC_PROTECTION_FINALIZER))
+                {
+                    arr.push(json!(PVC_PROTECTION_FINALIZER));
+                    return self
+                        .client
+                        .update_pvc(pvc_namespace, pvc_name, pvc)
+                        .await
+                        .map_err(StorageError::Apiserver);
+                }
+            }
+        }
+        Ok(pvc)
+    }
+
+    /// Removes the PVC protection finalizer (`kubernetes.io/pvc-protection`).
+    pub async fn remove_pvc_protection(
+        &self,
+        pvc_namespace: &str,
+        pvc_name: &str,
+    ) -> Result<Value> {
+        let mut pvc = self.client.get_pvc(pvc_namespace, pvc_name).await?;
+        if let Some(finalizers) = pvc
+            .pointer_mut("/metadata/finalizers")
+            .and_then(Value::as_array_mut)
+        {
+            finalizers.retain(|f| f.as_str() != Some(PVC_PROTECTION_FINALIZER));
+            return self
+                .client
+                .update_pvc(pvc_namespace, pvc_name, pvc)
+                .await
+                .map_err(StorageError::Apiserver);
+        }
+        Ok(pvc)
+    }
+
+    /// Ensures the PV protection finalizer (`kubernetes.io/pv-protection`) is present.
+    pub async fn ensure_pv_protection(&self, pv_name: &str) -> Result<Value> {
+        let mut pv = self.client.get_pv(pv_name).await?;
+        if let Some(obj) = pv.as_object_mut() {
+            let meta = obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(meta_obj) = meta.as_object_mut() {
+                let finalizers = meta_obj
+                    .entry("finalizers".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = finalizers.as_array_mut()
+                    && !arr
+                        .iter()
+                        .any(|v| v.as_str() == Some(PV_PROTECTION_FINALIZER))
+                {
+                    arr.push(json!(PV_PROTECTION_FINALIZER));
+                    return self
+                        .client
+                        .update_pv(pv_name, pv)
+                        .await
+                        .map_err(StorageError::Apiserver);
+                }
+            }
+        }
+        Ok(pv)
+    }
+
+    /// Removes the PV protection finalizer (`kubernetes.io/pv-protection`).
+    pub async fn remove_pv_protection(&self, pv_name: &str) -> Result<Value> {
+        let mut pv = self.client.get_pv(pv_name).await?;
+        if let Some(finalizers) = pv
+            .pointer_mut("/metadata/finalizers")
+            .and_then(Value::as_array_mut)
+        {
+            finalizers.retain(|f| f.as_str() != Some(PV_PROTECTION_FINALIZER));
+            return self
+                .client
+                .update_pv(pv_name, pv)
+                .await
+                .map_err(StorageError::Apiserver);
+        }
+        Ok(pv)
+    }
+
+    /// Register or ensure a `CSIDriver` object exists in the cluster.
+    pub async fn ensure_csi_driver(
+        &self,
+        driver_name: &str,
+        attach_required: bool,
+        pod_info_on_mount: bool,
+        storage_capacity: bool,
+    ) -> Result<Value> {
+        if let Ok(existing) = self
+            .client
+            .get_cluster_object("storage.k8s.io", "csidrivers", driver_name)
+            .await
+        {
+            Ok(existing)
+        } else {
+            let doc = generate_csi_driver(
+                driver_name,
+                attach_required,
+                pod_info_on_mount,
+                storage_capacity,
+            );
+            self.client
+                .create_cluster_object("storage.k8s.io", "CSIDriver", "csidrivers", doc)
+                .await
+                .map_err(StorageError::Apiserver)
+        }
+    }
+
+    /// Get a `CSIDriver` object.
+    pub async fn get_csi_driver(&self, driver_name: &str) -> Result<Value> {
+        self.client
+            .get_cluster_object("storage.k8s.io", "csidrivers", driver_name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Delete a `CSIDriver` object.
+    pub async fn delete_csi_driver(&self, driver_name: &str) -> Result<()> {
+        self.client
+            .delete_cluster_object("storage.k8s.io", "csidrivers", driver_name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Register or ensure a `CSINode` object exists in the cluster.
+    pub async fn ensure_csi_node(
+        &self,
+        node_name: &str,
+        driver_name: &str,
+        node_id: &str,
+        topology_keys: &[&str],
+    ) -> Result<Value> {
+        if let Ok(existing) = self
+            .client
+            .get_cluster_object("storage.k8s.io", "csinodes", node_name)
+            .await
+        {
+            Ok(existing)
+        } else {
+            let doc = generate_csi_node(node_name, driver_name, node_id, topology_keys);
+            self.client
+                .create_cluster_object("storage.k8s.io", "CSINode", "csinodes", doc)
+                .await
+                .map_err(StorageError::Apiserver)
+        }
+    }
+
+    /// Get a `CSINode` object.
+    pub async fn get_csi_node(&self, node_name: &str) -> Result<Value> {
+        self.client
+            .get_cluster_object("storage.k8s.io", "csinodes", node_name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Delete a `CSINode` object.
+    pub async fn delete_csi_node(&self, node_name: &str) -> Result<()> {
+        self.client
+            .delete_cluster_object("storage.k8s.io", "csinodes", node_name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Record or update storage capacity in `CSIStorageCapacity`.
+    pub async fn record_storage_capacity(
+        &self,
+        namespace: &str,
+        name: &str,
+        storage_class: &str,
+        capacity_bytes: i64,
+        node_topology: Option<&BTreeMap<String, String>>,
+    ) -> Result<Value> {
+        let doc = generate_csi_storage_capacity(
+            namespace,
+            name,
+            storage_class,
+            capacity_bytes,
+            node_topology,
+        );
+        match self
+            .client
+            .get_namespaced_object("storage.k8s.io", "csistoragecapacities", namespace, name)
+            .await
+        {
+            Ok(_) => self
+                .client
+                .replace_namespaced_object(
+                    "storage.k8s.io",
+                    "CSIStorageCapacity",
+                    "csistoragecapacities",
+                    namespace,
+                    name,
+                    doc,
+                )
+                .await
+                .map_err(StorageError::Apiserver),
+            Err(_) => self
+                .client
+                .create_namespaced_object(
+                    "storage.k8s.io",
+                    "CSIStorageCapacity",
+                    "csistoragecapacities",
+                    namespace,
+                    doc,
+                )
+                .await
+                .map_err(StorageError::Apiserver),
+        }
+    }
+
+    /// Get recorded storage capacity in bytes.
+    pub async fn get_storage_capacity(&self, namespace: &str, name: &str) -> Result<Option<i64>> {
+        let doc = self
+            .client
+            .get_namespaced_object("storage.k8s.io", "csistoragecapacities", namespace, name)
+            .await
+            .map_err(StorageError::Apiserver)?;
+        let capacity_str = doc.get("capacity").and_then(Value::as_str);
+        if let Some(cap) = capacity_str {
+            let bytes = cap.parse::<i64>().unwrap_or(0);
+            Ok(Some(bytes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a `CSIStorageCapacity` object.
+    pub async fn delete_storage_capacity(&self, namespace: &str, name: &str) -> Result<()> {
+        self.client
+            .delete_namespaced_object("storage.k8s.io", "csistoragecapacities", namespace, name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Create a `VolumeAttachment` resource.
+    pub async fn create_volume_attachment(
+        &self,
+        name: &str,
+        attacher: &str,
+        node_name: &str,
+        pv_name: &str,
+    ) -> Result<Value> {
+        let doc = generate_volume_attachment(name, attacher, node_name, pv_name);
+        self.client
+            .create_cluster_object(
+                "storage.k8s.io",
+                "VolumeAttachment",
+                "volumeattachments",
+                doc,
+            )
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Get a `VolumeAttachment` resource.
+    pub async fn get_volume_attachment(&self, name: &str) -> Result<Value> {
+        self.client
+            .get_cluster_object("storage.k8s.io", "volumeattachments", name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Update attachment status of a `VolumeAttachment` (`attached: true | false`).
+    pub async fn set_volume_attachment_status(&self, name: &str, attached: bool) -> Result<Value> {
+        let mut doc = self
+            .client
+            .get_cluster_object("storage.k8s.io", "volumeattachments", name)
+            .await
+            .map_err(StorageError::Apiserver)?;
+        if let Some(status) = doc.get_mut("status").and_then(Value::as_object_mut) {
+            status.insert("attached".to_string(), json!(attached));
+        } else if let Some(obj) = doc.as_object_mut() {
+            obj.insert("status".to_string(), json!({ "attached": attached }));
+        }
+        self.client
+            .replace_cluster_object(
+                "storage.k8s.io",
+                "VolumeAttachment",
+                "volumeattachments",
+                name,
+                doc,
+            )
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Delete a `VolumeAttachment` resource.
+    pub async fn delete_volume_attachment(&self, name: &str) -> Result<()> {
+        self.client
+            .delete_cluster_object("storage.k8s.io", "volumeattachments", name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Create a `VolumeAttributesClass` resource (Issue #503).
+    pub async fn create_volume_attributes_class(
+        &self,
+        name: &str,
+        driver_name: &str,
+        parameters: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
+        let doc = generate_volume_attributes_class(name, driver_name, parameters);
+        self.client
+            .create_cluster_object(
+                "storage.k8s.io",
+                "VolumeAttributesClass",
+                "volumeattributesclasses",
+                doc,
+            )
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Get a `VolumeAttributesClass` resource (Issue #503).
+    pub async fn get_volume_attributes_class(&self, name: &str) -> Result<Value> {
+        self.client
+            .get_cluster_object("storage.k8s.io", "volumeattributesclasses", name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Delete a `VolumeAttributesClass` resource (Issue #503).
+    pub async fn delete_volume_attributes_class(&self, name: &str) -> Result<()> {
+        self.client
+            .delete_cluster_object("storage.k8s.io", "volumeattributesclasses", name)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Update PVC status condition (Issue #456).
+    pub async fn update_pvc_condition(
+        &self,
+        namespace: &str,
+        name: &str,
+        condition_type: &str,
+        status: &str,
+        reason: &str,
+        message: &str,
+    ) -> Result<Value> {
+        let mut pvc = self
+            .client
+            .get_pvc(namespace, name)
+            .await
+            .map_err(StorageError::Apiserver)?;
+        let condition = json!({
+            "type": condition_type,
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "lastTransitionTime": now_rfc3339()
+        });
+        if let Some(obj) = pvc.as_object_mut() {
+            let status_obj = obj.entry("status".to_string()).or_insert_with(|| json!({}));
+            if let Some(s) = status_obj.as_object_mut() {
+                let conditions = s
+                    .entry("conditions".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = conditions.as_array_mut() {
+                    arr.retain(|c| c.get("type").and_then(Value::as_str) != Some(condition_type));
+                    arr.push(condition);
+                }
+            }
+        }
+        self.client
+            .update_pvc(namespace, name, pvc)
+            .await
+            .map_err(StorageError::Apiserver)
+    }
+
+    /// Update PV status phase and optional reason/message (Issue #456).
+    pub async fn update_pv_status_details(
+        &self,
+        name: &str,
+        phase: &str,
+        reason: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Value> {
+        let mut pv = self
+            .client
+            .get_pv(name)
+            .await
+            .map_err(StorageError::Apiserver)?;
+        if let Some(obj) = pv.as_object_mut() {
+            let status_obj = obj.entry("status".to_string()).or_insert_with(|| json!({}));
+            if let Some(status) = status_obj.as_object_mut() {
+                status.insert("phase".to_string(), json!(phase));
+                if let Some(r) = reason {
+                    status.insert("reason".to_string(), json!(r));
+                }
+                if let Some(m) = message {
+                    status.insert("message".to_string(), json!(m));
+                }
+            }
+        }
+        self.client
+            .update_pv(name, pv)
+            .await
+            .map_err(StorageError::Apiserver)
     }
 }
