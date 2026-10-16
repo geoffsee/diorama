@@ -7,6 +7,7 @@
 //! host-side volume staging used while preparing a pod.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -383,6 +384,48 @@ pub fn parse_memory_quantity_bytes(s: &str) -> Option<u64> {
         (r, 1_000_000_000u64)
     };
     num_str.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+/// Parses a CPU quantity from a JSON `Value` (string, integer, or float) into millicores.
+#[must_use]
+pub fn parse_cpu_quantity_from_value(v: &Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        parse_cpu_quantity_milli(s)
+    } else if let Some(n) = v.as_u64() {
+        n.checked_mul(1000)
+    } else if let Some(f) = v.as_f64() {
+        #[allow(clippy::cast_precision_loss)]
+        let max_f64 = (u64::MAX / 1000) as f64;
+        if f.is_sign_negative() || f.is_nan() || f.is_infinite() || f > max_f64 {
+            None
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let val = (f * 1000.0).round() as u64;
+            Some(val)
+        }
+    } else {
+        None
+    }
+}
+
+/// Parses a memory quantity from a JSON `Value` (string, integer, or float) into bytes.
+#[must_use]
+pub fn parse_memory_quantity_from_value(v: &Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        parse_memory_quantity_bytes(s)
+    } else if let Some(n) = v.as_u64() {
+        Some(n)
+    } else if let Some(f) = v.as_f64() {
+        if f.is_sign_negative() || f.is_nan() || f.is_infinite() {
+            None
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let val = f.round() as u64;
+            Some(val)
+        }
+    } else {
+        None
+    }
 }
 
 /// Determines the `QoS` class of a pod based on its container resource requirements.
@@ -779,18 +822,41 @@ pub struct WorkloadRestartReport {
 }
 
 pub(crate) fn safe_volume_path(vol_dir: &Path, rel: &str) -> Result<PathBuf, KubeletError> {
+    if rel.is_empty() || rel.contains('\0') || rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volume.items.path".into(),
+            reason: format!("invalid volume path '{rel}'"),
+        });
+    }
     let p = Path::new(rel);
-    if rel.is_empty()
-        || p.is_absolute()
-        || p.components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    if p.is_absolute()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+            )
+        })
     {
         return Err(KubeletError::InvalidConfiguration {
             field: "volume.items.path".into(),
             reason: format!("invalid volume path '{rel}'"),
         });
     }
-    Ok(vol_dir.join(p))
+    let mut clean = PathBuf::new();
+    for comp in p.components() {
+        if let std::path::Component::Normal(part) = comp {
+            clean.push(part);
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "volume.items.path".into(),
+            reason: format!("invalid volume path '{rel}'"),
+        });
+    }
+    Ok(vol_dir.join(clean))
 }
 
 pub(crate) fn write_volume_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -799,20 +865,28 @@ pub(crate) fn write_volume_file(path: &Path, content: &[u8]) -> std::io::Result<
     }
     // If the file already exists on disk and is read-only (e.g. 0400 from a previous sync pass),
     // opening it for writing with fs::write fails with PermissionDenied.
-    // Unlinking the existing file or temporarily making it writable ensures re-syncing succeeds.
+    // Temporarily setting writable permissions ensures re-syncing succeeds.
+    // In addition, regular files are truncated and overwritten in-place rather than unlinked
+    // so that existing open file descriptors and subpath mounts stay valid.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
         }
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            let _ = std::fs::remove_dir_all(path);
-        } else {
+        if meta.file_type().is_symlink() {
             let _ = std::fs::remove_file(path);
+        } else if meta.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
-    std::fs::write(path, content)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(content)?;
+    file.flush()
 }
 
 /// Applies a Kubernetes file `mode` (decimal, e.g. `420` for `0644`) to a staged file.
@@ -1171,11 +1245,13 @@ pub(crate) fn stage_projected_sa_token(
     let mut written = Vec::new();
     let token_path = safe_volume_path(vol_dir, rel_path)?;
     write_volume_file(&token_path, token_str.as_bytes())?;
+    chmod_volume_file(&token_path, volume_file_mode(Some(sa_tok), sa_tok));
     written.push(token_path);
 
     let ns_path = safe_volume_path(vol_dir, "namespace")?;
     if !ns_path.exists() {
         let _ = write_volume_file(&ns_path, namespace.as_bytes());
+        chmod_volume_file(&ns_path, 0o644);
     }
     written.push(ns_path);
 
@@ -1191,6 +1267,7 @@ pub(crate) fn stage_projected_sa_token(
             })
             .unwrap_or_else(|| b"mock-ca-cert".to_vec());
         let _ = write_volume_file(&ca_path, &ca_bytes);
+        chmod_volume_file(&ca_path, 0o644);
     }
     written.push(ca_path);
 
@@ -1278,6 +1355,11 @@ pub(crate) fn resolve_downward_field_path(
             if let Some(key) = other
                 .strip_prefix("metadata.labels['")
                 .and_then(|s| s.strip_suffix("']"))
+                .or_else(|| {
+                    other
+                        .strip_prefix("metadata.labels[\"")
+                        .and_then(|s| s.strip_suffix("\"]"))
+                })
             {
                 return Some(
                     pod.pointer("/metadata/labels")
@@ -1291,6 +1373,11 @@ pub(crate) fn resolve_downward_field_path(
             if let Some(key) = other
                 .strip_prefix("metadata.annotations['")
                 .and_then(|s| s.strip_suffix("']"))
+                .or_else(|| {
+                    other
+                        .strip_prefix("metadata.annotations[\"")
+                        .and_then(|s| s.strip_suffix("\"]"))
+                })
             {
                 return Some(
                     pod.pointer("/metadata/annotations")
@@ -1330,15 +1417,14 @@ pub(crate) fn resolve_downward_resource_field(
         containers.and_then(|arr| arr.first())
     };
     let resource = res_ref.get("resource").and_then(Value::as_str)?;
-    let divisor = res_ref.get("divisor").and_then(Value::as_str);
+    let divisor_val = res_ref.get("divisor");
 
     match resource {
         "limits.cpu" | "requests.cpu" => {
             let milli = if resource == "limits.cpu" {
                 container
                     .and_then(|c| c.pointer("/resources/limits/cpu"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_cpu_quantity_milli)
+                    .and_then(parse_cpu_quantity_from_value)
                     .unwrap_or(2000)
             } else {
                 container
@@ -1346,13 +1432,12 @@ pub(crate) fn resolve_downward_resource_field(
                         c.pointer("/resources/requests/cpu")
                             .or_else(|| c.pointer("/resources/limits/cpu"))
                     })
-                    .and_then(Value::as_str)
-                    .and_then(parse_cpu_quantity_milli)
+                    .and_then(parse_cpu_quantity_from_value)
                     .unwrap_or(0)
             };
-            let div = divisor
-                .filter(|d| !d.is_empty() && *d != "0")
-                .and_then(parse_cpu_quantity_milli)
+            let div = divisor_val
+                .and_then(parse_cpu_quantity_from_value)
+                .filter(|&d| d > 0)
                 .unwrap_or(1000)
                 .max(1);
             Some(milli.div_ceil(div).to_string())
@@ -1361,8 +1446,7 @@ pub(crate) fn resolve_downward_resource_field(
             let bytes = if resource == "limits.memory" {
                 container
                     .and_then(|c| c.pointer("/resources/limits/memory"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_memory_quantity_bytes)
+                    .and_then(parse_memory_quantity_from_value)
                     .unwrap_or(4 * 1024 * 1024 * 1024)
             } else {
                 container
@@ -1370,13 +1454,12 @@ pub(crate) fn resolve_downward_resource_field(
                         c.pointer("/resources/requests/memory")
                             .or_else(|| c.pointer("/resources/limits/memory"))
                     })
-                    .and_then(Value::as_str)
-                    .and_then(parse_memory_quantity_bytes)
+                    .and_then(parse_memory_quantity_from_value)
                     .unwrap_or(0)
             };
-            let div = divisor
-                .filter(|d| !d.is_empty() && *d != "0")
-                .and_then(parse_memory_quantity_bytes)
+            let div = divisor_val
+                .and_then(parse_memory_quantity_from_value)
+                .filter(|&d| d > 0)
                 .unwrap_or(1)
                 .max(1);
             Some(bytes.div_ceil(div).to_string())
@@ -1414,6 +1497,264 @@ pub(crate) fn stage_projected_downward_api(
         chmod_volume_file(&target, mode);
         written.push(target);
     }
+    Ok(written)
+}
+
+fn matches_label_selector(
+    labels: Option<&serde_json::Map<String, Value>>,
+    selector: Option<&Value>,
+) -> bool {
+    let Some(sel) = selector else {
+        return true;
+    };
+    if let Some(match_labels) = sel.get("matchLabels").and_then(Value::as_object) {
+        let Some(lbls) = labels else {
+            return false;
+        };
+        for (k, v) in match_labels {
+            let req_val = v.as_str().unwrap_or("");
+            let act_val = lbls.get(k).and_then(Value::as_str).unwrap_or("");
+            if act_val != req_val {
+                return false;
+            }
+        }
+    }
+    if let Some(exprs) = sel.get("matchExpressions").and_then(Value::as_array) {
+        let empty_map = serde_json::Map::new();
+        let lbls = labels.unwrap_or(&empty_map);
+        for expr in exprs {
+            let key = expr.get("key").and_then(Value::as_str).unwrap_or("");
+            let op = expr.get("operator").and_then(Value::as_str).unwrap_or("");
+            let values = expr.get("values").and_then(Value::as_array);
+            match op {
+                "In" => {
+                    let Some(v) = lbls.get(key).and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let in_set =
+                        values.is_some_and(|vals| vals.iter().any(|req| req.as_str() == Some(v)));
+                    if !in_set {
+                        return false;
+                    }
+                },
+                "NotIn" => {
+                    if let Some(v) = lbls.get(key).and_then(Value::as_str)
+                        && let Some(vals) = values
+                        && vals.iter().any(|req| req.as_str() == Some(v))
+                    {
+                        return false;
+                    }
+                },
+                "Exists" => {
+                    if !lbls.contains_key(key) {
+                        return false;
+                    }
+                },
+                "DoesNotExist" if lbls.contains_key(key) => {
+                    return false;
+                },
+                _ => {},
+            }
+        }
+    }
+    true
+}
+
+/// Stages projected `ClusterTrustBundle` files matching either `name` or `signerName`
+/// (with optional `labelSelector`), combining their PEM-encoded certificates into
+/// the destination relative path.
+pub fn stage_projected_clustertrustbundle(
+    vol_dir: &Path,
+    ctb_proj: &Value,
+    bundles: &[Value],
+    vol_spec: &Value,
+) -> Result<Vec<PathBuf>, KubeletError> {
+    let path = ctb_proj
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| KubeletError::InvalidConfiguration {
+            field: "clusterTrustBundle.path".to_string(),
+            reason: "clusterTrustBundle projection requires non-empty path".to_string(),
+        })?;
+
+    let optional = ctb_proj
+        .get("optional")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut matched: Vec<&Value> = Vec::new();
+
+    if let Some(name) = ctb_proj.get("name").and_then(Value::as_str) {
+        if let Some(bundle) = bundles
+            .iter()
+            .find(|b| b.pointer("/metadata/name").and_then(Value::as_str) == Some(name))
+        {
+            matched.push(bundle);
+        } else if !optional {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "clusterTrustBundle.name".to_string(),
+                reason: format!("ClusterTrustBundle '{name}' not found"),
+            });
+        }
+    } else if let Some(signer_name) = ctb_proj.get("signerName").and_then(Value::as_str) {
+        let selector = ctb_proj.get("labelSelector");
+        for bundle in bundles {
+            let b_signer = bundle.pointer("/spec/signerName").and_then(Value::as_str);
+            if b_signer == Some(signer_name) {
+                let b_labels = bundle
+                    .pointer("/metadata/labels")
+                    .and_then(Value::as_object);
+                if matches_label_selector(b_labels, selector) {
+                    matched.push(bundle);
+                }
+            }
+        }
+        if matched.is_empty() && !optional {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "clusterTrustBundle.signerName".to_string(),
+                reason: format!("no ClusterTrustBundle matching signerName '{signer_name}' found"),
+            });
+        }
+    } else if !optional {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "clusterTrustBundle".to_string(),
+            reason: "either name or signerName must be specified".to_string(),
+        });
+    }
+
+    if matched.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Sort bundles deterministically by name
+    matched.sort_by_key(|b| {
+        b.pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    });
+
+    let mut combined_bundle = String::new();
+    for bundle in matched {
+        if let Some(tb) = bundle.pointer("/spec/trustBundle").and_then(Value::as_str) {
+            let trimmed = tb.trim();
+            if !trimmed.is_empty() {
+                combined_bundle.push_str(trimmed);
+                combined_bundle.push('\n');
+            }
+        }
+    }
+
+    let file_path = safe_volume_path(vol_dir, path)?;
+    write_volume_file(&file_path, combined_bundle.as_bytes())?;
+    let mode = volume_file_mode(Some(ctb_proj), vol_spec);
+    chmod_volume_file(&file_path, mode);
+
+    Ok(vec![file_path])
+}
+
+/// Materializes a complete projected volume, combining any mix of `secret`, `configMap`,
+/// `downwardAPI`, `serviceAccountToken`, and `clusterTrustBundle` sources, applying
+/// the volume-level `defaultMode` and per-item `mode` accurately, and pruning any stale files.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_projected_volume(
+    vol_dir: &Path,
+    namespace: &str,
+    pod: &Value,
+    proj_spec: &Value,
+    configmaps: Option<&BTreeMap<String, Value>>,
+    secrets: Option<&BTreeMap<String, Value>>,
+    cluster_trust_bundles: Option<&[Value]>,
+    apiserver: Option<&Arc<ApiserverService>>,
+) -> Result<Vec<PathBuf>, KubeletError> {
+    std::fs::create_dir_all(vol_dir).map_err(KubeletError::Io)?;
+    let mut written = Vec::new();
+
+    let with_default_mode = |source_spec: &Value| -> Value {
+        if source_spec.get("defaultMode").is_none()
+            && let Some(dm) = proj_spec.get("defaultMode")
+        {
+            let mut merged = source_spec.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert("defaultMode".to_string(), dm.clone());
+            }
+            merged
+        } else {
+            source_spec.clone()
+        }
+    };
+
+    let Some(sources) = proj_spec.get("sources").and_then(Value::as_array) else {
+        return Ok(written);
+    };
+
+    for source in sources {
+        if let Some(sa_tok) = source.get("serviceAccountToken") {
+            let effective = with_default_mode(sa_tok);
+            let paths = stage_projected_sa_token(vol_dir, namespace, pod, &effective, apiserver)?;
+            let mode = volume_file_mode(Some(sa_tok), proj_spec);
+            for p in &paths {
+                chmod_volume_file(p, mode);
+            }
+            written.extend(paths);
+        }
+
+        if let Some(cm) = source.get("configMap") {
+            let cm_name = cm.get("name").and_then(Value::as_str).unwrap_or("");
+            let optional = cm.get("optional").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(cm_obj) = configmaps.and_then(|m| m.get(cm_name)) {
+                let effective = with_default_mode(cm);
+                written.extend(stage_configmap_files(vol_dir, &effective, cm_obj)?);
+            } else if !optional {
+                return Err(KubeletError::InvalidConfiguration {
+                    field: "projected.sources.configMap".to_string(),
+                    reason: format!("configMap '{cm_name}' not found"),
+                });
+            }
+        }
+
+        if let Some(sec) = source.get("secret") {
+            let sec_name = sec
+                .get("name")
+                .or_else(|| sec.get("secretName"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let optional = sec
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(sec_obj) = secrets.and_then(|m| m.get(sec_name)) {
+                let effective = with_default_mode(sec);
+                written.extend(stage_secret_files(vol_dir, &effective, sec_obj)?);
+            } else if !optional {
+                return Err(KubeletError::InvalidConfiguration {
+                    field: "projected.sources.secret".to_string(),
+                    reason: format!("secret '{sec_name}' not found"),
+                });
+            }
+        }
+
+        if let Some(dw) = source.get("downwardAPI")
+            && let Some(items) = dw.get("items").and_then(Value::as_array)
+        {
+            let effective = with_default_mode(dw);
+            written.extend(stage_projected_downward_api(
+                vol_dir, namespace, pod, items, &effective,
+            )?);
+        }
+
+        if let Some(ctb) = source.get("clusterTrustBundle") {
+            let effective = with_default_mode(ctb);
+            let ctbs = cluster_trust_bundles.unwrap_or(&[]);
+            written.extend(stage_projected_clustertrustbundle(
+                vol_dir, &effective, ctbs, &effective,
+            )?);
+        }
+    }
+
+    let written_set: std::collections::HashSet<PathBuf> = written.iter().cloned().collect();
+    prune_stale_volume_files(vol_dir, &written_set);
+
     Ok(written)
 }
 
@@ -1754,7 +2095,7 @@ pub fn prepare_subpath_target(vol_dir: &Path, sub_path: &str) -> Result<PathBuf,
     if sub_path.is_empty() {
         return Ok(vol_dir.to_path_buf());
     }
-    let target = vol_dir.join(sub_path);
+    let target = safe_volume_path(vol_dir, sub_path)?;
 
     // If target exists as a symlink (stale or broken), remove it so recovery can create the real path.
     if let Ok(meta) = std::fs::symlink_metadata(&target)
@@ -1769,6 +2110,30 @@ pub fn prepare_subpath_target(vol_dir: &Path, sub_path: &str) -> Result<PathBuf,
     }
 
     Ok(target)
+}
+
+/// Resolves a subPath within an atomic writer volume directory (`ConfigMap`, `Secret`,
+/// `DownwardAPI`, `Projected`), ensuring single-file and nested-key subPaths resolve
+/// cleanly and are verified safe against path traversal.
+pub fn resolve_atomic_writer_subpath(
+    vol_dir: &Path,
+    sub_path: &str,
+) -> Result<PathBuf, KubeletError> {
+    validate_sub_path(sub_path)?;
+    if sub_path.is_empty() {
+        return Ok(vol_dir.to_path_buf());
+    }
+    safe_volume_path(vol_dir, sub_path)
+}
+
+/// Expands `sub_path_expr` against `envs` and resolves the atomic writer subPath.
+pub fn resolve_atomic_writer_subpath_expr(
+    vol_dir: &Path,
+    sub_path_expr: &str,
+    envs: &[cri::KeyValue],
+) -> Result<PathBuf, KubeletError> {
+    let sub_path = expand_subpath_expr(sub_path_expr, envs)?;
+    resolve_atomic_writer_subpath(vol_dir, &sub_path)
 }
 
 /// Expands `sub_path_expr` against `envs`, validates the resulting path,
@@ -2183,5 +2548,619 @@ mod tests {
             expanded,
             "my-worker-pod/from_cm_dir/from_secret_dir/cpu-2/data"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_projected_combined_all_components_458() {
+        use std::collections::BTreeMap;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("diorama-proj-combined-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pod = json!({
+            "metadata": {
+                "name": "combined-proj-pod",
+                "namespace": "test-ns",
+                "uid": "uid-458-test",
+                "labels": {
+                    "tier": "backend",
+                    "app": "processor"
+                },
+                "annotations": {
+                    "team": "core-infra",
+                    "version": "v1.2.3"
+                }
+            },
+            "spec": {
+                "serviceAccountName": "worker-sa",
+                "containers": [
+                    {
+                        "name": "worker",
+                        "resources": {
+                            "limits": {
+                                "cpu": "500m",
+                                "memory": "128Mi"
+                            },
+                            "requests": {
+                                "cpu": "250m",
+                                "memory": "64Mi"
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let mut configmaps = BTreeMap::new();
+        configmaps.insert(
+            "app-config".to_string(),
+            json!({
+                "data": {
+                    "database.url": "postgres://localhost:5432/app",
+                    "nested/key.conf": "setting=enabled"
+                },
+                "binaryData": {
+                    "cert.bin": diorama_pki::base64_encode(b"binary-cert-payload")
+                }
+            }),
+        );
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            "app-secret".to_string(),
+            json!({
+                "data": {
+                    "api.key": diorama_pki::base64_encode(b"secret-api-token-999")
+                },
+                "stringData": {
+                    "nested/secret.txt": "raw-secret-data"
+                }
+            }),
+        );
+
+        // Create 110 ClusterTrustBundles for Issue #221 & #458
+        let mut ctbs = Vec::new();
+        for i in 1..=110 {
+            ctbs.push(json!({
+                "apiVersion": "certificates.k8s.io/v1alpha1",
+                "kind": "ClusterTrustBundle",
+                "metadata": {
+                    "name": format!("ctb-{i:03}"),
+                    "labels": { "domain": "corp" }
+                },
+                "spec": {
+                    "signerName": "example.com/corp-ca",
+                    "trustBundle": format!("-----BEGIN CERTIFICATE-----\nCERT_PEM_BLOCK_{i:03}\n-----END CERTIFICATE-----\n")
+                }
+            }));
+        }
+
+        // Projected volume spec combining Secret, ConfigMap, DownwardAPI,
+        // ServiceAccountToken, and ClusterTrustBundle
+        let proj_spec = json!({
+            "defaultMode": 416, // 0o640
+            "sources": [
+                {
+                    "secret": {
+                        "name": "app-secret",
+                        "defaultMode": 384 // 0o600
+                    }
+                },
+                {
+                    "configMap": {
+                        "name": "app-config",
+                        "items": [
+                            { "key": "database.url", "path": "db.url", "mode": 256 }, // 0o400
+                            { "key": "nested/key.conf", "path": "nested/app.conf" },
+                            { "key": "cert.bin", "path": "cert.bin" }
+                        ]
+                    }
+                },
+                {
+                    "downwardAPI": {
+                        "items": [
+                            { "path": "pod-name", "fieldRef": { "fieldPath": "metadata.name" } },
+                            { "path": "pod-labels", "fieldRef": { "fieldPath": "metadata.labels" } },
+                            { "path": "pod-annotations", "fieldRef": { "fieldPath": "metadata.annotations" } },
+                            { "path": "label-tier", "fieldRef": { "fieldPath": "metadata.labels['tier']" } },
+                            { "path": "annot-team", "fieldRef": { "fieldPath": "metadata.annotations[\"team\"]" } },
+                            { "path": "cpu-limit-milli", "resourceFieldRef": { "resource": "limits.cpu", "divisor": "1m" } },
+                            { "path": "cpu-limit-cores", "resourceFieldRef": { "resource": "limits.cpu", "divisor": "1" } },
+                            { "path": "cpu-req-milli", "resourceFieldRef": { "resource": "requests.cpu", "divisor": "1m" } },
+                            { "path": "mem-limit-mb", "resourceFieldRef": { "resource": "limits.memory", "divisor": "1Mi" } },
+                            { "path": "mem-limit-bytes", "resourceFieldRef": { "resource": "limits.memory", "divisor": "1" } },
+                            { "path": "mem-req-mb", "resourceFieldRef": { "resource": "requests.memory", "divisor": "1Mi" } },
+                            { "path": "custom-mode-field", "fieldRef": { "fieldPath": "metadata.name" }, "mode": 292 } // 0o444
+                        ]
+                    }
+                },
+                {
+                    "serviceAccountToken": {
+                        "path": "tokens/sa.jwt",
+                        "audience": "vault-api",
+                        "expirationSeconds": 3600
+                    }
+                },
+                {
+                    "clusterTrustBundle": {
+                        "signerName": "example.com/corp-ca",
+                        "labelSelector": { "matchLabels": { "domain": "corp" } },
+                        "path": "pki/combined-ca-bundle.pem"
+                    }
+                }
+            ]
+        });
+
+        let written = super::stage_projected_volume(
+            &dir,
+            "test-ns",
+            &pod,
+            &proj_spec,
+            Some(&configmaps),
+            Some(&secrets),
+            Some(&ctbs),
+            None,
+        )
+        .expect("staging combined projected volume must succeed");
+
+        assert_ne!(written.len(), 0);
+
+        // 1. Verify Secret files
+        let sec_key_path = dir.join("api.key");
+        assert_eq!(
+            std::fs::read_to_string(&sec_key_path).unwrap(),
+            "secret-api-token-999"
+        );
+        let sec_nested_path = dir.join("nested/secret.txt");
+        assert_eq!(
+            std::fs::read_to_string(&sec_nested_path).unwrap(),
+            "raw-secret-data"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&sec_key_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&sec_nested_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        // 2. Verify ConfigMap files
+        let cm_db_path = dir.join("db.url");
+        assert_eq!(
+            std::fs::read_to_string(&cm_db_path).unwrap(),
+            "postgres://localhost:5432/app"
+        );
+        let cm_nested_path = dir.join("nested/app.conf");
+        assert_eq!(
+            std::fs::read_to_string(&cm_nested_path).unwrap(),
+            "setting=enabled"
+        );
+        let cm_bin_path = dir.join("cert.bin");
+        assert_eq!(std::fs::read(&cm_bin_path).unwrap(), b"binary-cert-payload");
+        #[cfg(unix)]
+        {
+            // Per-item mode was 0o400
+            assert_eq!(
+                std::fs::metadata(&cm_db_path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            // Inherits projected defaultMode 0o640
+            assert_eq!(
+                std::fs::metadata(&cm_nested_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+
+        // 3. Verify DownwardAPI files
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pod-name")).unwrap(),
+            "combined-proj-pod"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("label-tier")).unwrap(),
+            "backend"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("annot-team")).unwrap(),
+            "core-infra"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu-limit-milli")).unwrap(),
+            "500"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu-limit-cores")).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu-req-milli")).unwrap(),
+            "250"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mem-limit-mb")).unwrap(),
+            "128"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mem-limit-bytes")).unwrap(),
+            "134217728"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mem-req-mb")).unwrap(),
+            "64"
+        );
+
+        let custom_field = dir.join("custom-mode-field");
+        assert_eq!(
+            std::fs::read_to_string(&custom_field).unwrap(),
+            "combined-proj-pod"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&custom_field)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+            assert_eq!(
+                std::fs::metadata(dir.join("pod-name"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+
+        // 4. Verify ServiceAccount token files
+        let sa_token_path = dir.join("tokens/sa.jwt");
+        assert!(sa_token_path.exists());
+        let token_text = std::fs::read_to_string(&sa_token_path).unwrap();
+        assert!(token_text.contains("mock-token-test-ns-worker-sa"));
+
+        // 5. Verify ClusterTrustBundle with >100 bundles
+        let ctb_bundle_path = dir.join("pki/combined-ca-bundle.pem");
+        assert!(ctb_bundle_path.exists());
+        let ctb_content = std::fs::read_to_string(&ctb_bundle_path).unwrap();
+        let cert_count = ctb_content.matches("-----BEGIN CERTIFICATE-----").count();
+        assert_eq!(
+            cert_count, 110,
+            "all 110 ClusterTrustBundles must be concatenated"
+        );
+        assert!(ctb_content.contains("CERT_PEM_BLOCK_001"));
+        assert!(ctb_content.contains("CERT_PEM_BLOCK_110"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clustertrustbundle_over_100_bundles_and_filtering_221() {
+        let dir = std::env::temp_dir().join(format!("diorama-ctb-100-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut ctbs = Vec::new();
+        // 115 matching bundles: signer "prod-signer", label "env=prod"
+        for i in 1..=115 {
+            ctbs.push(json!({
+                "metadata": {
+                    "name": format!("prod-bundle-{i:03}"),
+                    "labels": { "env": "prod", "zone": "us-east" }
+                },
+                "spec": {
+                    "signerName": "prod-signer",
+                    "trustBundle": format!("-----BEGIN CERTIFICATE-----\nPROD_CA_{i:03}\n-----END CERTIFICATE-----\n")
+                }
+            }));
+        }
+        // 10 non-matching label bundles: signer "prod-signer", label "env=dev"
+        for i in 1..=10 {
+            ctbs.push(json!({
+                "metadata": {
+                    "name": format!("dev-bundle-{i:03}"),
+                    "labels": { "env": "dev" }
+                },
+                "spec": {
+                    "signerName": "prod-signer",
+                    "trustBundle": format!("-----BEGIN CERTIFICATE-----\nDEV_CA_{i:03}\n-----END CERTIFICATE-----\n")
+                }
+            }));
+        }
+        // 5 non-matching signer bundles: signer "other-signer"
+        for i in 1..=5 {
+            ctbs.push(json!({
+                "metadata": {
+                    "name": format!("other-bundle-{i:03}"),
+                    "labels": { "env": "prod" }
+                },
+                "spec": {
+                    "signerName": "other-signer",
+                    "trustBundle": format!("-----BEGIN CERTIFICATE-----\nOTHER_CA_{i:03}\n-----END CERTIFICATE-----\n")
+                }
+            }));
+        }
+
+        let vol_spec = json!({ "defaultMode": 420 });
+
+        // Test 1: >100 bundles matched by signerName + labelSelector
+        let ctb_proj = json!({
+            "signerName": "prod-signer",
+            "labelSelector": { "matchLabels": { "env": "prod" } },
+            "path": "certs/prod-ca.crt"
+        });
+
+        let written = super::stage_projected_clustertrustbundle(&dir, &ctb_proj, &ctbs, &vol_spec)
+            .expect("staging >100 CTBs must succeed");
+        assert_eq!(written.len(), 1);
+        let content = std::fs::read_to_string(&written[0]).unwrap();
+        assert_eq!(content.matches("-----BEGIN CERTIFICATE-----").count(), 115);
+        assert!(content.contains("PROD_CA_001"));
+        assert!(content.contains("PROD_CA_115"));
+        assert!(!content.contains("DEV_CA"));
+        assert!(!content.contains("OTHER_CA"));
+
+        // Test 2: Match by exact name
+        let ctb_by_name = json!({
+            "name": "dev-bundle-005",
+            "path": "certs/single-dev.crt"
+        });
+        let written2 =
+            super::stage_projected_clustertrustbundle(&dir, &ctb_by_name, &ctbs, &vol_spec)
+                .expect("staging single CTB by name must succeed");
+        assert_eq!(written2.len(), 1);
+        let content2 = std::fs::read_to_string(&written2[0]).unwrap();
+        assert_eq!(content2.matches("-----BEGIN CERTIFICATE-----").count(), 1);
+        assert!(content2.contains("DEV_CA_005"));
+
+        // Test 3: Optional matching nothing
+        let ctb_opt_none = json!({
+            "signerName": "non-existent-signer",
+            "path": "certs/opt.crt",
+            "optional": true
+        });
+        let written3 =
+            super::stage_projected_clustertrustbundle(&dir, &ctb_opt_none, &ctbs, &vol_spec)
+                .expect("optional CTB should not fail when nothing matches");
+        assert_eq!(written3.len(), 0);
+
+        // Test 4: Non-optional matching nothing -> error
+        let ctb_req_none = json!({
+            "signerName": "non-existent-signer",
+            "path": "certs/req.crt",
+            "optional": false
+        });
+        let err4 = super::stage_projected_clustertrustbundle(&dir, &ctb_req_none, &ctbs, &vol_spec);
+        assert!(err4.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_subpath_atomic_writer_configmap_fd_preservation_496() {
+        use std::io::{Read, Seek, SeekFrom};
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("diorama-subpath-fd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cm_spec = json!({ "defaultMode": 256 }); // 0o400 read-only!
+
+        let cm_obj_v1 = json!({
+            "data": {
+                "server.conf": "port=8080\nworkers=4",
+                "nested/db.properties": "host=db-master\npool=10"
+            }
+        });
+
+        // Step 1: Initial stage
+        let files1 = super::stage_configmap_files(&dir, &cm_spec, &cm_obj_v1)
+            .expect("initial stage must succeed");
+        assert_eq!(files1.len(), 2);
+
+        // Step 2: Resolve subpaths (both direct and via subPathExpr)
+        let subpath_direct = super::resolve_atomic_writer_subpath(&dir, "server.conf").unwrap();
+        assert_eq!(subpath_direct, dir.join("server.conf"));
+        assert!(subpath_direct.is_file());
+
+        let envs = vec![
+            super::cri::KeyValue {
+                key: "SUB_DIR".to_string(),
+                value: b"nested".to_vec(),
+            },
+            super::cri::KeyValue {
+                key: "FILE_NAME".to_string(),
+                value: b"db.properties".to_vec(),
+            },
+        ];
+        let subpath_expr =
+            super::resolve_atomic_writer_subpath_expr(&dir, "$(SUB_DIR)/$(FILE_NAME)", &envs)
+                .unwrap();
+        assert_eq!(subpath_expr, dir.join("nested/db.properties"));
+        assert!(subpath_expr.is_file());
+
+        // Step 3: Open file descriptors to the subpath mounted files
+        let mut fd_server = std::fs::File::open(&subpath_direct).expect("open server.conf");
+        let mut fd_nested = std::fs::File::open(&subpath_expr).expect("open nested db.properties");
+
+        #[cfg(unix)]
+        let (ino_server_before, ino_nested_before) = (
+            fd_server.metadata().unwrap().ino(),
+            fd_nested.metadata().unwrap().ino(),
+        );
+
+        let mut buf1 = String::new();
+        fd_server.read_to_string(&mut buf1).unwrap();
+        assert_eq!(buf1, "port=8080\nworkers=4");
+
+        let mut buf2 = String::new();
+        fd_nested.read_to_string(&mut buf2).unwrap();
+        assert_eq!(buf2, "host=db-master\npool=10");
+
+        // Step 4: ConfigMap is updated while files are 0o400 on disk and file descriptors are held open
+        let cm_obj_v2 = json!({
+            "data": {
+                "server.conf": "port=9090\nworkers=8\nssl=enabled",
+                "nested/db.properties": "host=db-primary-v2\npool=20"
+            }
+        });
+
+        let files2 = super::stage_configmap_files(&dir, &cm_spec, &cm_obj_v2)
+            .expect("re-sync with open file descriptors and 0400 modes must succeed");
+        assert_eq!(files2.len(), 2);
+
+        // Step 5: Verify that inodes did NOT change (in-place truncate, no unlinking)
+        #[cfg(unix)]
+        {
+            let ino_server_after = std::fs::metadata(&subpath_direct).unwrap().ino();
+            let ino_nested_after = std::fs::metadata(&subpath_expr).unwrap().ino();
+            assert_eq!(
+                ino_server_before, ino_server_after,
+                "server.conf inode must be preserved"
+            );
+            assert_eq!(
+                ino_nested_before, ino_nested_after,
+                "nested db.properties inode must be preserved"
+            );
+        }
+
+        // Step 6: Verify that the open file descriptors read the updated contents
+        fd_server.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf1_updated = String::new();
+        fd_server.read_to_string(&mut buf1_updated).unwrap();
+        assert_eq!(buf1_updated, "port=9090\nworkers=8\nssl=enabled");
+
+        fd_nested.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf2_updated = String::new();
+        fd_nested.read_to_string(&mut buf2_updated).unwrap();
+        assert_eq!(buf2_updated, "host=db-primary-v2\npool=20");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_subpath_atomic_writer_secret_and_downward_and_projected_496() {
+        use std::io::{Read, Seek, SeekFrom};
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("diorama-subpath-sec-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Secret volume with single-file and nested subpath
+        let sec_spec = json!({ "defaultMode": 384 }); // 0o600
+        let sec_v1 = json!({
+            "stringData": {
+                "auth-token": "token-xyz-123",
+                "nested/tls.key": "private-key-v1"
+            }
+        });
+
+        super::stage_secret_files(&dir, &sec_spec, &sec_v1).unwrap();
+        let auth_path = super::resolve_atomic_writer_subpath(&dir, "auth-token").unwrap();
+        let mut fd_auth = std::fs::File::open(&auth_path).unwrap();
+
+        #[cfg(unix)]
+        let ino_auth_before = fd_auth.metadata().unwrap().ino();
+
+        let sec_v2 = json!({
+            "stringData": {
+                "auth-token": "token-xyz-456-rotated",
+                "nested/tls.key": "private-key-v2"
+            }
+        });
+        super::stage_secret_files(&dir, &sec_spec, &sec_v2).unwrap();
+
+        #[cfg(unix)]
+        {
+            let ino_auth_after = std::fs::metadata(&auth_path).unwrap().ino();
+            assert_eq!(ino_auth_before, ino_auth_after);
+        }
+
+        fd_auth.seek(SeekFrom::Start(0)).unwrap();
+        let mut auth_content = String::new();
+        fd_auth.read_to_string(&mut auth_content).unwrap();
+        assert_eq!(auth_content, "token-xyz-456-rotated");
+
+        // 2. DownwardAPI volume subpath with pod metadata update
+        let pod_v1 = json!({
+            "metadata": {
+                "name": "worker-v1",
+                "namespace": "default"
+            }
+        });
+        let dw_items = json!([
+            { "path": "metadata/name", "fieldRef": { "fieldPath": "metadata.name" } }
+        ]);
+        let dw_spec = json!({ "defaultMode": 420 });
+
+        super::stage_projected_downward_api(
+            &dir,
+            "default",
+            &pod_v1,
+            dw_items.as_array().unwrap(),
+            &dw_spec,
+        )
+        .unwrap();
+
+        let name_path = super::resolve_atomic_writer_subpath(&dir, "metadata/name").unwrap();
+        let mut fd_name = std::fs::File::open(&name_path).unwrap();
+        #[cfg(unix)]
+        let ino_name_before = fd_name.metadata().unwrap().ino();
+
+        let pod_v2 = json!({
+            "metadata": {
+                "name": "worker-v2",
+                "namespace": "default"
+            }
+        });
+        super::stage_projected_downward_api(
+            &dir,
+            "default",
+            &pod_v2,
+            dw_items.as_array().unwrap(),
+            &dw_spec,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            let ino_name_after = std::fs::metadata(&name_path).unwrap().ino();
+            assert_eq!(ino_name_before, ino_name_after);
+        }
+
+        fd_name.seek(SeekFrom::Start(0)).unwrap();
+        let mut name_content = String::new();
+        fd_name.read_to_string(&mut name_content).unwrap();
+        assert_eq!(name_content, "worker-v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
