@@ -10,7 +10,7 @@ autotests = false
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
 prost = "=0.14.4"
 diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
-tokio = { version = "=1.53.1", features = ["rt", "macros", "sync", "time", "net"] }
+tokio = { version = "=1.54.1", features = ["rt", "macros", "sync", "time", "net"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "transport"] }
 tonic-prost = "=0.14.6"
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
@@ -18,7 +18,7 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 [dev-dependencies]
 h2 = "=0.4.19"
 tempfile = "3.8"
-tokio = { version = "=1.53.1", features = ["test-util"] }
+tokio = { version = "=1.54.1", features = ["test-util"] }
 
 [lints]
 workspace = true
