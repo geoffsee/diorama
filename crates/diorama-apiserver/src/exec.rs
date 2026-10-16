@@ -24,6 +24,13 @@ pub const CHANNEL_STDIN: u8 = 0;
 pub const CHANNEL_STDOUT: u8 = 1;
 pub const CHANNEL_STDERR: u8 = 2;
 pub const CHANNEL_ERROR: u8 = 3;
+pub const CHANNEL_RESIZE: u8 = 4;
+
+pub const SUBPROTOCOL_V4: &str = "v4.channel.k8s.io";
+pub const SUBPROTOCOL_V3: &str = "v3.channel.k8s.io";
+pub const SUBPROTOCOL_V2: &str = "v2.channel.k8s.io";
+pub const SUBPROTOCOL_V1: &str = "v1.channel.k8s.io";
+pub const SUBPROTOCOL_PORTFORWARD: &str = "portforward.k8s.io";
 
 /// Captured output of one synchronous container exec.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,13 +138,14 @@ pub fn select_subprotocol(header: Option<&str>) -> Option<String> {
         .filter(|part| !part.is_empty())
         .collect();
     for wanted in [
-        "v4.channel.k8s.io",
-        "v3.channel.k8s.io",
-        "v2.channel.k8s.io",
-        "v1.channel.k8s.io",
+        SUBPROTOCOL_V4,
+        SUBPROTOCOL_V3,
+        SUBPROTOCOL_V2,
+        SUBPROTOCOL_V1,
+        SUBPROTOCOL_PORTFORWARD,
     ] {
         if offered.iter().any(|o| o == wanted) {
-            return Some(wanted.to_string());
+            return Some((*wanted).to_string());
         }
     }
     offered.into_iter().next()
@@ -159,12 +167,161 @@ pub fn exit_status(exit_code: i32) -> Value {
             "metadata": {},
             "status": "Failure",
             "message": format!("command terminated with exit code {exit_code}"),
-            "reason": "NonZeroExitCode"
+            "reason": "NonZeroExitCode",
+            "details": {
+                "causes": [
+                    {
+                        "reason": "ExitCode",
+                        "message": exit_code.to_string()
+                    }
+                ]
+            }
         })
     }
 }
 
-fn channel_message(channel: u8, payload: &[u8]) -> Message {
+/// Encapsulates terminal dimensions received on `CHANNEL_RESIZE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Parses a resize payload sent by clients on channel 4.
+pub fn parse_terminal_size(payload: &[u8]) -> Result<TerminalSize, ApiserverError> {
+    #[derive(serde::Deserialize)]
+    struct ResizeMsg {
+        #[serde(rename = "Width")]
+        width: u16,
+        #[serde(rename = "Height")]
+        height: u16,
+    }
+    let msg: ResizeMsg =
+        serde_json::from_slice(payload).map_err(|err| ApiserverError::BadRequest {
+            message: format!("invalid resize payload: {err}"),
+        })?;
+    Ok(TerminalSize {
+        width: msg.width,
+        height: msg.height,
+    })
+}
+
+/// Decoded query options for pod `attach`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodAttachOptions {
+    pub container: Option<String>,
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
+}
+
+impl PodAttachOptions {
+    /// Parses query parameters: `container`, `stdin`, `stdout`, `stderr`, `tty`.
+    pub fn from_query(query: Option<&str>) -> Self {
+        let pairs = crate::http::query::parse_pairs(query);
+        let mut options = Self {
+            container: None,
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+        };
+        for (key, value) in pairs {
+            match key.as_str() {
+                "container" => options.container = Some(value),
+                "stdin" => options.stdin = is_truthy(&value),
+                "stdout" => options.stdout = is_truthy(&value),
+                "stderr" => options.stderr = is_truthy(&value),
+                "tty" => options.tty = is_truthy(&value),
+                _ => {},
+            }
+        }
+        options
+    }
+
+    /// Resolves the targeted container in the pod.
+    pub fn resolve_container(&self, pod: &Value) -> Result<String, ApiserverError> {
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(wanted) = self.container.as_deref().filter(|c| !c.is_empty()) {
+            if containers
+                .iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(wanted))
+            {
+                return Ok(wanted.to_string());
+            }
+            return Err(ApiserverError::BadRequest {
+                message: format!("container {wanted} is not in the pod spec"),
+            });
+        }
+        containers
+            .first()
+            .and_then(|c| c.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ApiserverError::BadRequest {
+                message: "pod has no containers to attach to".to_string(),
+            })
+    }
+}
+
+/// Decoded query options for pod `portforward`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodPortForwardOptions {
+    pub ports: Vec<u16>,
+}
+
+impl PodPortForwardOptions {
+    /// Parses ports from query parameters (e.g. `ports=80,443` or repeated `ports=80&ports=443`).
+    pub fn from_query(query: Option<&str>) -> Result<Self, ApiserverError> {
+        let pairs = crate::http::query::parse_pairs(query);
+        let mut ports = Vec::new();
+        for (key, value) in pairs {
+            if key != "ports" && key != "port" {
+                continue;
+            }
+            for p_str in value.split(',') {
+                let trimmed = p_str.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let port = trimmed
+                    .parse::<u16>()
+                    .map_err(|_| ApiserverError::BadRequest {
+                        message: format!("invalid port number: {trimmed}"),
+                    })?;
+                ports.push(port);
+            }
+        }
+        Ok(Self { ports })
+    }
+
+    /// Calculates data channel ID for a given port index (even numbers: 0, 2, 4, ...).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn data_channel(port_index: usize) -> u8 {
+        (port_index * 2) as u8
+    }
+
+    /// Calculates error channel ID for a given port index (odd numbers: 1, 3, 5, ...).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn error_channel(port_index: usize) -> u8 {
+        (port_index * 2 + 1) as u8
+    }
+}
+
+/// Frames a port-forward data packet with channel byte prefix.
+pub fn frame_portforward_data(channel: u8, data: &[u8]) -> Message {
+    channel_message(channel, data)
+}
+
+pub fn channel_message(channel: u8, payload: &[u8]) -> Message {
     let mut framed = Vec::with_capacity(payload.len() + 1);
     framed.push(channel);
     framed.extend_from_slice(payload);
@@ -294,6 +451,60 @@ mod tests {
         let failed = exit_status(3);
         assert_eq!(failed["status"], "Failure");
         assert_eq!(failed["reason"], "NonZeroExitCode");
+        assert_eq!(failed["details"]["causes"][0]["reason"], "ExitCode");
+        assert_eq!(failed["details"]["causes"][0]["message"], "3");
+    }
+
+    #[test]
+    fn test_select_portforward_subprotocol() {
+        assert_eq!(
+            select_subprotocol(Some("portforward.k8s.io")).as_deref(),
+            Some("portforward.k8s.io")
+        );
+    }
+
+    #[test]
+    fn test_parse_terminal_size() {
+        let payload = br#"{"Width": 120, "Height": 40}"#;
+        let size = super::parse_terminal_size(payload).unwrap();
+        assert_eq!(size.width, 120);
+        assert_eq!(size.height, 40);
+        assert!(super::parse_terminal_size(b"invalid").is_err());
+    }
+
+    #[test]
+    fn test_pod_attach_options_and_resolve() {
+        let options = super::PodAttachOptions::from_query(Some("container=app&stdin=1&tty=1"));
+        assert_eq!(options.container.as_deref(), Some("app"));
+        assert!(options.stdin);
+        assert!(options.tty);
+
+        let pod = json!({
+            "spec": { "containers": [{ "name": "app" }, { "name": "sidecar" }] }
+        });
+        assert_eq!(options.resolve_container(&pod).unwrap(), "app");
+
+        let default_opt = super::PodAttachOptions::from_query(None);
+        assert_eq!(default_opt.resolve_container(&pod).unwrap(), "app");
+    }
+
+    #[test]
+    fn test_pod_port_forward_options_and_channels() {
+        let options =
+            super::PodPortForwardOptions::from_query(Some("ports=80,443&port=8080")).unwrap();
+        assert_eq!(options.ports, vec![80, 443, 8080]);
+        assert_eq!(super::PodPortForwardOptions::data_channel(0), 0);
+        assert_eq!(super::PodPortForwardOptions::error_channel(0), 1);
+        assert_eq!(super::PodPortForwardOptions::data_channel(1), 2);
+        assert_eq!(super::PodPortForwardOptions::error_channel(1), 3);
+        assert_eq!(super::PodPortForwardOptions::data_channel(2), 4);
+        assert_eq!(super::PodPortForwardOptions::error_channel(2), 5);
+
+        let msg = super::frame_portforward_data(0, b"data");
+        let tokio_tungstenite::tungstenite::Message::Binary(data) = msg else {
+            panic!("expected binary message");
+        };
+        assert_eq!(data.as_ref(), b"\x00data");
     }
 
     #[derive(Debug)]
