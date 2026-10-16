@@ -1,7 +1,8 @@
 #![allow(
     clippy::struct_excessive_bools,
     clippy::cast_possible_truncation,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::too_many_lines
 )]
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -16,6 +17,7 @@ pub enum DnsRecordType {
     CNAME = 5,
     PTR = 12,
     AAAA = 28,
+    SRV = 33,
     Other(u16),
 }
 
@@ -27,6 +29,7 @@ impl DnsRecordType {
             5 => Self::CNAME,
             12 => Self::PTR,
             28 => Self::AAAA,
+            33 => Self::SRV,
             other => Self::Other(other),
         }
     }
@@ -38,6 +41,7 @@ impl DnsRecordType {
             Self::CNAME => 5,
             Self::PTR => 12,
             Self::AAAA => 28,
+            Self::SRV => 33,
             Self::Other(val) => *val,
         }
     }
@@ -235,6 +239,12 @@ pub enum DnsRecordData {
     AAAA(Ipv6Addr),
     CNAME(String),
     PTR(String),
+    SRV {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: String,
+    },
     Raw(Vec<u8>),
 }
 
@@ -273,6 +283,21 @@ impl DnsAnswer {
             },
             DnsRecordData::PTR(target) => {
                 let mut data = Vec::new();
+                encode_domain_name(target, &mut data);
+                let len = data.len() as u16;
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(&data);
+            },
+            DnsRecordData::SRV {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
+                let mut data = Vec::new();
+                data.extend_from_slice(&priority.to_be_bytes());
+                data.extend_from_slice(&weight.to_be_bytes());
+                data.extend_from_slice(&port.to_be_bytes());
                 encode_domain_name(target, &mut data);
                 let len = data.len() as u16;
                 buf.extend_from_slice(&len.to_be_bytes());
@@ -409,6 +434,21 @@ impl DnsMessage {
                 DnsRecordType::PTR => {
                     let (ptr, _) = decode_domain_name(raw, cursor)?;
                     DnsRecordData::PTR(ptr)
+                },
+                DnsRecordType::SRV => {
+                    if rdlength < 6 {
+                        return Err(DnsError::Wire("invalid SRV record length".into()));
+                    }
+                    let priority = u16::from_be_bytes([rdata_bytes[0], rdata_bytes[1]]);
+                    let weight = u16::from_be_bytes([rdata_bytes[2], rdata_bytes[3]]);
+                    let port = u16::from_be_bytes([rdata_bytes[4], rdata_bytes[5]]);
+                    let (target, _) = decode_domain_name(raw, cursor + 6)?;
+                    DnsRecordData::SRV {
+                        priority,
+                        weight,
+                        port,
+                        target,
+                    }
                 },
                 DnsRecordType::Other(_) => DnsRecordData::Raw(rdata_bytes.to_vec()),
             };

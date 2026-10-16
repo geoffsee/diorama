@@ -173,6 +173,25 @@ impl LocalDnsServer {
             .push(DnsRecordData::PTR(normalize_domain(target)));
     }
 
+    /// Adds an SRV record for a service port.
+    pub async fn add_srv_record(
+        &self,
+        service_domain: &str,
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: &str,
+    ) {
+        let key = (normalize_domain(service_domain), DnsRecordType::SRV);
+        let mut lock = self.records.write().await;
+        lock.entry(key).or_default().push(DnsRecordData::SRV {
+            priority,
+            weight,
+            port,
+            target: normalize_domain(target),
+        });
+    }
+
     /// Stops the local DNS server and shuts down sockets.
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(true);

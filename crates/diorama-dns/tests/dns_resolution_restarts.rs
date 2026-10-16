@@ -507,6 +507,7 @@ async fn test_ipv6_reverse_forwarding_omitted_when_ipv6_disabled() {
         expected_ip: None,
         expected_cname: None,
         expected_ptr: Some("kube-dns.kube-system.svc.cluster.local".to_string()),
+        expected_srv: None,
         expected_rcode: diorama_dns::DnsRcode::NoError.as_u8(),
     };
     let res_ipv6_disabled = prober_no_ipv6.execute_probe(&probe_ipv6).await.unwrap();
@@ -539,6 +540,7 @@ async fn test_ipv6_reverse_forwarding_omitted_when_ipv6_disabled() {
         expected_ip: None,
         expected_cname: None,
         expected_ptr: None,
+        expected_srv: None,
         expected_rcode: diorama_dns::DnsRcode::NXDomain.as_u8(),
     };
     let unassigned_res = prober_with_ipv6
@@ -772,5 +774,143 @@ async fn test_headless_service_dns_resolution() {
     assert!(
         !invalid_res.success,
         "Dashed-IP not belonging to service must fail to resolve"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pqdn_and_srv_record_dns_resolution() {
+    let dir = TempDir::new().unwrap();
+    let (_apiserver, client) = setup_test_cluster(&dir);
+    let client_arc = Arc::new(client);
+
+    // 1. Create namespaces and service with named port
+    client_arc.create_namespace("tier5-a").await.unwrap();
+    client_arc.create_namespace("tier5-b").await.unwrap();
+
+    let svc_ip: Ipv4Addr = "10.43.0.100".parse().unwrap();
+    client_arc
+        .create_service(
+            "tier5-a",
+            json!({
+                "metadata": {
+                    "name": "web",
+                    "namespace": "tier5-a"
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "clusterIP": "10.43.0.100",
+                    "ports": [
+                        {
+                            "name": "http",
+                            "protocol": "TCP",
+                            "port": 8080,
+                            "targetPort": 8080
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let config = CoreDnsConfig::new();
+    let prober = DnsProber::new(ProbeTransport::Synthetic {
+        client: client_arc.clone(),
+        config: config.clone(),
+    });
+
+    // 2. Same-namespace PQDN: query "web" with client_namespace "tier5-a"
+    let probe_pqdn_same = DnsResolutionProbe::pqdn("web", "tier5-a", svc_ip, DnsProtocol::Udp);
+    let res_same = prober.execute_probe(&probe_pqdn_same).await.unwrap();
+    assert!(
+        res_same.success,
+        "Same-namespace PQDN resolution must succeed: {}",
+        res_same.details
+    );
+    assert_eq!(res_same.resolved_ips, vec![svc_ip]);
+
+    // 3. Cross-namespace PQDN: query "web.tier5-a" with client_namespace "tier5-b"
+    let probe_pqdn_cross =
+        DnsResolutionProbe::pqdn("web.tier5-a", "tier5-b", svc_ip, DnsProtocol::Udp);
+    let res_cross = prober.execute_probe(&probe_pqdn_cross).await.unwrap();
+    assert!(
+        res_cross.success,
+        "Cross-namespace PQDN resolution must succeed: {}",
+        res_cross.details
+    );
+    assert_eq!(res_cross.resolved_ips, vec![svc_ip]);
+
+    // 4. PQDN with .svc suffix: query "web.tier5-a.svc" with client_namespace "tier5-b"
+    let probe_pqdn_svc =
+        DnsResolutionProbe::pqdn("web.tier5-a.svc", "tier5-b", svc_ip, DnsProtocol::Tcp);
+    let res_svc = prober.execute_probe(&probe_pqdn_svc).await.unwrap();
+    assert!(
+        res_svc.success,
+        "PQDN with .svc suffix resolution must succeed: {}",
+        res_svc.details
+    );
+    assert_eq!(res_svc.resolved_ips, vec![svc_ip]);
+
+    // 5. SRV resolution (Synthetic): _http._tcp.web.tier5-a.svc.cluster.local
+    let probe_srv_fqdn = DnsResolutionProbe::srv(
+        "_http._tcp.web.tier5-a.svc.cluster.local",
+        "tier5-a",
+        8080,
+        "web.tier5-a.svc.cluster.local",
+        DnsProtocol::Udp,
+    );
+    let res_srv = prober.execute_probe(&probe_srv_fqdn).await.unwrap();
+    assert!(
+        res_srv.success,
+        "Synthetic SRV resolution must succeed: {}",
+        res_srv.details
+    );
+    assert_eq!(res_srv.resolved_srvs.len(), 1);
+    assert_eq!(res_srv.resolved_srvs[0].2, 8080);
+
+    // 6. SRV resolution (Live Mock Server) over both UDP and TCP
+    let local_server = LocalDnsServer::start_loopback().await.unwrap();
+    local_server
+        .add_srv_record(
+            "_http._tcp.web.tier5-a.svc.cluster.local",
+            0,
+            100,
+            8080,
+            "web.tier5-a.svc.cluster.local",
+        )
+        .await;
+
+    let live_prober = DnsProber::new(ProbeTransport::Live {
+        server_addr: local_server.local_addr(),
+        timeout: Duration::from_secs(2),
+    });
+
+    let live_udp_srv = DnsResolutionProbe::srv(
+        "_http._tcp.web.tier5-a.svc.cluster.local",
+        "tier5-a",
+        8080,
+        "web.tier5-a.svc.cluster.local",
+        DnsProtocol::Udp,
+    );
+    let live_udp_res = live_prober.execute_probe(&live_udp_srv).await.unwrap();
+    assert!(
+        live_udp_res.success,
+        "Live UDP SRV query must succeed: {}",
+        live_udp_res.details
+    );
+
+    let live_tcp_srv = DnsResolutionProbe::srv(
+        "_http._tcp.web.tier5-a.svc.cluster.local",
+        "tier5-a",
+        8080,
+        "web.tier5-a.svc.cluster.local",
+        DnsProtocol::Tcp,
+    );
+    let live_tcp_res = live_prober.execute_probe(&live_tcp_srv).await.unwrap();
+    assert!(
+        live_tcp_res.success,
+        "Live TCP SRV query must succeed: {}",
+        live_tcp_res.details
     );
 }

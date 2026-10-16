@@ -4,7 +4,9 @@ use std::fmt::Write;
 use diorama_network::CommandExecutor;
 
 use crate::error::ProxyError;
-use crate::routing::{ServicePort, ServiceRoutingTable, TargetEndpoint};
+use crate::routing::{
+    HostPortDefinition, ServiceDefinition, ServicePort, ServiceRoutingTable, TargetEndpoint,
+};
 
 /// Generates a deterministic 16-character hex hash from a key string for chain naming.
 #[must_use]
@@ -41,6 +43,8 @@ impl IptablesDataplane {
             }
         }
 
+        Self::synthesize_hostport_rules(table, &mut rules);
+
         rules
     }
 
@@ -59,7 +63,7 @@ impl IptablesDataplane {
         let svc_chain = format!("KUBE-SVC-{svc_hash}");
 
         // Headless Services are not DNAT targets.
-        if cluster_ip.is_none() && port.node_port.is_none() {
+        if cluster_ip.is_none() && port.node_port.is_none() && svc.load_balancer_ips.is_empty() {
             return;
         }
 
@@ -70,6 +74,18 @@ impl IptablesDataplane {
                 chain: "KUBE-SERVICES".to_string(),
                 rule: format!(
                     "-d {cip}/32 -p {proto} -m {proto} --dport {} -j {svc_chain}",
+                    port.port
+                ),
+            });
+        }
+
+        // LoadBalancer ingress IPs rules
+        for lb_ip in &svc.load_balancer_ips {
+            rules.push(IptablesRule {
+                table: "nat",
+                chain: "KUBE-SERVICES".to_string(),
+                rule: format!(
+                    "-d {lb_ip}/32 -p {proto} -m {proto} --dport {} -j {svc_chain}",
                     port.port
                 ),
             });
@@ -93,6 +109,52 @@ impl IptablesDataplane {
                 svc.session_affinity_seconds,
                 rules,
             );
+        }
+    }
+
+    fn synthesize_hostport_rules(table: &ServiceRoutingTable, rules: &mut Vec<IptablesRule>) {
+        let mut sorted_hps: Vec<_> = table.host_ports().values().collect();
+        // Place specific IPs before wildcard 0.0.0.0
+        sorted_hps.sort_by_key(|hp| hp.host_ip == "0.0.0.0");
+
+        for hp in sorted_hps {
+            let proto = hp.protocol.as_str().to_lowercase();
+            let hp_key = format!("{}:{}/{}", hp.host_ip, hp.host_port, hp.protocol);
+            let hp_hash = service_chain_hash(&hp_key);
+            let hp_chain = format!("KUBE-HP-{hp_hash}");
+
+            let dispatch_rule = if hp.host_ip == "0.0.0.0" {
+                format!(
+                    "-p {proto} -m {proto} --dport {} -j {hp_chain}",
+                    hp.host_port
+                )
+            } else {
+                format!(
+                    "-d {}/32 -p {proto} -m {proto} --dport {} -j {hp_chain}",
+                    hp.host_ip, hp.host_port
+                )
+            };
+
+            rules.push(IptablesRule {
+                table: "nat",
+                chain: "KUBE-HOSTPORTS".to_string(),
+                rule: dispatch_rule,
+            });
+
+            rules.push(IptablesRule {
+                table: "nat",
+                chain: hp_chain.clone(),
+                rule: "-j KUBE-MARK-MASQ".to_string(),
+            });
+
+            rules.push(IptablesRule {
+                table: "nat",
+                chain: hp_chain,
+                rule: format!(
+                    "-p {proto} -m {proto} -j DNAT --to-destination {}:{}",
+                    hp.pod_ip, hp.container_port
+                ),
+            });
         }
     }
 
@@ -203,6 +265,7 @@ impl IptablesDataplane {
         // Ensure base chains exist
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-SERVICES"]);
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-NODEPORTS"]);
+        let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-HOSTPORTS"]);
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-POSTROUTING"]);
         let _ = executor.run("iptables", &["-t", "nat", "-N", "KUBE-MARK-MASQ"]);
 
@@ -321,20 +384,27 @@ impl IptablesDataplane {
             return Ok(());
         }
 
-        // Flush only owned base chains to clear previous service/nodeport mappings
+        // Flush only owned base chains to clear previous service/nodeport/hostport mappings
         let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-SERVICES"]);
         let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-NODEPORTS"]);
+        let _ = executor.run("iptables", &["-t", "nat", "-F", "KUBE-HOSTPORTS"]);
 
         let mut custom_chains = BTreeSet::new();
         for rule in rules {
-            if rule.chain.starts_with("KUBE-SVC-") || rule.chain.starts_with("KUBE-SEP-") {
+            if rule.chain.starts_with("KUBE-SVC-")
+                || rule.chain.starts_with("KUBE-SEP-")
+                || rule.chain.starts_with("KUBE-HP-")
+            {
                 custom_chains.insert(rule.chain.clone());
             }
-            // ClusterIP/NodePort jumps are emitted even when a Service has no ready
+            // ClusterIP/NodePort/HostPort jumps are emitted even when a Service has no ready
             // endpoints. Those target chains must still exist or iptables-nft rejects
-            // the jump (seen on second start for kube-dns before EndpointSlices recover).
+            // the jump.
             for token in rule.rule.split_whitespace() {
-                if token.starts_with("KUBE-SVC-") || token.starts_with("KUBE-SEP-") {
+                if token.starts_with("KUBE-SVC-")
+                    || token.starts_with("KUBE-SEP-")
+                    || token.starts_with("KUBE-HP-")
+                {
                     custom_chains.insert(token.to_string());
                 }
             }
@@ -365,9 +435,10 @@ impl IptablesDataplane {
             }
         }
 
-        // ClusterIP matches must stay ahead of this jump. Localhost NodePort traffic
-        // (OUTPUT to 127.0.0.1:nodePort) only reaches KUBE-NODEPORTS through it.
+        // ClusterIP matches must stay ahead of this jump. Localhost NodePort and HostPort traffic
+        // only reaches KUBE-NODEPORTS and KUBE-HOSTPORTS through these jumps.
         Self::ensure_kube_services_nodeports_jump(executor)?;
+        Self::ensure_kube_services_hostports_jump(executor)?;
         Ok(())
     }
 
@@ -415,11 +486,17 @@ impl IptablesDataplane {
     pub fn restore_payload(rules: &[IptablesRule], existing_nat: &str) -> String {
         let mut chains = BTreeSet::new();
         for rule in rules {
-            if rule.chain.starts_with("KUBE-SVC-") || rule.chain.starts_with("KUBE-SEP-") {
+            if rule.chain.starts_with("KUBE-SVC-")
+                || rule.chain.starts_with("KUBE-SEP-")
+                || rule.chain.starts_with("KUBE-HP-")
+            {
                 chains.insert(rule.chain.clone());
             }
             for token in rule.rule.split_whitespace() {
-                if token.starts_with("KUBE-SVC-") || token.starts_with("KUBE-SEP-") {
+                if token.starts_with("KUBE-SVC-")
+                    || token.starts_with("KUBE-SEP-")
+                    || token.starts_with("KUBE-HP-")
+                {
                     chains.insert(token.to_string());
                 }
             }
@@ -427,11 +504,16 @@ impl IptablesDataplane {
         let stale: BTreeSet<&str> = existing_nat
             .split_whitespace()
             .filter(|t| {
-                (t.starts_with("KUBE-SEP-") || t.starts_with("KUBE-SVC-")) && !chains.contains(*t)
+                (t.starts_with("KUBE-SEP-")
+                    || t.starts_with("KUBE-SVC-")
+                    || t.starts_with("KUBE-HP-"))
+                    && !chains.contains(*t)
             })
             .collect();
 
-        let mut out = String::from("*nat\n:KUBE-SERVICES - [0:0]\n:KUBE-NODEPORTS - [0:0]\n");
+        let mut out = String::from(
+            "*nat\n:KUBE-SERVICES - [0:0]\n:KUBE-NODEPORTS - [0:0]\n:KUBE-HOSTPORTS - [0:0]\n",
+        );
         for chain in chains
             .iter()
             .map(String::as_str)
@@ -442,8 +524,9 @@ impl IptablesDataplane {
         for rule in rules {
             let _ = writeln!(out, "-A {} {}", rule.chain, rule.rule);
         }
-        // ClusterIP matches stay ahead of the NodePort dispatch.
+        // ClusterIP matches stay ahead of the NodePort and HostPort dispatch.
         out.push_str("-A KUBE-SERVICES -m addrtype --dst-type LOCAL -j KUBE-NODEPORTS\n");
+        out.push_str("-A KUBE-SERVICES -m addrtype --dst-type LOCAL -j KUBE-HOSTPORTS\n");
         for chain in &stale {
             let _ = writeln!(out, "-X {chain}");
         }
@@ -509,6 +592,60 @@ impl IptablesDataplane {
         Ok(())
     }
 
+    /// Appends the kube-proxy dispatch from `KUBE-SERVICES` into `KUBE-HOSTPORTS`.
+    fn ensure_kube_services_hostports_jump(
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), ProxyError> {
+        let local_jump = executor.run(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "KUBE-SERVICES",
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-j",
+                "KUBE-HOSTPORTS",
+            ],
+        );
+        if matches!(local_jump, Ok(ref out) if out.success) {
+            return Ok(());
+        }
+
+        let fallback = executor
+            .run(
+                "iptables",
+                &["-t", "nat", "-A", "KUBE-SERVICES", "-j", "KUBE-HOSTPORTS"],
+            )
+            .map_err(|e| ProxyError::CommandExecutionFailed {
+                command: "iptables -t nat -A KUBE-SERVICES -j KUBE-HOSTPORTS".to_string(),
+                reason: e.to_string(),
+            })?;
+        if !fallback.success {
+            let addrtype_reason = local_jump.map_or_else(
+                |e| e.to_string(),
+                |out| {
+                    if out.stderr.is_empty() {
+                        out.stdout
+                    } else {
+                        out.stderr
+                    }
+                },
+            );
+            return Err(ProxyError::RoutingVerificationFailed {
+                rule: "KUBE-SERVICES -> KUBE-HOSTPORTS".to_string(),
+                reason: format!(
+                    "failed to install HostPort dispatch jump (addrtype: {addrtype_reason}; fallback: {})",
+                    fallback.stderr
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn purge_stale_chains(executor: &dyn CommandExecutor, custom_chains: &BTreeSet<String>) {
         let Ok(out) = executor.run("iptables", &["-t", "nat", "-S"]) else {
             return;
@@ -520,7 +657,9 @@ impl IptablesDataplane {
             .stdout
             .split_whitespace()
             .filter(|t| {
-                (t.starts_with("KUBE-SEP-") || t.starts_with("KUBE-SVC-"))
+                (t.starts_with("KUBE-SEP-")
+                    || t.starts_with("KUBE-SVC-")
+                    || t.starts_with("KUBE-HP-"))
                     && !custom_chains.contains(*t)
             })
             .collect();
@@ -582,6 +721,14 @@ impl IptablesDataplane {
                         format!("ClusterIP {cluster_ip}:{}", port.port),
                     )?;
                 }
+                for lb_ip in &svc.load_balancer_ips {
+                    let needle =
+                        format!("-d {lb_ip}/32 -p {proto} -m {proto} --dport {} ", port.port);
+                    Self::require_nat_rule(
+                        existing_rules.lines().any(|line| line.contains(&needle)),
+                        format!("LoadBalancer {lb_ip}:{}", port.port),
+                    )?;
+                }
                 if let Some(node_port) = port.node_port {
                     expects_nodeport = true;
                     let needle = format!("-p {proto} -m {proto} --dport {node_port} ");
@@ -602,6 +749,38 @@ impl IptablesDataplane {
                 reason: "NodePort dispatch jump missing from iptables nat table".to_string(),
             });
         }
+
+        let mut expects_hostport = false;
+        for hp in table.host_ports().values() {
+            expects_hostport = true;
+            let proto = hp.protocol.as_str().to_lowercase();
+            let needle = if hp.host_ip == "0.0.0.0" {
+                format!("-p {proto} -m {proto} --dport {} ", hp.host_port)
+            } else {
+                format!(
+                    "-d {}/32 -p {proto} -m {proto} --dport {} ",
+                    hp.host_ip, hp.host_port
+                )
+            };
+            let has_hp = existing_rules
+                .lines()
+                .any(|line| line.contains("KUBE-HOSTPORTS") && line.contains(&needle));
+            Self::require_nat_rule(
+                has_hp,
+                format!("HostPort {}:{}/{}", hp.host_ip, hp.host_port, hp.protocol),
+            )?;
+        }
+        if expects_hostport
+            && !existing_rules
+                .lines()
+                .any(|l| l.contains("KUBE-SERVICES") && l.contains("-j KUBE-HOSTPORTS"))
+        {
+            return Err(ProxyError::RoutingVerificationFailed {
+                rule: "KUBE-SERVICES -> KUBE-HOSTPORTS".to_string(),
+                reason: "HostPort dispatch jump missing from iptables nat table".to_string(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -626,31 +805,24 @@ impl NftablesDataplane {
 
         for svc in table.services().values() {
             for port in &svc.ports {
-                Self::synthesize_nft_service_rules(
-                    table,
-                    &svc.namespace,
-                    &svc.name,
-                    svc.cluster_ip.as_deref(),
-                    port,
-                    &mut rules,
-                );
+                Self::synthesize_nft_service_rules(table, svc, port, &mut rules);
             }
         }
+
+        Self::synthesize_nft_hostport_rules(table, &mut rules);
 
         rules
     }
 
     fn synthesize_nft_service_rules(
         table: &ServiceRoutingTable,
-        namespace: &str,
-        name: &str,
-        cluster_ip: Option<&str>,
+        svc: &ServiceDefinition,
         port: &ServicePort,
         rules: &mut Vec<NftablesRule>,
     ) {
         let proto = port.protocol.as_str().to_lowercase();
         let endpoints = table
-            .get_ready_endpoints(namespace, name, port.port, port.protocol)
+            .get_ready_endpoints(&svc.namespace, &svc.name, port.port, port.protocol)
             .unwrap_or_default();
 
         if endpoints.is_empty() {
@@ -658,11 +830,22 @@ impl NftablesDataplane {
         }
 
         // ClusterIP rule
-        if let Some(cip) = cluster_ip {
+        if let Some(ref cip) = svc.cluster_ip {
             rules.push(Self::format_nft_rule(
                 "services",
                 &format!("ip daddr {cip} {proto} dport {}", port.port),
                 &endpoints,
+                svc.session_affinity_seconds,
+            ));
+        }
+
+        // LoadBalancer ingress rules
+        for lb_ip in &svc.load_balancer_ips {
+            rules.push(Self::format_nft_rule(
+                "services",
+                &format!("ip daddr {lb_ip} {proto} dport {}", port.port),
+                &endpoints,
+                svc.session_affinity_seconds,
             ));
         }
 
@@ -672,7 +855,39 @@ impl NftablesDataplane {
                 "nodeports",
                 &format!("{proto} dport {node_port}"),
                 &endpoints,
+                svc.session_affinity_seconds,
             ));
+        }
+    }
+
+    fn synthesize_nft_hostport_rules(table: &ServiceRoutingTable, rules: &mut Vec<NftablesRule>) {
+        let mut sorted_hostports: Vec<&HostPortDefinition> = table.host_ports().values().collect();
+        sorted_hostports.sort_by(|a, b| {
+            let a_is_wildcard = a.host_ip == "0.0.0.0";
+            let b_is_wildcard = b.host_ip == "0.0.0.0";
+            match (a_is_wildcard, b_is_wildcard) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => (&a.host_ip, a.host_port, a.protocol).cmp(&(
+                    &b.host_ip,
+                    b.host_port,
+                    b.protocol,
+                )),
+            }
+        });
+
+        for hp in sorted_hostports {
+            let proto = hp.protocol.as_str().to_lowercase();
+            let prefix = if hp.host_ip == "0.0.0.0" {
+                format!("{proto} dport {}", hp.host_port)
+            } else {
+                format!("ip daddr {} {proto} dport {}", hp.host_ip, hp.host_port)
+            };
+            rules.push(NftablesRule {
+                table: "ip kube-proxy",
+                chain: "hostports",
+                statement: format!("{prefix} dnat to {}:{}", hp.pod_ip, hp.container_port),
+            });
         }
     }
 
@@ -680,6 +895,7 @@ impl NftablesDataplane {
         chain: &'static str,
         prefix: &str,
         endpoints: &[TargetEndpoint],
+        session_affinity_seconds: Option<u32>,
     ) -> NftablesRule {
         if endpoints.len() == 1 {
             NftablesRule {
@@ -698,13 +914,15 @@ impl NftablesDataplane {
                 .map(|(idx, t)| format!("{idx} : {t}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let selector = if session_affinity_seconds.is_some() {
+                format!("jhash ip saddr mod {}", endpoints.len())
+            } else {
+                format!("numgen random mod {}", endpoints.len())
+            };
             NftablesRule {
                 table: "ip kube-proxy",
                 chain,
-                statement: format!(
-                    "{prefix} dnat to numgen random mod {} map {{ {map_body} }}",
-                    endpoints.len()
-                ),
+                statement: format!("{prefix} dnat to {selector} map {{ {map_body} }}"),
             }
         }
     }
@@ -755,11 +973,12 @@ impl NftablesDataplane {
         );
         let _ = executor.run("nft", &["add", "chain", "ip", "kube-proxy", "services"]);
         let _ = executor.run("nft", &["add", "chain", "ip", "kube-proxy", "nodeports"]);
+        let _ = executor.run("nft", &["add", "chain", "ip", "kube-proxy", "hostports"]);
 
         // Flush only the owned ip kube-proxy table rules
         let _ = executor.run("nft", &["flush", "table", "ip", "kube-proxy"]);
 
-        // Install dispatch jump rules from prerouting and output to services and nodeports
+        // Install dispatch jump rules from prerouting and output to services, nodeports, and hostports
         let _ = executor.run(
             "nft",
             &[
@@ -791,6 +1010,18 @@ impl NftablesDataplane {
                 "rule",
                 "ip",
                 "kube-proxy",
+                "prerouting",
+                "jump",
+                "hostports",
+            ],
+        );
+        let _ = executor.run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                "kube-proxy",
                 "output",
                 "jump",
                 "services",
@@ -806,6 +1037,18 @@ impl NftablesDataplane {
                 "output",
                 "jump",
                 "nodeports",
+            ],
+        );
+        let _ = executor.run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                "kube-proxy",
+                "output",
+                "jump",
+                "hostports",
             ],
         );
 
@@ -857,9 +1100,6 @@ impl NftablesDataplane {
         existing_rules: &str,
     ) -> Result<(), ProxyError> {
         for svc in table.services().values() {
-            let Some(ref cluster_ip) = svc.cluster_ip else {
-                continue;
-            };
             for port in &svc.ports {
                 let endpoints = table
                     .get_ready_endpoints(&svc.namespace, &svc.name, port.port, port.protocol)
@@ -867,14 +1107,59 @@ impl NftablesDataplane {
                 if endpoints.is_empty() {
                     continue;
                 }
-                let proto = port.protocol.as_str().to_lowercase();
-                let needle = format!("ip daddr {cluster_ip} {proto} dport {} ", port.port);
-                if !existing_rules.lines().any(|l| l.contains(&needle)) {
-                    return Err(ProxyError::RoutingVerificationFailed {
-                        rule: format!("ClusterIP {cluster_ip}:{}", port.port),
-                        reason: "matching rule missing from nftables table".to_string(),
-                    });
-                }
+                Self::verify_nft_service_port_rules(existing_rules, svc, port)?;
+            }
+        }
+
+        for hp in table.host_ports().values() {
+            let proto = hp.protocol.as_str().to_lowercase();
+            let needle = if hp.host_ip == "0.0.0.0" {
+                format!("{proto} dport {} ", hp.host_port)
+            } else {
+                format!("ip daddr {} {proto} dport {} ", hp.host_ip, hp.host_port)
+            };
+            if !existing_rules.lines().any(|l| l.contains(&needle)) {
+                return Err(ProxyError::RoutingVerificationFailed {
+                    rule: format!("HostPort {}:{}/{}", hp.host_ip, hp.host_port, hp.protocol),
+                    reason: "matching rule missing from nftables table".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_nft_service_port_rules(
+        existing_rules: &str,
+        svc: &ServiceDefinition,
+        port: &ServicePort,
+    ) -> Result<(), ProxyError> {
+        let proto = port.protocol.as_str().to_lowercase();
+        if let Some(ref cluster_ip) = svc.cluster_ip {
+            let needle = format!("ip daddr {cluster_ip} {proto} dport {} ", port.port);
+            if !existing_rules.lines().any(|l| l.contains(&needle)) {
+                return Err(ProxyError::RoutingVerificationFailed {
+                    rule: format!("ClusterIP {cluster_ip}:{}", port.port),
+                    reason: "matching rule missing from nftables table".to_string(),
+                });
+            }
+        }
+        for lb_ip in &svc.load_balancer_ips {
+            let needle = format!("ip daddr {lb_ip} {proto} dport {} ", port.port);
+            if !existing_rules.lines().any(|l| l.contains(&needle)) {
+                return Err(ProxyError::RoutingVerificationFailed {
+                    rule: format!("LoadBalancer {lb_ip}:{}", port.port),
+                    reason: "matching rule missing from nftables table".to_string(),
+                });
+            }
+        }
+        if let Some(node_port) = port.node_port {
+            let needle = format!("{proto} dport {node_port} ");
+            if !existing_rules.lines().any(|l| l.contains(&needle)) {
+                return Err(ProxyError::RoutingVerificationFailed {
+                    rule: format!("NodePort {node_port}"),
+                    reason: "matching rule missing from nftables table".to_string(),
+                });
             }
         }
         Ok(())
