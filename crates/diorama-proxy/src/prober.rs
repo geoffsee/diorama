@@ -215,6 +215,10 @@ impl DataplaneProber {
                         reason: format!("UDP probe reply failed or timed out: {e}"),
                     })?;
             },
+            Protocol::Sctp => {
+                // Live SCTP socket probes are not supported natively over standard std::net;
+                // synthetic routing verification checks endpoint reachability in-memory.
+            },
         }
         Ok(())
     }
@@ -269,6 +273,73 @@ impl DataplaneProber {
             endpoint = %target_endpoint,
             latency_ms = latency_ms,
             "dataplane workload probe succeeded"
+        );
+
+        Ok(ProbeResult {
+            success: true,
+            reached_endpoint: Some(target_endpoint),
+            latency_ms,
+            details,
+        })
+    }
+
+    /// Probes packet routing through the dataplane routing table using a client IP for session affinity.
+    pub fn probe_route_with_client(
+        &self,
+        table: &ServiceRoutingTable,
+        client_ip: &str,
+        dst_ip: &str,
+        dst_port: u16,
+        protocol: Protocol,
+    ) -> Result<ProbeResult, ProxyError> {
+        let start = Instant::now();
+        let target_endpoint = table
+            .route_packet_with_client(Some(client_ip), dst_ip, dst_port, protocol)
+            .map_err(|e| ProxyError::DataplaneProbeFailed {
+                service: format!("{dst_ip}:{dst_port}/{protocol}"),
+                reason: e.to_string(),
+            })?;
+
+        if let Some(ProbeTransport::Live { timeout }) = self.transport {
+            Self::execute_live_probe(&target_endpoint, timeout)?;
+        }
+
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let details = format!(
+            "probe successfully routed {protocol} from client {client_ip} to backend endpoint {target_endpoint}"
+        );
+
+        Ok(ProbeResult {
+            success: true,
+            reached_endpoint: Some(target_endpoint),
+            latency_ms,
+            details,
+        })
+    }
+
+    /// Probes a `HostPort` mapping through the dataplane routing table.
+    pub fn probe_host_port(
+        &self,
+        table: &ServiceRoutingTable,
+        host_ip: &str,
+        host_port: u16,
+        protocol: Protocol,
+    ) -> Result<ProbeResult, ProxyError> {
+        let start = Instant::now();
+        let target_endpoint = table
+            .route_host_port(host_ip, host_port, protocol)
+            .map_err(|e| ProxyError::DataplaneProbeFailed {
+                service: format!("{host_ip}:{host_port}/{protocol}"),
+                reason: e.to_string(),
+            })?;
+
+        if let Some(ProbeTransport::Live { timeout }) = self.transport {
+            Self::execute_live_probe(&target_endpoint, timeout)?;
+        }
+
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let details = format!(
+            "probe successfully routed HostPort {host_ip}:{host_port}/{protocol} to pod endpoint {target_endpoint}"
         );
 
         Ok(ProbeResult {
@@ -364,6 +435,27 @@ impl DataplaneProber {
             }
         }
 
+        for hp in table.host_ports().values() {
+            acc.total_probes += 1;
+            match self.probe_host_port(table, &hp.host_ip, hp.host_port, hp.protocol) {
+                Ok(res) => {
+                    acc.successful_probes += 1;
+                    acc.record_endpoint(res.reached_endpoint);
+                    acc.details.push(format!(
+                        "HostPort {}:{}/{} OK",
+                        hp.host_ip, hp.host_port, hp.protocol
+                    ));
+                },
+                Err(e) => {
+                    acc.failed_probes += 1;
+                    acc.details.push(format!(
+                        "HostPort {}:{}/{} FAILED: {e}",
+                        hp.host_ip, hp.host_port, hp.protocol
+                    ));
+                },
+            }
+        }
+
         let report = DataplaneProbeReport {
             timestamp: SystemTime::now(),
             tcp_clusterip_probes_passed: acc.tcp_clusterip_passed,
@@ -426,9 +518,36 @@ impl DataplaneProber {
                     match port.protocol {
                         Protocol::Tcp => acc.tcp_clusterip_passed = false,
                         Protocol::Udp => acc.udp_clusterip_passed = false,
+                        Protocol::Sctp => {},
                     }
                     acc.details.push(format!(
                         "ClusterIP {}/{}:{}/{} FAILED: {e}",
+                        svc.namespace, svc.name, port.port, port.protocol
+                    ));
+                },
+            }
+        }
+
+        for lb_ip in &svc.load_balancer_ips {
+            acc.total_probes += 1;
+            match self.probe_route(table, lb_ip, port.port, port.protocol) {
+                Ok(res) => {
+                    acc.successful_probes += 1;
+                    acc.record_endpoint(res.reached_endpoint);
+                    acc.details.push(format!(
+                        "LoadBalancer {}/{}:{}/{} OK",
+                        svc.namespace, svc.name, port.port, port.protocol
+                    ));
+                },
+                Err(e) => {
+                    acc.failed_probes += 1;
+                    match port.protocol {
+                        Protocol::Tcp => acc.tcp_clusterip_passed = false,
+                        Protocol::Udp => acc.udp_clusterip_passed = false,
+                        Protocol::Sctp => {},
+                    }
+                    acc.details.push(format!(
+                        "LoadBalancer {}/{}:{}/{} FAILED: {e}",
                         svc.namespace, svc.name, port.port, port.protocol
                     ));
                 },
@@ -451,6 +570,7 @@ impl DataplaneProber {
                     match port.protocol {
                         Protocol::Tcp => acc.tcp_nodeport_passed = false,
                         Protocol::Udp => acc.udp_nodeport_passed = false,
+                        Protocol::Sctp => {},
                     }
                     acc.details.push(format!(
                         "NodePort {}/{}:{}/{} FAILED: {e}",

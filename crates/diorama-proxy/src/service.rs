@@ -11,7 +11,9 @@ use crate::error::ProxyError;
 use crate::firewall::{DataplaneReconciler, FirewallSnapshot, ReconciliationSummary};
 use crate::health::ProxyHealthReport;
 use crate::prober::{DataplaneProbeReport, DataplaneProber};
-use crate::routing::{EndpointSliceDefinition, ServiceDefinition, ServiceRoutingTable};
+use crate::routing::{
+    EndpointSliceDefinition, HostPortDefinition, Protocol, ServiceDefinition, ServiceRoutingTable,
+};
 
 /// Supervised kube-proxy service managing configuration, backend selection,
 /// readiness verification, dataplane routing, and lifecycle.
@@ -158,6 +160,33 @@ impl ProxyService {
         let removed = table.remove_endpoint_slice(namespace, name);
         self.dataplane_ready.store(false, Ordering::SeqCst);
         removed
+    }
+
+    /// Registers or updates a `HostPort` mapping in the routing table, clearing dataplane readiness.
+    pub async fn apply_host_port(&self, host_port: HostPortDefinition) {
+        let mut table = self.routing_table.write().await;
+        table.apply_host_port(host_port);
+        self.dataplane_ready.store(false, Ordering::SeqCst);
+    }
+
+    /// Removes a `HostPort` mapping from the routing table, clearing dataplane readiness.
+    pub async fn remove_host_port(
+        &self,
+        host_ip: &str,
+        host_port: u16,
+        protocol: Protocol,
+    ) -> Option<HostPortDefinition> {
+        let mut table = self.routing_table.write().await;
+        let removed = table.remove_host_port(host_ip, host_port, protocol);
+        self.dataplane_ready.store(false, Ordering::SeqCst);
+        removed
+    }
+
+    /// Removes all `HostPort` mappings associated with a pod from the routing table, clearing dataplane readiness.
+    pub async fn remove_pod_host_ports(&self, namespace: &str, pod_name: &str) {
+        let mut table = self.routing_table.write().await;
+        table.remove_pod_host_ports(namespace, pod_name);
+        self.dataplane_ready.store(false, Ordering::SeqCst);
     }
 
     /// Checks and prepares all prerequisites for running kube-proxy.
@@ -396,10 +425,20 @@ impl ProxyService {
             .filter_map(|item| crate::routing::endpoint_slice_from_value(item).ok())
             .collect();
 
+        let pods_val = client.list_pods("").await.ok();
+        let host_ports: Vec<_> = pods_val
+            .as_ref()
+            .and_then(|v| v.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(crate::routing::host_ports_from_pod_value)
+            .collect();
+
         {
             let mut table = self.routing_table.write().await;
-            // Replace the in-memory table with the API listing so deleted Services
-            // and EndpointSlices cannot keep programming stale DNAT rules after a
+            // Replace the in-memory table with the API listing so deleted Services,
+            // EndpointSlices, and HostPorts cannot keep programming stale DNAT rules after a
             // restart or watch lag resync.
             *table = crate::routing::ServiceRoutingTable::new();
             for svc in svcs {
@@ -407,6 +446,9 @@ impl ProxyService {
             }
             for slice in slices {
                 table.apply_endpoint_slice(slice);
+            }
+            for hp in host_ports {
+                table.apply_host_port(hp);
             }
         }
         self.dataplane_ready.store(false, Ordering::SeqCst);

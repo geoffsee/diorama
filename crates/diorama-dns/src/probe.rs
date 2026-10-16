@@ -62,6 +62,8 @@ pub struct DnsResolutionProbe {
     pub expected_ip: Option<Ipv4Addr>,
     pub expected_cname: Option<String>,
     pub expected_ptr: Option<String>,
+    #[serde(default)]
+    pub expected_srv: Option<(u16, u16, u16, String)>,
     pub expected_rcode: u8,
 }
 
@@ -83,6 +85,7 @@ impl DnsResolutionProbe {
             expected_ip: Some(expected_ip),
             expected_cname: None,
             expected_ptr: None,
+            expected_srv: None,
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -105,6 +108,7 @@ impl DnsResolutionProbe {
             expected_ip: Some(expected_ip),
             expected_cname: None,
             expected_ptr: None,
+            expected_srv: None,
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -126,6 +130,7 @@ impl DnsResolutionProbe {
             expected_ip: None,
             expected_cname: Some(expected_cname.trim_end_matches('.').to_string()),
             expected_ptr: None,
+            expected_srv: None,
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -147,6 +152,7 @@ impl DnsResolutionProbe {
             expected_ip: Some(expected_ip),
             expected_cname: None,
             expected_ptr: None,
+            expected_srv: None,
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -163,6 +169,7 @@ impl DnsResolutionProbe {
             expected_ip: Some(expected_ip),
             expected_cname: None,
             expected_ptr: None,
+            expected_srv: None,
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -184,6 +191,57 @@ impl DnsResolutionProbe {
             expected_ip: None,
             expected_cname: None,
             expected_ptr: Some(expected_name.trim_end_matches('.').to_string()),
+            expected_srv: None,
+            expected_rcode: DnsRcode::NoError.as_u8(),
+        }
+    }
+
+    /// Constructs a PQDN (Partially Qualified Domain Name) service resolution probe.
+    #[must_use]
+    pub fn pqdn(
+        query_name: &str,
+        client_namespace: &str,
+        expected_ip: Ipv4Addr,
+        protocol: DnsProtocol,
+    ) -> Self {
+        Self {
+            category: ProbeCategory::SameNamespace,
+            query_name: query_name.to_string(),
+            record_type: DnsRecordType::A.as_u16(),
+            protocol,
+            client_namespace: client_namespace.to_string(),
+            expected_ip: Some(expected_ip),
+            expected_cname: None,
+            expected_ptr: None,
+            expected_srv: None,
+            expected_rcode: DnsRcode::NoError.as_u8(),
+        }
+    }
+
+    /// Constructs an SRV record resolution probe.
+    #[must_use]
+    pub fn srv(
+        query_name: &str,
+        client_namespace: &str,
+        expected_port: u16,
+        expected_target: &str,
+        protocol: DnsProtocol,
+    ) -> Self {
+        Self {
+            category: ProbeCategory::SameNamespace,
+            query_name: query_name.to_string(),
+            record_type: DnsRecordType::SRV.as_u16(),
+            protocol,
+            client_namespace: client_namespace.to_string(),
+            expected_ip: None,
+            expected_cname: None,
+            expected_ptr: None,
+            expected_srv: Some((
+                0,
+                100,
+                expected_port,
+                expected_target.trim_end_matches('.').to_string(),
+            )),
             expected_rcode: DnsRcode::NoError.as_u8(),
         }
     }
@@ -198,6 +256,8 @@ pub struct DnsProbeResult {
     pub resolved_ips: Vec<Ipv4Addr>,
     pub resolved_cnames: Vec<String>,
     pub resolved_ptrs: Vec<String>,
+    #[serde(default)]
+    pub resolved_srvs: Vec<(u16, u16, u16, String)>,
     pub latency_ms: u64,
     pub details: String,
 }
@@ -362,12 +422,19 @@ impl DnsProber {
         let mut resolved_ips = Vec::new();
         let mut resolved_cnames = Vec::new();
         let mut resolved_ptrs = Vec::new();
+        let mut resolved_srvs = Vec::new();
 
         for ans in &response.answers {
             match &ans.rdata {
                 DnsRecordData::A(ip) => resolved_ips.push(*ip),
                 DnsRecordData::CNAME(cname) => resolved_cnames.push(cname.clone()),
                 DnsRecordData::PTR(ptr) => resolved_ptrs.push(ptr.clone()),
+                DnsRecordData::SRV {
+                    priority,
+                    weight,
+                    port,
+                    target,
+                } => resolved_srvs.push((*priority, *weight, *port, target.clone())),
                 _ => {},
             }
         }
@@ -411,6 +478,20 @@ impl DnsProber {
             }
         }
 
+        if let Some((exp_prio, _exp_weight, exp_port, ref exp_target)) = probe.expected_srv {
+            let found = resolved_srvs.iter().any(|(prio, _weight, port, target)| {
+                *port == exp_port
+                    && target.eq_ignore_ascii_case(exp_target)
+                    && (exp_prio == 0 || *prio == exp_prio)
+            });
+            if !found {
+                success = false;
+                details.push_str(&format!(
+                    " (expected SRV port {exp_port} target {exp_target} not found in {resolved_srvs:?})"
+                ));
+            }
+        }
+
         Ok(DnsProbeResult {
             probe: probe.clone(),
             success,
@@ -418,6 +499,7 @@ impl DnsProber {
             resolved_ips,
             resolved_cnames,
             resolved_ptrs,
+            resolved_srvs,
             latency_ms,
             details,
         })
@@ -434,12 +516,83 @@ impl DnsProber {
         let mut resolved_ips = Vec::new();
         let mut resolved_cnames = Vec::new();
         let mut resolved_ptrs = Vec::new();
+        let mut resolved_srvs = Vec::new();
         let mut rcode = DnsRcode::NoError.as_u8();
 
         let clean_name = probe.query_name.trim_end_matches('.');
 
-        // Parse Kubernetes service query: <svc>.<ns>.svc.<cluster-domain>
-        if let Some(svc_part) = clean_name.strip_suffix(&format!(".svc.{}", config.cluster_domain))
+        // Parse SRV query: _port._proto.<svc>...
+        if clean_name.starts_with('_') {
+            let labels: Vec<&str> = clean_name.split('.').collect();
+            if labels.len() >= 3 && labels[0].starts_with('_') && labels[1].starts_with('_') {
+                let port_name = labels[0].trim_start_matches('_');
+                let proto_name = labels[1].trim_start_matches('_');
+                let rest_labels = &labels[2..];
+
+                let (svc_name, svc_ns) = if rest_labels.len() >= 2 && rest_labels.contains(&"svc") {
+                    let svc_n = rest_labels[0];
+                    let ns_n = rest_labels[1];
+                    (svc_n, ns_n)
+                } else if rest_labels.len() == 2 {
+                    (rest_labels[0], rest_labels[1])
+                } else if rest_labels.len() == 1 {
+                    (rest_labels[0], probe.client_namespace.as_str())
+                } else {
+                    ("", "")
+                };
+
+                if !svc_name.is_empty() && !svc_ns.is_empty() {
+                    match client.get_service(svc_ns, svc_name).await {
+                        Ok(svc_val) => {
+                            let mut found_port = false;
+                            if let Some(ports) = svc_val
+                                .pointer("/spec/ports")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                for p in ports {
+                                    let p_name = p
+                                        .get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("");
+                                    let p_proto = p
+                                        .get("protocol")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("TCP");
+                                    let p_num = p
+                                        .get("port")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .unwrap_or(0)
+                                        as u16;
+
+                                    if (p_name.eq_ignore_ascii_case(port_name)
+                                        || port_name.is_empty())
+                                        && p_proto.eq_ignore_ascii_case(proto_name)
+                                    {
+                                        let target = format!(
+                                            "{svc_name}.{svc_ns}.svc.{}",
+                                            config.cluster_domain
+                                        );
+                                        resolved_srvs.push((0, 100, p_num, target));
+                                        found_port = true;
+                                    }
+                                }
+                            }
+                            if !found_port {
+                                rcode = DnsRcode::NXDomain.as_u8();
+                            }
+                        },
+                        Err(_) => {
+                            rcode = DnsRcode::NXDomain.as_u8();
+                        },
+                    }
+                } else {
+                    rcode = DnsRcode::NXDomain.as_u8();
+                }
+            } else {
+                rcode = DnsRcode::NXDomain.as_u8();
+            }
+        } else if let Some(svc_part) =
+            clean_name.strip_suffix(&format!(".svc.{}", config.cluster_domain))
         {
             let parts: Vec<&str> = svc_part.split('.').collect();
             if parts.len() == 2 {
@@ -693,48 +846,83 @@ impl DnsProber {
             } else {
                 rcode = DnsRcode::NXDomain.as_u8();
             }
-        } else {
-            // Upstream query: resolve via local upstream dependencies if available
-            let resolvers = if !config.upstream_resolvers.is_empty() {
-                config.upstream_resolvers.clone()
-            } else if config.container_mode {
-                vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()]
+        } else if probe.category != ProbeCategory::Upstream && !clean_name.contains(".arpa") {
+            let (svc_name, svc_ns) = if let Some(svc_part) = clean_name.strip_suffix(".svc") {
+                let parts: Vec<&str> = svc_part.split('.').collect();
+                if parts.len() == 2 {
+                    (parts[0], parts[1])
+                } else {
+                    (parts[0], probe.client_namespace.as_str())
+                }
             } else {
-                Vec::new()
+                let parts: Vec<&str> = clean_name.split('.').collect();
+                if parts.len() == 2 {
+                    (parts[0], parts[1])
+                } else if parts.len() == 1 {
+                    (parts[0], probe.client_namespace.as_str())
+                } else {
+                    ("", "")
+                }
             };
 
-            let mut resolved = false;
-            for resolver in &resolvers {
-                let addr = if resolver.contains(':') {
-                    resolver.parse::<SocketAddr>().ok()
-                } else {
-                    format!("{resolver}:53").parse::<SocketAddr>().ok()
-                };
-                if let Some(target_addr) = addr {
-                    if target_addr.ip().is_loopback() {
-                        let rtype = DnsRecordType::from_u16(probe.record_type);
-                        let query = DnsMessage::new_query(1, &probe.query_name, rtype);
-                        if let Ok(Ok(resp)) = tokio::time::timeout(
-                            Duration::from_millis(500),
-                            send_udp_query(target_addr, &query),
-                        )
-                        .await
+            let mut resolved_service = false;
+            if !svc_name.is_empty() && !svc_ns.is_empty() {
+                if let Ok(svc_val) = client.get_service(svc_ns, svc_name).await {
+                    resolved_service = true;
+                    let svc_type = svc_val
+                        .pointer("/spec/type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("ClusterIP");
+                    if svc_type == "ExternalName" {
+                        if let Some(ext_name) = svc_val
+                            .pointer("/spec/externalName")
+                            .and_then(serde_json::Value::as_str)
                         {
-                            rcode = resp.header.rcode.as_u8();
-                            for ans in resp.answers {
-                                if let DnsRecordData::A(ip) = ans.rdata {
-                                    resolved_ips.push(ip);
-                                }
+                            resolved_cnames.push(ext_name.trim_end_matches('.').to_string());
+                        }
+                    } else {
+                        let cluster_ip_str = svc_val
+                            .pointer("/spec/clusterIP")
+                            .and_then(serde_json::Value::as_str);
+                        if let Some(ip_str) = cluster_ip_str {
+                            if ip_str == "None" {
+                                resolve_headless_endpoints(
+                                    client,
+                                    svc_ns,
+                                    svc_name,
+                                    &svc_val,
+                                    &mut resolved_ips,
+                                )
+                                .await;
+                            } else if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                resolved_ips.push(ip);
                             }
-                            resolved = true;
-                            break;
+                        } else {
+                            resolve_headless_endpoints(
+                                client,
+                                svc_ns,
+                                svc_name,
+                                &svc_val,
+                                &mut resolved_ips,
+                            )
+                            .await;
                         }
                     }
                 }
             }
-            if !resolved {
-                rcode = DnsRcode::ServFail.as_u8();
+
+            if !resolved_service {
+                if probe.category == ProbeCategory::SameNamespace
+                    || probe.category == ProbeCategory::CrossNamespace
+                    || probe.category == ProbeCategory::ExternalName
+                {
+                    rcode = DnsRcode::NXDomain.as_u8();
+                } else {
+                    resolve_upstream_query(probe, config, &mut resolved_ips, &mut rcode).await;
+                }
             }
+        } else {
+            resolve_upstream_query(probe, config, &mut resolved_ips, &mut rcode).await;
         }
 
         let mut success = rcode == probe.expected_rcode;
@@ -776,6 +964,20 @@ impl DnsProber {
             }
         }
 
+        if let Some((exp_prio, _exp_weight, exp_port, ref exp_target)) = probe.expected_srv {
+            let found = resolved_srvs.iter().any(|(prio, _weight, port, target)| {
+                *port == exp_port
+                    && target.eq_ignore_ascii_case(exp_target)
+                    && (exp_prio == 0 || *prio == exp_prio)
+            });
+            if !found {
+                success = false;
+                details.push_str(&format!(
+                    " (expected SRV port {exp_port} target {exp_target} not found in {resolved_srvs:?})"
+                ));
+            }
+        }
+
         Ok(DnsProbeResult {
             probe: probe.clone(),
             success,
@@ -783,9 +985,58 @@ impl DnsProber {
             resolved_ips,
             resolved_cnames,
             resolved_ptrs,
+            resolved_srvs,
             latency_ms,
             details,
         })
+    }
+}
+
+async fn resolve_upstream_query(
+    probe: &DnsResolutionProbe,
+    config: &CoreDnsConfig,
+    resolved_ips: &mut Vec<Ipv4Addr>,
+    rcode: &mut u8,
+) {
+    let resolvers = if !config.upstream_resolvers.is_empty() {
+        config.upstream_resolvers.clone()
+    } else if config.container_mode {
+        vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    let mut resolved = false;
+    for resolver in &resolvers {
+        let addr = if resolver.contains(':') {
+            resolver.parse::<SocketAddr>().ok()
+        } else {
+            format!("{resolver}:53").parse::<SocketAddr>().ok()
+        };
+        if let Some(target_addr) = addr {
+            if target_addr.ip().is_loopback() {
+                let rtype = DnsRecordType::from_u16(probe.record_type);
+                let query = DnsMessage::new_query(1, &probe.query_name, rtype);
+                if let Ok(Ok(resp)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    send_udp_query(target_addr, &query),
+                )
+                .await
+                {
+                    *rcode = resp.header.rcode.as_u8();
+                    for ans in resp.answers {
+                        if let DnsRecordData::A(ip) = ans.rdata {
+                            resolved_ips.push(ip);
+                        }
+                    }
+                    resolved = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !resolved {
+        *rcode = DnsRcode::ServFail.as_u8();
     }
 }
 

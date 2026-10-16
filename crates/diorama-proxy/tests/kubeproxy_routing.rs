@@ -6,9 +6,9 @@ use std::sync::Arc;
 use diorama_network::{CommandExecutor, MockCommandExecutor};
 use diorama_proxy::{
     DataplaneProber, DataplaneReconciler, EndpointConditions, EndpointItem, EndpointPort,
-    EndpointSliceDefinition, IptablesDataplane, KubeProxyOptions, NftablesDataplane, Protocol,
-    ProxyError, ProxyMode, ProxyService, ServiceDefinition, ServicePort, ServiceRoutingTable,
-    ServiceType,
+    EndpointSliceDefinition, HostPortDefinition, IptablesDataplane, KubeProxyOptions,
+    NftablesDataplane, Protocol, ProxyError, ProxyMode, ProxyService, ServiceDefinition,
+    ServicePort, ServiceRoutingTable, ServiceType, host_ports_from_pod_value,
 };
 use tempfile::TempDir;
 
@@ -1322,4 +1322,298 @@ fn reconcile_creates_service_chain_for_clusterip_without_ready_endpoints() {
     reconciler
         .reconcile(&table, ProxyMode::IpTables, &mock, None)
         .expect("second reconcile without endpoints must still verify");
+}
+
+#[test]
+fn test_hostport_conformance_coexistence_and_dataplane_rules() {
+    let mut table = ServiceRoutingTable::new();
+
+    // 1. Pod with hostPort 8080 on specific hostIP 192.168.1.1 (TCP)
+    let hp_tcp1 = HostPortDefinition::new(
+        "default",
+        "pod-tcp-ip1",
+        Some("192.168.1.1"),
+        8080,
+        Some(Protocol::Tcp),
+        8080,
+        "10.42.0.10",
+    );
+    // 2. Pod with same hostPort 8080 on different hostIP 192.168.1.2 (TCP)
+    let hp_tcp2 = HostPortDefinition::new(
+        "default",
+        "pod-tcp-ip2",
+        Some("192.168.1.2"),
+        8080,
+        Some(Protocol::Tcp),
+        8080,
+        "10.42.0.11",
+    );
+    // 3. Pod with same hostPort 8080 on 0.0.0.0 wildcard (TCP)
+    let hp_tcp_wildcard = HostPortDefinition::new(
+        "default",
+        "pod-tcp-wildcard",
+        Some("0.0.0.0"),
+        8080,
+        Some(Protocol::Tcp),
+        8080,
+        "10.42.0.12",
+    );
+    // 4. Pod with same hostPort 8080 and hostIP 192.168.1.1 but UDP protocol
+    let hp_udp = HostPortDefinition::new(
+        "default",
+        "pod-udp",
+        Some("192.168.1.1"),
+        8080,
+        Some(Protocol::Udp),
+        8080,
+        "10.42.0.13",
+    );
+    // 5. Pod with same hostPort 8080 and hostIP 192.168.1.1 but SCTP protocol
+    let hp_sctp = HostPortDefinition::new(
+        "default",
+        "pod-sctp",
+        Some("192.168.1.1"),
+        8080,
+        Some(Protocol::Sctp),
+        8080,
+        "10.42.0.14",
+    );
+
+    table.apply_host_port(hp_tcp1);
+    table.apply_host_port(hp_tcp2);
+    table.apply_host_port(hp_tcp_wildcard);
+    table.apply_host_port(hp_udp);
+    table.apply_host_port(hp_sctp);
+
+    assert_eq!(table.host_ports().len(), 5);
+
+    // Verify routing resolution
+    let ep_tcp1 = table
+        .route_host_port("192.168.1.1", 8080, Protocol::Tcp)
+        .expect("should route to pod-tcp-ip1");
+    assert_eq!(ep_tcp1.ip, "10.42.0.10");
+
+    let ep_tcp2 = table
+        .route_host_port("192.168.1.2", 8080, Protocol::Tcp)
+        .expect("should route to pod-tcp-ip2");
+    assert_eq!(ep_tcp2.ip, "10.42.0.11");
+
+    let ep_wildcard = table
+        .route_host_port("10.0.0.5", 8080, Protocol::Tcp)
+        .expect("should fallback to wildcard pod-tcp-wildcard");
+    assert_eq!(ep_wildcard.ip, "10.42.0.12");
+
+    let ep_udp = table
+        .route_host_port("192.168.1.1", 8080, Protocol::Udp)
+        .expect("should route to pod-udp");
+    assert_eq!(ep_udp.ip, "10.42.0.13");
+    assert_eq!(ep_udp.protocol, Protocol::Udp);
+
+    let ep_sctp = table
+        .route_host_port("192.168.1.1", 8080, Protocol::Sctp)
+        .expect("should route to pod-sctp");
+    assert_eq!(ep_sctp.ip, "10.42.0.14");
+    assert_eq!(ep_sctp.protocol, Protocol::Sctp);
+
+    // Verify prober probe_host_port
+    let prober = DataplaneProber::new();
+    let probe_res = prober
+        .probe_host_port(&table, "192.168.1.1", 8080, Protocol::Tcp)
+        .expect("probe should succeed");
+    assert!(probe_res.success);
+    assert_eq!(probe_res.reached_endpoint.unwrap().ip, "10.42.0.10");
+
+    // Verify Iptables rule generation & ordering (specific host IPs ahead of 0.0.0.0 wildcard)
+    let ipt_rules = IptablesDataplane::generate_rules(&table);
+    let hp_rules: Vec<_> = ipt_rules
+        .iter()
+        .filter(|r| r.chain == "KUBE-HOSTPORTS")
+        .collect();
+    assert_eq!(hp_rules.len(), 5);
+
+    let idx_specific1 = hp_rules
+        .iter()
+        .position(|r| r.rule.contains("-d 192.168.1.1/32 -p tcp"))
+        .unwrap();
+    let idx_specific2 = hp_rules
+        .iter()
+        .position(|r| r.rule.contains("-d 192.168.1.2/32 -p tcp"))
+        .unwrap();
+    let idx_wildcard = hp_rules
+        .iter()
+        .position(|r| r.rule.starts_with("-p tcp") && !r.rule.contains("-d "))
+        .unwrap();
+    assert!(
+        idx_specific1 < idx_wildcard,
+        "specific host IP rule must precede wildcard"
+    );
+    assert!(
+        idx_specific2 < idx_wildcard,
+        "specific host IP rule must precede wildcard"
+    );
+
+    // Verify Nftables rule generation & ordering
+    let nft_rules = NftablesDataplane::generate_rules(&table);
+    let nft_hp_rules: Vec<_> = nft_rules
+        .iter()
+        .filter(|r| r.chain == "hostports")
+        .collect();
+    assert_eq!(nft_hp_rules.len(), 5);
+    let nft_idx_specific = nft_hp_rules
+        .iter()
+        .position(|r| r.statement.contains("ip daddr 192.168.1.1 tcp"))
+        .unwrap();
+    let nft_idx_wildcard = nft_hp_rules
+        .iter()
+        .position(|r| r.statement.starts_with("tcp dport"))
+        .unwrap();
+    assert!(
+        nft_idx_specific < nft_idx_wildcard,
+        "specific nft rule must precede wildcard"
+    );
+
+    // Delete pod-tcp-ip1 and verify cleanly removed
+    table.remove_pod_host_ports("default", "pod-tcp-ip1");
+    assert_eq!(table.host_ports().len(), 4);
+    // Now querying 192.168.1.1:8080/TCP should fall back to wildcard pod-tcp-wildcard
+    let ep_after = table
+        .route_host_port("192.168.1.1", 8080, Protocol::Tcp)
+        .expect("should fall back to wildcard");
+    assert_eq!(ep_after.ip, "10.42.0.12");
+
+    // Also verify pod JSON serialization parsing via host_ports_from_pod_value
+    let pod_json = serde_json::json!({
+        "metadata": {
+            "name": "pod-from-json",
+            "namespace": "default"
+        },
+        "status": {
+            "podIP": "10.42.0.99"
+        },
+        "spec": {
+            "containers": [{
+                "name": "app",
+                "ports": [{
+                    "containerPort": 9090,
+                    "hostPort": 9090,
+                    "hostIP": "192.168.1.100",
+                    "protocol": "TCP"
+                }]
+            }]
+        }
+    });
+    let parsed_hps = host_ports_from_pod_value(&pod_json);
+    assert_eq!(parsed_hps.len(), 1);
+    assert_eq!(parsed_hps[0].host_ip, "192.168.1.100");
+    assert_eq!(parsed_hps[0].host_port, 9090);
+    assert_eq!(parsed_hps[0].container_port, 9090);
+    assert_eq!(parsed_hps[0].pod_ip, "10.42.0.99");
+}
+
+#[test]
+fn test_session_affinity_client_ip_and_load_balancer_routing() {
+    let mut table = ServiceRoutingTable::new();
+
+    let lb_svc = ServiceDefinition::new(
+        "default",
+        "lb-app",
+        ServiceType::LoadBalancer,
+        Some("10.43.0.50".to_string()),
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 80,
+            target_port: 8080,
+            node_port: Some(30080),
+        }],
+    )
+    .with_load_balancer_ips(vec!["203.0.113.50".to_string()])
+    .with_session_affinity(Some(10800));
+
+    table.apply_service(lb_svc);
+
+    let slice = EndpointSliceDefinition::new(
+        "default",
+        "lb-app-slice-1",
+        "lb-app",
+        vec![EndpointPort {
+            name: Some("http".to_string()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![
+            EndpointItem::new(
+                vec!["10.42.1.10".to_string()],
+                true,
+                Some("node-1".to_string()),
+            ),
+            EndpointItem::new(
+                vec!["10.42.1.20".to_string()],
+                true,
+                Some("node-2".to_string()),
+            ),
+        ],
+    );
+    table.apply_endpoint_slice(slice);
+
+    // Test routing via LoadBalancer IP
+    let routed_lb = table
+        .route_packet("203.0.113.50", 80, Protocol::Tcp)
+        .expect("LoadBalancer ingress IP should route successfully");
+    assert!(routed_lb.ip == "10.42.1.10" || routed_lb.ip == "10.42.1.20");
+
+    // Test session affinity stickiness
+    let client_a = "192.168.10.5";
+    let ep_a1 = table
+        .route_cluster_ip_with_client(Some(client_a), "10.43.0.50", 80, Protocol::Tcp)
+        .expect("first route for client A");
+    let ep_a2 = table
+        .route_cluster_ip_with_client(Some(client_a), "10.43.0.50", 80, Protocol::Tcp)
+        .expect("second route for client A");
+    assert_eq!(ep_a1.ip, ep_a2.ip, "client A must stick to same endpoint");
+
+    let prober = DataplaneProber::new();
+    let probe_affinity = prober
+        .probe_route_with_client(&table, client_a, "10.43.0.50", 80, Protocol::Tcp)
+        .expect("prober client affinity should succeed");
+    assert_eq!(
+        probe_affinity.reached_endpoint.unwrap().ip,
+        ep_a1.ip,
+        "prober client affinity must match sticky endpoint"
+    );
+
+    // Disable session affinity
+    let no_affinity_svc = ServiceDefinition::new(
+        "default",
+        "lb-app",
+        ServiceType::LoadBalancer,
+        Some("10.43.0.50".to_string()),
+        vec![ServicePort {
+            name: Some("http".to_string()),
+            protocol: Protocol::Tcp,
+            port: 80,
+            target_port: 8080,
+            node_port: Some(30080),
+        }],
+    )
+    .with_load_balancer_ips(vec!["203.0.113.50".to_string()]);
+    table.apply_service(no_affinity_svc);
+
+    // Verify Iptables rules include LoadBalancer ingress IP
+    let ipt_rules = IptablesDataplane::generate_rules(&table);
+    assert!(
+        ipt_rules.iter().any(|r| r
+            .rule
+            .contains("-d 203.0.113.50/32 -p tcp -m tcp --dport 80")),
+        "iptables rules must include LoadBalancer IP"
+    );
+
+    // Verify Nftables rules include LoadBalancer ingress IP and jhash / numgen
+    let nft_rules = NftablesDataplane::generate_rules(&table);
+    assert!(
+        nft_rules
+            .iter()
+            .any(|r| r.statement.contains("ip daddr 203.0.113.50 tcp dport 80")),
+        "nftables rules must include LoadBalancer IP"
+    );
 }
