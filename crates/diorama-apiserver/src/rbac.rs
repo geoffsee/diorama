@@ -16,7 +16,30 @@ impl Subject {
     pub fn matches_user_or_group(&self, username: &str, groups: &[String]) -> bool {
         match self {
             Subject::User { name } => name == username,
-            Subject::Group { name } => groups.iter().any(|g| g == name),
+            Subject::Group { name } => {
+                if groups.iter().any(|g| g == name) {
+                    return true;
+                }
+                if name == "system:nodes" && username.starts_with("system:node:") {
+                    return true;
+                }
+                if name == "system:serviceaccounts"
+                    && username.starts_with("system:serviceaccount:")
+                {
+                    return true;
+                }
+                if let Some(ns) = name.strip_prefix("system:serviceaccounts:")
+                    && let Some(rest) = username.strip_prefix("system:serviceaccount:")
+                    && let Some((user_ns, _)) = rest.split_once(':')
+                    && user_ns == ns
+                {
+                    return true;
+                }
+                name == "system:authenticated"
+                    && (username.starts_with("system:node:")
+                        || username.starts_with("system:serviceaccount:")
+                        || (!username.is_empty() && username != "system:anonymous"))
+            },
             Subject::ServiceAccount { namespace, name } => {
                 let sa_user = format!("system:serviceaccount:{namespace}:{name}");
                 sa_user == username
@@ -50,12 +73,19 @@ impl PolicyRule {
             return false;
         }
 
-        let group_match = self.api_groups.iter().any(|g| g == "*" || g == api_group);
+        let group_match = self.api_groups.is_empty()
+            || self.api_groups.iter().any(|g| g == "*" || g == api_group);
         if !group_match {
             return false;
         }
 
-        let resource_match = self.resources.iter().any(|r| r == "*" || r == resource);
+        let resource_match = self.resources.iter().any(|r| r == "*" || r == resource)
+            || (resource.starts_with('/')
+                && self.non_resource_urls.iter().any(|u| {
+                    u == "*"
+                        || u == resource
+                        || (u.ends_with('*') && resource.starts_with(&u[..u.len() - 1]))
+                }));
         if !resource_match {
             return false;
         }
@@ -319,10 +349,93 @@ impl RbacAuthorizer {
                     resource_names: Vec::new(),
                     non_resource_urls: Vec::new(),
                 },
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec![String::new()],
+                    resources: vec!["serviceaccounts/token".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authentication.k8s.io".to_string()],
+                    resources: vec!["tokenreviews".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authorization.k8s.io".to_string()],
+                    resources: vec![
+                        "subjectaccessreviews".to_string(),
+                        "selfsubjectaccessreviews".to_string(),
+                        "selfsubjectrulesreviews".to_string(),
+                    ],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
             ],
+        });
+
+        self.add_cluster_role(ClusterRole {
+            name: "system:auth-delegator".to_string(),
+            rules: vec![
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authentication.k8s.io".to_string()],
+                    resources: vec!["tokenreviews".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authorization.k8s.io".to_string()],
+                    resources: vec!["subjectaccessreviews".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+            ],
+        });
+
+        self.add_cluster_role(ClusterRole {
+            name: "system:basic-user".to_string(),
+            rules: vec![
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authorization.k8s.io".to_string()],
+                    resources: vec![
+                        "selfsubjectaccessreviews".to_string(),
+                        "selfsubjectrulesreviews".to_string(),
+                    ],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec!["create".to_string()],
+                    api_groups: vec!["authentication.k8s.io".to_string()],
+                    resources: vec!["selfsubjectreviews".to_string()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+            ],
+        });
+
+        self.add_cluster_role(ClusterRole {
+            name: "system:service-account-issuer-discovery".to_string(),
+            rules: vec![PolicyRule {
+                verbs: vec!["get".to_string()],
+                api_groups: Vec::new(),
+                resources: Vec::new(),
+                resource_names: Vec::new(),
+                non_resource_urls: vec![
+                    "/.well-known/openid-configuration".to_string(),
+                    "/openid/v1/jwks".to_string(),
+                ],
+            }],
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn seed_bootstrap_bindings(&self) {
         self.add_cluster_role_binding(ClusterRoleBinding {
             name: "cluster-admin".to_string(),
@@ -362,6 +475,54 @@ impl RbacAuthorizer {
             subjects: vec![Subject::Group {
                 name: "system:nodes".to_string(),
             }],
+        });
+
+        self.add_cluster_role_binding(ClusterRoleBinding {
+            name: "system:auth-delegator".to_string(),
+            role_ref: "system:auth-delegator".to_string(),
+            subjects: vec![
+                Subject::Group {
+                    name: "system:serviceaccounts".to_string(),
+                },
+                Subject::Group {
+                    name: "system:nodes".to_string(),
+                },
+                Subject::Group {
+                    name: "system:authenticated".to_string(),
+                },
+            ],
+        });
+
+        self.add_cluster_role_binding(ClusterRoleBinding {
+            name: "system:basic-user".to_string(),
+            role_ref: "system:basic-user".to_string(),
+            subjects: vec![
+                Subject::Group {
+                    name: "system:authenticated".to_string(),
+                },
+                Subject::Group {
+                    name: "system:unauthenticated".to_string(),
+                },
+                Subject::Group {
+                    name: "system:serviceaccounts".to_string(),
+                },
+            ],
+        });
+
+        self.add_cluster_role_binding(ClusterRoleBinding {
+            name: "system:service-account-issuer-discovery".to_string(),
+            role_ref: "system:service-account-issuer-discovery".to_string(),
+            subjects: vec![
+                Subject::Group {
+                    name: "system:serviceaccounts".to_string(),
+                },
+                Subject::Group {
+                    name: "system:authenticated".to_string(),
+                },
+                Subject::Group {
+                    name: "system:unauthenticated".to_string(),
+                },
+            ],
         });
     }
 
@@ -757,5 +918,166 @@ mod tests {
             "sonobuoy-serviceaccount-sonobuoy",
         );
         assert!(!authorizer.authorize(&allowed));
+    }
+
+    #[test]
+    fn authenticated_service_accounts_may_create_token_reviews_and_self_subject_reviews() {
+        let authorizer = RbacAuthorizer::new();
+        let groups = [
+            "system:serviceaccounts".to_string(),
+            "system:serviceaccounts:prod".to_string(),
+            "system:authenticated".to_string(),
+        ];
+        let sa_user = "system:serviceaccount:prod:web-sa";
+
+        // 1. TokenReview (granted via system:auth-delegator)
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // Also works with implicit groups if groups slice is empty
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &[],
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // 2. SelfSubjectAccessReview (granted via system:basic-user)
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "selfsubjectaccessreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // 3. SelfSubjectRulesReview (granted via system:basic-user)
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "selfsubjectrulesreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // 4. SelfSubjectReview (granted via system:basic-user)
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "selfsubjectreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // Disallowed access: secrets
+        assert!(!authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "secrets",
+            namespace: Some("prod"),
+            resource_name: Some("secret-1"),
+        }));
+    }
+
+    #[test]
+    fn nodes_may_create_token_reviews_and_access_reviews() {
+        let authorizer = RbacAuthorizer::new();
+        let groups = [
+            "system:nodes".to_string(),
+            "system:authenticated".to_string(),
+        ];
+        let node_user = "system:node:worker-1";
+
+        // TokenReview
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: node_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // SubjectAccessReview
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: node_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "subjectaccessreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        // ServiceAccount token creation
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: node_user,
+            groups: &groups,
+            verb: "create",
+            api_group: "",
+            resource: "serviceaccounts/token",
+            namespace: Some("default"),
+            resource_name: Some("default"),
+        }));
+
+        // Works with implicit group matching when groups is empty
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: node_user,
+            groups: &[],
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            namespace: None,
+            resource_name: None,
+        }));
+    }
+
+    #[test]
+    fn service_account_issuer_discovery_rules_allow_discovery_endpoints() {
+        let authorizer = RbacAuthorizer::new();
+        let groups = [
+            "system:serviceaccounts".to_string(),
+            "system:authenticated".to_string(),
+        ];
+        let sa_user = "system:serviceaccount:default:my-sa";
+
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "/.well-known/openid-configuration",
+            namespace: None,
+            resource_name: None,
+        }));
+
+        assert!(authorizer.authorize(&AuthzRequest {
+            username: sa_user,
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "/openid/v1/jwks",
+            namespace: None,
+            resource_name: None,
+        }));
     }
 }
