@@ -64,12 +64,17 @@ impl StatefulSetReconciler {
         for idx in 0..cfg.desired_replicas {
             let pod_name = format!("{}-{idx}", cfg.name);
             if let Ok(existing_pod) = self.client.get_pod(namespace, &pod_name).await {
-                if existing_pod
+                let is_failed = existing_pod
                     .pointer("/status/phase")
                     .and_then(Value::as_str)
                     == Some("Failed")
-                {
-                    let _ = self.client.delete_pod(namespace, &pod_name).await;
+                    || existing_pod
+                        .pointer("/status/reason")
+                        .and_then(Value::as_str)
+                        == Some("Evicted");
+
+                if is_failed {
+                    force_delete_failed_pod(&self.client, namespace, &pod_name).await;
                 } else if cfg.ordered_ready
                     && (has_nodes || existing_pod.pointer("/status/conditions").is_some())
                     && !super::replicaset::is_pod_ready(&existing_pod)
@@ -859,4 +864,29 @@ fn should_halt_scale_down(
         }
     }
     false
+}
+
+async fn force_delete_failed_pod(client: &KubernetesApiClient, namespace: &str, pod_name: &str) {
+    let _ = client
+        .delete_pod_options(namespace, pod_name, Some(0))
+        .await;
+    let _ = client.delete_pod(namespace, pod_name).await;
+    let Ok(mut pod_to_strip) = client.get_pod(namespace, pod_name).await else {
+        return;
+    };
+    if pod_to_strip.pointer("/metadata/finalizers").is_none() {
+        return;
+    }
+    if let Some(meta) = pod_to_strip
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        meta.remove("finalizers");
+    }
+    let _ = client
+        .replace_namespaced_object("", "Pod", "pods", namespace, pod_name, pod_to_strip)
+        .await;
+    let _ = client
+        .delete_pod_options(namespace, pod_name, Some(0))
+        .await;
 }

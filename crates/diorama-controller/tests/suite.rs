@@ -2837,4 +2837,217 @@ mod workload_conformance_lane_t07 {
         let rs1_after = client.get_replicaset(ns, "roll-dep-rev1").await.unwrap();
         assert_eq!(rs1_after["spec"]["replicas"], 1);
     }
+
+    #[tokio::test]
+    async fn test_ordered_namespace_deletion_preserves_configmap_while_pod_remains() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ns-order-del";
+        client.create_namespace(ns).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "active-pod",
+                "namespace": ns,
+            },
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{ "name": "c", "image": "nginx" }]
+            },
+            "status": {
+                "phase": "Running"
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        let cm = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "test-cm", "namespace": ns },
+            "data": { "key": "val" }
+        });
+        client.create_configmap_object(ns, cm).await.unwrap();
+
+        let mut ns_doc = client.get_namespace(ns).await.unwrap();
+        ns_doc["metadata"]["deletionTimestamp"] = json!("2026-10-27T00:00:00Z");
+        ns_doc["status"] = json!({ "phase": "Terminating" });
+        client
+            .replace_cluster_object("", "Namespace", "namespaces", ns, ns_doc)
+            .await
+            .unwrap();
+
+        // First reconcile: pod is marked for deletion but still remains in storage
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Pod and ConfigMap must both still exist
+        assert!(client.get_pod(ns, "active-pod").await.is_ok());
+        assert!(
+            client.get_configmap(ns, "test-cm").await.is_ok(),
+            "ConfigMap must not be deleted while pods remain in terminating namespace"
+        );
+
+        // Delete pod with 0 grace period simulating kubelet completion
+        let _ = client.delete_pod_options(ns, "active-pod", Some(0)).await;
+
+        // Second reconcile: all pods gone, now configmap and namespace should be cleaned up
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        assert!(client.get_configmap(ns, "test-cm").await.is_err());
+        assert!(client.get_namespace(ns).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_deployment_proportional_scale_persists_across_multiple_reconciliations() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "dep-persist-prop";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "prop-dep", "namespace": ns },
+            "spec": {
+                "replicas": 10,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "maxSurge": 5, "maxUnavailable": 2 }
+                },
+                "selector": { "matchLabels": { "app": "prop" } },
+                "template": {
+                    "metadata": { "labels": { "app": "prop" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx:1.27" }] }
+                }
+            }
+        });
+        client.create_deployment(ns, dep).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let dep_obj = client.get_deployment(ns, "prop-dep").await.unwrap();
+        let dep_uid = dep_obj["metadata"]["uid"].as_str().unwrap().to_string();
+
+        let old_rs = client.get_replicaset(ns, "prop-dep-rs").await.unwrap();
+        let mut old_scaled = old_rs.clone();
+        old_scaled["spec"]["replicas"] = json!(2);
+        client
+            .update_replicaset(ns, "prop-dep-rs", old_scaled)
+            .await
+            .unwrap();
+
+        let new_rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "prop-dep-newhash",
+                "namespace": ns,
+                "labels": { "app": "prop", "pod-template-hash": "newhash" },
+                "annotations": { "deployment.kubernetes.io/revision": "2" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "prop-dep",
+                    "uid": dep_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {
+                "replicas": 8,
+                "selector": { "matchLabels": { "app": "prop", "pod-template-hash": "newhash" } },
+                "template": {
+                    "metadata": { "labels": { "app": "prop", "pod-template-hash": "newhash" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx:1.28" }] }
+                }
+            }
+        });
+        client.create_replicaset(ns, new_rs).await.unwrap();
+
+        // Scale deployment from 10 to 20 replicas.
+        // max_total_replicas = 20 + 5 = 25.
+        // Old RS proportion: 2/10 * 25 = 5.
+        // New RS proportion: 8/10 * 25 = 20.
+        let mut dep_scaled = client.get_deployment(ns, "prop-dep").await.unwrap();
+        dep_scaled["spec"]["replicas"] = json!(20);
+        dep_scaled["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.28");
+        client
+            .update_deployment(ns, "prop-dep", dep_scaled)
+            .await
+            .unwrap();
+
+        // Pass 1: Proportional scaling scales old RS to 5 and new RS to 20
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let old_p1 = client.get_replicaset(ns, "prop-dep-rs").await.unwrap();
+        assert_eq!(old_p1["spec"]["replicas"], 5);
+        let new_p1 = client.get_replicaset(ns, "prop-dep-newhash").await.unwrap();
+        assert_eq!(new_p1["spec"]["replicas"], 20);
+
+        // Pass 2: Multiple subsequent reconciles must NOT scale down old RS from 5
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let old_p2 = client.get_replicaset(ns, "prop-dep-rs").await.unwrap();
+        assert_eq!(
+            old_p2["spec"]["replicas"], 5,
+            "Old RS must maintain proportional scale (5) on subsequent reconcile passes"
+        );
+        let new_p2 = client.get_replicaset(ns, "prop-dep-newhash").await.unwrap();
+        assert_eq!(new_p2["spec"]["replicas"], 20);
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_recreates_failed_and_evicted_pod() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ss-evict-recreate";
+        client.create_namespace(ns).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "ss-evict", "namespace": ns },
+            "spec": {
+                "serviceName": "ss-evict-svc",
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "ss-evict" } },
+                "template": {
+                    "metadata": { "labels": { "app": "ss-evict" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx" }] }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pod_before = client.get_pod(ns, "ss-evict-0").await.unwrap();
+        let orig_uid = pod_before["metadata"]["uid"].as_str().unwrap().to_string();
+
+        // Mark the pod as Failed / Evicted
+        let mut status = pod_before["status"].clone();
+        status["phase"] = json!("Failed");
+        status["reason"] = json!("Evicted");
+        client
+            .patch_pod_status(ns, "ss-evict-0", status)
+            .await
+            .unwrap();
+
+        // Reconcile StatefulSet: should delete Failed pod and recreate it
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pod_after = client.get_pod(ns, "ss-evict-0").await.unwrap();
+        let new_uid = pod_after["metadata"]["uid"].as_str().unwrap().to_string();
+        assert_ne!(orig_uid, new_uid, "Recreated pod must have a new UID");
+        assert_eq!(
+            pod_after.pointer("/status/phase").and_then(Value::as_str),
+            Some("Pending"),
+            "Recreated pod must be in Pending phase"
+        );
+    }
 }

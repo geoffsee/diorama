@@ -284,6 +284,15 @@ impl DeploymentReconciler {
             return Ok(updated_deployment);
         }
 
+        if ready_replicas > 0 || available_replicas > 0 {
+            let _ = super::EndpointSliceReconciler::new(self.client.clone())
+                .reconcile_all(namespace)
+                .await;
+            let _ = super::EndpointsReconciler::new(self.client.clone())
+                .reconcile_all(namespace)
+                .await;
+        }
+
         self.client
             .update_deployment(namespace, cfg.name, updated_deployment)
             .await
@@ -412,7 +421,7 @@ impl DeploymentReconciler {
         old_rs: &mut [Value],
         current_total_spec: &mut i64,
     ) {
-        if *current_total_spec <= ctx.desired_replicas {
+        if *current_total_spec <= ctx.desired_replicas || old_rs.len() < 2 {
             return;
         }
 
