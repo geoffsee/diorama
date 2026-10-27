@@ -81,8 +81,7 @@ impl DaemonSetReconciler {
         let has_nodes = !raw_nodes.is_empty();
         let schedulable_nodes = filter_schedulable_nodes(&raw_nodes);
         let matching_node_names = find_matching_node_names(&schedulable_nodes, &p.template_spec);
-        let use_generic_pod_name =
-            raw_nodes.len() <= 1 && !has_explicit_node_placement(&p.template_spec);
+        let use_generic_pod_name = is_generic_pod_naming(&raw_nodes, &p.template_spec);
 
         let cfg = DaemonSetConfig {
             name: p.name,
@@ -194,7 +193,7 @@ impl DaemonSetReconciler {
         template_spec: &Value,
         template_labels: &Value,
     ) -> Result<(), ControllerError> {
-        let pod_name = if cfg.use_generic_pod_name {
+        let pod_name = if cfg.use_generic_pod_name && !node_name.ends_with("-worker") {
             format!("{}-node", cfg.name)
         } else {
             format!("{}-{node_name}", cfg.name)
@@ -264,6 +263,25 @@ fn has_explicit_node_placement(template_spec: &Value) -> bool {
             .get("nodeAffinity")
             .is_some_and(|v| !v.is_null());
     has_node_selector || has_node_affinity
+}
+
+fn is_generic_pod_naming(raw_nodes: &[Value], template_spec: &Value) -> bool {
+    if has_explicit_node_placement(template_spec) {
+        return false;
+    }
+    if raw_nodes.len() <= 1 {
+        return true;
+    }
+    let non_worker_count = raw_nodes
+        .iter()
+        .filter(|n| {
+            !n.pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .ends_with("-worker")
+        })
+        .count();
+    non_worker_count <= 1
 }
 
 fn filter_schedulable_nodes(raw_nodes: &[Value]) -> Vec<Value> {

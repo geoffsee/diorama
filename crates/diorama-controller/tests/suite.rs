@@ -696,7 +696,7 @@ mod workload_conformance_lane_t07 {
     use diorama_controller::{ControllerManagerConfig, ControllerManagerService};
     use diorama_datastore::{DatastoreConfig, DatastoreEngine};
     use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     fn setup_controller(dir: &TempDir) -> ControllerManagerService {
@@ -877,6 +877,88 @@ mod workload_conformance_lane_t07 {
         let ds_obj = client.get_daemonset(ns, "gpu-monitor").await.unwrap();
         assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 0);
         assert_eq!(ds_obj["status"]["currentNumberScheduled"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_daemonset_companion_worker_pod_naming() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-companion-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let primary_node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "diorama",
+                "labels": { "kubernetes.io/hostname": "diorama" }
+            }
+        });
+        client.create_node(primary_node).await.unwrap();
+
+        let worker_node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "diorama-worker",
+                "labels": { "kubernetes.io/hostname": "diorama-worker" }
+            }
+        });
+        client.create_node(worker_node).await.unwrap();
+
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {
+                "name": "marker",
+                "namespace": ns
+            },
+            "spec": {
+                "selector": {
+                    "matchLabels": { "app": "marker" }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": { "app": "marker" }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "marker",
+                            "image": "registry.k8s.io/pause:3.9"
+                        }]
+                    }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let primary_pod = client
+            .get_pod(ns, "marker-node")
+            .await
+            .expect("marker-node must exist");
+        assert_eq!(
+            primary_pod
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str),
+            Some("diorama")
+        );
+
+        let worker_pod = client
+            .get_pod(ns, "marker-diorama-worker")
+            .await
+            .expect("marker-diorama-worker must exist");
+        assert_eq!(
+            worker_pod.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-worker")
+        );
+
+        let ds_obj = client.get_daemonset(ns, "marker").await.unwrap();
+        assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 2);
     }
 
     #[tokio::test]
