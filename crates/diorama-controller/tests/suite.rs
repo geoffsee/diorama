@@ -3050,4 +3050,357 @@ mod workload_conformance_lane_t07 {
             "Recreated pod must be in Pending phase"
         );
     }
+
+    #[tokio::test]
+    async fn test_daemonset_controller_revision_management_and_rollback() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-rev-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "node-rev" }
+        });
+        client.create_node(node).await.unwrap();
+
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "ds-rev", "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": "ds-rev" } },
+                "template": {
+                    "metadata": { "labels": { "app": "ds-rev" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx:1.26" }] }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds.clone()).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // 1. Verify revision 1 created
+        let revs = client
+            .list_namespaced_objects("apps", "ControllerRevisionList", "controllerrevisions", ns)
+            .await
+            .unwrap();
+        let items = revs["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["revision"], 1);
+        let rev1_name = items[0]["metadata"]["name"].as_str().unwrap().to_string();
+
+        // 2. Update to revision 2 (nginx:1.27)
+        let mut ds_v2 = ds.clone();
+        ds_v2["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.27");
+        client.update_daemonset(ns, "ds-rev", ds_v2).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let revs_v2 = client
+            .list_namespaced_objects("apps", "ControllerRevisionList", "controllerrevisions", ns)
+            .await
+            .unwrap();
+        let items_v2 = revs_v2["items"].as_array().unwrap();
+        assert_eq!(items_v2.len(), 2);
+
+        // 3. Rollback to nginx:1.26 (matching revision 1)
+        let mut ds_v3 = ds;
+        ds_v3["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.26");
+        client.update_daemonset(ns, "ds-rev", ds_v3).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Verify revision 1 was bumped to revision 3
+        let revs_v3 = client
+            .list_namespaced_objects("apps", "ControllerRevisionList", "controllerrevisions", ns)
+            .await
+            .unwrap();
+        let items_v3 = revs_v3["items"].as_array().unwrap();
+        assert_eq!(items_v3.len(), 2);
+        let rev1_after = items_v3
+            .iter()
+            .find(|r| r["metadata"]["name"] == rev1_name)
+            .unwrap();
+        assert_eq!(rev1_after["revision"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_daemonset_failed_pod_replacement_naming() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-fail-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "node-fail-worker" }
+        });
+        client.create_node(node).await.unwrap();
+
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "ds-fail", "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": "ds-fail" } },
+                "template": {
+                    "metadata": { "labels": { "app": "ds-fail" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx:alpine" }] }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let base_pod = client
+            .get_pod(ns, "ds-fail-node-fail-worker")
+            .await
+            .unwrap();
+        assert_eq!(
+            base_pod.pointer("/status/phase").and_then(Value::as_str),
+            Some("Pending")
+        );
+
+        // Simulate pod failure
+        let mut fail_pod = base_pod.clone();
+        fail_pod["status"] = json!({ "phase": "Failed" });
+        client
+            .update_pod(ns, "ds-fail-node-fail-worker", fail_pod)
+            .await
+            .unwrap();
+
+        // Reconcile: old pod is deleted, new pod is created with revision hash suffix
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let pods = client.list_pods(ns).await.unwrap();
+        let pod_items = pods["items"].as_array().unwrap();
+        assert!(pod_items.iter().any(|p| {
+            let name = p["metadata"]["name"].as_str().unwrap();
+            name.starts_with("ds-fail-node-fail-worker-") && p["status"]["phase"] == "Pending"
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_replicationcontroller_deletion_timestamp_early_return() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "rc-del-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let rc = json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "rc-term", "namespace": ns },
+            "spec": {
+                "replicas": 2,
+                "selector": { "app": "rc-term" },
+                "template": {
+                    "metadata": { "labels": { "app": "rc-term" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        client.create_replicationcontroller(ns, rc).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let initial_pods = client.list_pods(ns).await.unwrap();
+        assert_eq!(initial_pods["items"].as_array().unwrap().len(), 2);
+
+        // Mark RC with deletionTimestamp
+        let mut cur_rc = client
+            .get_replicationcontroller(ns, "rc-term")
+            .await
+            .unwrap();
+        cur_rc["metadata"]["deletionTimestamp"] = json!("2026-10-27T00:00:00Z");
+        cur_rc["spec"]["replicas"] = json!(5);
+        client
+            .update_replicationcontroller(ns, "rc-term", cur_rc)
+            .await
+            .unwrap();
+
+        // Reconcile RC: should return immediately without scaling up to 5
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let pods_after = client.list_pods(ns).await.unwrap();
+        assert_eq!(pods_after["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pod_controller_owner_reference_matching() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "rc-dual-owner-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let cm = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "config-ref", "namespace": ns },
+            "data": { "key": "value" }
+        });
+        let created_cm = client.create_configmap_object(ns, cm).await.unwrap();
+        let cm_uid = created_cm["metadata"]["uid"].as_str().unwrap();
+
+        let other_rc = json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "other-rc", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "app": "shared" },
+                "template": {
+                    "metadata": { "labels": { "app": "shared" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        let created_other = client
+            .create_replicationcontroller(ns, other_rc)
+            .await
+            .unwrap();
+        let other_uid = created_other["metadata"]["uid"].as_str().unwrap();
+
+        let rc = json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "ctrl-rc", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "app": "shared" },
+                "template": {
+                    "metadata": { "labels": { "app": "shared" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        let created_rc = client.create_replicationcontroller(ns, rc).await.unwrap();
+        let rc_uid = created_rc["metadata"]["uid"].as_str().unwrap();
+
+        // Pre-create a pod with matching labels, a non-controller ConfigMap ref, and a controller owner pointing to other-rc
+        let foreign_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "foreign-pod",
+                "namespace": ns,
+                "labels": { "app": "shared" },
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "name": "config-ref",
+                        "uid": cm_uid,
+                        "controller": false
+                    },
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "other-rc",
+                        "uid": other_uid,
+                        "controller": true
+                    }
+                ]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        client.create_pod(ns, foreign_pod).await.unwrap();
+
+        // Reconcile: other-rc keeps foreign_pod, ctrl-rc must NOT adopt foreign_pod, non-controller ref preserved
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pod = client.get_pod(ns, "foreign-pod").await.unwrap();
+        let owners = pod["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(owners.len(), 2);
+        assert!(
+            owners
+                .iter()
+                .any(|o| o["name"] == "config-ref" && o["controller"] == false)
+        );
+        assert!(
+            owners
+                .iter()
+                .any(|o| o["name"] == "other-rc" && o["controller"] == true)
+        );
+
+        // ctrl-rc will have created its own pod since foreign_pod was not adopted
+        let all_pods = client.list_pods(ns).await.unwrap();
+        let items = all_pods["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|p| {
+            p["metadata"]["ownerReferences"]
+                .as_array()
+                .is_some_and(|o| {
+                    o.iter()
+                        .any(|r| r["uid"] == rc_uid && r["controller"] == true)
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_deployment_reconciles_endpoints_when_ready() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "dep-ep-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "dep-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "dep-app" },
+                "ports": [{ "name": "http", "port": 80, "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "dep-app", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "dep-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "dep-app" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            }
+        });
+        client.create_deployment(ns, dep).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Mark pods ready with IP
+        let pod_list = client.list_pods(ns).await.unwrap();
+        for p in pod_list["items"].as_array().unwrap() {
+            let pname = p["metadata"]["name"].as_str().unwrap();
+            let mut updated = p.clone();
+            updated["status"] = json!({
+                "phase": "Running",
+                "podIP": "10.244.0.50",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            });
+            client.update_pod(ns, pname, updated).await.unwrap();
+        }
+
+        // Reconcile: Deployment reconciles EndpointSlice and Endpoints
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let eps = client.get_endpoints(ns, "dep-svc").await.unwrap();
+        assert!(eps["subsets"].as_array().is_some_and(|s| !s.is_empty()));
+    }
 }

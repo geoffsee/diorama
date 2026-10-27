@@ -277,13 +277,6 @@ impl DeploymentReconciler {
             is_rollout_complete,
         );
 
-        if updated_deployment.get("status") == deployment.get("status")
-            && updated_deployment.pointer("/metadata/annotations")
-                == deployment.pointer("/metadata/annotations")
-        {
-            return Ok(updated_deployment);
-        }
-
         if ready_replicas > 0 || available_replicas > 0 {
             let _ = super::EndpointSliceReconciler::new(self.client.clone())
                 .reconcile_all(namespace)
@@ -291,6 +284,13 @@ impl DeploymentReconciler {
             let _ = super::EndpointsReconciler::new(self.client.clone())
                 .reconcile_all(namespace)
                 .await;
+        }
+
+        if updated_deployment.get("status") == deployment.get("status")
+            && updated_deployment.pointer("/metadata/annotations")
+                == deployment.pointer("/metadata/annotations")
+        {
+            return Ok(updated_deployment);
         }
 
         self.client

@@ -195,6 +195,10 @@ impl ReplicationControllerReconciler {
         namespace: &str,
         rc: &Value,
     ) -> Result<Value, ControllerError> {
+        if rc.pointer("/metadata/deletionTimestamp").is_some() {
+            return Ok(rc.clone());
+        }
+
         let cfg = parse_rc_config(rc)?;
 
         let initial_pods = adopt_and_release_pods(
