@@ -211,13 +211,18 @@ impl WebhookDefinition {
         ns_labels: Option<&Value>,
     ) -> bool {
         let (obj_group, obj_version) = extract_group_version(req);
+        let effective_resource = if let Some(sub) = &req.subresource {
+            format!("{}/{}", req.resource.resource, sub)
+        } else {
+            req.resource.resource.clone()
+        };
 
         let rules_match = self.rules.iter().any(|r| {
             let direct = r.matches_scoped(
                 &req.operation,
                 &req.resource.group,
                 &req.resource.version,
-                &req.resource.resource,
+                &effective_resource,
                 req.namespace.as_deref(),
             );
             if direct {
@@ -229,7 +234,7 @@ impl WebhookDefinition {
                     &req.operation,
                     og,
                     ov,
-                    &req.resource.resource,
+                    &effective_resource,
                     req.namespace.as_deref(),
                 ) {
                     return true;
@@ -292,11 +297,13 @@ pub struct GroupVersionResource {
     pub resource: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UserInfo {
     pub username: String,
     pub uid: Option<String>,
     pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -304,6 +311,8 @@ pub struct AdmissionRequest {
     pub uid: String,
     pub kind: GroupVersionKind,
     pub resource: GroupVersionResource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresource: Option<String>,
     pub name: Option<String>,
     pub namespace: Option<String>,
     pub operation: String,
@@ -664,11 +673,17 @@ impl NamedRuleWithOperations {
             return false;
         }
 
+        let effective_resource = if let Some(sub) = &req.subresource {
+            format!("{}/{}", req.resource.resource, sub)
+        } else {
+            req.resource.resource.clone()
+        };
+
         let res_match = self.resources.is_empty()
             || self
                 .resources
                 .iter()
-                .any(|r| resource_rule_matches(r, &req.resource.resource));
+                .any(|r| resource_rule_matches(r, &effective_resource));
         if !res_match {
             return false;
         }
@@ -869,29 +884,310 @@ async fn dispatch_single_webhook(
     })
 }
 
+struct WebhookTarget {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_webhook_url(url_str: &str) -> Result<WebhookTarget, ApiserverError> {
+    let (scheme, rest) = if let Some(s) = url_str.strip_prefix("https://") {
+        ("https", s)
+    } else if let Some(s) = url_str.strip_prefix("http://") {
+        ("http", s)
+    } else {
+        return Err(ApiserverError::InvalidInput {
+            field: "clientConfig.url".to_string(),
+            reason: format!("invalid scheme in webhook URL: {url_str}"),
+        });
+    };
+    let (hp, p) = match rest.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    let (h, port) = match hp.split_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|e| ApiserverError::InvalidInput {
+                field: "clientConfig.url".to_string(),
+                reason: format!("invalid port in webhook URL: {e}"),
+            })?,
+        ),
+        None => (hp.to_string(), if scheme == "https" { 443 } else { 80 }),
+    };
+    Ok(WebhookTarget {
+        scheme,
+        host: h,
+        port,
+        path: p,
+    })
+}
+
+async fn resolve_webhook_service(
+    svc: &ServiceReference,
+    storage: Option<&KubernetesStorage>,
+) -> WebhookTarget {
+    let port = u16::try_from(svc.port.unwrap_or(443)).unwrap_or(443);
+    let mut path = svc.path.clone().unwrap_or_else(|| "/".to_string());
+    if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    let mut resolved_host = format!("{}.{}.svc", svc.name, svc.namespace);
+    if let Some(storage) = storage {
+        let ep_key = format!(
+            "{}/endpoints/{}/{}",
+            storage.prefix(),
+            svc.namespace,
+            svc.name
+        );
+        if let Ok(Some(kv)) = storage.get(&ep_key).await
+            && let Ok(ep_doc) = serde_json::from_slice::<Value>(&kv.value)
+            && let Some(ip) = ep_doc
+                .pointer("/subsets/0/addresses/0/ip")
+                .and_then(Value::as_str)
+            && !ip.is_empty()
+        {
+            resolved_host = ip.to_string();
+        } else {
+            let svc_key = format!(
+                "{}/services/{}/{}",
+                storage.prefix(),
+                svc.namespace,
+                svc.name
+            );
+            if let Ok(Some(kv)) = storage.get(&svc_key).await
+                && let Ok(svc_doc) = serde_json::from_slice::<Value>(&kv.value)
+                && let Some(cip) = svc_doc.pointer("/spec/clusterIP").and_then(Value::as_str)
+                && !cip.is_empty()
+                && cip != "None"
+            {
+                resolved_host = cip.to_string();
+            }
+        }
+    }
+    WebhookTarget {
+        scheme: "https",
+        host: resolved_host,
+        port,
+        path,
+    }
+}
+
+async fn send_webhook_http(
+    target: WebhookTarget,
+    ca_pem: Option<&str>,
+    body_bytes: Vec<u8>,
+    timeout_dur: std::time::Duration,
+    webhook_name: &str,
+    tcp_stream: tokio::net::TcpStream,
+) -> Result<bytes::Bytes, ApiserverError> {
+    if target.scheme == "https" {
+        let connector = crate::http::tls::tls_connector_for_ca(ca_pem);
+        let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+            .unwrap_or_else(|_| {
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+            });
+        let tls_stream =
+            tokio::time::timeout(timeout_dur, connector.connect(server_name, tcp_stream))
+                .await
+                .map_err(|_| ApiserverError::WebhookFailure {
+                    webhook: webhook_name.to_string(),
+                    reason: "TLS handshake timed out".to_string(),
+                })?
+                .map_err(|e| ApiserverError::WebhookFailure {
+                    webhook: webhook_name.to_string(),
+                    reason: format!("TLS handshake failed: {e}"),
+                })?;
+
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("HTTP handshake failed: {e}"),
+            })?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let http_req = http::Request::builder()
+            .method("POST")
+            .uri(&target.path)
+            .header(
+                http::header::HOST,
+                format!("{}:{}", target.host, target.port),
+            )
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
+            .map_err(|e| ApiserverError::Internal {
+                reason: e.to_string(),
+            })?;
+
+        let resp = tokio::time::timeout(timeout_dur, sender.send_request(http_req))
+            .await
+            .map_err(|_| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: "request timed out".to_string(),
+            })?
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("HTTP request failed: {e}"),
+            })?;
+
+        let collected = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("reading response failed: {e}"),
+            })?;
+        Ok(collected.to_bytes())
+    } else {
+        let io = hyper_util::rt::TokioIo::new(tcp_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("HTTP handshake failed: {e}"),
+            })?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let http_req = http::Request::builder()
+            .method("POST")
+            .uri(&target.path)
+            .header(
+                http::header::HOST,
+                format!("{}:{}", target.host, target.port),
+            )
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
+            .map_err(|e| ApiserverError::Internal {
+                reason: e.to_string(),
+            })?;
+
+        let resp = tokio::time::timeout(timeout_dur, sender.send_request(http_req))
+            .await
+            .map_err(|_| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: "request timed out".to_string(),
+            })?
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("HTTP request failed: {e}"),
+            })?;
+
+        let collected = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .map_err(|e| ApiserverError::WebhookFailure {
+                webhook: webhook_name.to_string(),
+                reason: format!("reading response failed: {e}"),
+            })?;
+        Ok(collected.to_bytes())
+    }
+}
+
+async fn dispatch_live_webhook(
+    webhook: &WebhookDefinition,
+    req: &AdmissionRequest,
+    storage: Option<&KubernetesStorage>,
+) -> Result<AdmissionResponse, ApiserverError> {
+    let target = if let Some(url_str) = &webhook.client_config.url {
+        parse_webhook_url(url_str)?
+    } else if let Some(svc) = &webhook.client_config.service {
+        resolve_webhook_service(svc, storage).await
+    } else {
+        return Err(ApiserverError::InvalidInput {
+            field: "clientConfig".to_string(),
+            reason: "webhook clientConfig must specify url or service".to_string(),
+        });
+    };
+
+    let ca_pem = webhook
+        .client_config
+        .ca_bundle
+        .as_ref()
+        .and_then(|b64| diorama_pki::base64_decode(b64).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+
+    let timeout_secs = u64::from(webhook.timeout_seconds.unwrap_or(10));
+    let timeout_dur = std::time::Duration::from_secs(timeout_secs);
+
+    let tcp_stream = tokio::time::timeout(
+        timeout_dur,
+        tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
+    )
+    .await
+    .map_err(|_| ApiserverError::WebhookFailure {
+        webhook: webhook.name.clone(),
+        reason: format!("connection to {}:{} timed out", target.host, target.port),
+    })?
+    .map_err(|e| ApiserverError::WebhookFailure {
+        webhook: webhook.name.clone(),
+        reason: format!("failed to connect to {}:{}: {e}", target.host, target.port),
+    })?;
+
+    let review = AdmissionReview {
+        api_version: "admission.k8s.io/v1".to_string(),
+        kind: "AdmissionReview".to_string(),
+        request: Some(req.clone()),
+        response: None,
+    };
+    let body_bytes = serde_json::to_vec(&review).map_err(|e| ApiserverError::Internal {
+        reason: format!("failed to serialize AdmissionReview: {e}"),
+    })?;
+
+    let resp_bytes = send_webhook_http(
+        target,
+        ca_pem.as_deref(),
+        body_bytes,
+        timeout_dur,
+        &webhook.name,
+        tcp_stream,
+    )
+    .await?;
+
+    let parsed_review: AdmissionReview =
+        serde_json::from_slice(&resp_bytes).map_err(|e| ApiserverError::WebhookFailure {
+            webhook: webhook.name.clone(),
+            reason: format!("invalid AdmissionReview response JSON: {e}"),
+        })?;
+
+    parsed_review
+        .response
+        .ok_or_else(|| ApiserverError::WebhookFailure {
+            webhook: webhook.name.clone(),
+            reason: "AdmissionReview response missing".to_string(),
+        })
+}
+
 async fn apply_mutating_webhook(
     webhook: &WebhookDefinition,
     endpoint: Option<&RegisteredEndpoint>,
     req: &mut AdmissionRequest,
+    storage: Option<&KubernetesStorage>,
 ) -> Result<(), ApiserverError> {
-    let Some(endpoint) = endpoint else {
-        if webhook.failure_policy == FailurePolicy::Fail {
-            return Err(ApiserverError::WebhookFailure {
-                webhook: webhook.name.clone(),
-                reason: "webhook endpoint handler not registered".to_string(),
-            });
+    let response = if let Some(endpoint) = endpoint {
+        match dispatch_single_webhook(webhook, endpoint, req).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if webhook.failure_policy == FailurePolicy::Fail {
+                    return Err(err);
+                }
+                return Ok(());
+            },
         }
-        return Ok(());
-    };
-
-    let response = match dispatch_single_webhook(webhook, endpoint, req).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            if webhook.failure_policy == FailurePolicy::Fail {
-                return Err(err);
-            }
-            return Ok(());
-        },
+    } else {
+        match dispatch_live_webhook(webhook, req, storage).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if webhook.failure_policy == FailurePolicy::Fail {
+                    return Err(err);
+                }
+                return Ok(());
+            },
+        }
     };
 
     if !response.allowed {
@@ -924,25 +1220,28 @@ async fn apply_validating_webhook(
     webhook: &WebhookDefinition,
     endpoint: Option<&RegisteredEndpoint>,
     req: &AdmissionRequest,
+    storage: Option<&KubernetesStorage>,
 ) -> Result<(), ApiserverError> {
-    let Some(endpoint) = endpoint else {
-        if webhook.failure_policy == FailurePolicy::Fail {
-            return Err(ApiserverError::WebhookFailure {
-                webhook: webhook.name.clone(),
-                reason: "webhook endpoint handler not registered".to_string(),
-            });
+    let response = if let Some(endpoint) = endpoint {
+        match dispatch_single_webhook(webhook, endpoint, req).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if webhook.failure_policy == FailurePolicy::Fail {
+                    return Err(err);
+                }
+                return Ok(());
+            },
         }
-        return Ok(());
-    };
-
-    let response = match dispatch_single_webhook(webhook, endpoint, req).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            if webhook.failure_policy == FailurePolicy::Fail {
-                return Err(err);
-            }
-            return Ok(());
-        },
+    } else {
+        match dispatch_live_webhook(webhook, req, storage).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if webhook.failure_policy == FailurePolicy::Fail {
+                    return Err(err);
+                }
+                return Ok(());
+            },
+        }
     };
 
     if !response.allowed {
@@ -2758,9 +3057,10 @@ impl AdmissionEngine {
                 let guard = self.endpoints.read().unwrap();
                 find_endpoint(&guard, webhook)
             };
+            let storage = self.storage.read().unwrap().clone();
 
             let before = req.object.clone();
-            apply_mutating_webhook(webhook, endpoint.as_deref(), req).await?;
+            apply_mutating_webhook(webhook, endpoint.as_deref(), req, storage.as_ref()).await?;
             if req.object != before {
                 mutated = true;
             }
@@ -2801,6 +3101,7 @@ impl AdmissionEngine {
         }
 
         let mut webhook_mutated = false;
+        let storage = self.storage.read().unwrap().clone();
         for webhook in &matching_webhooks {
             let endpoint = {
                 let guard = self.endpoints.read().unwrap();
@@ -2808,7 +3109,7 @@ impl AdmissionEngine {
             };
 
             let before = req.object.clone();
-            apply_mutating_webhook(webhook, endpoint.as_deref(), req).await?;
+            apply_mutating_webhook(webhook, endpoint.as_deref(), req, storage.as_ref()).await?;
             if req.object != before {
                 webhook_mutated = true;
             }
@@ -2876,6 +3177,7 @@ impl AdmissionEngine {
             .await?;
 
         let configs = self.validating_configs.read().unwrap().clone();
+        let storage = self.storage.read().unwrap().clone();
         for config in configs {
             for webhook in &config.webhooks {
                 if !webhook.matches_request_with_ns(req, ns_labels.as_ref()) {
@@ -2887,7 +3189,8 @@ impl AdmissionEngine {
                     find_endpoint(&guard, webhook)
                 };
 
-                apply_validating_webhook(webhook, endpoint.as_deref(), req).await?;
+                apply_validating_webhook(webhook, endpoint.as_deref(), req, storage.as_ref())
+                    .await?;
             }
         }
 
@@ -3570,6 +3873,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "pods".to_string(),
             },
+            subresource: None,
             name: Some("test-pod".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -3577,6 +3881,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec!["system:masters".to_string()],
+                extra: BTreeMap::new(),
             },
             object: Some(initial_pod),
             old_object: None,
@@ -3709,6 +4014,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "pods".to_string(),
             },
+            subresource: None,
             name: Some("dash-pod".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -3716,6 +4022,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(initial_pod),
             old_object: None,
@@ -3852,6 +4159,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "pods".to_string(),
             },
+            subresource: None,
             name: Some("reinvoked-pod".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -3859,6 +4167,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec!["system:masters".to_string()],
+                extra: BTreeMap::new(),
             },
             object: Some(initial_pod),
             old_object: None,
@@ -4023,6 +4332,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "configmaps".to_string(),
             },
+            subresource: None,
             name: Some("skip-me".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -4030,6 +4340,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "metadata": {
@@ -4159,6 +4470,7 @@ mod tests {
                 version: "v1alpha1".to_string(),
                 resource: "cronbars".to_string(),
             },
+            subresource: None,
             name: Some("test-cronbar".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -4166,6 +4478,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "apiVersion": "mycrd.example.com/v1alpha1",
@@ -4205,6 +4518,7 @@ mod tests {
                 version: "v1alpha1".to_string(),
                 resource: "cronbars".to_string(),
             },
+            subresource: None,
             name: Some("test-cronbar".to_string()),
             namespace: Some("default".to_string()),
             operation: "UPDATE".to_string(),
@@ -4212,6 +4526,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "apiVersion": "mycrd.example.com/v1alpha1",
@@ -4333,6 +4648,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "deployments".to_string(),
             },
+            subresource: None,
             name: Some("test-deploy".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -4340,6 +4656,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "apiVersion": "apps/v1",
@@ -4444,6 +4761,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "deployments".to_string(),
             },
+            subresource: None,
             name: Some("test-deploy".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -4451,6 +4769,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "apiVersion": "apps/v1",
@@ -4556,6 +4875,7 @@ mod tests {
                 version: "v1".to_string(),
                 resource: "deployments".to_string(),
             },
+            subresource: None,
             name: Some("test-deploy".to_string()),
             namespace: Some("default".to_string()),
             operation: "CREATE".to_string(),
@@ -4563,6 +4883,7 @@ mod tests {
                 username: "admin".to_string(),
                 uid: None,
                 groups: vec![],
+                extra: BTreeMap::new(),
             },
             object: Some(json!({
                 "spec": { "replicas": 5 }

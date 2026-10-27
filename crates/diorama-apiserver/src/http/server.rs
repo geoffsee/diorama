@@ -87,37 +87,27 @@ pub(crate) async fn serve(
                 let service = service.clone();
                 let shutdown_rx = shutdown.clone();
                 connections.spawn(async move {
-                    let Ok(Ok(tls)) =
-                        tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await
-                    else {
-                        return;
+                    let mut buf = [0u8; 1];
+                    let is_tls = match stream.peek(&mut buf).await {
+                        Ok(n) if n > 0 => buf[0] == 0x16,
+                        _ => false,
                     };
-                    let peer = tls
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|chain| chain.first())
-                        .and_then(|cert| tls::identity_from_der(cert.as_ref()));
-                    let io = TokioIo::new(tls);
-                    let mut hyper = hyper::server::conn::http1::Builder::new();
-                    hyper.timer(TokioTimer::new());
-                    hyper.header_read_timeout(Duration::from_secs(30));
-                    let connection = hyper
-                        .serve_connection(
-                            io,
-                            service_fn(move |request| {
-                                let service = service.clone();
-                                let peer = peer.clone();
-                                let shutdown_rx = shutdown_rx.clone();
-                                async move {
-                                    Ok::<_, Infallible>(
-                                        handle(request, &service, peer.as_ref(), shutdown_rx).await,
-                                    )
-                                }
-                            }),
-                        )
-                        .with_upgrades();
-                    let _ = connection.await;
+                    if is_tls {
+                        let Ok(Ok(tls)) =
+                            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await
+                        else {
+                            return;
+                        };
+                        let peer = tls
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|chain| chain.first())
+                            .and_then(|cert| tls::identity_from_der(cert.as_ref()));
+                        serve_connection(TokioIo::new(tls), service, peer, shutdown_rx).await;
+                    } else {
+                        serve_connection(TokioIo::new(stream), service, None, shutdown_rx).await;
+                    }
                 });
             }
         }
@@ -126,6 +116,33 @@ pub(crate) async fn serve(
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
+}
+
+async fn serve_connection<I>(
+    io: TokioIo<I>,
+    service: ApiserverService,
+    peer: Option<PeerIdentity>,
+    shutdown_rx: watch::Receiver<bool>,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut hyper = hyper::server::conn::http1::Builder::new();
+    hyper.timer(TokioTimer::new());
+    hyper.header_read_timeout(Duration::from_secs(30));
+    let connection = hyper
+        .serve_connection(
+            io,
+            service_fn(move |request| {
+                let service = service.clone();
+                let peer = peer.clone();
+                let shutdown_rx = shutdown_rx.clone();
+                async move {
+                    Ok::<_, Infallible>(handle(request, &service, peer.as_ref(), shutdown_rx).await)
+                }
+            }),
+        )
+        .with_upgrades();
+    let _ = connection.await;
 }
 
 #[allow(clippy::too_many_lines)]
@@ -143,15 +160,39 @@ async fn handle(
     if matches!(route, Route::Version) {
         return json_response(StatusCode::OK, &version());
     }
+    if matches!(route, Route::OpenIdConfig) {
+        let issuer = &service.config().service_account_issuer;
+        let jwks_uri = format!("{issuer}/openid/v1/jwks");
+        return json_response(
+            StatusCode::OK,
+            &json!({
+                "issuer": issuer,
+                "jwks_uri": jwks_uri,
+                "response_types_supported": ["id_token"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"]
+            }),
+        );
+    }
+    if matches!(route, Route::OpenIdJwks) {
+        let keys = service
+            .token_service_opt()
+            .map_or_else(|| json!([]), |ts| ts.jwks());
+        return json_response(StatusCode::OK, &json!({ "keys": keys }));
+    }
 
     let query = request.uri().query().map(str::to_owned);
     let bearer = bearer_token(&request);
     let client = client_for(service, peer, bearer.as_deref());
     if is_websocket_upgrade(&request)
         && let Route::Resource(path) = &route
-        && path.subresource.as_deref() == Some("exec")
     {
-        return exec_upgrade(request, service, &client, path).await;
+        if path.subresource.as_deref() == Some("exec") {
+            return exec_upgrade(request, service, &client, path).await;
+        }
+        if path.subresource.as_deref() == Some("log") {
+            return log_upgrade(request, service, &client, path).await;
+        }
     }
     let accept = request
         .headers()
@@ -186,7 +227,9 @@ async fn handle(
     };
 
     match route {
-        Route::Health | Route::Version => unreachable!("handled above"),
+        Route::Health | Route::Version | Route::OpenIdConfig | Route::OpenIdJwks => {
+            unreachable!("handled above")
+        },
         Route::NotFound => status_response(
             StatusCode::NOT_FOUND,
             "NotFound",
@@ -378,6 +421,88 @@ async fn exec_upgrade(
         })
 }
 
+async fn log_upgrade(
+    request: Request<Incoming>,
+    service: &ApiserverService,
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+) -> Response<Body> {
+    let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "log requires a namespaced pod",
+        );
+    };
+    if let Err(err) = client.check_auth_detailed("get", "", "pods/log", Some(namespace), Some(name))
+    {
+        return error_response(&err);
+    }
+    let pod = match client.get_pod(namespace, name).await {
+        Ok(pod) => pod,
+        Err(err) => return error_response(&err),
+    };
+    let Some(reader) = service.pod_log_reader() else {
+        return error_response(&ApiserverError::Internal {
+            reason: "no kubelet is registered to serve pod logs".to_string(),
+        });
+    };
+    let query = request.uri().query().map(str::to_owned);
+    let options = crate::logs::PodLogOptions::from_params(&query::parse(query.as_deref()));
+    let text = match reader.read_pod_log(&pod, &options).await {
+        Ok(t) => t,
+        Err(err) => return error_response(&err),
+    };
+    let Some(key) = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "missing Sec-WebSocket-Key",
+        );
+    };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let upgrade = hyper::upgrade::on(request);
+    tokio::spawn(async move {
+        if let Ok(upgraded) = upgrade.await {
+            use futures_util::SinkExt;
+            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                TokioIo::new(upgraded),
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let _ = ws
+                .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                .await;
+            let _ = ws
+                .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    reason: "".into(),
+                }))
+                .await;
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header("sec-websocket-accept", accept)
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap_or_else(|_| {
+            status_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "log upgrade failed",
+            )
+        })
+}
+
 fn outcome_to_response(
     outcome: dispatch::Outcome,
     path: &ResourcePath,
@@ -530,17 +655,7 @@ async fn watch_hub_loop(hub: Arc<WatchHub>, mut raw_rx: WatchReceiver) {
     }
 }
 
-async fn watch_response(
-    service: &ApiserverService,
-    client: &KubernetesApiClient,
-    path: &ResourcePath,
-    params: &BTreeMap<String, String>,
-    shutdown: watch::Receiver<bool>,
-) -> Response<Body> {
-    let hub = get_or_init_watch_hub(service).await;
-    let broadcast_rx = hub.inner.read().await.broadcast_tx.subscribe();
-
-    let storage_prefix = service.storage().prefix();
+fn compute_resource_key_prefix(storage_prefix: &str, path: &ResourcePath) -> String {
     let group_segment = if path.group.is_empty() {
         String::new()
     } else {
@@ -550,16 +665,31 @@ async fn watch_response(
         .namespace
         .as_ref()
         .map_or_else(String::new, |ns| format!("{ns}/"));
-    let resource_key_prefix = format!(
+    format!(
         "{}{group_segment}/{}/{namespace_segment}",
         storage_prefix, path.resource
-    );
+    )
+}
 
-    let filter = WatchFilter {
-        name: params
-            .get("fieldSelector")
-            .and_then(|selector| selector.strip_prefix("metadata.name="))
-            .map(str::to_owned),
+async fn build_watch_filter(
+    service: &ApiserverService,
+    path: &ResourcePath,
+    params: &BTreeMap<String, String>,
+    resource_key_prefix: &str,
+) -> WatchFilter {
+    let name_filter = params
+        .get("fieldSelector")
+        .and_then(|selector| selector.strip_prefix("metadata.name="))
+        .map(str::to_owned);
+    let object_exists = if let Some(ref name) = name_filter {
+        let key = format!("{resource_key_prefix}{name}");
+        service.storage().get(&key).await.ok().flatten().is_some()
+    } else {
+        false
+    };
+
+    WatchFilter {
+        name: name_filter,
         field_selector: params.get("fieldSelector").cloned().unwrap_or_default(),
         label_selector: params.get("labelSelector").cloned().unwrap_or_default(),
         since: params
@@ -579,7 +709,23 @@ async fn watch_response(
         kind: dispatch::kind_name(&path.resource)
             .unwrap_or("Object")
             .to_string(),
-    };
+        object_exists,
+    }
+}
+
+async fn watch_response(
+    service: &ApiserverService,
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    params: &BTreeMap<String, String>,
+    shutdown: watch::Receiver<bool>,
+) -> Response<Body> {
+    let hub = get_or_init_watch_hub(service).await;
+    let broadcast_rx = hub.inner.read().await.broadcast_tx.subscribe();
+
+    let storage_prefix = service.storage().prefix();
+    let resource_key_prefix = compute_resource_key_prefix(storage_prefix, path);
+    let filter = build_watch_filter(service, path, params, &resource_key_prefix).await;
 
     let timeout = params
         .get("timeoutSeconds")
@@ -651,6 +797,7 @@ struct WatchFilter {
     namespace: Option<String>,
     api_version: String,
     kind: String,
+    object_exists: bool,
 }
 
 impl WatchFilter {
@@ -799,6 +946,7 @@ async fn stream_watch(
 
     if !found
         && filter.since > 0
+        && !filter.object_exists
         && let Some(name) = &filter.name
     {
         let mut metadata =

@@ -617,6 +617,27 @@ pub fn quota_tracks(quota: &Value, group: &str, plural: &str) -> bool {
     })
 }
 
+pub async fn enforce_resource_quota(
+    client: &crate::client::KubernetesApiClient,
+    namespace: &str,
+    group: &str,
+    plural: &str,
+    doc: &Value,
+) -> Result<(), crate::error::ApiserverError> {
+    let quotas = list_counted(client, "", "ResourceQuotaList", "resourcequotas", namespace).await;
+    for quota in &quotas {
+        if !quota_tracks(quota, group, plural) || !object_in_scope(quota, group, plural, doc) {
+            continue;
+        }
+        let delta = usage_for(group, plural, doc);
+        let totals = compute_totals(client, quota, namespace).await;
+        if let Some(reason) = exceeded(quota, &totals, &delta) {
+            return Err(crate::error::ApiserverError::AdmissionDenied { reason });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

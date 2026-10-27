@@ -14,6 +14,8 @@ pub(crate) enum Route {
     OpenApiV3Core,
     OpenApiV3StorageV1,
     OpenApiV3Group { group: String, version: String },
+    OpenIdConfig,
+    OpenIdJwks,
     Resource(ResourcePath),
     NotFound,
 }
@@ -21,6 +23,7 @@ pub(crate) enum Route {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourcePath {
     pub(crate) group: String,
+    pub(crate) version: String,
     pub(crate) namespace: Option<String>,
     pub(crate) resource: String,
     pub(crate) name: Option<String>,
@@ -35,6 +38,8 @@ pub(crate) fn parse(path: &str) -> Route {
     match parts.as_slice() {
         ["healthz" | "livez" | "readyz"] => Route::Health,
         ["version"] => Route::Version,
+        [".well-known", "openid-configuration"] => Route::OpenIdConfig,
+        ["openid", "v1", "jwks"] => Route::OpenIdJwks,
         ["openapi", "v2"] => Route::OpenApiV2,
         ["openapi", "v3"] => Route::OpenApiV3Index,
         ["openapi", "v3", "api", "v1"] => Route::OpenApiV3Core,
@@ -45,7 +50,7 @@ pub(crate) fn parse(path: &str) -> Route {
         },
         ["api"] => Route::ApiVersions,
         ["api", "v1"] => Route::CoreDiscovery,
-        ["api", "v1", rest @ ..] => parse_resource("", rest, trailing_slash),
+        ["api", "v1", rest @ ..] => parse_resource("", "v1", rest, trailing_slash),
         ["apis"] => Route::ApiGroupList,
         ["apis", group] => Route::ApiGroup {
             group: (*group).to_string(),
@@ -55,7 +60,7 @@ pub(crate) fn parse(path: &str) -> Route {
             version: (*version).to_string(),
         },
         ["apis", group, version, rest @ ..] if is_api_version(version) => {
-            parse_resource(group, rest, trailing_slash)
+            parse_resource(group, version, rest, trailing_slash)
         },
         _ => Route::NotFound,
     }
@@ -66,7 +71,7 @@ fn is_api_version(version: &str) -> bool {
     matches!(chars.next(), Some('v')) && chars.next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
-fn parse_resource(group: &str, parts: &[&str], trailing_slash: bool) -> Route {
+fn parse_resource(group: &str, version: &str, parts: &[&str], trailing_slash: bool) -> Route {
     if parts.is_empty() {
         return Route::NotFound;
     }
@@ -78,6 +83,7 @@ fn parse_resource(group: &str, parts: &[&str], trailing_slash: bool) -> Route {
         };
         return Route::Resource(ResourcePath {
             group: group.to_string(),
+            version: version.to_string(),
             namespace: Some(parts[2].to_string()),
             resource: parts[3].to_string(),
             name: Some(parts[4].to_string()),
@@ -117,6 +123,7 @@ fn parse_resource(group: &str, parts: &[&str], trailing_slash: bool) -> Route {
     };
     Route::Resource(ResourcePath {
         group: group.to_string(),
+        version: version.to_string(),
         namespace,
         resource,
         name,
