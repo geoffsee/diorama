@@ -144,7 +144,47 @@ impl DeploymentReconciler {
             }
         }
 
+        self.ensure_owned_rs_pod_template_hashes(namespace, &mut owned)
+            .await;
+
         Ok(owned)
+    }
+
+    async fn ensure_owned_rs_pod_template_hashes(&self, namespace: &str, owned: &mut [Value]) {
+        for rs in owned.iter_mut() {
+            let rs_name = rs
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let rs_uid = rs
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let has_hash = rs
+                .pointer("/metadata/labels/pod-template-hash")
+                .and_then(Value::as_str)
+                .is_some_and(|h| !h.is_empty());
+            if has_hash {
+                continue;
+            }
+            let rs_template = rs
+                .pointer("/spec/template")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let hash = compute_pod_template_hash(&rs_template);
+
+            apply_hash_to_replicaset(rs, &hash);
+            if let Ok(updated) = self
+                .client
+                .update_replicaset(namespace, &rs_name, rs.clone())
+                .await
+            {
+                *rs = updated;
+            }
+            stamp_matching_pods_hash(&self.client, namespace, &rs_name, &rs_uid, &hash).await;
+        }
     }
 
     fn strip_deployment_owner(rs: &mut Value, name: &str, uid: &str) {
@@ -335,7 +375,7 @@ impl DeploymentReconciler {
 
         let total_old_spec: i64 = old_rs.iter().map(get_rs_spec_replicas).sum();
         let new_spec = new_rs.as_ref().map_or(0, get_rs_spec_replicas);
-        let current_total_spec = new_spec + total_old_spec;
+        let mut current_total_spec = new_spec + total_old_spec;
 
         if !old_rs.is_empty()
             && total_old_spec > 0
@@ -356,11 +396,45 @@ impl DeploymentReconciler {
             }
         }
 
+        self.cleanup_unhealthy_old_replicas(ctx, old_rs, &mut current_total_spec)
+            .await;
+
         self.ensure_and_scale_new_rs(ctx, new_rs, old_rs, max_total_replicas)
             .await?;
         self.reconcile_scale_down_old(ctx, new_rs.as_ref(), old_rs, max_unavailable)
             .await;
         Ok(())
+    }
+
+    async fn cleanup_unhealthy_old_replicas(
+        &self,
+        ctx: &RolloutContext<'_>,
+        old_rs: &mut [Value],
+        current_total_spec: &mut i64,
+    ) {
+        if *current_total_spec <= ctx.desired_replicas {
+            return;
+        }
+
+        for old in old_rs.iter_mut() {
+            if *current_total_spec <= ctx.desired_replicas {
+                break;
+            }
+            let spec_rep = get_rs_spec_replicas(old);
+            let (_, avail) = self
+                .get_rs_ready_and_available(ctx.namespace, old, ctx.name)
+                .await;
+            if spec_rep <= avail {
+                continue;
+            }
+            let unhealthy = spec_rep - avail;
+            let cleanup_count = unhealthy.min(*current_total_spec - ctx.desired_replicas);
+            if cleanup_count > 0 {
+                cleanup_old_replicaset(&self.client, ctx.namespace, old, spec_rep, cleanup_count)
+                    .await;
+                *current_total_spec -= cleanup_count;
+            }
+        }
     }
 
     async fn ensure_and_scale_new_rs(
@@ -877,6 +951,22 @@ async fn scale_down_old_replicasets(
     }
 }
 
+async fn cleanup_old_replicaset(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    old: &mut Value,
+    spec_rep: i64,
+    cleanup_count: i64,
+) {
+    let target_replicas = spec_rep - cleanup_count;
+    set_rs_spec_replicas(old, target_replicas);
+    if let Some(old_name) = old.pointer("/metadata/name").and_then(Value::as_str) {
+        let _ = client
+            .update_replicaset(namespace, old_name, old.clone())
+            .await;
+    }
+}
+
 fn is_pod_owned_by_rs_names(pod: &Value, rs_names: &[&str]) -> bool {
     let Some(owners) = pod
         .pointer("/metadata/ownerReferences")
@@ -1192,5 +1282,93 @@ fn apply_deployment_status(
                 "conditions": conditions
             }),
         );
+    }
+}
+
+fn apply_hash_to_replicaset(rs: &mut Value, hash: &str) {
+    if let Some(meta) = rs.get_mut("metadata").and_then(Value::as_object_mut) {
+        let labels = meta
+            .entry("labels".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(l) = labels.as_object_mut() {
+            l.insert("pod-template-hash".to_string(), json!(hash));
+        }
+    }
+    if let Some(spec) = rs.get_mut("spec").and_then(Value::as_object_mut) {
+        let selector = spec
+            .entry("selector".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(sel_obj) = selector.as_object_mut() {
+            let match_labels = sel_obj
+                .entry("matchLabels".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(ml) = match_labels.as_object_mut() {
+                ml.insert("pod-template-hash".to_string(), json!(hash));
+            }
+        }
+        let tpl = spec
+            .entry("template".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(tpl_obj) = tpl.as_object_mut() {
+            let tpl_meta = tpl_obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(meta_obj) = tpl_meta.as_object_mut() {
+                let labels = meta_obj
+                    .entry("labels".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(l) = labels.as_object_mut() {
+                    l.insert("pod-template-hash".to_string(), json!(hash));
+                }
+            }
+        }
+    }
+}
+
+async fn stamp_matching_pods_hash(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    rs_name: &str,
+    rs_uid: &str,
+    hash: &str,
+) {
+    let Ok(pod_list) = client.list_pods(namespace).await else {
+        return;
+    };
+    let pods = pod_list
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for mut pod in pods {
+        let is_owned = super::is_pod_owned_by(&pod, "ReplicaSet", rs_name, rs_uid);
+        let matches_name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.starts_with(rs_name));
+        if !is_owned && !matches_name {
+            continue;
+        }
+        let cur_hash = pod
+            .pointer("/metadata/labels/pod-template-hash")
+            .and_then(Value::as_str);
+        if cur_hash == Some(hash) {
+            continue;
+        }
+        if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
+            let labels = meta
+                .entry("labels".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(l) = labels.as_object_mut() {
+                l.insert("pod-template-hash".to_string(), json!(hash));
+            }
+        }
+        if let Some(pname) = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            let _ = client.update_pod(namespace, &pname, pod).await;
+        }
     }
 }
