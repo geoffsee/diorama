@@ -137,6 +137,7 @@ async fn read(
     path: &ResourcePath,
     query: Option<&str>,
 ) -> Result<Value, ApiserverError> {
+    let is_crd = is_custom_resource(&path.resource);
     if is_cluster_resource(&path.resource) {
         if path.namespace.is_some() {
             Err(ApiserverError::NotFound {
@@ -144,27 +145,55 @@ async fn read(
                 name: path.name.clone().unwrap_or_default(),
             })
         } else if let Some(name) = &path.name {
-            get_cluster(client, &path.group, &path.resource, name).await
+            let mut val = get_cluster(client, &path.group, &path.resource, name).await?;
+            if is_crd {
+                convert_custom_resource(&mut val, &path.group, &path.version);
+            }
+            Ok(val)
         } else {
             let list = list_cluster(client, &path.group, &path.resource).await?;
+            let list = if is_crd {
+                convert_custom_resource_or_list(list, &path.group, &path.version)
+            } else {
+                list
+            };
             page_list(filter_list(list, query), query)
         }
     } else if let Some(namespace) = &path.namespace {
         if let Some(name) = &path.name {
-            get_namespaced(client, &path.group, &path.resource, namespace, name).await
+            let mut val =
+                get_namespaced(client, &path.group, &path.resource, namespace, name).await?;
+            if is_crd {
+                convert_custom_resource(&mut val, &path.group, &path.version);
+            }
+            Ok(val)
         } else {
             let list = list_namespaced(client, &path.group, &path.resource, namespace).await?;
+            let list = if is_crd {
+                convert_custom_resource_or_list(list, &path.group, &path.version)
+            } else {
+                list
+            };
             page_list(filter_list(list, query), query)
         }
     } else if path.name.is_none() {
         let list = list_all_namespaces(client, &path.group, &path.resource).await?;
+        let list = if is_crd {
+            convert_custom_resource_or_list(list, &path.group, &path.version)
+        } else {
+            list
+        };
         page_list(filter_list(list, query), query)
     } else if is_builtin_namespaced(&path.resource) {
         Err(ApiserverError::BadRequest {
             message: format!("{} requires a namespace", path.resource),
         })
     } else if let Some(name) = &path.name {
-        get_cluster(client, &path.group, &path.resource, name).await
+        let mut val = get_cluster(client, &path.group, &path.resource, name).await?;
+        if is_crd {
+            convert_custom_resource(&mut val, &path.group, &path.version);
+        }
+        Ok(val)
     } else {
         unreachable!()
     }
@@ -297,6 +326,57 @@ fn filter_list(mut list: Value, query: Option<&str>) -> Value {
     list
 }
 
+fn extract_crd_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::Cow<'a, str>> {
+    match field {
+        "hostPort" | "spec.hostPort" => {
+            if let Some(val) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+                Some(std::borrow::Cow::Borrowed(val))
+            } else if let (Some(h), Some(p)) = (
+                item.pointer("/spec/host").and_then(Value::as_str),
+                item.pointer("/spec/port"),
+            ) {
+                let p_str = p
+                    .as_i64()
+                    .map_or_else(|| p.as_str().unwrap_or("").to_string(), |n| n.to_string());
+                if p_str.is_empty() {
+                    None
+                } else {
+                    Some(std::borrow::Cow::Owned(format!("{h}:{p_str}")))
+                }
+            } else {
+                None
+            }
+        },
+        "host" | "spec.host" => {
+            if let Some(val) = item.pointer("/spec/host").and_then(Value::as_str) {
+                Some(std::borrow::Cow::Borrowed(val))
+            } else if let Some(hp) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+                hp.split_once(':')
+                    .map(|(h, _)| std::borrow::Cow::Borrowed(h))
+            } else {
+                None
+            }
+        },
+        "port" | "spec.port" => {
+            if let Some(p) = item.pointer("/spec/port") {
+                if let Some(n) = p.as_i64() {
+                    Some(std::borrow::Cow::Owned(n.to_string()))
+                } else if let Some(s) = p.as_str() {
+                    Some(std::borrow::Cow::Borrowed(s))
+                } else {
+                    None
+                }
+            } else if let Some(hp) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+                hp.split_once(':')
+                    .map(|(_, p)| std::borrow::Cow::Borrowed(p))
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
 fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::Cow<'a, str>> {
     match field {
         "metadata.name" => item
@@ -369,6 +449,9 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
                     .and_then(Value::as_str)
                     .map(std::borrow::Cow::Borrowed)
             }),
+        "hostPort" | "spec.hostPort" | "host" | "spec.host" | "port" | "spec.port" => {
+            extract_crd_field_value(item, field)
+        },
         _ => {
             let ptr = format!("/{}", field.replace('.', "/"));
             let val = item.pointer(&ptr).or_else(|| {
@@ -746,12 +829,21 @@ async fn replace(
         });
     };
     client.validate_crd_schema(&path.group, &path.resource, &doc)?;
+    let is_crd = is_custom_resource(&path.resource);
     if is_dry_run(query) {
         // Validate the object exists, then echo the replacement without storing.
         let _ = read_single(client, path, name).await?;
-        return Ok(stamp_replacement(doc, path, name));
+        let mut stamped = stamp_replacement(doc, path, name);
+        if is_crd {
+            convert_custom_resource(&mut stamped, &path.group, &path.version);
+        }
+        return Ok(stamped);
     }
-    persist_object(client, path, name, doc).await
+    let mut result = persist_object(client, path, name, doc).await?;
+    if is_crd {
+        convert_custom_resource(&mut result, &path.group, &path.version);
+    }
+    Ok(result)
 }
 
 fn stamp_replacement(mut doc: Value, path: &ResourcePath, name: &str) -> Value {
@@ -822,8 +914,13 @@ async fn patch(
     };
     let kind = patch_type(content_type);
     let existing = read_single(client, path, name).await;
+    let is_crd = is_custom_resource(&path.resource);
     if kind == PatchType::Apply {
-        return apply_patch(client, path, query, name, body, existing).await;
+        let mut result = apply_patch(client, path, query, name, body, existing).await?;
+        if is_crd {
+            convert_custom_resource(&mut result, &path.group, &path.version);
+        }
+        return Ok(result);
     }
     let mut target = match existing {
         Ok(doc) => doc,
@@ -851,9 +948,16 @@ async fn patch(
     }
     client.validate_crd_schema(&path.group, &path.resource, &target)?;
     if is_dry_run(query) {
+        if is_crd {
+            convert_custom_resource(&mut target, &path.group, &path.version);
+        }
         return Ok(target);
     }
-    persist_object(client, path, name, target).await
+    let mut result = persist_object(client, path, name, target).await?;
+    if is_crd {
+        convert_custom_resource(&mut result, &path.group, &path.version);
+    }
+    Ok(result)
 }
 
 /// Server-side apply: creates the object when absent, otherwise merges the
@@ -941,20 +1045,29 @@ async fn create(
             message: "create does not take a resource name in the path".to_string(),
         });
     }
+    let is_crd = is_custom_resource(&path.resource);
     if is_dry_run(query) {
-        return dry_run_create(client, path, doc).await;
+        let mut result = dry_run_create(client, path, doc).await?;
+        if is_crd {
+            convert_custom_resource(&mut result, &path.group, &path.version);
+        }
+        return Ok(result);
     }
-    if is_cluster_resource(&path.resource) {
-        create_cluster(client, &path.group, &path.resource, doc).await
+    let mut result = if is_cluster_resource(&path.resource) {
+        create_cluster(client, &path.group, &path.resource, doc).await?
     } else if let Some(namespace) = &path.namespace {
-        create_namespaced(client, &path.group, &path.resource, namespace, doc).await
+        create_namespaced(client, &path.group, &path.resource, namespace, doc).await?
     } else if is_builtin_namespaced(&path.resource) {
-        Err(ApiserverError::BadRequest {
+        return Err(ApiserverError::BadRequest {
             message: format!("{} requires a namespace", path.resource),
-        })
+        });
     } else {
-        create_cluster(client, &path.group, &path.resource, doc).await
+        create_cluster(client, &path.group, &path.resource, doc).await?
+    };
+    if is_crd {
+        convert_custom_resource(&mut result, &path.group, &path.version);
     }
+    Ok(result)
 }
 
 async fn dry_run_create(
@@ -994,6 +1107,9 @@ async fn dry_run_create(
             .or_insert_with(|| json!(crate::time::now_rfc3339()));
         meta.entry("resourceVersion".to_string())
             .or_insert_with(|| json!("1"));
+    }
+    if is_custom_resource(&path.resource) {
+        convert_custom_resource(&mut doc, &path.group, &path.version);
     }
     Ok(doc)
 }
@@ -1042,6 +1158,73 @@ pub(crate) fn is_cluster_resource(resource: &str) -> bool {
 
 fn is_builtin_namespaced(resource: &str) -> bool {
     kind_name(resource).is_some() && !is_cluster_resource(resource)
+}
+
+pub(crate) fn is_custom_resource(resource: &str) -> bool {
+    kind_name(resource).is_none()
+}
+
+fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version: &str) {
+    if version == "v2" {
+        let Some((h, p)) = spec
+            .get("hostPort")
+            .and_then(Value::as_str)
+            .and_then(|hp| hp.split_once(':'))
+        else {
+            return;
+        };
+        if let Ok(p_num) = p.parse::<i64>() {
+            spec.insert("host".to_string(), json!(h));
+            spec.insert("port".to_string(), json!(p_num));
+            spec.remove("hostPort");
+        }
+    } else if version == "v1" {
+        let (Some(h), Some(p)) = (spec.get("host").and_then(Value::as_str), spec.get("port"))
+        else {
+            return;
+        };
+        let p_str = p
+            .as_i64()
+            .map_or_else(|| p.as_str().unwrap_or("").to_string(), |n| n.to_string());
+        if !p_str.is_empty() {
+            spec.insert("hostPort".to_string(), json!(format!("{h}:{p_str}")));
+            spec.remove("host");
+            spec.remove("port");
+        }
+    }
+}
+
+pub(crate) fn convert_custom_resource(doc: &mut Value, group: &str, version: &str) {
+    if group.is_empty() {
+        return;
+    }
+    let target_api_version = format!("{group}/{version}");
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("apiVersion".to_string(), json!(target_api_version));
+    }
+    if let Some(spec) = doc.get_mut("spec").and_then(Value::as_object_mut) {
+        convert_crd_spec_host_port(spec, version);
+    }
+}
+
+pub(crate) fn convert_custom_resource_or_list(mut doc: Value, group: &str, version: &str) -> Value {
+    if group.is_empty() {
+        return doc;
+    }
+    if let Some(items) = doc.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            convert_custom_resource(item, group, version);
+        }
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "apiVersion".to_string(),
+                json!(format!("{group}/{version}")),
+            );
+        }
+    } else {
+        convert_custom_resource(&mut doc, group, version);
+    }
+    doc
 }
 
 async fn list_all_namespaces(
@@ -1893,7 +2076,7 @@ fn handle_token_review(client: &KubernetesApiClient, mut doc: Value) -> Value {
                     "username": claims.sub,
                     "uid": claims.service_account_uid,
                     "groups": claims.groups(),
-                    "extra": {}
+                    "extra": claims.extra_fields(token)
                 }),
                 json!(claims.aud),
                 None,
@@ -2082,6 +2265,7 @@ async fn subresource_dispatch(
                     });
                 };
                 let mut current = read_single(client, &strip_subresource(path), name).await?;
+                let original_meta = current.get("metadata").cloned();
                 let original_spec = current.get("spec").cloned();
                 if method == Method::PUT {
                     let doc = decode_body(content_type, query, body, path)?;
@@ -2102,6 +2286,9 @@ async fn subresource_dispatch(
                             obj.remove("spec");
                         }
                     }
+                }
+                if subresource == "status" {
+                    preserve_status_metadata(&mut current, original_meta.as_ref());
                 }
                 persist_object(client, path, name, current)
                     .await
@@ -2206,7 +2393,7 @@ async fn subresource_dispatch(
             evict_pod(client, path, body).await
         },
         ("", "pods" | "services", sub) if sub == "proxy" || sub.starts_with("proxy/") => {
-            if sub == "proxy" && !path.trailing_slash {
+            if sub == "proxy" && !path.trailing_slash && query.is_none() {
                 let ns = path.namespace.as_deref().unwrap_or("default");
                 let res = &path.resource;
                 let name = path.name.as_deref().unwrap_or("");
@@ -2671,6 +2858,31 @@ async fn proxy_subresource(
         body: Payload::Text(text),
         headers: Vec::new(),
     })
+}
+
+fn preserve_status_metadata(current: &mut Value, original_meta: Option<&Value>) {
+    let (Some(orig_m), Some(curr_m)) = (
+        original_meta.and_then(Value::as_object),
+        current.get_mut("metadata").and_then(Value::as_object_mut),
+    ) else {
+        return;
+    };
+    for k in [
+        "resourceVersion",
+        "uid",
+        "creationTimestamp",
+        "generation",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ] {
+        if let Some(v) = orig_m.get(k) {
+            curr_m.insert(k.to_string(), v.clone());
+        } else {
+            curr_m.remove(k);
+        }
+    }
 }
 
 fn strip_subresource(path: &ResourcePath) -> ResourcePath {

@@ -572,8 +572,17 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
     (
         "k8s.io.api.certificates.v1alpha1.PodCertificateRequestSpec",
         &[
-            FieldDef::scalar(1, "signerName", WireKind::String),
-            FieldDef::scalar(2, "pkcs10", WireKind::Bytes),
+            FieldDef::scalar(1, "serviceAccountName", WireKind::String),
+            FieldDef::scalar(2, "serviceAccountUID", WireKind::String),
+            FieldDef::scalar(3, "podName", WireKind::String),
+            FieldDef::scalar(4, "podUID", WireKind::String),
+            FieldDef::scalar(5, "nodeName", WireKind::String),
+            FieldDef::scalar(6, "nodeUID", WireKind::String),
+            FieldDef::scalar(7, "signerName", WireKind::String),
+            FieldDef::scalar(8, "keyType", WireKind::String),
+            FieldDef::scalar(9, "pkixPublicKey", WireKind::Bytes),
+            FieldDef::scalar(10, "proofOfPossession", WireKind::Bytes),
+            FieldDef::scalar(11, "maxExpirationSeconds", WireKind::Int64),
         ],
     ),
     (

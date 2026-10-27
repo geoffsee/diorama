@@ -696,6 +696,48 @@ pub struct PodCertificateRequest {
     pub status: Option<PodCertificateRequestStatus>,
 }
 
+mod serde_opt_base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(&diorama_pki::base64_encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum BytesOrString {
+            Str(String),
+            Bytes(Vec<u8>),
+        }
+
+        let opt: Option<BytesOrString> = Option::deserialize(deserializer)?;
+        match opt {
+            None => Ok(None),
+            Some(BytesOrString::Bytes(b)) => Ok(Some(b)),
+            Some(BytesOrString::Str(s)) => {
+                if s.is_empty() {
+                    Ok(Some(Vec::new()))
+                } else {
+                    diorama_pki::base64_decode(&s)
+                        .map(Some)
+                        .map_err(serde::de::Error::custom)
+                }
+            },
+        }
+    }
+}
+
 /// Specification for a `PodCertificateRequest`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodCertificateRequestSpec {
@@ -728,19 +770,22 @@ pub struct PodCertificateRequestSpec {
     #[serde(
         rename = "stubPKCS10Request",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        with = "serde_opt_base64_bytes"
     )]
     pub stub_pkcs10_request: Option<Vec<u8>>,
     #[serde(
         rename = "pkixPublicKey",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        with = "serde_opt_base64_bytes"
     )]
     pub pkix_public_key: Option<Vec<u8>>,
     #[serde(
         rename = "proofOfPossession",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        with = "serde_opt_base64_bytes"
     )]
     pub proof_of_possession: Option<Vec<u8>>,
 }
@@ -849,13 +894,13 @@ pub fn validate_pod_certificate_request_spec(
         if exp < 3600 {
             return Err(ApiserverError::InvalidInput {
                 field: "spec.maxExpirationSeconds".into(),
-                reason: format!("maxExpirationSeconds ({exp}) must be at least 3600 (1h)"),
+                reason: "if provided, maxExpirationSeconds must be >= 3600".into(),
             });
         }
-        if exp > 91 * 86_400 {
+        if exp > 7_862_400 {
             return Err(ApiserverError::InvalidInput {
                 field: "spec.maxExpirationSeconds".into(),
-                reason: format!("maxExpirationSeconds ({exp}) must not exceed 7862400 (91d)"),
+                reason: "if provided, maxExpirationSeconds must be <= 7862400".into(),
             });
         }
     }

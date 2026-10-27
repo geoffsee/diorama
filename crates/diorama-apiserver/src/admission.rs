@@ -889,6 +889,7 @@ struct WebhookTarget {
     host: String,
     port: u16,
     path: String,
+    tls_server_name: String,
 }
 
 fn parse_webhook_url(url_str: &str) -> Result<WebhookTarget, ApiserverError> {
@@ -918,9 +919,10 @@ fn parse_webhook_url(url_str: &str) -> Result<WebhookTarget, ApiserverError> {
     };
     Ok(WebhookTarget {
         scheme,
-        host: h,
+        host: h.clone(),
         port,
         path: p,
+        tls_server_name: h,
     })
 }
 
@@ -928,12 +930,13 @@ async fn resolve_webhook_service(
     svc: &ServiceReference,
     storage: Option<&KubernetesStorage>,
 ) -> WebhookTarget {
-    let port = u16::try_from(svc.port.unwrap_or(443)).unwrap_or(443);
+    let mut port = u16::try_from(svc.port.unwrap_or(443)).unwrap_or(443);
     let mut path = svc.path.clone().unwrap_or_else(|| "/".to_string());
     if !path.starts_with('/') {
         path = format!("/{path}");
     }
-    let mut resolved_host = format!("{}.{}.svc", svc.name, svc.namespace);
+    let tls_server_name = format!("{}.{}.svc", svc.name, svc.namespace);
+    let mut resolved_host = tls_server_name.clone();
     if let Some(storage) = storage {
         let ep_key = format!(
             "{}/endpoints/{}/{}",
@@ -949,6 +952,13 @@ async fn resolve_webhook_service(
             && !ip.is_empty()
         {
             resolved_host = ip.to_string();
+            if let Some(target_port) = ep_doc
+                .pointer("/subsets/0/ports/0/port")
+                .and_then(Value::as_u64)
+                .and_then(|p| u16::try_from(p).ok())
+            {
+                port = target_port;
+            }
         } else {
             let svc_key = format!(
                 "{}/services/{}/{}",
@@ -971,6 +981,7 @@ async fn resolve_webhook_service(
         host: resolved_host,
         port,
         path,
+        tls_server_name,
     }
 }
 
@@ -984,7 +995,7 @@ async fn send_webhook_http(
 ) -> Result<bytes::Bytes, ApiserverError> {
     if target.scheme == "https" {
         let connector = crate::http::tls::tls_connector_for_ca(ca_pem);
-        let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+        let server_name = rustls::pki_types::ServerName::try_from(target.tls_server_name.clone())
             .unwrap_or_else(|_| {
                 rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
             });
@@ -1014,10 +1025,7 @@ async fn send_webhook_http(
         let http_req = http::Request::builder()
             .method("POST")
             .uri(&target.path)
-            .header(
-                http::header::HOST,
-                format!("{}:{}", target.host, target.port),
-            )
+            .header(http::header::HOST, &target.tls_server_name)
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
             .map_err(|e| ApiserverError::Internal {
@@ -2370,6 +2378,9 @@ pub fn evaluate_match_condition(expression: &str, req: &AdmissionRequest) -> boo
     ctx.object = req.object.clone();
     ctx.old_object = req.old_object.clone();
     ctx.request = serde_json::to_value(req).ok();
+    if let Some(ns) = req.namespace.as_deref() {
+        ctx.namespace_object = Some(json!({"metadata": {"name": ns}}));
+    }
     eval_cel_bool(trimmed, &ctx)
 }
 
@@ -2377,6 +2388,30 @@ impl AdmissionEngine {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn evaluate_match_condition(&self, expression: &str, req: &AdmissionRequest) -> bool {
+        let trimmed = expression.trim();
+        if trimmed.is_empty() || trimmed == "true" {
+            return true;
+        }
+        if trimmed == "false" {
+            return false;
+        }
+        let mut ctx = CelContext::default();
+        ctx.object = req.object.clone();
+        ctx.old_object = req.old_object.clone();
+        ctx.request = serde_json::to_value(req).ok();
+        let mut ns_obj = self
+            .resolve_namespace_object(req.namespace.as_deref())
+            .await;
+        if ns_obj.is_none()
+            && let Some(ns) = req.namespace.as_deref()
+        {
+            ns_obj = Some(json!({"metadata": {"name": ns}}));
+        }
+        ctx.namespace_object = ns_obj;
+        eval_cel_bool(trimmed, &ctx)
     }
 
     pub fn register_webhook_endpoint(
@@ -2455,6 +2490,34 @@ impl AdmissionEngine {
             guard.retain(|b| b.metadata.get("name").and_then(Value::as_str) != Some(name));
         }
         guard.push(binding);
+    }
+
+    pub fn remove_validating_webhook(&self, name: &str) {
+        self.remove_validating_webhook_config(name);
+    }
+
+    pub fn remove_mutating_webhook(&self, name: &str) {
+        self.remove_mutating_webhook_config(name);
+    }
+
+    pub fn remove_validating_policy(&self, name: &str) {
+        let mut guard = self.validating_policies.write().unwrap();
+        guard.retain(|p| p.metadata.get("name").and_then(Value::as_str) != Some(name));
+    }
+
+    pub fn remove_validating_policy_binding(&self, name: &str) {
+        let mut guard = self.validating_policy_bindings.write().unwrap();
+        guard.retain(|b| b.metadata.get("name").and_then(Value::as_str) != Some(name));
+    }
+
+    pub fn remove_mutating_policy(&self, name: &str) {
+        let mut guard = self.mutating_policies.write().unwrap();
+        guard.retain(|p| p.metadata.get("name").and_then(Value::as_str) != Some(name));
+    }
+
+    pub fn remove_mutating_policy_binding(&self, name: &str) {
+        let mut guard = self.mutating_policy_bindings.write().unwrap();
+        guard.retain(|b| b.metadata.get("name").and_then(Value::as_str) != Some(name));
     }
 
     pub fn register_namespace_labels(&self, name: impl Into<String>, labels: Value) {
@@ -2712,7 +2775,7 @@ impl AdmissionEngine {
             if let Some(conditions) = &policy.spec.match_conditions {
                 let mut matches_all = true;
                 for cond in conditions {
-                    if !evaluate_match_condition(&cond.expression, req) {
+                    if !self.evaluate_match_condition(&cond.expression, req).await {
                         matches_all = false;
                         break;
                     }
@@ -2859,7 +2922,7 @@ impl AdmissionEngine {
             if let Some(conditions) = &policy.spec.match_conditions {
                 let mut matches_all = true;
                 for cond in conditions {
-                    if !evaluate_match_condition(&cond.expression, req) {
+                    if !self.evaluate_match_condition(&cond.expression, req).await {
                         matches_all = false;
                         break;
                     }
@@ -2948,7 +3011,10 @@ impl AdmissionEngine {
                     }
 
                     if has_deny {
-                        return Err(ApiserverError::AdmissionDenied { reason: message });
+                        return Err(ApiserverError::InvalidInput {
+                            field: String::new(),
+                            reason: message,
+                        });
                     }
                 }
             }
@@ -4795,10 +4861,10 @@ mod tests {
         let req_even = make_req(4);
         let res_even = engine.run_validating_admission(&req_even).await;
         match res_even {
-            Err(ApiserverError::AdmissionDenied { reason }) => {
+            Err(ApiserverError::InvalidInput { reason, .. }) => {
                 assert!(reason.contains("Deployment replicas 4 must be odd"));
             },
-            other => panic!("expected AdmissionDenied error, got {other:?}"),
+            other => panic!("expected InvalidInput error, got {other:?}"),
         }
     }
 

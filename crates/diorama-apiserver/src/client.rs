@@ -43,6 +43,15 @@ pub enum ClientIdentity {
     Anonymous,
 }
 
+struct PodUpdateTarget<'a> {
+    key: &'a str,
+    namespace: &'a str,
+    name: &'a str,
+    subresource: Option<&'a str>,
+    expected_version: Option<u64>,
+    old_gen: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct KubernetesApiClient {
     storage: KubernetesStorage,
@@ -347,10 +356,7 @@ impl KubernetesApiClient {
                 let (username, uid) = if let Some(ts) = &self.token_service
                     && let Ok(claims) = ts.verify_token(token, None)
                 {
-                    extra.insert(
-                        "authentication.kubernetes.io/credential-id".to_string(),
-                        vec![format!("JTI={}", claims.jti)],
-                    );
+                    extra = claims.extra_fields(token);
                     (claims.sub, Some(claims.jti))
                 } else {
                     ("system:serviceaccount:default:token".to_string(), None)
@@ -1670,13 +1676,13 @@ impl KubernetesApiClient {
     }
 
     fn generate_rfc4122_uuid(cur_rev: u64) -> String {
-        let ts = crate::time::now_unix();
-        let seq = cur_rev;
-        format!(
-            "{ts:08x}-{seq:04x}-4{:03x}-8{:03x}-{ts:012x}",
-            seq & 0xfff,
-            (seq >> 12) & 0xfff
-        )
+        #[allow(clippy::cast_possible_truncation)]
+        let ts_low = crate::time::now_unix() as u32;
+        let seg2 = (cur_rev >> 16) & 0xffff;
+        let ver_rev = 0x4000 | (cur_rev & 0x0fff);
+        let var_hi = 0x8000 | ((cur_rev >> 12) & 0x3fff);
+        let node = ((u64::from(ts_low) << 16) ^ cur_rev) & 0xffff_ffff_ffff;
+        format!("{ts_low:08x}-{seg2:04x}-{ver_rev:04x}-{var_hi:04x}-{node:012x}")
     }
 
     fn stamp_creation_and_uid(
@@ -2721,14 +2727,20 @@ impl KubernetesApiClient {
             .pointer("/spec/securityContext/sysctls")
             .and_then(Value::as_array)
         {
+            let mut invalid_errors = Vec::new();
             for (idx, sc) in sysctls.iter().enumerate() {
                 let name = sc.get("name").and_then(Value::as_str).unwrap_or("");
                 if !Self::is_valid_sysctl_name(name) {
-                    return Err(ApiserverError::InvalidInput {
-                        field: format!("spec.securityContext.sysctls[{idx}].name"),
-                        reason: format!("Invalid value: \"{name}\""),
-                    });
+                    invalid_errors.push(format!(
+                        "spec.securityContext.sysctls[{idx}].name: Invalid value: \"{name}\""
+                    ));
                 }
+            }
+            if !invalid_errors.is_empty() {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.securityContext.sysctls".to_string(),
+                    reason: invalid_errors.join(", "),
+                });
             }
         }
         if let Some(volumes) = pod.pointer("/spec/volumes").and_then(Value::as_array) {
@@ -2775,16 +2787,23 @@ impl KubernetesApiClient {
             if let Some(max_exp) = src
                 .pointer("/podCertificate/maxExpirationSeconds")
                 .and_then(Value::as_i64)
-                && !(3600..=91 * 86_400).contains(&max_exp)
             {
-                return Err(ApiserverError::InvalidInput {
-                    field: format!(
-                        "spec.volumes[{v_idx}].projected.sources[{s_idx}].podCertificate.maxExpirationSeconds"
-                    ),
-                    reason: format!(
-                        "maxExpirationSeconds ({max_exp}) must be between 3600 and 7862400"
-                    ),
-                });
+                if max_exp < 3600 {
+                    return Err(ApiserverError::InvalidInput {
+                        field: format!(
+                            "spec.volumes[{v_idx}].projected.sources[{s_idx}].podCertificate.maxExpirationSeconds"
+                        ),
+                        reason: "if provided, maxExpirationSeconds must be >= 3600".into(),
+                    });
+                }
+                if max_exp > 7_862_400 {
+                    return Err(ApiserverError::InvalidInput {
+                        field: format!(
+                            "spec.volumes[{v_idx}].projected.sources[{s_idx}].podCertificate.maxExpirationSeconds"
+                        ),
+                        reason: "if provided, maxExpirationSeconds must be <= 7862400".into(),
+                    });
+                }
             }
         }
         Ok(())
@@ -2974,6 +2993,7 @@ impl KubernetesApiClient {
                 let Some(resources_map) = res.as_object_mut() else {
                     continue;
                 };
+                Self::default_requests_from_limits(resources_map);
                 if let Some(limits) = def_lim {
                     Self::merge_resource_map(resources_map, "limits", limits);
                 }
@@ -3332,6 +3352,9 @@ impl KubernetesApiClient {
             if let Some(old_uid) = old_pod.get("metadata").and_then(|m| m.get("uid")) {
                 meta.insert("uid".to_string(), old_uid.clone());
             }
+            if let Some(old_gen) = old_pod.get("metadata").and_then(|m| m.get("generation")) {
+                meta.insert("generation".to_string(), old_gen.clone());
+            }
             if let Some(old_dt) = old_pod
                 .get("metadata")
                 .and_then(|m| m.get("deletionTimestamp"))
@@ -3351,36 +3374,109 @@ impl KubernetesApiClient {
         }
     }
 
+    fn should_update_pod_generation(
+        pod: &Value,
+        old_pod: &Value,
+        subresource: Option<&str>,
+    ) -> bool {
+        if let Some(sub) = subresource
+            && matches!(sub, "status" | "ephemeralcontainers" | "binding")
+        {
+            return false;
+        }
+        let mut pod_spec = pod.get("spec").cloned();
+        let mut old_spec = old_pod.get("spec").cloned();
+        let old_node_empty = old_pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty();
+
+        if let Some(s) = pod_spec.as_mut().and_then(Value::as_object_mut) {
+            s.remove("ephemeralContainers");
+            if old_node_empty {
+                s.remove("nodeName");
+            }
+        }
+        if let Some(s) = old_spec.as_mut().and_then(Value::as_object_mut) {
+            s.remove("ephemeralContainers");
+            if old_node_empty {
+                s.remove("nodeName");
+            }
+        }
+        pod_spec != old_spec
+    }
+
     async fn write_pod_update_with_retry(
         &self,
-        key: &str,
-        bytes: Vec<u8>,
-        expected_version: Option<u64>,
-        old_gen: Option<i64>,
-        namespace: &str,
-        name: &str,
+        target: &PodUpdateTarget<'_>,
+        pod: &mut Value,
+        old_pod: &Value,
     ) -> Result<diorama_datastore::KeyValue, ApiserverError> {
+        let bytes = serde_json::to_vec(&pod)?;
         match self
             .storage
-            .update(key, bytes.clone(), expected_version)
+            .update(target.key, bytes.clone(), target.expected_version)
             .await
         {
             Ok(kv) => Ok(kv),
-            Err(ApiserverError::Conflict { .. }) if expected_version.is_none() => {
-                if let Some(refreshed) = self.storage.get(key).await?
+            Err(ApiserverError::Conflict { .. }) if target.expected_version.is_none() => {
+                if let Some(refreshed) = self.storage.get(target.key).await?
                     && let Ok(refreshed_pod) = serde_json::from_slice::<Value>(&refreshed.value)
                     && refreshed_pod
                         .pointer("/metadata/generation")
                         .and_then(Value::as_i64)
-                        == old_gen
+                        == target.old_gen
                 {
                     self.storage
-                        .update(key, bytes, Some(refreshed.mod_revision))
+                        .update(target.key, bytes, Some(refreshed.mod_revision))
                         .await
                 } else {
                     Err(ApiserverError::Conflict {
                         resource: "pods".to_string(),
-                        name: format!("{namespace}/{name}"),
+                        name: format!("{}/{}", target.namespace, target.name),
+                    })
+                }
+            },
+            Err(ApiserverError::Conflict { .. })
+                if target.expected_version.is_some() && target.subresource.is_none() =>
+            {
+                if let Some(refreshed) = self.storage.get(target.key).await?
+                    && let Ok(refreshed_pod) = serde_json::from_slice::<Value>(&refreshed.value)
+                    && refreshed_pod.pointer("/metadata/generation")
+                        == old_pod.pointer("/metadata/generation")
+                    && refreshed_pod.pointer("/metadata/labels")
+                        == old_pod.pointer("/metadata/labels")
+                    && refreshed_pod.pointer("/metadata/annotations")
+                        == old_pod.pointer("/metadata/annotations")
+                {
+                    if let Some(status) = refreshed_pod.get("status") {
+                        pod["status"] = status.clone();
+                    }
+                    if pod
+                        .pointer("/spec/nodeName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .is_empty()
+                        && let Some(nn) = refreshed_pod.pointer("/spec/nodeName")
+                        && let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut)
+                    {
+                        spec.insert("nodeName".to_string(), nn.clone());
+                    }
+                    if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
+                        meta.insert(
+                            "resourceVersion".to_string(),
+                            json!(refreshed.mod_revision.to_string()),
+                        );
+                    }
+                    let retry_bytes = serde_json::to_vec(&pod)?;
+                    self.storage
+                        .update(target.key, retry_bytes, Some(refreshed.mod_revision))
+                        .await
+                } else {
+                    Err(ApiserverError::Conflict {
+                        resource: "pods".to_string(),
+                        name: format!("{}/{}", target.namespace, target.name),
                     })
                 }
             },
@@ -3448,7 +3544,9 @@ impl KubernetesApiClient {
             pod = obj;
         }
 
-        Self::update_generation(&mut pod, &old_pod);
+        if Self::should_update_pod_generation(&pod, &old_pod, subresource) {
+            Self::update_generation(&mut pod, &old_pod);
+        }
 
         if dry_run {
             return Ok(pod);
@@ -3457,9 +3555,16 @@ impl KubernetesApiClient {
         let old_gen = old_pod
             .pointer("/metadata/generation")
             .and_then(Value::as_i64);
-        let bytes = serde_json::to_vec(&pod)?;
+        let target = PodUpdateTarget {
+            key: &key,
+            namespace,
+            name,
+            subresource,
+            expected_version,
+            old_gen,
+        };
         let kv = self
-            .write_pod_update_with_retry(&key, bytes, expected_version, old_gen, namespace, name)
+            .write_pod_update_with_retry(&target, &mut pod, &old_pod)
             .await?;
         let mut result = pod;
         if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -3814,14 +3919,10 @@ impl KubernetesApiClient {
             if doc.get("metadata").is_none() {
                 doc["metadata"] = json!({});
             }
-            if let Some(meta_obj) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
-                let gen_num = meta_obj
-                    .get("generation")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                if gen_num <= 0 {
-                    meta_obj.insert("generation".to_string(), json!(1));
-                }
+            if let Some(meta_obj) = doc.get_mut("metadata").and_then(Value::as_object_mut)
+                && meta_obj.get("generation").is_none()
+            {
+                meta_obj.insert("generation".to_string(), json!(1));
             }
         }
     }
@@ -4526,7 +4627,28 @@ impl KubernetesApiClient {
             });
         }
         self.rbac.forget_api_object(plural, None, name);
+        Self::cleanup_admission_registration_object(&self.admission, group, plural, name);
         Ok(())
+    }
+
+    fn cleanup_admission_registration_object(
+        admission: &AdmissionEngine,
+        group: &str,
+        plural: &str,
+        name: &str,
+    ) {
+        if group != "admissionregistration.k8s.io" {
+            return;
+        }
+        match plural {
+            "validatingwebhookconfigurations" => admission.remove_validating_webhook_config(name),
+            "mutatingwebhookconfigurations" => admission.remove_mutating_webhook_config(name),
+            "validatingadmissionpolicies" => admission.remove_validating_policy(name),
+            "validatingadmissionpolicybindings" => admission.remove_validating_policy_binding(name),
+            "mutatingadmissionpolicies" => admission.remove_mutating_policy(name),
+            "mutatingadmissionpolicybindings" => admission.remove_mutating_policy_binding(name),
+            _ => {},
+        }
     }
 
     fn authorize_rbac_write(
@@ -7120,6 +7242,48 @@ impl KubernetesApiClient {
         Ok(())
     }
 
+    fn validate_single_match_condition(
+        c: &crate::admission::MatchCondition,
+    ) -> Result<(), ApiserverError> {
+        if c.name.trim().is_empty() {
+            return Err(ApiserverError::InvalidInput {
+                field: "webhooks.matchConditions".to_string(),
+                reason: "matchCondition name cannot be empty".to_string(),
+            });
+        }
+        if c.expression.trim().is_empty() {
+            return Err(ApiserverError::InvalidInput {
+                field: "webhooks.matchConditions".to_string(),
+                reason: "matchCondition expression cannot be empty".to_string(),
+            });
+        }
+        if let Err(e) = crate::admission::validate_match_condition(&c.expression) {
+            let reason = match e {
+                ApiserverError::InvalidInput { reason, .. } => reason,
+                other => other.to_string(),
+            };
+            return Err(ApiserverError::InvalidInput {
+                field: "webhooks.matchConditions".to_string(),
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_webhook_match_conditions(
+        webhooks: &[crate::admission::WebhookDefinition],
+    ) -> Result<(), ApiserverError> {
+        for wh in webhooks {
+            let Some(conds) = &wh.match_conditions else {
+                continue;
+            };
+            for c in conds {
+                Self::validate_single_match_condition(c)?;
+            }
+        }
+        Ok(())
+    }
+
     // --- Webhook Configurations CRUD ---
 
     pub async fn create_validating_webhook_configuration(
@@ -7148,13 +7312,7 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::ValidatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
-        for wh in &typed.webhooks {
-            if let Some(conds) = &wh.match_conditions {
-                for c in conds {
-                    crate::admission::validate_match_condition(&c.expression)?;
-                }
-            }
-        }
+        Self::validate_webhook_match_conditions(&typed.webhooks)?;
         self.admission.add_validating_webhook_config(typed);
 
         let key = format!(
@@ -7255,13 +7413,7 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::ValidatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
-        for wh in &typed.webhooks {
-            if let Some(conds) = &wh.match_conditions {
-                for c in conds {
-                    crate::admission::validate_match_condition(&c.expression)?;
-                }
-            }
-        }
+        Self::validate_webhook_match_conditions(&typed.webhooks)?;
 
         let expected_version = config
             .get("metadata")
@@ -7366,13 +7518,7 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::MutatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
-        for wh in &typed.webhooks {
-            if let Some(conds) = &wh.match_conditions {
-                for c in conds {
-                    crate::admission::validate_match_condition(&c.expression)?;
-                }
-            }
-        }
+        Self::validate_webhook_match_conditions(&typed.webhooks)?;
         self.admission.add_mutating_webhook_config(typed);
 
         let key = format!(
@@ -7473,13 +7619,7 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::MutatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
-        for wh in &typed.webhooks {
-            if let Some(conds) = &wh.match_conditions {
-                for c in conds {
-                    crate::admission::validate_match_condition(&c.expression)?;
-                }
-            }
-        }
+        Self::validate_webhook_match_conditions(&typed.webhooks)?;
 
         let expected_version = config
             .get("metadata")

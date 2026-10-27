@@ -94,6 +94,59 @@ impl ServiceAccountClaims {
             "system:authenticated".to_string(),
         ]
     }
+
+    #[must_use]
+    pub fn extra_fields(&self, token_str: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut extra = std::collections::BTreeMap::new();
+        let jti = if self.jti.is_empty() {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in token_str.as_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let seg1 = (h >> 32) as u32;
+            #[allow(clippy::cast_possible_truncation)]
+            let seg2 = ((h >> 16) & 0xffff) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let ver = 0x4000 | (h & 0x0fff) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let var = 0x8000 | ((h >> 12) & 0x3fff) as u16;
+            let node = (h.rotate_left(17) ^ 0x5a5a_5a5a_5a5a) & 0xffff_ffff_ffff;
+            format!("{seg1:08x}-{seg2:04x}-{ver:04x}-{var:04x}-{node:012x}")
+        } else {
+            self.jti.clone()
+        };
+        extra.insert(
+            "authentication.kubernetes.io/credential-id".to_string(),
+            vec![format!("JTI={jti}")],
+        );
+        if let Some(pod) = &self.kubernetes_io.pod {
+            extra.insert(
+                "authentication.kubernetes.io/pod-name".to_string(),
+                vec![pod.name.clone()],
+            );
+            if let Some(uid) = &pod.uid {
+                extra.insert(
+                    "authentication.kubernetes.io/pod-uid".to_string(),
+                    vec![uid.clone()],
+                );
+            }
+        }
+        if let Some(node) = &self.kubernetes_io.node {
+            extra.insert(
+                "authentication.kubernetes.io/node-name".to_string(),
+                vec![node.name.clone()],
+            );
+            if let Some(uid) = &node.uid {
+                extra.insert(
+                    "authentication.kubernetes.io/node-uid".to_string(),
+                    vec![uid.clone()],
+                );
+            }
+        }
+        extra
+    }
 }
 
 #[derive(Deserialize)]

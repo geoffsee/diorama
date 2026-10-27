@@ -702,14 +702,17 @@ async fn build_watch_filter(
         namespaced: path.namespace.is_some() || dispatch_is_namespaced(&path.resource),
         namespace: path.namespace.clone(),
         api_version: if path.group.is_empty() {
-            "v1".to_string()
+            path.version.clone()
         } else {
-            format!("{}/v1", path.group)
+            format!("{}/{}", path.group, path.version)
         },
         kind: dispatch::kind_name(&path.resource)
             .unwrap_or("Object")
             .to_string(),
         object_exists,
+        is_custom_resource: dispatch::is_custom_resource(&path.resource),
+        group: path.group.clone(),
+        version: path.version.clone(),
     }
 }
 
@@ -787,6 +790,7 @@ fn dispatch_is_namespaced(resource: &str) -> bool {
     !dispatch::is_cluster_resource(resource)
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct WatchFilter {
     name: Option<String>,
     label_selector: String,
@@ -798,6 +802,9 @@ struct WatchFilter {
     api_version: String,
     kind: String,
     object_exists: bool,
+    is_custom_resource: bool,
+    group: String,
+    version: String,
 }
 
 impl WatchFilter {
@@ -904,15 +911,26 @@ async fn stream_watch(
                 json!(event.resource_version.to_string()),
             );
         }
+        if filter.is_custom_resource {
+            dispatch::convert_custom_resource(&mut object, &filter.group, &filter.version);
+        }
         if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
             continue;
         }
         let key = object_key(&object);
         let mut kind = event.event_type.as_str();
+        let prev_converted = if filter.is_custom_resource {
+            event.prev_object.as_ref().map(|po| {
+                let mut c = po.clone();
+                dispatch::convert_custom_resource(&mut c, &filter.group, &filter.version);
+                c
+            })
+        } else {
+            event.prev_object.clone()
+        };
         if !filter.accepts(&object) {
             if kind == "MODIFIED"
-                && (event
-                    .prev_object
+                && (prev_converted
                     .as_ref()
                     .is_some_and(|prev| filter.accepts(prev))
                     || sent.remove(&key).is_some())
@@ -926,8 +944,7 @@ async fn stream_watch(
         }
         found = true;
         if kind == "MODIFIED"
-            && event
-                .prev_object
+            && prev_converted
                 .as_ref()
                 .is_some_and(|prev| !filter.accepts(prev))
         {
@@ -1000,15 +1017,26 @@ async fn stream_watch(
                         json!(event.resource_version.to_string()),
                     );
                 }
+                if filter.is_custom_resource {
+                    dispatch::convert_custom_resource(&mut object, &filter.group, &filter.version);
+                }
                 if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
                     continue;
                 }
                 let key = object_key(&object);
                 let mut kind = event.event_type.as_str();
+                let prev_converted = if filter.is_custom_resource {
+                    event.prev_object.as_ref().map(|po| {
+                        let mut c = po.clone();
+                        dispatch::convert_custom_resource(&mut c, &filter.group, &filter.version);
+                        c
+                    })
+                } else {
+                    event.prev_object.clone()
+                };
                 if !filter.accepts(&object) {
                     if kind == "MODIFIED"
-                        && (event
-                            .prev_object
+                        && (prev_converted
                             .as_ref()
                             .is_some_and(|prev| filter.accepts(prev))
                             || sent.remove(&key).is_some())
@@ -1021,8 +1049,7 @@ async fn stream_watch(
                     continue;
                 }
                 if kind == "MODIFIED"
-                    && event
-                        .prev_object
+                    && prev_converted
                         .as_ref()
                         .is_some_and(|prev| !filter.accepts(prev))
                 {

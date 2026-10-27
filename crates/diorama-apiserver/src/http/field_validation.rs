@@ -209,8 +209,9 @@ fn decode_json_with_directive(
             if !unknown_fields.is_empty() || !duplicate_fields.is_empty() {
                 let mut all_errors = unknown_fields;
                 all_errors.extend(duplicate_fields);
-                return Err(ApiserverError::BadRequest {
-                    message: format!("strict decoding error: {}", all_errors.join(", ")),
+                return Err(ApiserverError::InvalidInput {
+                    field: "body".to_string(),
+                    reason: format!("strict decoding error: {}", all_errors.join(", ")),
                 });
             }
         },
@@ -288,15 +289,14 @@ pub(crate) fn decode_yaml_with_directive(
             | Event::DocumentStart(_)
             | Event::DocumentEnd => {},
             _ => {
-                root_val = decode_yaml_node(
-                    &mut parser,
-                    event,
-                    span,
-                    &mut anchors,
+                let mut ctx = YamlDecodeContext {
                     directive,
-                    &mut duplicate_fields,
-                    0,
-                )?;
+                    duplicate_fields: &mut duplicate_fields,
+                    prefix: String::new(),
+                    has_path: path.is_some(),
+                    depth: 0,
+                };
+                root_val = decode_yaml_node(&mut parser, event, span, &mut anchors, &mut ctx)?;
                 break;
             },
         }
@@ -316,9 +316,12 @@ pub(crate) fn decode_yaml_with_directive(
 
         match directive {
             FieldValidationDirective::Strict => {
-                if !unknown_fields.is_empty() {
-                    return Err(ApiserverError::BadRequest {
-                        message: format!("strict decoding error: {}", unknown_fields.join(", ")),
+                if !unknown_fields.is_empty() || !duplicate_fields.is_empty() {
+                    let mut all_errors = unknown_fields;
+                    all_errors.extend(duplicate_fields);
+                    return Err(ApiserverError::InvalidInput {
+                        field: "body".to_string(),
+                        reason: format!("strict decoding error: {}", all_errors.join(", ")),
                     });
                 }
             },
@@ -349,12 +352,18 @@ pub(crate) fn decode_yaml_with_directive(
     Ok(root_val)
 }
 
+struct YamlDecodeContext<'a> {
+    directive: FieldValidationDirective,
+    duplicate_fields: &'a mut Vec<String>,
+    prefix: String,
+    has_path: bool,
+    depth: usize,
+}
+
 fn decode_yaml_sequence<'a>(
     parser: &mut Parser<'a, BufferedInput<std::str::Chars<'a>>>,
     anchors: &mut BTreeMap<usize, Value>,
-    directive: FieldValidationDirective,
-    duplicate_fields: &mut Vec<String>,
-    depth: usize,
+    ctx: &mut YamlDecodeContext<'_>,
 ) -> Result<Value, ApiserverError> {
     let mut list = Vec::new();
     loop {
@@ -371,15 +380,10 @@ fn decode_yaml_sequence<'a>(
         if next_event == Event::SequenceEnd {
             break;
         }
-        list.push(decode_yaml_node(
-            parser,
-            next_event,
-            next_span,
-            anchors,
-            directive,
-            duplicate_fields,
-            depth + 1,
-        )?);
+        ctx.depth += 1;
+        let node = decode_yaml_node(parser, next_event, next_span, anchors, ctx);
+        ctx.depth -= 1;
+        list.push(node?);
     }
     Ok(Value::Array(list))
 }
@@ -387,9 +391,7 @@ fn decode_yaml_sequence<'a>(
 fn decode_yaml_mapping<'a>(
     parser: &mut Parser<'a, BufferedInput<std::str::Chars<'a>>>,
     anchors: &mut BTreeMap<usize, Value>,
-    directive: FieldValidationDirective,
-    duplicate_fields: &mut Vec<String>,
-    depth: usize,
+    ctx: &mut YamlDecodeContext<'_>,
 ) -> Result<Value, ApiserverError> {
     let mut map = serde_json::Map::new();
     let mut seen_keys = BTreeSet::new();
@@ -415,19 +417,30 @@ fn decode_yaml_mapping<'a>(
                 });
             },
         };
+        let field_path = if ctx.prefix.is_empty() {
+            key_str.clone()
+        } else {
+            format!("{}.{key_str}", ctx.prefix)
+        };
         if !seen_keys.insert(key_str.clone()) {
-            match directive {
+            match ctx.directive {
                 FieldValidationDirective::Strict => {
-                    return Err(ApiserverError::BadRequest {
-                        message: format!(
-                            "error unmarshaling JSON: while decoding JSON: line {}: key \"{}\" already set in map",
-                            key_span.start.line(),
-                            key_str
-                        ),
-                    });
+                    if ctx.has_path {
+                        ctx.duplicate_fields
+                            .push(format!("duplicate field \"{field_path}\""));
+                    } else {
+                        return Err(ApiserverError::BadRequest {
+                            message: format!(
+                                "error unmarshaling JSON: while decoding JSON: line {}: key \"{}\" already set in map",
+                                key_span.start.line(),
+                                key_str
+                            ),
+                        });
+                    }
                 },
                 FieldValidationDirective::Warn => {
-                    duplicate_fields.push(format!("duplicate field \"{key_str}\""));
+                    ctx.duplicate_fields
+                        .push(format!("duplicate field \"{key_str}\""));
                 },
                 FieldValidationDirective::Ignore => {},
             }
@@ -442,16 +455,12 @@ fn decode_yaml_mapping<'a>(
         let (val_event, val_span) = val_opt.ok_or_else(|| ApiserverError::BadRequest {
             message: "unexpected EOF in YAML mapping value".to_string(),
         })?;
-        let val = decode_yaml_node(
-            parser,
-            val_event,
-            val_span,
-            anchors,
-            directive,
-            duplicate_fields,
-            depth + 1,
-        )?;
-        map.insert(key_str, val);
+        let old_prefix = std::mem::replace(&mut ctx.prefix, field_path);
+        ctx.depth += 1;
+        let val = decode_yaml_node(parser, val_event, val_span, anchors, ctx);
+        ctx.depth -= 1;
+        ctx.prefix = old_prefix;
+        map.insert(key_str, val?);
     }
     Ok(Value::Object(map))
 }
@@ -461,11 +470,9 @@ fn decode_yaml_node<'a>(
     event: Event<'a>,
     _span: Span,
     anchors: &mut BTreeMap<usize, Value>,
-    directive: FieldValidationDirective,
-    duplicate_fields: &mut Vec<String>,
-    depth: usize,
+    ctx: &mut YamlDecodeContext<'_>,
 ) -> Result<Value, ApiserverError> {
-    if depth > 128 {
+    if ctx.depth > 128 {
         return Err(ApiserverError::BadRequest {
             message: "YAML depth limit exceeded".to_string(),
         });
@@ -485,11 +492,11 @@ fn decode_yaml_node<'a>(
             return Ok(val);
         },
         Event::SequenceStart(anchor, _) => {
-            let seq = decode_yaml_sequence(parser, anchors, directive, duplicate_fields, depth)?;
+            let seq = decode_yaml_sequence(parser, anchors, ctx)?;
             (anchor, seq)
         },
         Event::MappingStart(anchor, _) => {
-            let map = decode_yaml_mapping(parser, anchors, directive, duplicate_fields, depth)?;
+            let map = decode_yaml_mapping(parser, anchors, ctx)?;
             (anchor, map)
         },
         _ => return Ok(Value::Null),
@@ -557,8 +564,9 @@ impl<'a> JsonStrictChecker<'a> {
         } else {
             let mut all_errors = unknown_fields;
             all_errors.extend(duplicate_fields);
-            Err(ApiserverError::BadRequest {
-                message: format!("strict decoding error: {}", all_errors.join(", ")),
+            Err(ApiserverError::InvalidInput {
+                field: "body".to_string(),
+                reason: format!("strict decoding error: {}", all_errors.join(", ")),
             })
         }
     }
@@ -735,7 +743,11 @@ fn is_unknown_crd_field(schema: &Value, prefix: &str, key: &str) -> bool {
     if is_meta && !is_known_metadata_key(key) {
         return true;
     }
-    if prefix.is_empty() && matches!(key, "apiVersion" | "kind" | "metadata") {
+    let is_embedded = subschema
+        .and_then(|s| s.get("x-kubernetes-embedded-resource"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if (prefix.is_empty() || is_embedded) && matches!(key, "apiVersion" | "kind" | "metadata") {
         return false;
     }
     let Some(sub) = subschema else {
@@ -855,9 +867,13 @@ fn strip_node(val: &mut Value, kind: Option<&str>, crd_schema: Option<&Value>, p
                 .and_then(|s| s.get("properties"))
                 .and_then(Value::as_object)
             {
+                let is_embedded = subschema
+                    .and_then(|s| s.get("x-kubernetes-embedded-resource"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
                 obj.retain(|k, _| {
                     props.contains_key(k)
-                        || (prefix.is_empty()
+                        || ((prefix.is_empty() || is_embedded)
                             && matches!(k.as_str(), "apiVersion" | "kind" | "metadata"))
                 });
             } else if subschema
