@@ -139,13 +139,7 @@ impl NodeRegistration {
         match self.client.get_node(name).await {
             Ok(existing) => {
                 let mut updated = node_doc;
-                if let Some(rv) = existing
-                    .get("metadata")
-                    .and_then(|m| m.get("resourceVersion"))
-                    && let Some(meta) = updated.get_mut("metadata").and_then(Value::as_object_mut)
-                {
-                    meta.insert("resourceVersion".to_string(), rv.clone());
-                }
+                merge_existing_node_fields(&mut updated, &existing);
                 self.client.update_node(name, updated).await.map_err(|e| {
                     KubeletError::NodeRegistrationFailed {
                         reason: format!("failed to update node {name}: {e}"),
@@ -266,6 +260,88 @@ fn days_to_ymd(days: u64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+const STANDARD_NODE_RESOURCES: &[&str] = &["cpu", "memory", "pods", "ephemeral-storage"];
+
+fn merge_node_metadata(node: &mut Value, existing: &Value) {
+    let Some(existing_meta) = existing.get("metadata").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(node_meta) = node.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for field in ["uid", "creationTimestamp", "generation", "resourceVersion"] {
+        if let Some(val) = existing_meta.get(field) {
+            node_meta.insert(field.to_string(), val.clone());
+        }
+    }
+
+    if let Some(existing_labels) = existing_meta.get("labels").and_then(Value::as_object) {
+        let mut merged_labels = existing_labels.clone();
+        if let Some(default_labels) = node_meta.get("labels").and_then(Value::as_object) {
+            for (k, v) in default_labels {
+                merged_labels.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        node_meta.insert("labels".to_string(), Value::Object(merged_labels));
+    }
+
+    if let Some(existing_annotations) = existing_meta.get("annotations").and_then(Value::as_object)
+    {
+        let mut merged_annotations = existing_annotations.clone();
+        if let Some(default_annotations) = node_meta.get("annotations").and_then(Value::as_object) {
+            for (k, v) in default_annotations {
+                merged_annotations
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+        }
+        node_meta.insert("annotations".to_string(), Value::Object(merged_annotations));
+    }
+}
+
+fn merge_node_spec(node: &mut Value, existing: &Value) {
+    let Some(existing_spec) = existing.get("spec").and_then(Value::as_object) else {
+        return;
+    };
+    let node_spec = node.as_object_mut().and_then(|obj| {
+        obj.entry("spec".to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    });
+
+    if let Some(node_spec) = node_spec {
+        for (k, v) in existing_spec {
+            node_spec.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+fn merge_node_resources(node: &mut Value, existing: &Value) {
+    for section in ["capacity", "allocatable"] {
+        let existing_res = existing
+            .pointer(&format!("/status/{section}"))
+            .and_then(Value::as_object);
+        let node_res = node
+            .pointer_mut(&format!("/status/{section}"))
+            .and_then(Value::as_object_mut);
+
+        if let (Some(existing_res), Some(node_res)) = (existing_res, node_res) {
+            for (k, v) in existing_res {
+                if !STANDARD_NODE_RESOURCES.contains(&k.as_str()) {
+                    node_res.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn merge_existing_node_fields(node: &mut Value, existing: &Value) {
+    merge_node_metadata(node, existing);
+    merge_node_spec(node, existing);
+    merge_node_resources(node, existing);
 }
 
 #[cfg(test)]

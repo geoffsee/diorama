@@ -1586,6 +1586,12 @@ pub fn stage_projected_clustertrustbundle(
     let mut matched: Vec<&Value> = Vec::new();
 
     if let Some(name) = ctb_proj.get("name").and_then(Value::as_str) {
+        if ctb_proj.get("signerName").is_some() || ctb_proj.get("labelSelector").is_some() {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "clusterTrustBundle".to_string(),
+                reason: "name and signerName/labelSelector are mutually exclusive".to_string(),
+            });
+        }
         if let Some(bundle) = bundles
             .iter()
             .find(|b| b.pointer("/metadata/name").and_then(Value::as_str) == Some(name))

@@ -1812,3 +1812,89 @@ async fn service_links_publish_kubernetes_even_when_disabled_and_skip_headless()
     );
     assert!(!on_env.contains_key("PLAINHEAD_SERVICE_HOST"));
 }
+
+#[tokio::test]
+async fn test_pod_with_custom_projected_token_still_receives_default_service_account_mount() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "custom-token-pod",
+            "namespace": "default",
+            "uid": "uid-custom-token-pod"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "serviceAccountName": "default",
+            "containers": [
+                {
+                    "name": "worker",
+                    "image": "docker.io/library/busybox:1.36",
+                    "volumeMounts": [
+                        {
+                            "name": "custom-token-vol",
+                            "mountPath": "/var/run/secrets/tokens"
+                        }
+                    ]
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "custom-token-vol",
+                    "projected": {
+                        "sources": [
+                            {
+                                "serviceAccountToken": {
+                                    "path": "custom-token",
+                                    "audience": "custom-audience",
+                                    "expirationSeconds": 3600
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    let count = kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Verify container configs received CRI Mount specs:
+    // Both custom token mount (/var/run/secrets/tokens) AND default serviceaccount mount
+    // (/var/run/secrets/kubernetes.io/serviceaccount) MUST be present.
+    let c_configs = runtime.container_configs("uid-custom-token-pod");
+    assert_eq!(c_configs.len(), 1);
+    let mounts = &c_configs[0].mounts;
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.container_path == "/var/run/secrets/tokens"),
+        "Custom projected token volume must be mounted"
+    );
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.container_path == "/var/run/secrets/kubernetes.io/serviceaccount"),
+        "Default serviceaccount volume must still be mounted at /var/run/secrets/kubernetes.io/serviceaccount"
+    );
+}

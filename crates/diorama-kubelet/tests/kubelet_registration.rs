@@ -268,3 +268,115 @@ impl dioramalet::RuntimeProvider for RealCriMock {
         Ok(image.image.clone())
     }
 }
+
+fn assert_custom_node_fields(node: &serde_json::Value) {
+    assert_eq!(
+        node["metadata"]["labels"]["custom.example.com/tier"],
+        "gpu-worker"
+    );
+    assert_eq!(
+        node["metadata"]["annotations"]["custom.example.com/rack"],
+        "rack-42"
+    );
+    assert_eq!(node["spec"]["unschedulable"], true);
+    assert_eq!(node["spec"]["taints"][0]["key"], "example.com/special");
+    assert_eq!(node["status"]["capacity"]["example.com/gpu"], "2");
+    assert_eq!(node["status"]["allocatable"]["example.com/gpu"], "2");
+}
+
+#[tokio::test]
+async fn test_node_heartbeat_preserves_custom_labels_annotations_spec_and_resources() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+
+    let apiserver_arc = Arc::new(apiserver);
+    let runtime = Arc::new(MockRuntimeProvider::new("containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
+
+    // Initial registration
+    kubelet.registration().register_or_update().await.unwrap();
+
+    let client = kubelet.client();
+    let mut node = client.get_node("test-node").await.expect("Node exists");
+
+    // Patch node with custom labels, annotations, spec fields (taints, unschedulable), and extended resources
+    let meta = node.get_mut("metadata").unwrap().as_object_mut().unwrap();
+    let labels = meta
+        .entry("labels")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    labels.insert(
+        "custom.example.com/tier".to_string(),
+        serde_json::json!("gpu-worker"),
+    );
+
+    let annotations = meta
+        .entry("annotations")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    annotations.insert(
+        "custom.example.com/rack".to_string(),
+        serde_json::json!("rack-42"),
+    );
+
+    let node_obj = node.as_object_mut().unwrap();
+    let spec = node_obj
+        .entry("spec")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    spec.insert("unschedulable".to_string(), serde_json::json!(true));
+    spec.insert(
+        "taints".to_string(),
+        serde_json::json!([
+            {
+                "key": "example.com/special",
+                "value": "true",
+                "effect": "NoSchedule"
+            }
+        ]),
+    );
+
+    let status = node.get_mut("status").unwrap().as_object_mut().unwrap();
+    let capacity = status
+        .entry("capacity")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    capacity.insert("example.com/gpu".to_string(), serde_json::json!("2"));
+
+    let allocatable = status
+        .entry("allocatable")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    allocatable.insert("example.com/gpu".to_string(), serde_json::json!("2"));
+
+    client.update_node("test-node", node).await.unwrap();
+
+    // Verify patch applied
+    let patched_node = client.get_node("test-node").await.unwrap();
+    assert_custom_node_fields(&patched_node);
+
+    // Perform node heartbeat / registration update
+    kubelet.registration().register_or_update().await.unwrap();
+
+    // Verify node after heartbeat retains custom labels, annotations, spec, and extended resources
+    let node_after = client.get_node("test-node").await.unwrap();
+    assert_custom_node_fields(&node_after);
+    assert_eq!(
+        node_after["metadata"]["labels"]["kubernetes.io/hostname"],
+        "test-node"
+    );
+    assert!(node_after["status"]["capacity"]["cpu"].is_string());
+    assert!(node_after["status"]["allocatable"]["cpu"].is_string());
+
+    let conditions = node_after["status"]["conditions"].as_array().unwrap();
+    let ready = conditions.iter().find(|c| c["type"] == "Ready").unwrap();
+    assert_eq!(ready["status"], "True");
+}
