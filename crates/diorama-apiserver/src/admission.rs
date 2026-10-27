@@ -1036,7 +1036,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "request timed out".to_string(),
+                reason: "request timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)".to_string(),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1079,7 +1079,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "request timed out".to_string(),
+                reason: "request timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)".to_string(),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1129,7 +1129,7 @@ async fn dispatch_live_webhook(
     .await
     .map_err(|_| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
-        reason: format!("connection to {}:{} timed out", target.host, target.port),
+        reason: format!("connection to {}:{} timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)", target.host, target.port),
     })?
     .map_err(|e| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
@@ -1201,7 +1201,9 @@ async fn apply_mutating_webhook(
     if !response.allowed {
         let msg = response
             .status
-            .and_then(|s| s.message)
+            .as_ref()
+            .and_then(|s| s.message.clone())
+            .filter(|m| !m.is_empty())
             .unwrap_or_else(|| format!("admission denied by webhook '{}'", webhook.name));
         return Err(ApiserverError::AdmissionDenied { reason: msg });
     }
@@ -1255,7 +1257,9 @@ async fn apply_validating_webhook(
     if !response.allowed {
         let msg = response
             .status
-            .and_then(|s| s.message)
+            .as_ref()
+            .and_then(|s| s.message.clone())
+            .filter(|m| !m.is_empty())
             .unwrap_or_else(|| format!("admission denied by webhook '{}'", webhook.name));
         return Err(ApiserverError::AdmissionDenied { reason: msg });
     }
@@ -2277,6 +2281,39 @@ pub fn merge_json_values(target: &mut Value, patch: &Value) {
     }
 }
 
+fn cel_evaluates_to_bool(expr: &str) -> bool {
+    let patterns = [
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "<",
+        ">",
+        "&&",
+        "||",
+        "!",
+        ".startsWith(",
+        ".endsWith(",
+        ".contains(",
+        ".matches(",
+        "has(",
+        "true",
+        "false",
+        "?",
+    ];
+    for p in patterns {
+        if expr.contains(p) {
+            return true;
+        }
+    }
+    for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if word == "in" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Validates CEL matchCondition syntax.
 pub fn validate_match_condition(expression: &str) -> Result<(), ApiserverError> {
     let trimmed = expression.trim();
@@ -2306,16 +2343,11 @@ pub fn validate_match_condition(expression: &str) -> Result<(), ApiserverError> 
         field: "matchConditions.expression".to_string(),
         reason: format!("compilation failed: {e}"),
     })?;
-    if tokens.len() == 1 {
-        match &tokens[0] {
-            CelToken::NumberLit(..) | CelToken::StringLit(..) => {
-                return Err(ApiserverError::InvalidInput {
-                    field: "matchConditions.expression".to_string(),
-                    reason: "compilation failed: expression must evaluate to bool".to_string(),
-                });
-            },
-            _ => {},
-        }
+    if !cel_evaluates_to_bool(trimmed) {
+        return Err(ApiserverError::InvalidInput {
+            field: "matchConditions.expression".to_string(),
+            reason: "compilation failed: expression must evaluate to bool".to_string(),
+        });
     }
     for (i, tok) in tokens.iter().enumerate() {
         if let CelToken::Ident(name) = tok {

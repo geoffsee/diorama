@@ -22,6 +22,7 @@ use tokio::sync::{RwLock, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
+use crate::admission::{AdmissionRequest, GroupVersionKind, GroupVersionResource};
 use crate::client::KubernetesApiClient;
 use crate::error::ApiserverError;
 use crate::exec::{PodExecOptions, select_subprotocol, serve_exec};
@@ -341,6 +342,45 @@ fn is_websocket_upgrade(request: &Request<Incoming>) -> bool {
     upgrade.contains("websocket") && connection.contains("upgrade")
 }
 
+async fn run_connect_admission(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    name: &str,
+    subresource: &str,
+) -> Result<(), ApiserverError> {
+    let cur_rev = client.storage().current_revision().await + 1;
+    let mut adm_req = AdmissionRequest {
+        uid: format!("adm-{cur_rev}"),
+        kind: GroupVersionKind {
+            group: String::new(),
+            version: "v1".to_string(),
+            kind: "Pod".to_string(),
+        },
+        resource: GroupVersionResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+        },
+        subresource: Some(subresource.to_string()),
+        name: Some(name.to_string()),
+        namespace: Some(namespace.to_string()),
+        operation: "CONNECT".to_string(),
+        user_info: client.current_user_info().await,
+        object: None,
+        old_object: None,
+        dry_run: None,
+    };
+    client
+        .admission()
+        .run_mutating_admission(&mut adm_req)
+        .await?;
+    client
+        .admission()
+        .run_validating_admission(&adm_req)
+        .await?;
+    Ok(())
+}
+
 /// Upgrades a pod `exec` request to the channel subprotocol and streams the
 /// command output. Pre-upgrade failures (bad query, missing pod, no kubelet)
 /// are plain HTTP errors so clients fail fast without switching protocols.
@@ -363,6 +403,9 @@ async fn exec_upgrade(
         );
     };
     if let Err(err) = client.authorize_pod_exec(namespace, name) {
+        return error_response(&err);
+    }
+    if let Err(err) = run_connect_admission(client, namespace, name, "exec").await {
         return error_response(&err);
     }
     let pod = match client.get_pod(namespace, name).await {
@@ -1552,6 +1595,9 @@ fn bearer_token(request: &Request<Incoming>) -> Option<String> {
 fn error_response(err: &ApiserverError) -> Response<Body> {
     let (status, reason) = match &err {
         ApiserverError::Unauthenticated { .. } => (StatusCode::UNAUTHORIZED, "Unauthorized"),
+        ApiserverError::Forbidden { reason } => {
+            return status_response(StatusCode::FORBIDDEN, "Forbidden", reason);
+        },
         ApiserverError::Unauthorized { .. } | ApiserverError::AdmissionDenied { .. } => {
             (StatusCode::FORBIDDEN, "Forbidden")
         },

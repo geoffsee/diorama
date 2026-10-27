@@ -74,6 +74,11 @@ pub fn format_milli(value: i128) -> String {
     }
 }
 
+#[must_use]
+pub fn parse_quantity_value(v: &Value) -> Option<i128> {
+    quantity(v)
+}
+
 fn quantity(v: &Value) -> Option<i128> {
     match v {
         Value::String(s) => parse_quantity_milli(s),

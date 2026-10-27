@@ -3,6 +3,7 @@
 use http::Method;
 use serde_json::{Value, json};
 
+use crate::admission::{AdmissionRequest, GroupVersionKind, GroupVersionResource};
 use crate::client::KubernetesApiClient;
 use crate::error::ApiserverError;
 use crate::logs::PodLogOptions;
@@ -430,17 +431,22 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
                 "false"
             },
         )),
-        "source" | "source.component" | "reportingController" | "reportingComponent" => item
+        "source" => item
+            .pointer("/source/component")
+            .and_then(Value::as_str)
+            .or_else(|| item.pointer("/reportingController").and_then(Value::as_str))
+            .map(std::borrow::Cow::Borrowed),
+        "source.component" | "reportingController" | "reportingComponent" => item
             .pointer("/source/component")
             .and_then(Value::as_str)
             .map(std::borrow::Cow::Borrowed)
             .or_else(|| {
-                item.pointer("/deprecatedSource/component")
+                item.pointer("/reportingController")
                     .and_then(Value::as_str)
                     .map(std::borrow::Cow::Borrowed)
             })
             .or_else(|| {
-                item.pointer("/reportingController")
+                item.pointer("/deprecatedSource/component")
                     .and_then(Value::as_str)
                     .map(std::borrow::Cow::Borrowed)
             })
@@ -452,23 +458,36 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
         "hostPort" | "spec.hostPort" | "host" | "spec.host" | "port" | "spec.port" => {
             extract_crd_field_value(item, field)
         },
-        _ => {
-            let ptr = format!("/{}", field.replace('.', "/"));
-            let val = item.pointer(&ptr).or_else(|| {
-                if field.starts_with("spec.") {
-                    None
-                } else {
-                    let spec_ptr = format!("/spec/{}", field.replace('.', "/"));
-                    item.pointer(&spec_ptr)
+        _ => extract_nested_field(item, field),
+    }
+}
+
+fn extract_nested_field<'a>(item: &'a Value, field: &str) -> Option<std::borrow::Cow<'a, str>> {
+    let clean = field.trim_start_matches('.');
+    let mut curr = Some(item);
+    for part in clean.split('.') {
+        if !part.is_empty() {
+            curr = curr.and_then(|v| v.get(part));
+        }
+    }
+    let val = curr.or_else(|| {
+        if clean.starts_with("spec.") {
+            None
+        } else {
+            let mut spec_curr = item.get("spec");
+            for part in clean.split('.') {
+                if !part.is_empty() {
+                    spec_curr = spec_curr.and_then(|v| v.get(part));
                 }
-            });
-            match val {
-                Some(Value::String(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
-                Some(Value::Bool(b)) => Some(std::borrow::Cow::Owned(b.to_string())),
-                Some(Value::Number(n)) => Some(std::borrow::Cow::Owned(n.to_string())),
-                _ => None,
             }
-        },
+            spec_curr
+        }
+    });
+    match val {
+        Some(Value::String(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+        Some(Value::Bool(b)) => Some(std::borrow::Cow::Owned(b.to_string())),
+        Some(Value::Number(n)) => Some(std::borrow::Cow::Owned(n.to_string())),
+        _ => None,
     }
 }
 
@@ -1166,16 +1185,18 @@ pub(crate) fn is_custom_resource(resource: &str) -> bool {
 
 fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version: &str) {
     if version == "v2" {
-        let Some((h, p)) = spec
+        if let Some((h, p)) = spec
             .get("hostPort")
             .and_then(Value::as_str)
             .and_then(|hp| hp.split_once(':'))
-        else {
-            return;
-        };
-        if let Ok(p_num) = p.parse::<i64>() {
+            .map(|(h, p)| (h.to_string(), p.to_string()))
+        {
             spec.insert("host".to_string(), json!(h));
-            spec.insert("port".to_string(), json!(p_num));
+            if let Ok(p_num) = p.parse::<i64>() {
+                spec.insert("port".to_string(), json!(p_num));
+            } else {
+                spec.insert("port".to_string(), json!(p));
+            }
             spec.remove("hostPort");
         }
     } else if version == "v1" {
@@ -1782,9 +1803,9 @@ async fn create_cluster(
             client.create_mutating_webhook_configuration(doc).await
         },
         ("apiregistration.k8s.io", "apiservices") => client.create_api_service(doc).await,
-        ("authentication.k8s.io", "tokenreviews") => Ok(handle_token_review(client, doc)),
+        ("authentication.k8s.io", "tokenreviews") => client.create_token_review(doc).await,
         ("authentication.k8s.io", "selfsubjectreviews") => {
-            Ok(handle_self_subject_review(client, doc))
+            client.create_self_subject_review(doc).await
         },
         ("authorization.k8s.io", "subjectaccessreviews") => {
             Ok(handle_subject_access_review(doc, "SubjectAccessReview"))
@@ -2058,68 +2079,6 @@ fn status_outcome(status: http::StatusCode, reason: &str, message: &str) -> Outc
     }
 }
 
-fn handle_token_review(client: &KubernetesApiClient, mut doc: Value) -> Value {
-    let token = doc
-        .pointer("/spec/token")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let aud = doc
-        .pointer("/spec/audiences")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(Value::as_str);
-    let (auth, user, auds, err_msg) = if let Some(ts) = client.token_service() {
-        match ts.verify_token(token, aud) {
-            Ok(claims) => (
-                true,
-                json!({
-                    "username": claims.sub,
-                    "uid": claims.service_account_uid,
-                    "groups": claims.groups(),
-                    "extra": claims.extra_fields(token)
-                }),
-                json!(claims.aud),
-                None,
-            ),
-            Err(e) => (false, json!({}), json!([]), Some(e.to_string())),
-        }
-    } else {
-        (
-            false,
-            json!({}),
-            json!([]),
-            Some("token service unavailable".to_string()),
-        )
-    };
-    let mut status = json!({
-        "authenticated": auth,
-        "user": user,
-        "audiences": auds,
-    });
-    if let Some(err) = err_msg {
-        status["error"] = json!(err);
-    }
-    doc["status"] = status;
-    doc["apiVersion"] = json!("authentication.k8s.io/v1");
-    doc["kind"] = json!("TokenReview");
-    doc
-}
-
-fn handle_self_subject_review(client: &KubernetesApiClient, mut doc: Value) -> Value {
-    let user_info = client.current_user_info();
-    doc["status"] = json!({
-        "userInfo": {
-            "username": user_info.username,
-            "uid": user_info.uid.unwrap_or_default(),
-            "groups": user_info.groups,
-            "extra": user_info.extra
-        }
-    });
-    doc["apiVersion"] = json!("authentication.k8s.io/v1");
-    doc["kind"] = json!("SelfSubjectReview");
-    doc
-}
-
 fn handle_subject_access_review(mut doc: Value, kind: &str) -> Value {
     doc["status"] = json!({
         "allowed": true,
@@ -2264,33 +2223,58 @@ async fn subresource_dispatch(
                         message: format!("{subresource} requires a resource name"),
                     });
                 };
-                let mut current = read_single(client, &strip_subresource(path), name).await?;
-                let original_meta = current.get("metadata").cloned();
+                let current = read_single(client, &strip_subresource(path), name).await?;
+                let mut updated = current.clone();
                 let original_spec = current.get("spec").cloned();
-                if method == Method::PUT {
+                if *method == Method::PUT {
                     let doc = decode_body(content_type, query, body, path)?;
                     if let Some(status) = doc.get("status") {
-                        current["status"] = status.clone();
+                        updated["status"] = status.clone();
                     }
                     if matches!(subresource, "finalize" | "resize")
                         && let Some(spec) = doc.get("spec")
                     {
-                        current["spec"] = spec.clone();
+                        updated["spec"] = spec.clone();
+                    }
+                    if subresource == "status" {
+                        let patched_labels = doc.pointer("/metadata/labels").cloned();
+                        let patched_annotations = doc.pointer("/metadata/annotations").cloned();
+                        updated["metadata"] = current["metadata"].clone();
+                        if let Some(l) = patched_labels {
+                            updated["metadata"]["labels"] = l;
+                        }
+                        if let Some(a) = patched_annotations {
+                            updated["metadata"]["annotations"] = a;
+                        }
                     }
                 } else {
-                    apply_body_patch(&mut current, content_type, body)?;
+                    apply_body_patch(&mut updated, content_type, body)?;
+                    let patched_labels = updated.pointer("/metadata/labels").cloned();
+                    let patched_annotations = updated.pointer("/metadata/annotations").cloned();
                     if matches!(subresource, "status" | "approval") {
                         if let Some(spec) = original_spec {
-                            current["spec"] = spec;
-                        } else if let Some(obj) = current.as_object_mut() {
+                            updated["spec"] = spec;
+                        } else if let Some(obj) = updated.as_object_mut() {
                             obj.remove("spec");
                         }
                     }
+                    if subresource == "status" {
+                        updated["metadata"] = current["metadata"].clone();
+                        if let Some(l) = patched_labels {
+                            updated["metadata"]["labels"] = l;
+                        }
+                        if let Some(a) = patched_annotations {
+                            updated["metadata"]["annotations"] = a;
+                        }
+                        if *method == Method::PATCH
+                            && let Some(m) =
+                                updated.get_mut("metadata").and_then(Value::as_object_mut)
+                        {
+                            m.remove("resourceVersion");
+                        }
+                    }
                 }
-                if subresource == "status" {
-                    preserve_status_metadata(&mut current, original_meta.as_ref());
-                }
-                persist_object(client, path, name, current)
+                persist_object(client, path, name, updated)
                     .await
                     .map(ok_json)
             },
@@ -2393,7 +2377,10 @@ async fn subresource_dispatch(
             evict_pod(client, path, body).await
         },
         ("", "pods" | "services", sub) if sub == "proxy" || sub.starts_with("proxy/") => {
-            if sub == "proxy" && !path.trailing_slash && query.is_none() {
+            if sub == "proxy"
+                && !path.trailing_slash
+                && (*method == Method::GET || *method == Method::HEAD)
+            {
                 let ns = path.namespace.as_deref().unwrap_or("default");
                 let res = &path.resource;
                 let name = path.name.as_deref().unwrap_or("");
@@ -2415,9 +2402,41 @@ async fn subresource_dispatch(
             }
             proxy_subresource(client, method, path, sub, query, content_type, body).await
         },
-        (_, "pods", "exec" | "attach" | "portforward") => Err(ApiserverError::BadRequest {
-            message: format!("{subresource} requires a websocket upgrade"),
-        }),
+        (_, "pods", subresource @ ("exec" | "attach" | "portforward")) => {
+            let cur_rev = client.storage().current_revision().await + 1;
+            let mut adm_req = AdmissionRequest {
+                uid: format!("adm-{cur_rev}"),
+                kind: GroupVersionKind {
+                    group: String::new(),
+                    version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                },
+                resource: GroupVersionResource {
+                    group: String::new(),
+                    version: "v1".to_string(),
+                    resource: "pods".to_string(),
+                },
+                subresource: Some(subresource.to_string()),
+                name: path.name.clone(),
+                namespace: path.namespace.clone(),
+                operation: "CONNECT".to_string(),
+                user_info: client.current_user_info().await,
+                object: None,
+                old_object: None,
+                dry_run: None,
+            };
+            client
+                .admission()
+                .run_mutating_admission(&mut adm_req)
+                .await?;
+            client
+                .admission()
+                .run_validating_admission(&adm_req)
+                .await?;
+            Err(ApiserverError::BadRequest {
+                message: format!("{subresource} requires a websocket upgrade"),
+            })
+        },
         _ => Err(ApiserverError::NotFound {
             resource: format!("{}/{subresource}", path.resource),
             name: path.name.clone().unwrap_or_default(),
@@ -2860,36 +2879,15 @@ async fn proxy_subresource(
     })
 }
 
-fn preserve_status_metadata(current: &mut Value, original_meta: Option<&Value>) {
-    let (Some(orig_m), Some(curr_m)) = (
-        original_meta.and_then(Value::as_object),
-        current.get_mut("metadata").and_then(Value::as_object_mut),
-    ) else {
-        return;
-    };
-    for k in [
-        "resourceVersion",
-        "uid",
-        "creationTimestamp",
-        "generation",
-        "labels",
-        "annotations",
-        "ownerReferences",
-        "finalizers",
-    ] {
-        if let Some(v) = orig_m.get(k) {
-            curr_m.insert(k.to_string(), v.clone());
-        } else {
-            curr_m.remove(k);
-        }
-    }
-}
-
 fn strip_subresource(path: &ResourcePath) -> ResourcePath {
     ResourcePath {
         subresource: None,
         ..path.clone()
     }
+}
+
+pub(crate) fn strategic_merge_patch(target: &mut Value, patch: Value) {
+    crate::client::json_merge_patch(target, patch);
 }
 
 fn apply_body_patch(
@@ -2912,7 +2910,7 @@ fn apply_body_patch(
                 Ok(v) => v,
                 Err(_) => crate::http::field_validation::decode_yaml(body, false)?,
             };
-            crate::client::json_merge_patch(target, patch);
+            strategic_merge_patch(target, patch);
             Ok(())
         },
     }

@@ -834,6 +834,10 @@ fn collect_unknown_fields(
     }
 }
 
+pub(crate) fn strip_unknown_crd_fields(val: &mut Value, schema: &Value) {
+    strip_node(val, None, Some(schema), "");
+}
+
 fn strip_unknown_fields(val: &mut Value, kind: Option<&str>, crd_schema: Option<&Value>) {
     strip_node(val, kind, crd_schema, "");
 }

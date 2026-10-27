@@ -1006,3 +1006,113 @@ async fn conformance_apiservice_update_lifecycle() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+async fn conformance_pod_service_account_projected_volume_and_generation() {
+    let server = TestServer::start().await;
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "projected-vol-pod" },
+        "spec": {
+            "containers": [{
+                "name": "c1",
+                "image": "alpine:latest"
+            }]
+        }
+    });
+
+    let (s, created) = server
+        .request("POST", "/api/v1/namespaces/default/pods", &pod.to_string())
+        .await;
+    assert_eq!(s, 201);
+    assert_eq!(created["metadata"]["generation"], 1);
+
+    // Verify injected volume
+    let volumes = created["spec"]["volumes"]
+        .as_array()
+        .expect("volumes array");
+    let has_proj_vol = volumes
+        .iter()
+        .any(|v| v["name"] == "kube-api-access-e2e" && v.get("projected").is_some());
+    assert!(
+        has_proj_vol,
+        "kube-api-access-e2e volume should be injected"
+    );
+
+    // Verify injected volumeMount in container
+    let mounts = created["spec"]["containers"][0]["volumeMounts"]
+        .as_array()
+        .expect("volumeMounts array");
+    let has_mount = mounts.iter().any(|m| {
+        m["name"] == "kube-api-access-e2e"
+            && m["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+            && m["readOnly"] == true
+    });
+    assert!(has_mount, "serviceaccount volume mount should be injected");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_proxy_subresource_redirect_preserves_query() {
+    let server = TestServer::start().await;
+
+    let (s, headers, _) = server
+        .request_raw(
+            "GET",
+            "/api/v1/namespaces/default/services/test-svc/proxy?arg1=val1",
+            "application/json",
+            "",
+        )
+        .await;
+    assert_eq!(s, 301);
+    let lower_headers = headers.to_ascii_lowercase();
+    assert!(
+        lower_headers
+            .contains("location: /api/v1/namespaces/default/services/test-svc/proxy/?arg1=val1"),
+        "headers did not contain expected location: {headers}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_pod_exec_subresource_requires_websocket() {
+    let server = TestServer::start().await;
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "exec-target-pod" },
+        "spec": {
+            "containers": [{
+                "name": "app",
+                "image": "alpine:latest"
+            }]
+        }
+    });
+    let (s, _) = server
+        .request("POST", "/api/v1/namespaces/default/pods", &pod.to_string())
+        .await;
+    assert_eq!(s, 201);
+
+    // HTTP POST to pods/exec without websocket upgrade should fail fast with 400
+    let (s, resp) = server
+        .request(
+            "POST",
+            "/api/v1/namespaces/default/pods/exec-target-pod/exec",
+            "",
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires a websocket upgrade")
+    );
+
+    server.stop().await;
+}
