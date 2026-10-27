@@ -2348,4 +2348,493 @@ mod workload_conformance_lane_t07 {
             "Terminating namespace must be deleted once empty"
         );
     }
+
+    fn endpoints_contain_pod(subsets: &[Value], pod_name: &str) -> bool {
+        subsets.iter().any(|sub| {
+            let Some(addrs) = sub.get("addresses").and_then(Value::as_array) else {
+                return false;
+            };
+            addrs
+                .iter()
+                .any(|a| a.pointer("/targetRef/name").and_then(Value::as_str) == Some(pod_name))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_endpointslice_and_endpoints_multi_port_partial_resolution() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-multi-port-res";
+        client.create_namespace(ns).await.unwrap();
+
+        let svc_obj = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "multi-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "multi" },
+                "ports": [
+                    { "name": "port1", "port": 80, "targetPort": "target1" },
+                    { "name": "port2", "port": 443, "targetPort": "target2" }
+                ]
+            }
+        });
+        client.create_service(ns, svc_obj).await.unwrap();
+
+        let pod_a = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-a", "namespace": ns, "labels": { "app": "multi" } },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "app:latest",
+                    "ports": [{ "name": "target1", "containerPort": 8080 }]
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.1",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod_a).await.unwrap();
+
+        let pod_b = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-b", "namespace": ns, "labels": { "app": "multi" } },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "app:latest",
+                    "ports": [
+                        { "name": "target1", "containerPort": 8080 },
+                        { "name": "target2", "containerPort": 8443 }
+                    ]
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.2",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod_b).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let slices = client.list_endpointslices(ns).await.unwrap();
+        let slice_items = slices.get("items").and_then(Value::as_array).unwrap();
+        assert!(!slice_items.is_empty(), "EndpointSlices should be created");
+
+        let mut all_endpoints = Vec::new();
+        for slice in slice_items {
+            if let Some(eps) = slice.get("endpoints").and_then(Value::as_array) {
+                all_endpoints.extend(eps.clone());
+            }
+        }
+        let has_pod_a = all_endpoints
+            .iter()
+            .any(|ep| ep.pointer("/targetRef/name").and_then(Value::as_str) == Some("pod-a"));
+        let has_pod_b = all_endpoints
+            .iter()
+            .any(|ep| ep.pointer("/targetRef/name").and_then(Value::as_str) == Some("pod-b"));
+        assert!(
+            has_pod_a,
+            "pod-a must not be excluded when defining only a subset of service ports"
+        );
+        assert!(has_pod_b, "pod-b must be included in endpoint slices");
+
+        let ep = client.get_endpoints(ns, "multi-svc").await.unwrap();
+        let subsets = ep.get("subsets").and_then(Value::as_array).unwrap();
+        assert!(!subsets.is_empty(), "Endpoints subsets must be created");
+        let has_ep_pod_a = endpoints_contain_pod(subsets, "pod-a");
+        assert!(has_ep_pod_a, "pod-a must be present in Endpoints subsets");
+    }
+
+    #[tokio::test]
+    async fn test_namespace_terminating_conditions_and_pod_finalizer_hold() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ns-term-hold";
+        client.create_namespace(ns).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "hold-pod",
+                "namespace": ns,
+                "finalizers": ["example.com/hold-finalizer"]
+            },
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{ "name": "c", "image": "busybox:latest" }]
+            },
+            "status": { "phase": "Running" }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        let mut ns_doc = client.get_namespace(ns).await.unwrap();
+        ns_doc["metadata"]["deletionTimestamp"] = json!("2026-10-27T00:00:00Z");
+        ns_doc["status"] = json!({ "phase": "Terminating" });
+        client
+            .replace_cluster_object("", "Namespace", "namespaces", ns, ns_doc)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Namespace must still exist because pod has a finalizer
+        let ns_after = client.get_namespace(ns).await.unwrap();
+        assert_eq!(
+            ns_after.pointer("/status/phase").and_then(Value::as_str),
+            Some("Terminating")
+        );
+        let conds = ns_after
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("Conditions must be set on terminating namespace");
+        assert_eq!(conds.len(), 5);
+        let content_cond = conds
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("NamespaceContentRemaining"))
+            .unwrap();
+        assert_eq!(content_cond["status"], "True");
+        assert_eq!(content_cond["reason"], "SomeResourcesRemain");
+        let fin_cond = conds
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("NamespaceFinalizersRemaining"))
+            .unwrap();
+        assert_eq!(fin_cond["status"], "True");
+        assert_eq!(fin_cond["reason"], "SomeFinalizersRemain");
+
+        // The pod must still exist and have deletionTimestamp set
+        let pod_after = client.get_pod(ns, "hold-pod").await.unwrap();
+        assert!(
+            pod_after.pointer("/metadata/deletionTimestamp").is_some(),
+            "delete_pod must set deletionTimestamp"
+        );
+        assert!(
+            pod_after.pointer("/metadata/finalizers").is_some(),
+            "Pod finalizers must not be stripped"
+        );
+
+        // Remove the finalizer and delete the pod
+        let mut pod_cleared = pod_after.clone();
+        pod_cleared["metadata"]["finalizers"] = json!([]);
+        client
+            .update_pod(ns, "hold-pod", pod_cleared)
+            .await
+            .unwrap();
+        let _ = client.delete_pod_options(ns, "hold-pod", Some(0)).await;
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Namespace must now be completely deleted
+        assert!(
+            client.get_namespace(ns).await.is_err(),
+            "Namespace must be deleted once pods are gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_scale_down_halt_when_lower_ordinal_pod_unready() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-ss-halt";
+        client.create_namespace(ns).await.unwrap();
+
+        // Create a mock node so has_nodes is true
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "node-ss" }
+        });
+        client.create_node(node).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "ss-halt", "namespace": ns },
+            "spec": {
+                "replicas": 2,
+                "template": {
+                    "metadata": { "labels": { "app": "halt" } },
+                    "spec": { "containers": [{ "name": "c", "image": "test:latest" }] }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Under ordered_ready, ss-halt-0 is created first
+        assert!(client.get_pod(ns, "ss-halt-0").await.is_ok());
+
+        // Mark ss-halt-0 ready so ss-halt-1 can be created
+        let mut p0_init = client.get_pod(ns, "ss-halt-0").await.unwrap();
+        p0_init["status"]["conditions"] = json!([{ "type": "Ready", "status": "True" }]);
+        client.update_pod(ns, "ss-halt-0", p0_init).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Both pods created
+        assert!(client.get_pod(ns, "ss-halt-0").await.is_ok());
+        assert!(client.get_pod(ns, "ss-halt-1").await.is_ok());
+
+        // Mark ss-halt-0 as NOT ready, and ss-halt-1 as ready
+        let mut p0 = client.get_pod(ns, "ss-halt-0").await.unwrap();
+        p0["status"]["conditions"] = json!([{ "type": "Ready", "status": "False" }]);
+        client.update_pod(ns, "ss-halt-0", p0).await.unwrap();
+
+        let mut p1 = client.get_pod(ns, "ss-halt-1").await.unwrap();
+        p1["status"]["conditions"] = json!([{ "type": "Ready", "status": "True" }]);
+        client.update_pod(ns, "ss-halt-1", p1).await.unwrap();
+
+        // Scale down to 1 (ss-halt-1 is excess)
+        let mut ss_scaled = client.get_statefulset(ns, "ss-halt").await.unwrap();
+        ss_scaled["spec"]["replicas"] = json!(1);
+        client
+            .update_statefulset(ns, "ss-halt", ss_scaled)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Scale-down must HALT: ss-halt-1 must NOT be deleted while ss-halt-0 is unhealthy!
+        assert!(
+            client.get_pod(ns, "ss-halt-1").await.is_ok(),
+            "ss-halt-1 must not be deleted while lower-ordinal pod ss-halt-0 is unhealthy"
+        );
+
+        // Now fix ss-halt-0 to be Ready
+        let mut p0_ready = client.get_pod(ns, "ss-halt-0").await.unwrap();
+        p0_ready["status"]["conditions"] = json!([{ "type": "Ready", "status": "True" }]);
+        client.update_pod(ns, "ss-halt-0", p0_ready).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Now ss-halt-1 should be deleted
+        assert!(
+            client.get_pod(ns, "ss-halt-1").await.is_err(),
+            "ss-halt-1 should be deleted once ss-halt-0 is healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deployment_adopted_replicaset_hash_and_unhealthy_old_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-adopt-rollover";
+        client.create_namespace(ns).await.unwrap();
+
+        // 1. Create an orphan ReplicaSet without pod-template-hash label
+        let orphan_rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "orphan-rs",
+                "namespace": ns,
+                "labels": { "app": "adopt-app" }
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "adopt-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "adopt-app" } },
+                    "spec": { "containers": [{ "name": "c", "image": "v1" }] }
+                }
+            }
+        });
+        client.create_replicaset(ns, orphan_rs).await.unwrap();
+
+        // Create a matching pod without pod-template-hash
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "orphan-rs-pod1",
+                "namespace": ns,
+                "labels": { "app": "adopt-app" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "orphan-rs",
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "v1" }] }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        // Create deployment adopting orphan-rs
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "adopt-dep", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "adopt-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "adopt-app" } },
+                    "spec": { "containers": [{ "name": "c", "image": "v1" }] }
+                }
+            }
+        });
+        client.create_deployment(ns, dep).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Verify adopted ReplicaSet and pod have pod-template-hash stamped
+        let adopted = client.get_replicaset(ns, "orphan-rs").await.unwrap();
+        let hash = adopted
+            .pointer("/metadata/labels/pod-template-hash")
+            .and_then(Value::as_str)
+            .expect("pod-template-hash must be stamped on adopted ReplicaSet");
+        assert_ne!(hash, "");
+        assert_eq!(
+            adopted
+                .pointer("/spec/selector/matchLabels/pod-template-hash")
+                .and_then(Value::as_str),
+            Some(hash)
+        );
+
+        let pod_adopted = client.get_pod(ns, "orphan-rs-pod1").await.unwrap();
+        assert_eq!(
+            pod_adopted
+                .pointer("/metadata/labels/pod-template-hash")
+                .and_then(Value::as_str),
+            Some(hash)
+        );
+    }
+
+    async fn create_rollover_rs_and_pod(
+        client: &KubernetesApiClient,
+        ns: &str,
+        dep_uid: &str,
+        rev: &str,
+        ready: bool,
+    ) {
+        let (img, ready_rep, avail_rep, phase, ready_status) = if ready {
+            ("v1", 1, 1, "Running", "True")
+        } else {
+            ("nonexistent", 0, 0, "Pending", "False")
+        };
+        let rs_name = format!("roll-dep-rev{rev}");
+        let hash = format!("rev{rev}hash");
+        let rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": rs_name,
+                "namespace": ns,
+                "labels": { "app": "roll", "pod-template-hash": hash },
+                "annotations": { "deployment.kubernetes.io/revision": rev },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "roll-dep",
+                    "uid": dep_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "roll", "pod-template-hash": hash } },
+                "template": {
+                    "metadata": { "labels": { "app": "roll", "pod-template-hash": hash } },
+                    "spec": { "containers": [{ "name": "c", "image": img }] }
+                }
+            },
+            "status": {
+                "replicas": 1,
+                "readyReplicas": ready_rep,
+                "availableReplicas": avail_rep
+            }
+        });
+        client.create_replicaset(ns, rs).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("{rs_name}-pod"),
+                "namespace": ns,
+                "labels": { "app": "roll", "pod-template-hash": hash },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": rs_name,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": img }] },
+            "status": {
+                "phase": phase,
+                "conditions": [{ "type": "Ready", "status": ready_status }]
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deployment_rolling_update_rollover_unhealthy_old_rs_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-rollover-unhealthy";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "roll-dep", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "maxSurge": 1, "maxUnavailable": 0 }
+                },
+                "selector": { "matchLabels": { "app": "roll" } },
+                "template": {
+                    "metadata": { "labels": { "app": "roll" } },
+                    "spec": { "containers": [{ "name": "c", "image": "v3" }] }
+                }
+            }
+        });
+        client.create_deployment(ns, dep).await.unwrap();
+        let dep_uid = client.get_deployment(ns, "roll-dep").await.unwrap()["metadata"]["uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        create_rollover_rs_and_pod(&client, ns, &dep_uid, "1", true).await;
+        create_rollover_rs_and_pod(&client, ns, &dep_uid, "2", false).await;
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let rs2_after = client.get_replicaset(ns, "roll-dep-rev2").await.unwrap();
+        assert_eq!(
+            rs2_after["spec"]["replicas"], 0,
+            "Unhealthy old RS rev2 must be scaled down to 0 to unblock rollout"
+        );
+
+        let rs1_after = client.get_replicaset(ns, "roll-dep-rev1").await.unwrap();
+        assert_eq!(rs1_after["spec"]["replicas"], 1);
+    }
 }

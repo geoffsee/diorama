@@ -810,7 +810,9 @@ fn extract_service_slice_ports_for_pod(service: &Value, pod: &Value) -> Option<V
 
     let mut slice_ports = Vec::new();
     for sp in service_ports {
-        let port_num = resolve_target_port_for_pod(sp, pod)?;
+        let Some(port_num) = resolve_target_port_for_pod(sp, pod) else {
+            continue;
+        };
         let port_name = sp.get("name").and_then(Value::as_str);
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
@@ -822,6 +824,9 @@ fn extract_service_slice_ports_for_pod(service: &Value, pod: &Value) -> Option<V
             port_obj.insert("appProtocol".to_string(), json!(ap));
         }
         slice_ports.push(Value::Object(port_obj));
+    }
+    if slice_ports.is_empty() {
+        return None;
     }
     Some(slice_ports)
 }

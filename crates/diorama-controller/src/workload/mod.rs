@@ -63,6 +63,10 @@ impl WorkloadManager {
     ) -> Result<ReconciliationSummary, ControllerError> {
         let mut errors = Vec::new();
 
+        let _ = self
+            .reconcile_endpoint_resources(namespace, &mut errors)
+            .await;
+
         let (deployments, replicasets, statefulsets, daemonsets, cronjobs, jobs) =
             self.reconcile_workloads(namespace, &mut errors).await;
 
@@ -116,10 +120,13 @@ impl WorkloadManager {
         let cronjob_reconciler = CronJobReconciler::new(self.client.clone());
         let job_reconciler = JobReconciler::new(self.client.clone());
 
+        let replicasets_pre =
+            run_stage(|| replicaset_reconciler.reconcile_all(namespace), errors).await;
         let deployments =
             run_stage(|| deployment_reconciler.reconcile_all(namespace), errors).await;
-        let replicasets =
+        let replicasets_post =
             run_stage(|| replicaset_reconciler.reconcile_all(namespace), errors).await;
+        let replicasets = replicasets_pre.max(replicasets_post);
         let _rcs = run_stage(|| rc_reconciler.reconcile_all(namespace), errors).await;
         let statefulsets =
             run_stage(|| statefulset_reconciler.reconcile_all(namespace), errors).await;

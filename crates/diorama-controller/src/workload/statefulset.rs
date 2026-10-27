@@ -184,42 +184,37 @@ impl StatefulSetReconciler {
             .cloned()
             .unwrap_or_default();
 
-        let mut to_delete: Vec<(usize, String)> = Vec::new();
+        let mut owned_pods = std::collections::BTreeMap::new();
         for pod in all_pods {
-            let is_owned = pod
-                .get("metadata")
-                .and_then(|m| m.get("ownerReferences"))
-                .and_then(Value::as_array)
-                .is_some_and(|owners| {
-                    owners.iter().any(|o| {
-                        o.get("kind").and_then(Value::as_str) == Some("StatefulSet")
-                            && (o.get("uid").and_then(Value::as_str) == Some(cfg.uid)
-                                || o.get("name").and_then(Value::as_str) == Some(cfg.name))
-                    })
-                });
-
-            if !is_owned {
-                continue;
-            }
-
-            if let Some(pname) = pod
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(Value::as_str)
-                && let Some(suffix) = pname.strip_prefix(&format!("{}-", cfg.name))
-                && let Ok(idx) = suffix.parse::<usize>()
-                && idx >= cfg.desired_replicas
+            if is_statefulset_pod_owned(&pod, cfg.name, cfg.uid)
+                && let Some(idx) = parse_pod_ordinal(&pod, cfg.name)
             {
-                if cfg.ordered_ready
-                    && pod
-                        .pointer("/metadata/deletionTimestamp")
-                        .and_then(Value::as_str)
-                        .is_some()
-                {
-                    return Ok(());
-                }
-                to_delete.push((idx, pname.to_string()));
+                owned_pods.insert(idx, pod);
             }
+        }
+
+        let mut to_delete: Vec<(usize, String)> = owned_pods
+            .iter()
+            .filter(|(idx, _)| **idx >= cfg.desired_replicas)
+            .map(|(idx, pod)| {
+                let name = pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                (*idx, name)
+            })
+            .collect();
+
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+
+        to_delete.sort_by_key(|b| std::cmp::Reverse(b.0));
+
+        let max_idx = to_delete[0].0;
+        if cfg.ordered_ready && has_nodes && should_halt_scale_down(&owned_pods, max_idx) {
+            return Ok(());
         }
 
         if cfg.pvc_retention_when_scaled == "Delete" {
@@ -232,11 +227,12 @@ impl StatefulSetReconciler {
                     let pvc_name = format!("{vct_name}-{}-{idx}", cfg.name);
                     let _ = self.client.delete_pvc(namespace, &pvc_name).await;
                 }
+                if cfg.ordered_ready && has_nodes {
+                    break;
+                }
             }
         }
 
-        // Delete in descending ordinal order (reverse order)
-        to_delete.sort_by_key(|b| std::cmp::Reverse(b.0));
         for (_, pname) in to_delete {
             match self.client.delete_pod(namespace, &pname).await {
                 Ok(()) | Err(ApiserverError::NotFound { .. }) => {},
@@ -822,4 +818,45 @@ fn attach_pvc_volumes(pod_spec: &mut Value, cfg: &StatefulSetConfig<'_>, idx: us
             }));
         }
     }
+}
+
+fn is_statefulset_pod_owned(pod: &Value, name: &str, uid: &str) -> bool {
+    pod.get("metadata")
+        .and_then(|m| m.get("ownerReferences"))
+        .and_then(Value::as_array)
+        .is_some_and(|owners| {
+            owners.iter().any(|o| {
+                o.get("kind").and_then(Value::as_str) == Some("StatefulSet")
+                    && (o.get("uid").and_then(Value::as_str) == Some(uid)
+                        || o.get("name").and_then(Value::as_str) == Some(name))
+            })
+        })
+}
+
+fn parse_pod_ordinal(pod: &Value, statefulset_name: &str) -> Option<usize> {
+    let pname = pod.pointer("/metadata/name").and_then(Value::as_str)?;
+    let suffix = pname.strip_prefix(&format!("{statefulset_name}-"))?;
+    suffix.parse::<usize>().ok()
+}
+
+fn should_halt_scale_down(
+    owned_pods: &std::collections::BTreeMap<usize, Value>,
+    max_idx: usize,
+) -> bool {
+    if let Some(max_pod) = owned_pods.get(&max_idx)
+        && max_pod.pointer("/metadata/deletionTimestamp").is_some()
+    {
+        return true;
+    }
+    for ord in 0..max_idx {
+        let Some(pod) = owned_pods.get(&ord) else {
+            return true;
+        };
+        if pod.pointer("/metadata/deletionTimestamp").is_some()
+            || !super::replicaset::is_pod_ready(pod)
+        {
+            return true;
+        }
+    }
+    false
 }

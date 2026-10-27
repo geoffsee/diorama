@@ -390,7 +390,9 @@ fn extract_service_endpoints_ports_for_pod(service: &Value, pod: &Value) -> Opti
 
     let mut ports = Vec::new();
     for sp in service_ports {
-        let port_num = super::endpointslice::resolve_target_port_for_pod(sp, pod)?;
+        let Some(port_num) = super::endpointslice::resolve_target_port_for_pod(sp, pod) else {
+            continue;
+        };
         let port_name = sp.get("name").and_then(Value::as_str);
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
@@ -406,6 +408,9 @@ fn extract_service_endpoints_ports_for_pod(service: &Value, pod: &Value) -> Opti
             port_obj.insert("appProtocol".to_string(), json!(ap));
         }
         ports.push(Value::Object(port_obj));
+    }
+    if ports.is_empty() {
+        return None;
     }
     Some(ports)
 }
