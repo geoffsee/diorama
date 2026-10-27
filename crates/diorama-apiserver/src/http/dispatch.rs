@@ -217,9 +217,7 @@ fn page_list(mut list: Value, query: Option<&str>) -> Result<Value, ApiserverErr
     Ok(list)
 }
 
-/// Applies `labelSelector` and `fieldSelector` (`metadata.name=x`) to a list
-/// response. Selectors kubectl always sends (`spec.nodeName`, `status.phase`)
-/// that we do not index are ignored rather than rejected so list calls succeed.
+/// Applies `labelSelector` and `fieldSelector` to a list response.
 fn filter_list(mut list: Value, query: Option<&str>) -> Value {
     let params = query::parse(query);
     let label_selector = params.get("labelSelector").cloned().unwrap_or_default();
@@ -227,26 +225,110 @@ fn filter_list(mut list: Value, query: Option<&str>) -> Value {
     if label_selector.is_empty() && field_selector.is_empty() {
         return list;
     }
-    let fields = parse_label_selector(&field_selector);
     let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
         return list;
     };
     items.retain(|item| {
         matches_label_selector(item, &label_selector)
-            && fields.iter().all(|(key, want)| match key.as_str() {
-                "metadata.name" => {
-                    item.pointer("/metadata/name").and_then(Value::as_str) == Some(want.as_str())
-                },
-                "metadata.namespace" => {
-                    item.pointer("/metadata/namespace").and_then(Value::as_str)
-                        == Some(want.as_str())
-                },
-                // Unindexed selectors (spec.nodeName, status.phase, ...) match
-                // everything so controllers can list without field indexing.
-                _ => true,
-            })
+            && matches_field_selector(item, &field_selector)
     });
     list
+}
+
+fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::Cow<'a, str>> {
+    match field {
+        "metadata.name" => item
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "metadata.namespace" => item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "status.phase" => item
+            .pointer("/status/phase")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "spec.nodeName" => item
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "involvedObject.name" => item
+            .pointer("/involvedObject/name")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "involvedObject.kind" => item
+            .pointer("/involvedObject/kind")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "involvedObject.namespace" => item
+            .pointer("/involvedObject/namespace")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "involvedObject.uid" => item
+            .pointer("/involvedObject/uid")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "type" => item
+            .get("type")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "reason" => item
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "reportingComponent" => item
+            .get("reportingComponent")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed),
+        "source" => item
+            .pointer("/source/component")
+            .and_then(Value::as_str)
+            .map(std::borrow::Cow::Borrowed)
+            .or_else(|| {
+                item.pointer("/reportingComponent")
+                    .and_then(Value::as_str)
+                    .map(std::borrow::Cow::Borrowed)
+            }),
+        _ => {
+            let ptr = format!("/{}", field.replace('.', "/"));
+            match item.pointer(&ptr) {
+                Some(Value::String(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+                Some(Value::Bool(b)) => Some(std::borrow::Cow::Owned(b.to_string())),
+                Some(Value::Number(n)) => Some(std::borrow::Cow::Owned(n.to_string())),
+                _ => None,
+            }
+        },
+    }
+}
+
+fn match_single_field(item: &Value, term: &str) -> bool {
+    let term = term.trim();
+    if term.is_empty() {
+        return true;
+    }
+    if let Some((field, want)) = term.split_once("!=") {
+        let actual = extract_field_value(item, field.trim());
+        actual.as_deref().unwrap_or("") != want.trim()
+    } else if let Some((field, want)) = term.split_once("==") {
+        let actual = extract_field_value(item, field.trim());
+        actual.as_deref().unwrap_or("") == want.trim()
+    } else if let Some((field, want)) = term.split_once('=') {
+        let actual = extract_field_value(item, field.trim());
+        actual.as_deref().unwrap_or("") == want.trim()
+    } else {
+        true
+    }
+}
+
+pub(crate) fn matches_field_selector(item: &Value, selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return true;
+    }
+    split_selector_terms(selector)
+        .iter()
+        .all(|term| match_single_field(item, term))
 }
 
 pub(crate) fn matches_label_selector(item: &Value, selector: &str) -> bool {
@@ -334,21 +416,6 @@ fn parse_set_values(raw: &str) -> Vec<&str> {
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn parse_label_selector(selector: &str) -> Vec<(String, String)> {
-    selector
-        .split(',')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            let key = key.trim();
-            let value = value.trim();
-            if key.is_empty() || key.contains('!') || value.is_empty() {
-                return None;
-            }
-            Some((key.to_string(), value.to_string()))
-        })
         .collect()
 }
 
@@ -1214,6 +1281,10 @@ async fn create_namespaced(
                 )
                 .await
         },
+        ("authorization.k8s.io", "localsubjectaccessreviews") => Ok(handle_subject_access_review(
+            doc,
+            "LocalSubjectAccessReview",
+        )),
         _ => {
             let kind = kind_name(resource)
                 .map(str::to_owned)
@@ -1421,6 +1492,19 @@ async fn create_cluster(
             client.create_mutating_webhook_configuration(doc).await
         },
         ("apiregistration.k8s.io", "apiservices") => client.create_api_service(doc).await,
+        ("authentication.k8s.io", "tokenreviews") => Ok(handle_token_review(client, doc)),
+        ("authentication.k8s.io", "selfsubjectreviews") => {
+            Ok(handle_self_subject_review(client, doc))
+        },
+        ("authorization.k8s.io", "subjectaccessreviews") => {
+            Ok(handle_subject_access_review(doc, "SubjectAccessReview"))
+        },
+        ("authorization.k8s.io", "selfsubjectaccessreviews") => {
+            Ok(handle_subject_access_review(doc, "SelfSubjectAccessReview"))
+        },
+        ("authorization.k8s.io", "selfsubjectrulesreviews") => {
+            Ok(handle_self_subject_rules_review(doc))
+        },
         _ => {
             let kind = kind_name(resource)
                 .map(str::to_owned)
@@ -1555,6 +1639,13 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "priorityclasses" => "PriorityClass",
         "flowschemas" => "FlowSchema",
         "prioritylevelconfigurations" => "PriorityLevelConfiguration",
+        "tokenreviews" => "TokenReview",
+        "selfsubjectreviews" => "SelfSubjectReview",
+        "subjectaccessreviews" => "SubjectAccessReview",
+        "selfsubjectaccessreviews" => "SelfSubjectAccessReview",
+        "localsubjectaccessreviews" => "LocalSubjectAccessReview",
+        "selfsubjectrulesreviews" => "SelfSubjectRulesReview",
+        "podcertificaterequests" => "PodCertificateRequest",
         _ => return None,
     })
 }
@@ -1616,6 +1707,7 @@ fn list_kind(resource: &str) -> &'static str {
         "priorityclasses" => "PriorityClassList",
         "flowschemas" => "FlowSchemaList",
         "prioritylevelconfigurations" => "PriorityLevelConfigurationList",
+        "podcertificaterequests" => "PodCertificateRequestList",
         _ => "List",
     }
 }
@@ -1649,6 +1741,101 @@ fn status_outcome(status: http::StatusCode, reason: &str, message: &str) -> Outc
     }
 }
 
+fn handle_token_review(client: &KubernetesApiClient, mut doc: Value) -> Value {
+    let token = doc
+        .pointer("/spec/token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let aud = doc
+        .pointer("/spec/audiences")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str);
+    let (auth, user, auds, err_msg) = if let Some(ts) = client.token_service() {
+        match ts.verify_token(token, aud) {
+            Ok(claims) => (
+                true,
+                json!({
+                    "username": claims.sub,
+                    "uid": claims.service_account_uid,
+                    "groups": claims.groups(),
+                    "extra": {}
+                }),
+                json!(claims.aud),
+                None,
+            ),
+            Err(e) => (false, json!({}), json!([]), Some(e.to_string())),
+        }
+    } else {
+        (
+            false,
+            json!({}),
+            json!([]),
+            Some("token service unavailable".to_string()),
+        )
+    };
+    let mut status = json!({
+        "authenticated": auth,
+        "user": user,
+        "audiences": auds,
+    });
+    if let Some(err) = err_msg {
+        status["error"] = json!(err);
+    }
+    doc["status"] = status;
+    doc["apiVersion"] = json!("authentication.k8s.io/v1");
+    doc["kind"] = json!("TokenReview");
+    doc
+}
+
+fn handle_self_subject_review(client: &KubernetesApiClient, mut doc: Value) -> Value {
+    let user_info = client.current_user_info();
+    doc["status"] = json!({
+        "userInfo": {
+            "username": user_info.username,
+            "uid": user_info.uid.unwrap_or_default(),
+            "groups": user_info.groups,
+            "extra": {}
+        }
+    });
+    doc["apiVersion"] = json!("authentication.k8s.io/v1");
+    doc["kind"] = json!("SelfSubjectReview");
+    doc
+}
+
+fn handle_subject_access_review(mut doc: Value, kind: &str) -> Value {
+    doc["status"] = json!({
+        "allowed": true,
+        "denied": false,
+        "reason": "RBAC allowed"
+    });
+    doc["apiVersion"] = json!("authorization.k8s.io/v1");
+    doc["kind"] = json!(kind);
+    doc
+}
+
+fn handle_self_subject_rules_review(mut doc: Value) -> Value {
+    doc["status"] = json!({
+        "resourceRules": [
+            {
+                "verbs": ["*"],
+                "apiGroups": ["*"],
+                "resources": ["*"]
+            }
+        ],
+        "nonResourceRules": [
+            {
+                "verbs": ["*"],
+                "nonResourceURLs": ["*"]
+            }
+        ],
+        "incomplete": false
+    });
+    doc["apiVersion"] = json!("authorization.k8s.io/v1");
+    doc["kind"] = json!("SelfSubjectRulesReview");
+    doc
+}
+
 /// Serves the subresources kubectl needs: `status` echoes or replaces the stored
 /// object, `scale` reports or sets replicas, and `log` streams captured
 /// container output from the kubelet.
@@ -1669,7 +1856,29 @@ async fn subresource_dispatch(
         });
     }
     match (path.group.as_str(), path.resource.as_str(), subresource) {
-        (_, _, "status" | "finalize" | "resize") => match *method {
+        ("", "serviceaccounts", "token") => {
+            if *method != Method::POST {
+                return Ok(status_outcome(
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "method is not supported",
+                ));
+            }
+            let Some(namespace) = &path.namespace else {
+                return Err(ApiserverError::BadRequest {
+                    message: "token request requires namespace".to_string(),
+                });
+            };
+            let Some(name) = &path.name else {
+                return Err(ApiserverError::BadRequest {
+                    message: "token request requires serviceaccount name".to_string(),
+                });
+            };
+            let doc = decode_body(content_type, query, body, path)?;
+            let token_req = client.create_token_request(namespace, name, doc).await?;
+            Ok(created_json(token_req))
+        },
+        (_, _, "status" | "finalize" | "resize" | "approval") => match *method {
             Method::GET => {
                 let object = ResourcePath {
                     subresource: None,
@@ -1684,6 +1893,7 @@ async fn subresource_dispatch(
                     });
                 };
                 let mut current = read_single(client, &strip_subresource(path), name).await?;
+                let original_spec = current.get("spec").cloned();
                 if method == Method::PUT {
                     let doc = decode_body(content_type, query, body, path)?;
                     if let Some(status) = doc.get("status") {
@@ -1696,6 +1906,13 @@ async fn subresource_dispatch(
                     }
                 } else {
                     apply_body_patch(&mut current, content_type, body)?;
+                    if matches!(subresource, "status" | "approval") {
+                        if let Some(spec) = original_spec {
+                            current["spec"] = spec;
+                        } else if let Some(obj) = current.as_object_mut() {
+                            obj.remove("spec");
+                        }
+                    }
                 }
                 persist_object(client, path, name, current)
                     .await
@@ -1773,7 +1990,11 @@ async fn subresource_dispatch(
             };
             let options = PodLogOptions::from_params(&query::parse(query));
             let follow = options.follow;
-            let text = reader.read_pod_log(&pod, &options).await?;
+            let mut text = reader.read_pod_log(&pod, &options).await?;
+            if let Some(limit) = options.limit_bytes {
+                let boundary = text.floor_char_boundary(limit);
+                text.truncate(boundary);
+            }
             let body = if follow {
                 Payload::ChunkedText(text)
             } else {
@@ -1889,12 +2110,54 @@ async fn evict_pod(
         record_pdb_disruption(client, pdb, &counts, namespace, name).await;
     }
 
-    client.delete_pod_options(namespace, name, grace).await?;
+    mark_pod_disrupted_and_wait_job(client, namespace, name).await?;
+    client
+        .delete_pod_options(namespace, name, grace.or(Some(0)))
+        .await?;
     Ok(status_outcome(
         http::StatusCode::CREATED,
         "Success",
         "evicted",
     ))
+}
+
+async fn mark_pod_disrupted_and_wait_job(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ApiserverError> {
+    let current_pod = client.get_pod(namespace, name).await?;
+    let mut status = current_pod
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    status["phase"] = json!("Failed");
+    if status.get("conditions").is_none() {
+        status["conditions"] = json!([]);
+    }
+    if let Some(arr) = status.get_mut("conditions").and_then(Value::as_array_mut) {
+        arr.retain(|c| c.get("type").and_then(Value::as_str) != Some("DisruptionTarget"));
+        arr.push(json!({
+            "type": "DisruptionTarget",
+            "status": "True",
+            "reason": "TerminationByKubelet",
+            "message": "Pod was evicted",
+            "lastTransitionTime": crate::time::now_rfc3339()
+        }));
+    }
+    let _ = client.patch_pod_status(namespace, name, status).await;
+
+    let has_job_owner = current_pod
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|r| r.get("kind").and_then(Value::as_str) == Some("Job"))
+        });
+    if has_job_owner {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+    Ok(())
 }
 
 async fn record_pdb_disruption(

@@ -52,11 +52,13 @@ pub struct WebhookClientConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleWithOperations {
+    #[serde(default)]
     pub operations: Vec<String>,
-    #[serde(rename = "apiGroups")]
+    #[serde(default, rename = "apiGroups")]
     pub api_groups: Vec<String>,
-    #[serde(rename = "apiVersions")]
+    #[serde(default, rename = "apiVersions")]
     pub api_versions: Vec<String>,
+    #[serde(default)]
     pub resources: Vec<String>,
     pub scope: Option<String>,
 }
@@ -148,6 +150,7 @@ impl RuleWithOperations {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WebhookDefinition {
     pub name: String,
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
     #[serde(rename = "clientConfig")]
     pub client_config: WebhookClientConfig,
@@ -215,13 +218,17 @@ impl WebhookDefinition {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatingWebhookConfiguration {
+    #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
     pub webhooks: Vec<WebhookDefinition>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MutatingWebhookConfiguration {
+    #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+    #[serde(default)]
     pub webhooks: Vec<WebhookDefinition>,
 }
 

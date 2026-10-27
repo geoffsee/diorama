@@ -132,15 +132,23 @@ pub(crate) fn wants_aggregated_discovery(accept: Option<&str>) -> bool {
     };
     accept.split(',').any(|entry| {
         let mut group_ok = false;
-        let mut version_v2 = false;
-        for param in entry.split(';').skip(1) {
-            match param.trim() {
-                "g=apidiscovery.k8s.io" => group_ok = true,
-                "v=v2" => version_v2 = true,
-                _ => {},
+        let mut as_discovery = false;
+        let mut version_explicit = false;
+        let mut v2_ok = false;
+        for param in entry.split(';') {
+            let p = param.trim().replace(' ', "");
+            if p == "g=apidiscovery.k8s.io" {
+                group_ok = true;
+            } else if p == "as=APIGroupDiscoveryList" {
+                as_discovery = true;
+            } else if p.starts_with("v=") {
+                version_explicit = true;
+                if p == "v=v2" {
+                    v2_ok = true;
+                }
             }
         }
-        group_ok && version_v2
+        group_ok && (!version_explicit || v2_ok) && (v2_ok || as_discovery)
     })
 }
 
