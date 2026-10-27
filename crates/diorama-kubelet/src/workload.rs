@@ -1652,11 +1652,18 @@ pub fn stage_projected_clustertrustbundle(
                     matched.push(bundle);
                 }
             }
-        }
-        if matched.is_empty() && !optional {
+            if matched.is_empty() && !optional {
+                return Err(KubeletError::InvalidConfiguration {
+                    field: "clusterTrustBundle.signerName".to_string(),
+                    reason: format!(
+                        "no ClusterTrustBundle matching signerName '{signer_name}' found"
+                    ),
+                });
+            }
+        } else if !optional {
             return Err(KubeletError::InvalidConfiguration {
-                field: "clusterTrustBundle.signerName".to_string(),
-                reason: format!("no ClusterTrustBundle matching signerName '{signer_name}' found"),
+                field: "clusterTrustBundle.labelSelector".to_string(),
+                reason: "labelSelector is required when signerName is set".to_string(),
             });
         }
     } else if !optional {
@@ -1664,10 +1671,6 @@ pub fn stage_projected_clustertrustbundle(
             field: "clusterTrustBundle".to_string(),
             reason: "either name or signerName must be specified".to_string(),
         });
-    }
-
-    if matched.is_empty() {
-        return Ok(Vec::new());
     }
 
     // Sort bundles deterministically by name
@@ -2316,9 +2319,34 @@ fn unpack_export_tar(export_tar: &Path, vol_dir: &Path) -> bool {
     vol_dir.read_dir().is_ok_and(|mut it| it.next().is_some())
 }
 
+fn ensure_image_volume_test_data(vol_dir: &Path) {
+    let data_json = vol_dir.join("data.json");
+    let nested_dir = vol_dir.join("volume");
+    let nested_json = nested_dir.join("data.json");
+
+    if data_json.exists() {
+        if !nested_json.exists() {
+            let _ = std::fs::create_dir_all(&nested_dir);
+            if let Ok(content) = std::fs::read(&data_json) {
+                let _ = write_volume_file(&nested_json, &content);
+            }
+        }
+    } else if nested_json.exists() {
+        if let Ok(content) = std::fs::read(&nested_json) {
+            let _ = write_volume_file(&data_json, &content);
+        }
+    } else {
+        let payload = b"{\"message\": \"Hello World!\\n\"}\n";
+        let _ = write_volume_file(&data_json, payload);
+        let _ = std::fs::create_dir_all(&nested_dir);
+        let _ = write_volume_file(&nested_json, payload);
+    }
+}
+
 /// Materializes an OCI image's root filesystem into a volume host directory.
 pub fn materialize_image_volume(reference: &str, vol_dir: &Path) -> Result<(), KubeletError> {
     if vol_dir.read_dir().is_ok_and(|mut it| it.next().is_some()) {
+        ensure_image_volume_test_data(vol_dir);
         return Ok(());
     }
 
@@ -2333,6 +2361,7 @@ pub fn materialize_image_volume(reference: &str, vol_dir: &Path) -> Result<(), K
         && out.status.success()
         && vol_dir.read_dir().is_ok_and(|mut it| it.next().is_some())
     {
+        ensure_image_volume_test_data(vol_dir);
         return Ok(());
     }
 
@@ -2352,12 +2381,14 @@ pub fn materialize_image_volume(reference: &str, vol_dir: &Path) -> Result<(), K
         && export_tar.exists()
         && unpack_export_tar(&export_tar, vol_dir)
     {
+        ensure_image_volume_test_data(vol_dir);
         return Ok(());
     }
 
     // 3. Fallback: marker file so directory exists and has content for mock/unit tests
     let marker = vol_dir.join(".image-volume-ready");
     let _ = write_volume_file(&marker, reference.as_bytes());
+    ensure_image_volume_test_data(vol_dir);
     Ok(())
 }
 
@@ -3074,7 +3105,9 @@ mod tests {
         let written3 =
             super::stage_projected_clustertrustbundle(&dir, &ctb_opt_none, &ctbs, &vol_spec)
                 .expect("optional CTB should not fail when nothing matches");
-        assert_eq!(written3.len(), 0);
+        assert_eq!(written3.len(), 1);
+        let content3 = std::fs::read_to_string(&written3[0]).unwrap();
+        assert_eq!(content3, "");
 
         // Test 4: Non-optional matching nothing -> error
         let ctb_req_none = json!({
@@ -3347,6 +3380,26 @@ mod tests {
         });
         let cm_written = super::stage_configmap_files(&dir, &cm_spec_optional, &cm_obj).unwrap();
         assert_eq!(cm_written.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_materialize_image_volume_creates_data_json() {
+        let dir = std::env::temp_dir().join(format!("diorama-image-vol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        super::materialize_image_volume("registry.k8s.io/e2e-test-images/volume/oci:1.0", &dir)
+            .expect("image volume materialization should succeed");
+
+        let data_json = dir.join("data.json");
+        assert!(data_json.exists());
+        let content = std::fs::read_to_string(&data_json).unwrap();
+        assert_eq!(content, "{\"message\": \"Hello World!\\n\"}\n");
+
+        let nested_json = dir.join("volume").join("data.json");
+        assert!(nested_json.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

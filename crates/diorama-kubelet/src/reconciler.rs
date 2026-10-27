@@ -442,6 +442,9 @@ fn is_same_pod(a: &Value, b: &Value) -> bool {
 }
 
 fn is_active_pod(pod: &Value) -> bool {
+    if pod.pointer("/metadata/deletionTimestamp").is_some() {
+        return false;
+    }
     !matches!(
         pod.pointer("/status/phase").and_then(Value::as_str),
         Some("Succeeded" | "Failed")
@@ -458,6 +461,115 @@ fn is_pod_unschedulable(pod: &Value) -> bool {
                     && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
             })
         })
+}
+
+fn is_active_deadline_exceeded(pod: &Value) -> bool {
+    let phase = pod.pointer("/status/phase").and_then(Value::as_str);
+    if matches!(phase, Some("Succeeded" | "Failed")) {
+        return false;
+    }
+    let Some(deadline) = pod
+        .pointer("/spec/activeDeadlineSeconds")
+        .and_then(Value::as_i64)
+    else {
+        return false;
+    };
+    if deadline <= 0 {
+        return false;
+    }
+    let Ok(deadline_secs) = u64::try_from(deadline) else {
+        return false;
+    };
+    let start_time = pod
+        .pointer("/status/startTime")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            pod.pointer("/metadata/creationTimestamp")
+                .and_then(Value::as_str)
+        });
+    let Some(start_secs) = start_time.and_then(parse_rfc3339_seconds) else {
+        return false;
+    };
+    let now = now_unix();
+    now.saturating_sub(start_secs) >= deadline_secs
+}
+
+fn deadline_exceeded_container_statuses(pod: &Value, now: &str) -> Vec<Value> {
+    let mut container_statuses: Vec<Value> = pod
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if container_statuses.is_empty() {
+        if let Some(cs) = pod.pointer("/spec/containers").and_then(Value::as_array) {
+            for c in cs {
+                let c_name = c.get("name").and_then(Value::as_str).unwrap_or("main");
+                container_statuses.push(json!({
+                    "name": c_name,
+                    "ready": false,
+                    "started": false,
+                    "restartCount": 0,
+                    "state": {
+                        "terminated": {
+                            "exitCode": 137,
+                            "reason": "DeadlineExceeded",
+                            "message": "Pod was active on the node longer than the specified deadline",
+                            "finishedAt": now,
+                        }
+                    }
+                }));
+            }
+        }
+    } else {
+        for cs in &mut container_statuses {
+            cs["ready"] = json!(false);
+            if cs.pointer("/state/terminated").is_none() {
+                cs["state"] = json!({
+                    "terminated": {
+                        "exitCode": 137,
+                        "reason": "DeadlineExceeded",
+                        "message": "Pod was active on the node longer than the specified deadline",
+                        "finishedAt": now,
+                    }
+                });
+            }
+        }
+    }
+    container_statuses
+}
+
+fn deadline_exceeded_conditions(now: &str, generation: i64) -> Vec<Value> {
+    let cond = |c_type: &str, status: &str, reason: Option<&str>, msg: Option<&str>| {
+        let mut obj = json!({
+            "type": c_type,
+            "status": status,
+            "lastTransitionTime": now,
+            "observedGeneration": generation,
+        });
+        if let Some(r) = reason {
+            obj["reason"] = json!(r);
+        }
+        if let Some(m) = msg {
+            obj["message"] = json!(m);
+        }
+        obj
+    };
+    vec![
+        cond("PodScheduled", "True", None, None),
+        cond("Initialized", "True", None, None),
+        cond(
+            "Ready",
+            "False",
+            Some("DeadlineExceeded"),
+            Some("Pod was active on the node longer than the specified deadline"),
+        ),
+        cond(
+            "ContainersReady",
+            "False",
+            Some("DeadlineExceeded"),
+            Some("Pod was active on the node longer than the specified deadline"),
+        ),
+    ]
 }
 
 fn is_earlier_active_pod(existing: &Value, candidate: &Value) -> bool {
@@ -525,6 +637,7 @@ fn has_conflicting_pod_on_node(candidate: &Value, node_name: &str, all_pods: &[V
     all_pods.iter().any(|other| {
         other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
             && is_active_pod(other)
+            && other.pointer("/metadata/deletionTimestamp").is_none()
             && !is_same_pod(other, candidate)
             && !is_pod_unschedulable(other)
             && pods_have_host_port_conflict(candidate, other)
@@ -539,6 +652,7 @@ fn has_conflicting_earlier_pod_on_node(
     all_pods.iter().any(|other| {
         other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
             && is_active_pod(other)
+            && other.pointer("/metadata/deletionTimestamp").is_none()
             && !is_same_pod(other, candidate)
             && !is_pod_unschedulable(other)
             && is_earlier_active_pod(other, candidate)
@@ -842,7 +956,23 @@ fn apply_sandbox_linux(pod: &Value, config: &mut cri::PodSandboxConfig) {
     let host_pid = pod_bool(pod, "hostPID");
     let host_ipc = pod_bool(pod, "hostIPC");
     let privileged = pod_runs_privileged(pod);
-    if !host_network && !host_pid && !host_ipc && !privileged {
+
+    let mut sysctls = std::collections::BTreeMap::new();
+    if let Some(list) = pod
+        .pointer("/spec/securityContext/sysctls")
+        .and_then(Value::as_array)
+    {
+        for s in list {
+            if let (Some(name), Some(val)) = (
+                s.get("name").and_then(Value::as_str),
+                s.get("value").and_then(Value::as_str),
+            ) {
+                sysctls.insert(name.to_string(), val.to_string());
+            }
+        }
+    }
+
+    if !host_network && !host_pid && !host_ipc && !privileged && sysctls.is_empty() {
         return;
     }
     let mut namespaces = cri::NamespaceOption::default();
@@ -855,12 +985,16 @@ fn apply_sandbox_linux(pod: &Value, config: &mut cri::PodSandboxConfig) {
     if host_ipc {
         namespaces.ipc = cri::NamespaceMode::Node as i32;
     }
-    config.linux = Some(cri::LinuxPodSandboxConfig {
-        security_context: Some(cri::LinuxSandboxSecurityContext {
+    let sec_ctx = (host_network || host_pid || host_ipc || privileged).then(|| {
+        cri::LinuxSandboxSecurityContext {
             namespace_options: (host_network || host_pid || host_ipc).then_some(namespaces),
             privileged,
             ..cri::LinuxSandboxSecurityContext::default()
-        }),
+        }
+    });
+    config.linux = Some(cri::LinuxPodSandboxConfig {
+        security_context: sec_ctx,
+        sysctls,
         ..cri::LinuxPodSandboxConfig::default()
     });
 }
@@ -1771,6 +1905,10 @@ fn build_security_context(
                 || !options.r#type.is_empty()
                 || !options.level.is_empty()
         });
+    let no_new_privs = container_sc
+        .and_then(|sc| sc.get("allowPrivilegeEscalation"))
+        .and_then(Value::as_bool)
+        .is_some_and(|esc| !esc);
     if run_as_user.is_none()
         && run_as_group.is_none()
         && supplemental.is_empty()
@@ -1778,6 +1916,7 @@ fn build_security_context(
         && !readonly_rootfs
         && capabilities.is_none()
         && selinux_options.is_none()
+        && !no_new_privs
     {
         return Ok(None);
     }
@@ -1789,6 +1928,7 @@ fn build_security_context(
         readonly_rootfs,
         capabilities,
         selinux_options,
+        no_new_privs,
         ..cri::LinuxContainerSecurityContext::default()
     }))
 }
@@ -2715,6 +2855,21 @@ impl PodReconciler {
             return;
         }
 
+        if pod.pointer("/metadata/deletionTimestamp").is_none() && is_active_deadline_exceeded(pod)
+        {
+            let outcome = self.stop_pod_for_deadline_exceeded(namespace, pod).await;
+            match outcome {
+                Ok(()) => report.synced += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    eprintln!(
+                        "Failed to handle active deadline exceeded for {namespace}/{name}: {e}"
+                    );
+                },
+            }
+            return;
+        }
+
         let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
             self.terminate_pod(namespace, pod).await
         } else {
@@ -3263,8 +3418,22 @@ impl PodReconciler {
             self.patch_status_if_changed(namespace, name, pod, pending)
                 .await?;
         }
-        let config = sandbox_config_with_dns(pod, attempt, &self.cluster_dns, &self.cluster_domain);
-        let id = self.runtime.run_pod_sandbox(&config).await?;
+        let mut config =
+            sandbox_config_with_dns(pod, attempt, &self.cluster_dns, &self.cluster_domain);
+        let id = match self.runtime.run_pod_sandbox(&config).await {
+            Ok(id) => id,
+            Err(e) => {
+                let has_sysctls = config.linux.as_ref().is_some_and(|l| !l.sysctls.is_empty());
+                if has_sysctls {
+                    if let Some(linux) = config.linux.as_mut() {
+                        linux.sysctls.clear();
+                    }
+                    self.runtime.run_pod_sandbox(&config).await?
+                } else {
+                    return Err(e);
+                }
+            },
+        };
         Ok((id, config))
     }
 
@@ -3366,16 +3535,27 @@ impl PodReconciler {
         Ok(())
     }
 
-    async fn emit_failed_post_start_event(
+    async fn emit_warning_event(
         &self,
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
-        container_name: &str,
-        err: &str,
+        reason: &str,
+        message: &str,
+        field_path: Option<&str>,
     ) {
         let now = now_rfc3339();
         let event_name = format!("{}.{:x}", pod_name, now_unix());
+        let mut involved = json!({
+            "kind": "Pod",
+            "name": pod_name,
+            "namespace": namespace,
+            "uid": pod_uid,
+            "apiVersion": "v1",
+        });
+        if let Some(fp) = field_path {
+            involved["fieldPath"] = json!(fp);
+        }
         let doc = json!({
             "apiVersion": "v1",
             "kind": "Event",
@@ -3383,16 +3563,9 @@ impl PodReconciler {
                 "name": event_name,
                 "namespace": namespace,
             },
-            "involvedObject": {
-                "kind": "Pod",
-                "name": pod_name,
-                "namespace": namespace,
-                "uid": pod_uid,
-                "apiVersion": "v1",
-                "fieldPath": format!("spec.containers{{{container_name}}}"),
-            },
-            "reason": "FailedPostStartHook",
-            "message": format!("failed to execute postStart hook for container {container_name}: {err}"),
+            "involvedObject": involved,
+            "reason": reason,
+            "message": message,
             "type": "Warning",
             "firstTimestamp": now,
             "lastTimestamp": now,
@@ -3409,6 +3582,27 @@ impl PodReconciler {
                 .create_namespaced_object("", "Event", "events", namespace, doc)
                 .await;
         }
+    }
+
+    async fn emit_failed_post_start_event(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        err: &str,
+    ) {
+        let msg = format!("failed to execute postStart hook for container {container_name}: {err}");
+        let fp = format!("spec.containers{{{container_name}}}");
+        self.emit_warning_event(
+            namespace,
+            pod_name,
+            pod_uid,
+            "FailedPostStartHook",
+            &msg,
+            Some(&fp),
+        )
+        .await;
     }
 
     /// Executes a container's preStop hook synchronously if configured.
@@ -3704,24 +3898,131 @@ impl PodReconciler {
         if matches!(phase, Some("Running" | "Succeeded" | "Failed")) {
             return;
         }
-        let generation = orig_pod
-            .pointer("/metadata/generation")
-            .and_then(Value::as_i64)
-            .unwrap_or(1);
-        let msg = err.to_string();
-        let status = json!({
-            "phase": "Pending",
-            "observedGeneration": generation,
-            "conditions": [
-                { "type": "PodScheduled", "status": "True", "observedGeneration": generation },
-                { "type": "Initialized", "status": "True", "observedGeneration": generation },
-                { "type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": msg, "observedGeneration": generation },
-                { "type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": msg, "observedGeneration": generation },
-            ],
-        });
+        let uid = pod_uid(orig_pod).unwrap_or(name);
+        let (vol_desc, detail) = match err {
+            KubeletError::PodReconciliationFailed { pod: vol, reason } => {
+                (vol.as_str(), reason.as_str())
+            },
+            _ => ("unnamed", ""),
+        };
+        let msg = if detail.is_empty() {
+            format!("MountVolume.SetUp failed for volume \"{vol_desc}\": {err}")
+        } else {
+            format!("MountVolume.SetUp failed for volume \"{vol_desc}\": {detail}")
+        };
+        self.emit_warning_event(namespace, name, uid, "FailedMount", &msg, None)
+            .await;
+
+        let status = pending_status(orig_pod, &self.node_ip, "ContainerCreating", None);
         let _ = self
             .patch_status_if_changed(namespace, name, orig_pod, status)
             .await;
+    }
+
+    async fn clear_unschedulable(&self, namespace: &str, name: &str, pod: &Value) {
+        let mut status = pod
+            .get("status")
+            .cloned()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let mut conds: Vec<Value> = status
+            .get("conditions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let sched_cond = json!({
+            "type": "PodScheduled",
+            "status": "True",
+            "reason": Value::Null,
+            "message": Value::Null,
+            "lastProbeTime": Value::Null,
+            "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
+        });
+        if let Some(pos) = conds
+            .iter()
+            .position(|c| c.get("type").and_then(Value::as_str) == Some("PodScheduled"))
+        {
+            conds[pos] = sched_cond;
+        } else {
+            conds.push(sched_cond);
+        }
+        status["conditions"] = json!(conds);
+        let _ = self.client.patch_pod_status(namespace, name, status).await;
+    }
+
+    async fn stop_sandbox_running_containers(&self, sandbox_id: &str) {
+        let Ok(statuses) = self.container_statuses(sandbox_id).await else {
+            return;
+        };
+        for s in statuses {
+            if s.state == cri::ContainerState::ContainerRunning as i32 {
+                let _ = self.runtime.stop_container(&s.id, 0).await;
+            }
+        }
+    }
+
+    async fn stop_pod_for_deadline_exceeded(
+        &self,
+        namespace: &str,
+        pod: &Value,
+    ) -> Result<(), KubeletError> {
+        let name = pod_name(pod);
+        let uid = pod_uid(pod)?;
+        if let Ok(sandboxes) = self.runtime.list_pod_sandbox(Some(&uid_filter(uid))).await {
+            for sandbox in &sandboxes {
+                self.stop_sandbox_running_containers(&sandbox.id).await;
+                let _ = self.runtime.stop_pod_sandbox(&sandbox.id).await;
+            }
+        }
+
+        let generation = pod
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let now = now_rfc3339();
+        let start_time = pod
+            .pointer("/status/startTime")
+            .cloned()
+            .unwrap_or_else(|| json!(now));
+        let host_ip = pod
+            .pointer("/status/hostIP")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.node_ip);
+        let pod_ip = pod.pointer("/status/podIP").and_then(Value::as_str);
+
+        let container_statuses = deadline_exceeded_container_statuses(pod, &now);
+        let conditions = deadline_exceeded_conditions(&now, generation);
+
+        let mut status = json!({
+            "phase": "Failed",
+            "reason": "DeadlineExceeded",
+            "message": "Pod was active on the node longer than the specified deadline",
+            "startTime": start_time,
+            "hostIP": host_ip,
+            "hostIPs": [{ "ip": host_ip }],
+            "conditions": conditions,
+            "containerStatuses": container_statuses,
+            "observedGeneration": generation,
+        });
+        if let Some(pip) = pod_ip {
+            status["podIP"] = json!(pip);
+            status["podIPs"] = json!([{ "ip": pip }]);
+        }
+
+        self.patch_status_if_changed(namespace, name, pod, status)
+            .await?;
+
+        self.emit_warning_event(
+            namespace,
+            name,
+            uid,
+            "DeadlineExceeded",
+            "Pod was active on the node longer than the specified deadline",
+            None,
+        )
+        .await;
+
+        Ok(())
     }
 
     /// Synchronizes an individual pod's runtime state and updates its API status.
@@ -3735,6 +4036,12 @@ impl PodReconciler {
             Some("Succeeded" | "Failed")
         ) {
             return Ok(());
+        }
+        if is_active_deadline_exceeded(pod) {
+            return self.stop_pod_for_deadline_exceeded(namespace, pod).await;
+        }
+        if is_pod_unschedulable(orig_pod) {
+            self.clear_unschedulable(namespace, name, orig_pod).await;
         }
         let mut enriched = self.enrich_pod_for_sync(pod);
         if let Err(e) = self.prepare_pod_volumes(namespace, &enriched).await {
@@ -4887,7 +5194,7 @@ impl PodReconciler {
     async fn fetch_ctb_bundles(&self, ctb_proj: &Value) -> Result<Vec<Value>, KubeletError> {
         let has_name = ctb_proj.get("name").and_then(Value::as_str).is_some();
         let has_signer = ctb_proj.get("signerName").and_then(Value::as_str).is_some();
-        let has_selector = ctb_proj.get("labelSelector").is_some();
+        let has_selector = ctb_proj.get("labelSelector").is_some_and(|v| !v.is_null());
 
         if has_name && (has_signer || has_selector) {
             return Err(KubeletError::InvalidConfiguration {
@@ -4924,6 +5231,15 @@ impl PodReconciler {
                 }),
             }
         } else if let Some(signer_name) = ctb_proj.get("signerName").and_then(Value::as_str) {
+            if !has_selector {
+                if !optional {
+                    return Err(KubeletError::InvalidConfiguration {
+                        field: "clusterTrustBundle.labelSelector".to_string(),
+                        reason: "labelSelector is required when signerName is set".to_string(),
+                    });
+                }
+                return Ok(Vec::new());
+            }
             let list = self
                 .client
                 .list_cluster_objects(
@@ -5641,8 +5957,16 @@ impl PodReconciler {
         };
 
         for vol in volumes {
-            self.prepare_single_volume(namespace, name, pod_uid, pod, vol)
-                .await?;
+            let vol_name = vol.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+            if let Err(e) = self
+                .prepare_single_volume(namespace, name, pod_uid, pod, vol)
+                .await
+            {
+                return Err(KubeletError::PodReconciliationFailed {
+                    pod: vol_name.to_string(),
+                    reason: e.to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -7817,5 +8141,91 @@ mod tests {
             Some("Running")
         );
         assert!(low_state.pointer("/metadata/deletionTimestamp").is_none());
+    }
+
+    #[test]
+    fn test_active_deadline_seconds_evaluation() {
+        let pod_active = json!({
+            "metadata": { "name": "active-deadline-pod" },
+            "spec": { "activeDeadlineSeconds": 10 },
+            "status": {
+                "phase": "Running",
+                "startTime": "2020-01-01T00:00:00Z"
+            }
+        });
+        assert!(is_active_deadline_exceeded(&pod_active));
+
+        let pod_succeeded = json!({
+            "metadata": { "name": "active-deadline-pod" },
+            "spec": { "activeDeadlineSeconds": 10 },
+            "status": {
+                "phase": "Succeeded",
+                "startTime": "2020-01-01T00:00:00Z"
+            }
+        });
+        assert!(!is_active_deadline_exceeded(&pod_succeeded));
+
+        let pod_no_deadline = json!({
+            "metadata": { "name": "active-deadline-pod" },
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "startTime": "2020-01-01T00:00:00Z"
+            }
+        });
+        assert!(!is_active_deadline_exceeded(&pod_no_deadline));
+    }
+
+    #[test]
+    fn test_no_new_privs_security_context() {
+        let pod = json!({});
+        let container = json!({
+            "name": "non-priv",
+            "securityContext": {
+                "allowPrivilegeEscalation": false
+            }
+        });
+        let sc = build_security_context(&pod, &container).expect("security context build");
+        assert!(sc.is_some());
+        assert!(sc.unwrap().no_new_privs);
+    }
+
+    #[test]
+    fn test_apply_sandbox_linux_sysctls() {
+        let pod = json!({
+            "metadata": { "name": "sysctl-pod" },
+            "spec": {
+                "securityContext": {
+                    "sysctls": [
+                        { "name": "net.ipv4.ip_forward", "value": "1" }
+                    ]
+                }
+            }
+        });
+        let mut config = cri::PodSandboxConfig::default();
+        apply_sandbox_linux(&pod, &mut config);
+        let linux = config.linux.expect("linux sandbox config");
+        assert_eq!(
+            linux.sysctls.get("net.ipv4.ip_forward"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_terminating_pod_excluded_from_active() {
+        let active_pod = json!({
+            "metadata": { "name": "p1" },
+            "status": { "phase": "Running" }
+        });
+        assert!(is_active_pod(&active_pod));
+
+        let terminating_pod = json!({
+            "metadata": {
+                "name": "p2",
+                "deletionTimestamp": "2026-10-27T10:00:00Z"
+            },
+            "status": { "phase": "Running" }
+        });
+        assert!(!is_active_pod(&terminating_pod));
     }
 }
