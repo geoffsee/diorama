@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -328,6 +328,35 @@ pub fn channel_message(channel: u8, payload: &[u8]) -> Message {
     Message::Binary(framed.into())
 }
 
+async fn collect_stdin<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut stdin_bytes = Vec::new();
+    let timeout = std::time::Duration::from_millis(1500);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let idle_timeout = if stdin_bytes.is_empty() {
+            remaining
+        } else {
+            std::time::Duration::from_millis(50).min(remaining)
+        };
+        match tokio::time::timeout(idle_timeout, ws.next()).await {
+            Ok(Some(Ok(Message::Binary(data)))) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
+                stdin_bytes.extend_from_slice(&data[1..]);
+                if stdin_bytes.ends_with(b"\n") {
+                    break;
+                }
+            },
+            Ok(Some(Ok(Message::Close(_))) | None) => break,
+            Err(_) if !stdin_bytes.is_empty() => break,
+            _ => {},
+        }
+    }
+    stdin_bytes
+}
+
 /// Runs the command and replays its output on a server-side websocket.
 ///
 /// `stream` must already have completed the HTTP upgrade handshake.
@@ -340,8 +369,6 @@ pub async fn serve_exec<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use futures_util::StreamExt;
-
     let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
         stream,
         tokio_tungstenite::tungstenite::protocol::Role::Server,
@@ -350,37 +377,37 @@ pub async fn serve_exec<S>(
     .await;
 
     let mut command = options.command.clone();
+    let mut cat_result = None;
     if options.stdin {
-        let mut stdin_bytes = Vec::new();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(150), async {
-            while let Some(Ok(msg)) = ws.next().await {
-                match msg {
-                    Message::Binary(data) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
-                        stdin_bytes.extend_from_slice(&data[1..]);
-                    },
-                    Message::Close(_) => break,
-                    _ => {},
+        let stdin_bytes = collect_stdin(&mut ws).await;
+        if !stdin_bytes.is_empty() {
+            if command == ["cat"] || command == ["/bin/cat"] {
+                cat_result = Some(PodExecResult {
+                    exit_code: 0,
+                    stdout: stdin_bytes.clone(),
+                    stderr: Vec::new(),
+                });
+            } else if let Ok(stdin_str) = std::str::from_utf8(&stdin_bytes) {
+                let trimmed = stdin_str.trim();
+                if !trimmed.is_empty()
+                    && (command == ["/bin/sh"]
+                        || command == ["sh"]
+                        || command == ["/bin/bash"]
+                        || command == ["bash"]
+                        || command == ["/bin/sh", "-i"]
+                        || command == ["sh", "-i"])
+                {
+                    command = vec![command[0].clone(), "-c".to_string(), trimmed.to_string()];
                 }
-            }
-        })
-        .await;
-
-        if !stdin_bytes.is_empty()
-            && let Ok(stdin_str) = std::str::from_utf8(&stdin_bytes)
-        {
-            let trimmed = stdin_str.trim();
-            if !trimmed.is_empty()
-                && (command == ["/bin/sh"]
-                    || command == ["sh"]
-                    || command == ["/bin/bash"]
-                    || command == ["bash"])
-            {
-                command = vec![command[0].clone(), "-c".to_string(), trimmed.to_string()];
             }
         }
     }
 
-    let result = exec.exec_in_pod(&pod, &container, &command).await;
+    let result = if let Some(res) = cat_result {
+        Ok(res)
+    } else {
+        exec.exec_in_pod(&pod, &container, &command).await
+    };
     match result {
         Ok(output) => {
             if options.stdout && !output.stdout.is_empty() {
