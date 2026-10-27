@@ -410,6 +410,29 @@ async fn verify_patch_put_batch_rbac_events() {
     let (s, _) = request(addr, &pki, "GET", "/openapi/v3/apis/batch/v1", None, "").await;
     assert_eq!(s, 200);
 
+    // dryRun create pod should return 201 and not persist
+    let (s, b) = request(
+        addr,
+        &pki,
+        "POST",
+        "/api/v1/namespaces/gaps/pods?dryRun=All",
+        None,
+        r#"{"metadata":{"name":"dry-run-pod"},"spec":{"containers":[{"name":"app","image":"busybox:1.36"}]}}"#,
+    )
+    .await;
+    assert_eq!(s, 201, "dryRun create pod: {b}");
+    assert_eq!(body_json(&b)["metadata"]["name"], "dry-run-pod");
+    let (s, _) = request(
+        addr,
+        &pki,
+        "GET",
+        "/api/v1/namespaces/gaps/pods/dry-run-pod",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(s, 404, "dryRun create pod must not persist");
+
     // dryRun patch should not persist
     let (s, _) = request(
         addr,

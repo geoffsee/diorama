@@ -143,9 +143,7 @@ impl LocalPathService {
             return;
         };
         for pvc in pvcs {
-            let Some((pvc_name, node)) =
-                unbound_local_path_claim(pvc, default_node, &self.config.volume_binding_mode)
-            else {
+            let Some((pvc_name, node)) = unbound_local_path_claim(pvc, default_node) else {
                 continue;
             };
             let _ = volume_manager
@@ -320,7 +318,6 @@ fn scheduled_pod_with_pvc(pod: &Value) -> Option<&str> {
 fn unbound_local_path_claim<'a>(
     pvc: &'a Value,
     default_node: Option<&str>,
-    volume_binding_mode: &str,
 ) -> Option<(&'a str, String)> {
     let storage_class = pvc
         .pointer("/spec/storageClassName")
@@ -342,13 +339,7 @@ fn unbound_local_path_claim<'a>(
         .pointer("/metadata/annotations/volume.kubernetes.io~1selected-node")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let node = if volume_binding_mode == "WaitForFirstConsumer" {
-        // WaitForFirstConsumer delayed binding MUST wait until a pod is scheduled
-        // (which sets the selected-node annotation)
-        selected_node?
-    } else {
-        selected_node.or_else(|| default_node.map(ToString::to_string))?
-    };
+    let node = selected_node.or_else(|| default_node.map(ToString::to_string))?;
     let name = pvc.pointer("/metadata/name").and_then(Value::as_str)?;
     Some((name, node))
 }

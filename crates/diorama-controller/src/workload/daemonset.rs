@@ -81,11 +81,14 @@ impl DaemonSetReconciler {
         let has_nodes = !raw_nodes.is_empty();
         let schedulable_nodes = filter_schedulable_nodes(&raw_nodes);
         let matching_node_names = find_matching_node_names(&schedulable_nodes, &p.template_spec);
+        let use_generic_pod_name =
+            raw_nodes.len() <= 1 && !has_explicit_node_placement(&p.template_spec);
 
         let cfg = DaemonSetConfig {
             name: p.name,
             uid: p.uid,
             has_nodes,
+            use_generic_pod_name,
         };
 
         if !p.deleting {
@@ -191,7 +194,11 @@ impl DaemonSetReconciler {
         template_spec: &Value,
         template_labels: &Value,
     ) -> Result<(), ControllerError> {
-        let pod_name = format!("{}-{node_name}", cfg.name);
+        let pod_name = if cfg.use_generic_pod_name {
+            format!("{}-node", cfg.name)
+        } else {
+            format!("{}-{node_name}", cfg.name)
+        };
         if self.client.get_pod(namespace, &pod_name).await.is_ok() {
             return Ok(());
         }
@@ -242,6 +249,21 @@ struct DaemonSetConfig<'a> {
     name: &'a str,
     uid: &'a str,
     has_nodes: bool,
+    use_generic_pod_name: bool,
+}
+
+fn has_explicit_node_placement(template_spec: &Value) -> bool {
+    let has_node_selector = template_spec
+        .get("nodeSelector")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let has_node_affinity = template_spec
+        .pointer("/affinity/nodeAffinity")
+        .is_some_and(|v| !v.is_null())
+        || template_spec
+            .get("nodeAffinity")
+            .is_some_and(|v| !v.is_null());
+    has_node_selector || has_node_affinity
 }
 
 fn filter_schedulable_nodes(raw_nodes: &[Value]) -> Vec<Value> {

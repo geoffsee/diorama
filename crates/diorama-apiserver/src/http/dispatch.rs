@@ -61,7 +61,7 @@ pub(crate) async fn dispatch(
     }
     if method == Method::POST {
         let doc = decode_body(content_type, query, body, path)?;
-        return create(client, path, doc).await.map(created_json);
+        return create(client, path, query, doc).await.map(created_json);
     }
     Ok(status_outcome(
         http::StatusCode::METHOD_NOT_ALLOWED,
@@ -763,12 +763,16 @@ fn grace_period_seconds(query: Option<&str>, body: &[u8]) -> Option<i64> {
 async fn create(
     client: &KubernetesApiClient,
     path: &ResourcePath,
+    query: Option<&str>,
     doc: Value,
 ) -> Result<Value, ApiserverError> {
     if path.name.is_some() {
         return Err(ApiserverError::BadRequest {
             message: "create does not take a resource name in the path".to_string(),
         });
+    }
+    if is_dry_run(query) {
+        return dry_run_create(client, path, doc).await;
     }
     if is_cluster_resource(&path.resource) {
         create_cluster(client, &path.group, &path.resource, doc).await
@@ -781,6 +785,47 @@ async fn create(
     } else {
         create_cluster(client, &path.group, &path.resource, doc).await
     }
+}
+
+async fn dry_run_create(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    mut doc: Value,
+) -> Result<Value, ApiserverError> {
+    if !is_cluster_resource(&path.resource)
+        && path.namespace.is_none()
+        && is_builtin_namespaced(&path.resource)
+    {
+        return Err(ApiserverError::BadRequest {
+            message: format!("{} requires a namespace", path.resource),
+        });
+    }
+    stamp_type_meta(&mut doc, path);
+    if path.group.is_empty()
+        && path.resource == "pods"
+        && let Some(namespace) = &path.namespace
+    {
+        enforce_quota(client, &path.group, &path.resource, namespace, &doc).await?;
+        let mut pod = client.create_pod_options(namespace, doc, true).await?;
+        if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.entry("resourceVersion".to_string())
+                .or_insert_with(|| json!("1"));
+        }
+        return Ok(pod);
+    }
+    client.validate_crd_schema(&path.group, &path.resource, &doc)?;
+    if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+        if let Some(namespace) = &path.namespace {
+            meta.insert("namespace".to_string(), json!(namespace));
+        }
+        meta.entry("uid".to_string())
+            .or_insert_with(|| json!("dry-run-uid"));
+        meta.entry("creationTimestamp".to_string())
+            .or_insert_with(|| json!(crate::time::now_rfc3339()));
+        meta.entry("resourceVersion".to_string())
+            .or_insert_with(|| json!("1"));
+    }
+    Ok(doc)
 }
 
 pub(crate) fn is_cluster_resource(resource: &str) -> bool {
