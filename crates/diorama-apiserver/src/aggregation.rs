@@ -245,7 +245,7 @@ impl AggregationManager {
             Ok(()) => (
                 "True".to_string(),
                 "Passed".to_string(),
-                "endpoint is available and TLS trust verified".to_string(),
+                "all checks passed".to_string(),
             ),
             Err(e) => (
                 "False".to_string(),
@@ -268,9 +268,11 @@ impl AggregationManager {
             ep
         };
 
-        let (status, reason, msg) =
-            Self::evaluate_service_condition(&service.spec, &name, endpoint.as_deref());
-        service.update_available_condition(&status, &reason, &msg);
+        if service.get_condition("Available").is_none() || endpoint.is_some() {
+            let (status, reason, msg) =
+                Self::evaluate_service_condition(&service.spec, &name, endpoint.as_deref());
+            service.update_available_condition(&status, &reason, &msg);
+        }
 
         let mut guard = self.services.write().unwrap();
         guard.insert(name, service);

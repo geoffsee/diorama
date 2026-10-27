@@ -92,7 +92,14 @@ fn parse_resource(group: &str, version: &str, parts: &[&str], trailing_slash: bo
         });
     }
     let (namespace, resource, name, subresource) = if parts[0] == "namespaces" && parts.len() >= 3 {
-        if parts.len() > 5 {
+        if parts.len() == 3 && (parts[2] == "status" || parts[2] == "finalize") {
+            (
+                None,
+                "namespaces".to_string(),
+                Some(parts[1].to_string()),
+                Some(parts[2].to_string()),
+            )
+        } else if parts.len() > 5 {
             if parts.get(4) == Some(&"proxy") {
                 let sub = parts[4..].join("/");
                 (
@@ -201,6 +208,22 @@ mod tests {
             parse("/api/v1/nodes/n1/status"),
             Route::Resource(path)
                 if path.resource == "nodes" && path.subresource.as_deref() == Some("status")
+        ));
+        assert!(matches!(
+            parse("/api/v1/namespaces/test-ns/status"),
+            Route::Resource(path)
+                if path.namespace.is_none()
+                    && path.resource == "namespaces"
+                    && path.name.as_deref() == Some("test-ns")
+                    && path.subresource.as_deref() == Some("status")
+        ));
+        assert!(matches!(
+            parse("/api/v1/namespaces/test-ns/finalize"),
+            Route::Resource(path)
+                if path.namespace.is_none()
+                    && path.resource == "namespaces"
+                    && path.name.as_deref() == Some("test-ns")
+                    && path.subresource.as_deref() == Some("finalize")
         ));
         assert!(matches!(
             parse("/api/v1/namespaces/default/pods/hello/log/extra"),

@@ -187,6 +187,27 @@ pub(crate) fn decode_body_with_directive(
     }
 }
 
+fn format_strict_errors(unknown_fields: &[String], duplicate_fields: &[String]) -> String {
+    let mut all_errors = Vec::new();
+    all_errors.extend(unknown_fields.iter().cloned());
+    all_errors.extend(duplicate_fields.iter().cloned());
+    for unk in unknown_fields {
+        let f = unk
+            .strip_prefix("unknown field \"")
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(unk);
+        all_errors.push(format!(".{f}: field not declared in schema"));
+    }
+    for dup in duplicate_fields {
+        let d = dup
+            .strip_prefix("duplicate field \"")
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(dup);
+        all_errors.push(format!(".{d}: duplicate entries for key"));
+    }
+    format!("strict decoding error: {}", all_errors.join(", "))
+}
+
 fn decode_json_with_directive(
     body: &[u8],
     directive: FieldValidationDirective,
@@ -207,11 +228,9 @@ fn decode_json_with_directive(
     match directive {
         FieldValidationDirective::Strict => {
             if !unknown_fields.is_empty() || !duplicate_fields.is_empty() {
-                let mut all_errors = unknown_fields;
-                all_errors.extend(duplicate_fields);
                 return Err(ApiserverError::InvalidInput {
                     field: "body".to_string(),
-                    reason: format!("strict decoding error: {}", all_errors.join(", ")),
+                    reason: format_strict_errors(&unknown_fields, &duplicate_fields),
                 });
             }
         },
@@ -317,11 +336,9 @@ pub(crate) fn decode_yaml_with_directive(
         match directive {
             FieldValidationDirective::Strict => {
                 if !unknown_fields.is_empty() || !duplicate_fields.is_empty() {
-                    let mut all_errors = unknown_fields;
-                    all_errors.extend(duplicate_fields);
                     return Err(ApiserverError::InvalidInput {
                         field: "body".to_string(),
-                        reason: format!("strict decoding error: {}", all_errors.join(", ")),
+                        reason: format_strict_errors(&unknown_fields, &duplicate_fields),
                     });
                 }
             },
@@ -562,11 +579,9 @@ impl<'a> JsonStrictChecker<'a> {
         if unknown_fields.is_empty() && duplicate_fields.is_empty() {
             Ok(())
         } else {
-            let mut all_errors = unknown_fields;
-            all_errors.extend(duplicate_fields);
             Err(ApiserverError::InvalidInput {
                 field: "body".to_string(),
-                reason: format!("strict decoding error: {}", all_errors.join(", ")),
+                reason: format_strict_errors(&unknown_fields, &duplicate_fields),
             })
         }
     }
@@ -782,10 +797,31 @@ fn resolve_subschema<'a>(schema: &'a Value, path: &str) -> Option<&'a Value> {
         let next = props.get(clean_part)?;
         curr = next;
         if part.contains('[') {
-            curr = curr.get("items").unwrap_or(curr);
+            let mut sub = curr;
+            let mut bracket_part = &part[clean_part.len()..];
+            while bracket_part.starts_with('[') {
+                sub = sub.get("items").unwrap_or(sub);
+                if let Some((_, rest)) = bracket_part.split_once(']') {
+                    bracket_part = rest;
+                } else {
+                    break;
+                }
+            }
+            curr = sub;
         }
     }
     Some(curr)
+}
+
+fn validate_embedded_metadata(v: &Value, field_path: &str, unknowns: &mut Vec<String>) {
+    let Some(meta_obj) = v.as_object() else {
+        return;
+    };
+    for meta_k in meta_obj.keys() {
+        if !is_known_metadata_key(meta_k) {
+            unknowns.push(format!("unknown field \"{field_path}.{meta_k}\""));
+        }
+    }
 }
 
 fn collect_unknown_fields(
@@ -813,7 +849,17 @@ fn collect_unknown_fields(
         };
 
         let is_unknown = if let Some(schema) = crd_schema {
-            is_unknown_crd_field(schema, prefix, k)
+            let sub = resolve_subschema(schema, prefix);
+            let is_embedded = sub
+                .and_then(|s| s.get("x-kubernetes-embedded-resource"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if is_embedded && k == "metadata" {
+                validate_embedded_metadata(v, &field_path, unknowns);
+                false
+            } else {
+                is_unknown_crd_field(schema, prefix, k)
+            }
         } else {
             let is_meta = prefix == "metadata" || prefix.ends_with(".metadata");
             let is_spec = prefix == "spec";

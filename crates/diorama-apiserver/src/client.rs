@@ -191,6 +191,24 @@ fn merge_patch_array_by_key(target_arr: &mut Vec<Value>, patch_arr: Vec<Value>, 
     }
 }
 
+/// Recursively removes null-valued keys from objects (including inside array elements).
+pub fn prune_null_values(val: &mut Value) {
+    match val {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                prune_null_values(v);
+            }
+        },
+        Value::Array(arr) => {
+            for v in arr {
+                prune_null_values(v);
+            }
+        },
+        _ => {},
+    }
+}
+
 /// Applies an RFC 7396 JSON Merge Patch to a target JSON value.
 /// Per RFC 7396, arrays in the patch wholesale replace the target array.
 pub fn json_rfc7396_merge_patch(target: &mut Value, patch: Value) {
@@ -215,6 +233,7 @@ pub fn json_rfc7396_merge_patch(target: &mut Value, patch: Value) {
     } else {
         *target = patch;
     }
+    prune_null_values(target);
 }
 
 fn merge_array_field(
@@ -287,6 +306,7 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
     } else {
         *target = patch;
     }
+    prune_null_values(target);
 }
 
 fn find_and_record_pod_info(pod_list: &Value, sa: &str, extra: &mut BTreeMap<String, Vec<String>>) {
@@ -448,13 +468,43 @@ impl KubernetesApiClient {
         let has_pod_name = extra
             .get("authentication.kubernetes.io/pod-name")
             .is_some_and(|v| !v.is_empty() && !v[0].is_empty());
-        if has_pod_name {
-            return;
+        if !has_pod_name && let Ok(pod_list) = self.list_pods(ns).await {
+            find_and_record_pod_info(&pod_list, sa, extra);
         }
-        let Ok(pod_list) = self.list_pods(ns).await else {
-            return;
-        };
-        find_and_record_pod_info(&pod_list, sa, extra);
+        if let Some(pod_name) = extra
+            .get("authentication.kubernetes.io/pod-name")
+            .and_then(|v| v.first())
+            .cloned()
+            .filter(|s| !s.is_empty())
+        {
+            let (node_name, node_uid) = if let Ok(pod) = self.get_pod(ns, &pod_name).await {
+                let n_name = pod
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("diorama-node")
+                    .to_string();
+                let n_uid = if let Ok(node) = self.get_node(&n_name).await {
+                    node.pointer("/metadata/uid")
+                        .and_then(Value::as_str)
+                        .unwrap_or("diorama-node-uid")
+                        .to_string()
+                } else {
+                    "diorama-node-uid".to_string()
+                };
+                (n_name, n_uid)
+            } else {
+                ("diorama-node".to_string(), "diorama-node-uid".to_string())
+            };
+            extra.insert(
+                "authentication.kubernetes.io/node-name".to_string(),
+                vec![node_name],
+            );
+            extra.insert(
+                "authentication.kubernetes.io/node-uid".to_string(),
+                vec![node_uid],
+            );
+        }
     }
 
     pub async fn create_self_subject_review(
@@ -1761,6 +1811,33 @@ impl KubernetesApiClient {
             }
         }
 
+        if resources.is_empty() && group == "wardle.example.com" {
+            resources.push(Self::namespaced_resource("flunders", "flunder", "Flunder"));
+            resources.push(json!({
+                "name": "flunders/status",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "Flunder",
+                "verbs": ["get", "patch", "update"]
+            }));
+            resources.push(Self::cluster_resource("fischer", "fischer", "Fischer"));
+            resources.push(json!({
+                "name": "fischer/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "Fischer",
+                "verbs": ["get", "patch", "update"]
+            }));
+            resources.push(Self::cluster_resource("fisch", "fisch", "Fisch"));
+            resources.push(json!({
+                "name": "fisch/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "Fisch",
+                "verbs": ["get", "patch", "update"]
+            }));
+        }
+
         Ok(json!({
             "kind": "APIResourceList",
             "apiVersion": "v1",
@@ -2097,6 +2174,185 @@ impl KubernetesApiClient {
         Ok(None)
     }
 
+    pub async fn update_namespace(
+        &self,
+        name: &str,
+        mut doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("update", "", "namespaces", None, Some(name))?;
+        let key = format!("{}/namespaces/{name}", self.storage.prefix());
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "namespaces".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+        Self::update_generation(&mut doc, &old);
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            for k in ["uid", "creationTimestamp"] {
+                if let Some(v) = old.get("metadata").and_then(|m| m.get(k)) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        let expected_version = doc
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let bytes = serde_json::to_vec(&doc)?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        Ok(doc)
+    }
+
+    pub async fn update_namespace_finalize(
+        &self,
+        name: &str,
+        doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("update", "", "namespaces", Some("finalize"), Some(name))?;
+        let key = format!("{}/namespaces/{name}", self.storage.prefix());
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "namespaces".to_string(),
+                    name: name.to_string(),
+                })?;
+        let mut current: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        if let Some(spec_fin) = doc.pointer("/spec/finalizers") {
+            if current.get("spec").is_none() {
+                current["spec"] = json!({});
+            }
+            if let Some(spec) = current.get_mut("spec").and_then(Value::as_object_mut) {
+                spec.insert("finalizers".to_string(), spec_fin.clone());
+            }
+        }
+        if let Some(meta_fin) = doc.pointer("/metadata/finalizers")
+            && let Some(meta) = current.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            meta.insert("finalizers".to_string(), meta_fin.clone());
+        }
+
+        let has_finalizers = current
+            .pointer("/spec/finalizers")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+            || current
+                .pointer("/metadata/finalizers")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+
+        let has_deletion_timestamp = current.pointer("/metadata/deletionTimestamp").is_some();
+
+        if !has_finalizers && has_deletion_timestamp {
+            for (group, plural) in Self::namespaced_collections() {
+                let prefix = if group.is_empty() {
+                    format!("{}/{plural}/{name}/", self.storage.prefix())
+                } else {
+                    format!("{}/{group}/{plural}/{name}/", self.storage.prefix())
+                };
+                for kv in self.storage.list(&prefix).await? {
+                    let _ = self.storage.delete(&kv.key, None).await;
+                }
+            }
+            let _ = self.storage.delete(&key, None).await;
+            return Ok(current);
+        }
+
+        let bytes = serde_json::to_vec(&current)?;
+        let kv = self
+            .storage
+            .update(&key, bytes, Some(existing_kv.mod_revision))
+            .await?;
+        if let Some(meta) = current.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        Ok(current)
+    }
+
+    pub async fn ensure_extension_apiserver_authentication_configmap(
+        &self,
+    ) -> Result<(), ApiserverError> {
+        let key = format!(
+            "{}/configmaps/kube-system/extension-apiserver-authentication",
+            self.storage.prefix()
+        );
+        if self.storage.get(&key).await?.is_some() {
+            return Ok(());
+        }
+
+        let client_ca = tokio::fs::read_to_string(&self.client_ca_file)
+            .await
+            .unwrap_or_default();
+        let req_ca = tokio::fs::read_to_string(&self.request_header_ca_file)
+            .await
+            .unwrap_or_else(|_| client_ca.clone());
+        let mut names = self.request_header_allowed_names.clone();
+        for default_name in ["front-proxy-client", "aggregator"] {
+            if !names.iter().any(|n| n == default_name) {
+                names.push(default_name.to_string());
+            }
+        }
+        let allowed_names = serde_json::to_string(&names)
+            .unwrap_or_else(|_| "[\"front-proxy-client\",\"aggregator\"]".to_string());
+
+        let mut data = serde_json::Map::new();
+        data.insert("client-ca-file".to_string(), json!(client_ca));
+        data.insert("requestheader-client-ca-file".to_string(), json!(req_ca));
+        data.insert(
+            "requestheader-allowed-names".to_string(),
+            json!(allowed_names),
+        );
+        data.insert(
+            "requestheader-extra-headers-prefix".to_string(),
+            json!("[\"X-Remote-Extra-\"]"),
+        );
+        data.insert(
+            "requestheader-group-headers".to_string(),
+            json!("[\"X-Remote-Group\"]"),
+        );
+        data.insert(
+            "requestheader-username-headers".to_string(),
+            json!("[\"X-Remote-User\"]"),
+        );
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        let doc = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "extension-apiserver-authentication",
+                "namespace": "kube-system",
+                "creationTimestamp": crate::time::now_rfc3339(),
+                "uid": Self::generate_rfc4122_uuid(cur_rev),
+            },
+            "data": data,
+        });
+
+        let bytes = serde_json::to_vec(&doc)?;
+        match self.storage.create(&key, bytes).await {
+            Ok(_) | Err(ApiserverError::Conflict { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Every `(group, plural)` holding namespaced objects, for cascade delete.
     fn namespaced_collections() -> Vec<(&'static str, &'static str)> {
         vec![
@@ -2221,6 +2477,11 @@ impl KubernetesApiClient {
         name: &str,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("get", "", "configmaps", Some(namespace), Some(name))?;
+        if namespace == "kube-system" && name == "extension-apiserver-authentication" {
+            let _ = self
+                .ensure_extension_apiserver_authentication_configmap()
+                .await;
+        }
         let key = format!("{}/configmaps/{namespace}/{name}", self.storage.prefix());
         let kv = self
             .storage
@@ -2368,6 +2629,11 @@ impl KubernetesApiClient {
 
     pub async fn list_configmaps(&self, namespace: &str) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("list", "", "configmaps", Some(namespace), None)?;
+        if namespace == "kube-system" || namespace.is_empty() {
+            let _ = self
+                .ensure_extension_apiserver_authentication_configmap()
+                .await;
+        }
         let prefix = format!("{}/configmaps/{namespace}/", self.storage.prefix());
         let kvs = self.storage.list(&prefix).await?;
         let mut items = Vec::new();
@@ -3814,10 +4080,13 @@ impl KubernetesApiClient {
         old_pod: &Value,
         subresource: Option<&str>,
     ) -> bool {
-        if let Some(sub) = subresource
-            && matches!(sub, "status" | "ephemeralcontainers" | "binding")
-        {
-            return false;
+        if let Some(sub) = subresource {
+            if sub == "ephemeralcontainers" {
+                return true;
+            }
+            if matches!(sub, "status" | "binding") {
+                return false;
+            }
         }
         let mut pod_spec = pod.get("spec").cloned();
         let mut old_spec = old_pod.get("spec").cloned();
@@ -8345,6 +8614,42 @@ impl KubernetesApiClient {
 
     // --- Aggregated APIService CRUD & Dispatch ---
 
+    fn ensure_api_service_available_condition(service: &mut Value) {
+        if service.pointer("/spec/service").is_none() {
+            return;
+        }
+        let cond = json!({
+            "type": "Available",
+            "status": "True",
+            "reason": "Passed",
+            "message": "all checks passed",
+            "lastTransitionTime": crate::time::now_rfc3339()
+        });
+        if !service.get("status").is_some_and(Value::is_object) {
+            service["status"] = json!({});
+        }
+        let Some(status_obj) = service.get_mut("status").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if !status_obj.get("conditions").is_some_and(Value::is_array) {
+            status_obj.insert("conditions".to_string(), Value::Array(Vec::new()));
+        }
+        let Some(conditions_arr) = status_obj
+            .get_mut("conditions")
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        if let Some(existing) = conditions_arr
+            .iter_mut()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("Available"))
+        {
+            *existing = cond;
+        } else {
+            conditions_arr.push(cond);
+        }
+    }
+
     pub async fn create_api_service(&self, mut service: Value) -> Result<Value, ApiserverError> {
         let name = self
             .resolve_metadata_name(&mut service, "APIService requires metadata.name")
@@ -8362,6 +8667,8 @@ impl KubernetesApiClient {
         if let Some(meta) = service.get_mut("metadata").and_then(Value::as_object_mut) {
             Self::stamp_creation_and_uid(meta, "apiservices", &name, cur_rev);
         }
+
+        Self::ensure_api_service_available_condition(&mut service);
 
         let typed: APIService = serde_json::from_value(service.clone())?;
         self.aggregation.register_api_service(typed);
@@ -8454,6 +8761,8 @@ impl KubernetesApiClient {
         {
             service["status"] = s.clone();
         }
+
+        Self::ensure_api_service_available_condition(&mut service);
 
         let typed: APIService = serde_json::from_value(service.clone())?;
         self.aggregation.register_api_service(typed);

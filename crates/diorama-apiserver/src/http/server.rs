@@ -191,8 +191,26 @@ async fn handle(
         if path.subresource.as_deref() == Some("exec") {
             return exec_upgrade(request, service, &client, path).await;
         }
+        if path.subresource.as_deref() == Some("attach") {
+            return attach_upgrade(request, service, &client, path).await;
+        }
         if path.subresource.as_deref() == Some("log") {
             return log_upgrade(request, service, &client, path).await;
+        }
+        if path.subresource.as_deref() == Some("portforward") {
+            let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
+                return status_response(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequest",
+                    "portforward requires a namespaced pod",
+                );
+            };
+            if let Err(err) =
+                run_connect_admission(&client, namespace, name, "portforward", query.as_deref())
+                    .await
+            {
+                return error_response(&err);
+            }
         }
     }
     let accept = request
@@ -347,14 +365,16 @@ async fn run_connect_admission(
     namespace: &str,
     name: &str,
     subresource: &str,
+    query: Option<&str>,
 ) -> Result<(), ApiserverError> {
     let cur_rev = client.storage().current_revision().await + 1;
+    let (kind_str, obj) = dispatch::connect_options_object(subresource, query);
     let mut adm_req = AdmissionRequest {
         uid: format!("adm-{cur_rev}"),
         kind: GroupVersionKind {
             group: String::new(),
             version: "v1".to_string(),
-            kind: "Pod".to_string(),
+            kind: kind_str,
         },
         resource: GroupVersionResource {
             group: String::new(),
@@ -366,7 +386,7 @@ async fn run_connect_admission(
         namespace: Some(namespace.to_string()),
         operation: "CONNECT".to_string(),
         user_info: client.current_user_info().await,
-        object: None,
+        object: obj,
         old_object: None,
         dry_run: None,
     };
@@ -405,7 +425,8 @@ async fn exec_upgrade(
     if let Err(err) = client.authorize_pod_exec(namespace, name) {
         return error_response(&err);
     }
-    if let Err(err) = run_connect_admission(client, namespace, name, "exec").await {
+    if let Err(err) = run_connect_admission(client, namespace, name, "exec", query.as_deref()).await
+    {
         return error_response(&err);
     }
     let pod = match client.get_pod(namespace, name).await {
@@ -461,6 +482,93 @@ async fn exec_upgrade(
         .body(Full::new(Bytes::new()).boxed())
         .unwrap_or_else(|_| {
             status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", "exec")
+        })
+}
+
+async fn attach_upgrade(
+    request: Request<Incoming>,
+    service: &ApiserverService,
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+) -> Response<Body> {
+    let query = request.uri().query().map(str::to_owned);
+    let options = crate::exec::PodAttachOptions::from_query(query.as_deref());
+    let (Some(namespace), Some(name)) = (&path.namespace, &path.name) else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "attach requires a namespaced pod",
+        );
+    };
+    if let Err(err) = client.authorize_pod_exec(namespace, name) {
+        return error_response(&err);
+    }
+    if let Err(err) =
+        run_connect_admission(client, namespace, name, "attach", query.as_deref()).await
+    {
+        return error_response(&err);
+    }
+    let pod = match client.get_pod(namespace, name).await {
+        Ok(pod) => pod,
+        Err(err) => return error_response(&err),
+    };
+    let container = match options.resolve_container(&pod) {
+        Ok(container) => container,
+        Err(err) => return error_response(&err),
+    };
+    let Some(exec) = service.pod_exec() else {
+        return error_response(&ApiserverError::Internal {
+            reason: "no kubelet is registered to serve pod attach".to_string(),
+        });
+    };
+    let Some(key) = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return status_response(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "missing Sec-WebSocket-Key",
+        );
+    };
+    let protocol = select_subprotocol(
+        request
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let upgrade = hyper::upgrade::on(request);
+    let exec_opts = PodExecOptions {
+        command: vec!["cat".to_string()],
+        container: options.container,
+        stdin: options.stdin,
+        stdout: options.stdout,
+        stderr: options.stderr,
+        tty: options.tty,
+    };
+    tokio::spawn(async move {
+        match upgrade.await {
+            Ok(upgraded) => {
+                serve_exec(TokioIo::new(upgraded), exec, pod, exec_opts, container).await;
+            },
+            Err(err) => eprintln!("attach upgrade failed: {err}"),
+        }
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header("sec-websocket-accept", accept);
+    if let Some(protocol) = protocol {
+        builder = builder.header("sec-websocket-protocol", protocol);
+    }
+    builder
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap_or_else(|_| {
+            status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", "attach")
         })
 }
 
@@ -892,23 +1000,29 @@ async fn stream_watch(
     let mut found = false;
 
     if let Some(initial_doc) = initial {
-        for item in initial_doc
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        let items: Vec<Value> =
+            if let Some(arr) = initial_doc.get("items").and_then(Value::as_array) {
+                arr.clone()
+            } else if initial_doc.is_object() && initial_doc.pointer("/metadata/name").is_some() {
+                vec![initial_doc]
+            } else {
+                Vec::new()
+            };
+        for mut item in items {
             if *shutdown.borrow() {
                 return;
             }
-            if !filter.accepts(item) {
+            if filter.is_custom_resource {
+                dispatch::convert_custom_resource(&mut item, &filter.group, &filter.version);
+            }
+            if !filter.accepts(&item) {
                 continue;
             }
             found = true;
-            let version = resource_version(item);
-            sent.insert(object_key(item), version);
+            let version = resource_version(&item);
+            sent.insert(object_key(&item), version);
             last_delivered_rv = last_delivered_rv.max(version);
-            if send_event(&mut sender, "ADDED", item).await.is_err() {
+            if send_event(&mut sender, "ADDED", &item).await.is_err() {
                 return;
             }
         }

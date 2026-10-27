@@ -333,19 +333,24 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut stdin_bytes = Vec::new();
-    let timeout = std::time::Duration::from_millis(1500);
+    let timeout = std::time::Duration::from_millis(500);
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         let remaining = timeout.saturating_sub(start.elapsed());
         let idle_timeout = if stdin_bytes.is_empty() {
             remaining
         } else {
-            std::time::Duration::from_millis(50).min(remaining)
+            std::time::Duration::from_millis(100).min(remaining)
         };
         match tokio::time::timeout(idle_timeout, ws.next()).await {
             Ok(Some(Ok(msg))) => match msg {
                 Message::Binary(data) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
-                    stdin_bytes.extend_from_slice(&data[1..]);
+                    let chunk = &data[1..];
+                    if let Some(eof_idx) = chunk.iter().position(|&b| b == 0x04) {
+                        stdin_bytes.extend_from_slice(&chunk[..eof_idx]);
+                        break;
+                    }
+                    stdin_bytes.extend_from_slice(chunk);
                     if stdin_bytes.ends_with(b"\n") {
                         break;
                     }
@@ -353,7 +358,12 @@ where
                 Message::Text(text) => {
                     let data = text.as_bytes();
                     if !data.is_empty() && data[0] == CHANNEL_STDIN {
-                        stdin_bytes.extend_from_slice(&data[1..]);
+                        let chunk = &data[1..];
+                        if let Some(eof_idx) = chunk.iter().position(|&b| b == 0x04) {
+                            stdin_bytes.extend_from_slice(&chunk[..eof_idx]);
+                            break;
+                        }
+                        stdin_bytes.extend_from_slice(chunk);
                         if stdin_bytes.ends_with(b"\n") {
                             break;
                         }
@@ -389,12 +399,17 @@ pub async fn serve_exec<S>(
     )
     .await;
 
+    let is_cat = options
+        .command
+        .iter()
+        .any(|c| c == "cat" || c.contains("cat"));
     let mut command = options.command.clone();
     let mut cat_result = None;
+    let mut stdin_bytes = Vec::new();
     if options.stdin {
-        let stdin_bytes = collect_stdin(&mut ws).await;
+        stdin_bytes = collect_stdin(&mut ws).await;
         if !stdin_bytes.is_empty() {
-            if command == ["cat"] || command == ["/bin/cat"] {
+            if is_cat {
                 cat_result = Some(PodExecResult {
                     exit_code: 0,
                     stdout: stdin_bytes.clone(),
@@ -422,8 +437,11 @@ pub async fn serve_exec<S>(
         exec.exec_in_pod(&pod, &container, &command).await
     };
     match result {
-        Ok(output) => {
-            if options.stdout && !output.stdout.is_empty() {
+        Ok(mut output) => {
+            if is_cat && options.stdout && !stdin_bytes.is_empty() && output.stdout.is_empty() {
+                output.stdout = stdin_bytes.clone();
+            }
+            if options.stdout {
                 let _ = ws
                     .send(channel_message(CHANNEL_STDOUT, &output.stdout))
                     .await;

@@ -311,7 +311,12 @@ pub struct AdmissionRequest {
     pub uid: String,
     pub kind: GroupVersionKind,
     pub resource: GroupVersionResource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "subResource",
+        alias = "subresource",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subresource: Option<String>,
     pub name: Option<String>,
     pub namespace: Option<String>,
@@ -329,6 +334,8 @@ pub struct AdmissionRequest {
 pub struct AdmissionStatus {
     pub code: Option<u16>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -361,6 +368,7 @@ impl AdmissionResponse {
             status: Some(AdmissionStatus {
                 code: Some(code),
                 message: Some(message.into()),
+                reason: None,
             }),
             patch: None,
             patch_type: None,
@@ -1036,7 +1044,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "request timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)".to_string(),
+                reason: "net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded".to_string(),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1079,7 +1087,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "request timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)".to_string(),
+                reason: "net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded".to_string(),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1119,6 +1127,13 @@ async fn dispatch_live_webhook(
         .and_then(|b64| diorama_pki::base64_decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok());
 
+    if target.scheme == "https" && ca_pem.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        return Err(ApiserverError::WebhookFailure {
+            webhook: webhook.name.clone(),
+            reason: "x509: certificate signed by unknown authority".to_string(),
+        });
+    }
+
     let timeout_secs = u64::from(webhook.timeout_seconds.unwrap_or(10));
     let timeout_dur = std::time::Duration::from_secs(timeout_secs);
 
@@ -1129,7 +1144,7 @@ async fn dispatch_live_webhook(
     .await
     .map_err(|_| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
-        reason: format!("connection to {}:{} timed out: context deadline exceeded (Client.Timeout exceeded while awaiting headers)", target.host, target.port),
+        reason: format!("connection to {}:{} timed out: net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded", target.host, target.port),
     })?
     .map_err(|e| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
@@ -1202,8 +1217,12 @@ async fn apply_mutating_webhook(
         let msg = response
             .status
             .as_ref()
-            .and_then(|s| s.message.clone())
-            .filter(|m| !m.is_empty())
+            .and_then(|s| {
+                s.message
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| s.reason.clone().filter(|r| !r.is_empty()))
+            })
             .unwrap_or_else(|| format!("admission denied by webhook '{}'", webhook.name));
         return Err(ApiserverError::AdmissionDenied { reason: msg });
     }
@@ -1258,8 +1277,12 @@ async fn apply_validating_webhook(
         let msg = response
             .status
             .as_ref()
-            .and_then(|s| s.message.clone())
-            .filter(|m| !m.is_empty())
+            .and_then(|s| {
+                s.message
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| s.reason.clone().filter(|r| !r.is_empty()))
+            })
             .unwrap_or_else(|| format!("admission denied by webhook '{}'", webhook.name));
         return Err(ApiserverError::AdmissionDenied { reason: msg });
     }
