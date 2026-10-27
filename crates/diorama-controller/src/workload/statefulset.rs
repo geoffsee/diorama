@@ -58,6 +58,8 @@ impl StatefulSetReconciler {
         namespace: &str,
         cfg: &StatefulSetConfig<'_>,
         has_nodes: bool,
+        current_rev: Option<&str>,
+        current_rev_tpl: Option<&(Value, Value)>,
     ) -> Result<(), ControllerError> {
         for idx in 0..cfg.desired_replicas {
             let pod_name = format!("{}-{idx}", cfg.name);
@@ -80,7 +82,26 @@ impl StatefulSetReconciler {
 
             self.ensure_ordinal_pvcs(namespace, cfg, idx).await?;
 
-            let new_pod = build_ordinal_pod(namespace, cfg, idx, &pod_name);
+            let (rev_hash, tpl_labels, tpl_spec) = if idx < cfg.partition
+                && let Some(rev) = current_rev
+                && let Some((labels, spec)) = current_rev_tpl
+            {
+                (rev, labels, spec)
+            } else {
+                (
+                    cfg.update_revision.as_str(),
+                    &cfg.template_labels,
+                    &cfg.template_spec,
+                )
+            };
+
+            let rev_spec = PodRevisionSpec {
+                revision_hash: rev_hash,
+                template_labels: tpl_labels,
+                template_spec: tpl_spec,
+            };
+
+            let new_pod = build_ordinal_pod(namespace, cfg, idx, &pod_name, &rev_spec);
             self.client
                 .create_pod(namespace, new_pod)
                 .await
@@ -269,6 +290,119 @@ impl StatefulSetReconciler {
         }
     }
 
+    async fn ensure_controller_revision(
+        &self,
+        namespace: &str,
+        cfg: &StatefulSetConfig<'_>,
+        observed_generation: i64,
+    ) {
+        if self
+            .client
+            .get_namespaced_object(
+                "apps",
+                "controllerrevisions",
+                namespace,
+                &cfg.update_revision,
+            )
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        let cr_obj = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ControllerRevision",
+            "metadata": {
+                "name": cfg.update_revision,
+                "namespace": namespace,
+                "labels": {
+                    "controller.kubernetes.io/hash": cfg.update_revision,
+                    "app.kubernetes.io/component": cfg.name,
+                },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": cfg.name,
+                    "uid": cfg.uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true,
+                }],
+            },
+            "data": {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "labels": cfg.template_labels,
+                        },
+                        "spec": cfg.template_spec,
+                    }
+                }
+            },
+            "revision": observed_generation,
+        });
+
+        let _ = self
+            .client
+            .create_namespaced_object(
+                "apps",
+                "ControllerRevision",
+                "controllerrevisions",
+                namespace,
+                cr_obj,
+            )
+            .await;
+    }
+
+    async fn resolve_current_revision(
+        &self,
+        namespace: &str,
+        ss: &Value,
+        name: &str,
+        desired: usize,
+    ) -> Option<String> {
+        if let Some(rev) = ss
+            .pointer("/status/currentRevision")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(rev.to_string());
+        }
+        for idx in 0..desired {
+            let pname = format!("{name}-{idx}");
+            if let Ok(p) = self.client.get_pod(namespace, &pname).await
+                && let Some(rev) = p
+                    .pointer("/metadata/labels/controller-revision-hash")
+                    .and_then(Value::as_str)
+            {
+                return Some(rev.to_string());
+            }
+        }
+        None
+    }
+
+    async fn fetch_current_revision_template(
+        &self,
+        namespace: &str,
+        current_rev: &str,
+    ) -> Option<(Value, Value)> {
+        let cr = self
+            .client
+            .get_namespaced_object("apps", "controllerrevisions", namespace, current_rev)
+            .await
+            .ok()?;
+        let template = cr.pointer("/data/spec/template")?;
+        let labels = template
+            .pointer("/metadata/labels")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let spec = template
+            .pointer("/spec")
+            .cloned()
+            .unwrap_or_else(|| json!({ "containers": [] }));
+        Some((labels, spec))
+    }
+
     /// Reconciles a single `StatefulSet` by maintaining ordered ordinal pods (name-0, name-1, etc.).
     pub async fn reconcile_statefulset(
         &self,
@@ -296,8 +430,37 @@ impl StatefulSetReconciler {
         )
         .await?;
 
+        let observed_generation = ss
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+
+        self.ensure_controller_revision(namespace, &cfg, observed_generation)
+            .await;
+
+        let current_rev = self
+            .resolve_current_revision(namespace, ss, cfg.name, cfg.desired_replicas)
+            .await;
+
+        let current_rev_tpl = if let Some(ref rev) = current_rev {
+            if rev != &cfg.update_revision && cfg.partition > 0 {
+                self.fetch_current_revision_template(namespace, rev).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if !cfg.deleting {
-            self.ensure_ordinal_pods(namespace, &cfg, has_nodes).await?;
+            self.ensure_ordinal_pods(
+                namespace,
+                &cfg,
+                has_nodes,
+                current_rev.as_deref(),
+                current_rev_tpl.as_ref(),
+            )
+            .await?;
             self.prune_excess_ordinal_pods(namespace, &cfg, has_nodes)
                 .await?;
 
@@ -316,10 +479,6 @@ impl StatefulSetReconciler {
                 ss,
             )
             .await;
-        let observed_generation = ss
-            .pointer("/metadata/generation")
-            .and_then(Value::as_i64)
-            .unwrap_or(1);
 
         let mut updated_ss = ss.clone();
         apply_statefulset_status(
@@ -577,13 +736,20 @@ fn parse_statefulset_config(ss: &Value) -> Result<StatefulSetConfig<'_>, Control
     })
 }
 
+struct PodRevisionSpec<'a> {
+    revision_hash: &'a str,
+    template_labels: &'a Value,
+    template_spec: &'a Value,
+}
+
 fn build_ordinal_pod(
     namespace: &str,
     cfg: &StatefulSetConfig<'_>,
     idx: usize,
     pod_name: &str,
+    rev: &PodRevisionSpec<'_>,
 ) -> Value {
-    let mut pod_labels = cfg.template_labels.clone();
+    let mut pod_labels = rev.template_labels.clone();
     if let Some(labels_obj) = pod_labels.as_object_mut() {
         labels_obj.insert(
             "statefulset.kubernetes.io/pod-name".to_string(),
@@ -595,11 +761,11 @@ fn build_ordinal_pod(
         );
         labels_obj.insert(
             "controller-revision-hash".to_string(),
-            json!(cfg.update_revision),
+            json!(rev.revision_hash),
         );
     }
 
-    let mut pod_spec = cfg.template_spec.clone();
+    let mut pod_spec = rev.template_spec.clone();
     attach_pvc_volumes(&mut pod_spec, cfg, idx);
 
     json!({

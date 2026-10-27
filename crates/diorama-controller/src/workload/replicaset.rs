@@ -253,26 +253,73 @@ impl ReplicaSetReconciler {
             .and_then(Value::as_i64)
             .unwrap_or(1);
 
-        let mut updated_rs = replicaset.clone();
         let metrics = RsStatusMetrics {
             actual_replicas,
             fully_labeled_replicas,
             ready_replicas,
             observed_generation,
         };
-        apply_rs_status(&mut updated_rs, &metrics, creation_error.as_deref());
 
-        if updated_rs.get("status") == replicaset.get("status") {
-            return Ok(updated_rs);
-        }
-
-        self.client
-            .update_replicaset(namespace, name, updated_rs)
+        self.patch_namespaced_status(namespace, name, &metrics, creation_error.as_deref())
             .await
-            .map_err(|e| ControllerError::ReconciliationFailed {
-                resource: format!("replicasets/{name}"),
-                reason: e.to_string(),
-            })
+    }
+
+    async fn patch_namespaced_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        metrics: &RsStatusMetrics,
+        creation_error: Option<&str>,
+    ) -> Result<Value, ControllerError> {
+        let max_retries = 3;
+        for attempt in 0..max_retries {
+            let current = match self.client.get_replicaset(namespace, name).await {
+                Ok(rs) => rs,
+                Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
+                    return Err(ControllerError::ReconciliationFailed {
+                        resource: format!("replicasets/{name}"),
+                        reason: "ReplicaSet not found".to_string(),
+                    });
+                },
+                Err(e) => {
+                    if attempt + 1 == max_retries {
+                        return Err(ControllerError::ReconciliationFailed {
+                            resource: format!("replicasets/{name}"),
+                            reason: e.to_string(),
+                        });
+                    }
+                    continue;
+                },
+            };
+
+            let mut updated = current.clone();
+            apply_rs_status(&mut updated, metrics, creation_error);
+
+            if updated.get("status") == current.get("status") {
+                return Ok(updated);
+            }
+
+            match self
+                .client
+                .update_replicaset(namespace, name, updated)
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(diorama_apiserver::ApiserverError::Conflict { .. }) => {},
+                Err(e) => {
+                    if attempt + 1 == max_retries {
+                        return Err(ControllerError::ReconciliationFailed {
+                            resource: format!("replicasets/{name}"),
+                            reason: e.to_string(),
+                        });
+                    }
+                },
+            }
+        }
+        Err(ControllerError::ReconciliationFailed {
+            resource: format!("replicasets/{name}"),
+            reason: "exhausted retries patching status".to_string(),
+        })
     }
 }
 

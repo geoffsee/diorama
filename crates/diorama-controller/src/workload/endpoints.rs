@@ -382,6 +382,34 @@ struct EndpointGroup {
 }
 
 /// Packs addresses into subsets keyed by the port set each pod resolves to.
+fn extract_service_endpoints_ports_for_pod(service: &Value, pod: &Value) -> Option<Vec<Value>> {
+    let service_ports = service
+        .get("spec")
+        .and_then(|s| s.get("ports"))
+        .and_then(Value::as_array)?;
+
+    let mut ports = Vec::new();
+    for sp in service_ports {
+        let port_num = super::endpointslice::resolve_target_port_for_pod(sp, pod)?;
+        let port_name = sp.get("name").and_then(Value::as_str);
+        let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+
+        let mut port_obj = Map::new();
+        port_obj.insert("port".to_string(), json!(port_num));
+        port_obj.insert("protocol".to_string(), json!(protocol));
+        if let Some(pn) = port_name
+            && !pn.is_empty()
+        {
+            port_obj.insert("name".to_string(), json!(pn));
+        }
+        if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
+            port_obj.insert("appProtocol".to_string(), json!(ap));
+        }
+        ports.push(Value::Object(port_obj));
+    }
+    Some(ports)
+}
+
 fn build_subsets(
     service: &Value,
     ready: &[Value],
@@ -399,8 +427,12 @@ fn build_subsets(
     let mut groups: BTreeMap<String, EndpointGroup> = BTreeMap::new();
     for (addrs, is_ready) in [(ready, true), (not_ready, false)] {
         for addr in addrs {
-            let pod_slice: Vec<Value> = pod_for(addr).cloned().into_iter().collect();
-            let ports = extract_service_endpoints_ports(service, &pod_slice);
+            let Some(pod) = pod_for(addr) else {
+                continue;
+            };
+            let Some(ports) = extract_service_endpoints_ports_for_pod(service, pod) else {
+                continue;
+            };
             let key = serde_json::to_string(&ports).unwrap_or_default();
             let entry = groups.entry(key).or_insert_with(|| EndpointGroup {
                 ready: Vec::new(),
@@ -416,7 +448,10 @@ fn build_subsets(
     }
     groups
         .into_values()
-        .map(|grp| {
+        .filter_map(|grp| {
+            if grp.ready.is_empty() && grp.not_ready.is_empty() {
+                return None;
+            }
             let mut subset = Map::new();
             if !grp.ready.is_empty() {
                 subset.insert("addresses".to_string(), Value::Array(grp.ready));
@@ -425,11 +460,12 @@ fn build_subsets(
                 subset.insert("notReadyAddresses".to_string(), Value::Array(grp.not_ready));
             }
             subset.insert("ports".to_string(), Value::Array(grp.ports));
-            Value::Object(subset)
+            Some(Value::Object(subset))
         })
         .collect()
 }
 
+#[cfg(test)]
 fn extract_service_endpoints_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
     let service_ports = service
         .get("spec")

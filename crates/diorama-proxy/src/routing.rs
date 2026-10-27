@@ -523,7 +523,8 @@ impl ServiceRoutingTable {
 
             // Determine target port from matching slice port, or skip slice
             let Some(slice_port) = slice.ports.iter().find(|p| {
-                p.name == port_spec.name && p.protocol.unwrap_or(Protocol::Tcp) == protocol
+                p.name.as_deref().unwrap_or("") == port_spec.name.as_deref().unwrap_or("")
+                    && p.protocol.unwrap_or(Protocol::Tcp) == protocol
             }) else {
                 continue;
             };
@@ -876,6 +877,7 @@ pub fn service_from_value(val: &Value) -> Result<ServiceDefinition, ProxyError> 
             let name = p
                 .get("name")
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
                 .map(ToString::to_string);
 
             let target_port = if let Some(tp) = p.get("targetPort") {
@@ -963,6 +965,7 @@ pub fn endpoint_slice_from_value(val: &Value) -> Result<EndpointSliceDefinition,
             let port_name = p
                 .get("name")
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
                 .map(ToString::to_string);
             let port = p.get("port").and_then(Value::as_u64).map(|p| p as u16);
             let protocol = p.get("protocol").and_then(Value::as_str).map(|pr| {

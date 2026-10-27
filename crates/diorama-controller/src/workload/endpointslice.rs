@@ -721,6 +721,45 @@ pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
     fallback
 }
 
+pub(crate) fn resolve_target_port_for_pod(sp: &Value, pod: &Value) -> Option<i64> {
+    let fallback = sp.get("port").and_then(Value::as_i64).unwrap_or(80);
+    let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+    let Some(tp) = sp.get("targetPort") else {
+        return Some(fallback);
+    };
+    if let Some(n) = tp.as_i64() {
+        return Some(if n > 0 { n } else { fallback });
+    }
+    if let Some(s) = tp.as_str() {
+        if s.is_empty() || s == "0" {
+            return Some(fallback);
+        }
+        if let Ok(n) = s.parse::<i64>() {
+            return Some(if n > 0 { n } else { fallback });
+        }
+        return find_named_container_port(std::slice::from_ref(pod), s, protocol);
+    }
+    if let Some(obj) = tp.as_object() {
+        if let Some(n) = obj.get("intVal").and_then(Value::as_i64)
+            && n > 0
+        {
+            return Some(n);
+        }
+        if let Some(s) = obj.get("strVal").and_then(Value::as_str)
+            && !s.is_empty()
+            && s != "0"
+        {
+            if let Ok(n) = s.parse::<i64>()
+                && n > 0
+            {
+                return Some(n);
+            }
+            return find_named_container_port(std::slice::from_ref(pod), s, protocol);
+        }
+    }
+    Some(fallback)
+}
+
 fn match_container_port(p: &Value, name: &str, protocol: &str) -> Option<i64> {
     if p.get("name").and_then(Value::as_str) != Some(name) {
         return None;
@@ -763,6 +802,30 @@ struct ServiceSliceGroup {
     endpoints: Vec<Value>,
 }
 
+fn extract_service_slice_ports_for_pod(service: &Value, pod: &Value) -> Option<Vec<Value>> {
+    let service_ports = service
+        .get("spec")
+        .and_then(|s| s.get("ports"))
+        .and_then(Value::as_array)?;
+
+    let mut slice_ports = Vec::new();
+    for sp in service_ports {
+        let port_num = resolve_target_port_for_pod(sp, pod)?;
+        let port_name = sp.get("name").and_then(Value::as_str);
+        let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+
+        let mut port_obj = Map::new();
+        port_obj.insert("name".to_string(), json!(port_name.unwrap_or("")));
+        port_obj.insert("port".to_string(), json!(port_num));
+        port_obj.insert("protocol".to_string(), json!(protocol));
+        if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
+            port_obj.insert("appProtocol".to_string(), json!(ap));
+        }
+        slice_ports.push(Value::Object(port_obj));
+    }
+    Some(slice_ports)
+}
+
 fn build_service_slice_groups(
     service: &Value,
     endpoints: &[Value],
@@ -787,14 +850,26 @@ fn build_service_slice_groups(
 
     let mut groups: BTreeMap<String, ServiceSliceGroup> = BTreeMap::new();
     for ep in endpoints {
-        let pod_slice: Vec<Value> = pod_for(ep).cloned().into_iter().collect();
-        let ports = extract_service_slice_ports(service, &pod_slice);
+        let Some(pod) = pod_for(ep) else {
+            continue;
+        };
+        let Some(ports) = extract_service_slice_ports_for_pod(service, pod) else {
+            continue;
+        };
         let key = serde_json::to_string(&ports).unwrap_or_default();
         let entry = groups.entry(key).or_insert_with(|| ServiceSliceGroup {
             ports,
             endpoints: Vec::new(),
         });
         entry.endpoints.push(ep.clone());
+    }
+
+    if groups.is_empty() {
+        let ports = extract_service_slice_ports(service, &[]);
+        return vec![ServiceSliceGroup {
+            ports,
+            endpoints: Vec::new(),
+        }];
     }
 
     groups.into_values().collect()

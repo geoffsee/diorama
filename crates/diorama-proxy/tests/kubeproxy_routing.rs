@@ -1617,3 +1617,92 @@ fn test_session_affinity_client_ip_and_load_balancer_routing() {
         "nftables rules must include LoadBalancer IP"
     );
 }
+
+#[test]
+fn test_unnamed_service_port_matching_with_endpoint_slice() {
+    use diorama_proxy::{endpoint_slice_from_value, service_from_value};
+    use serde_json::json;
+
+    let svc_val = json!({
+        "metadata": { "namespace": "default", "name": "unnamed-svc" },
+        "spec": {
+            "clusterIP": "10.43.0.88",
+            "ports": [
+                { "port": 80, "targetPort": 8080, "protocol": "TCP" }
+            ]
+        }
+    });
+
+    let ep_slice_val = json!({
+        "metadata": {
+            "namespace": "default",
+            "name": "unnamed-svc-slice",
+            "labels": { "kubernetes.io/service-name": "unnamed-svc" }
+        },
+        "addressType": "IPv4",
+        "ports": [
+            { "name": "", "port": 8080, "protocol": "TCP" }
+        ],
+        "endpoints": [
+            {
+                "addresses": ["10.244.0.15"],
+                "conditions": { "ready": true }
+            }
+        ]
+    });
+
+    let svc = service_from_value(&svc_val).expect("parse service");
+    assert_eq!(svc.ports[0].name, None);
+
+    let slice = endpoint_slice_from_value(&ep_slice_val).expect("parse slice");
+    assert_eq!(slice.ports[0].name, None);
+
+    let mut table = ServiceRoutingTable::new();
+    table.apply_service(svc);
+    table.apply_endpoint_slice(slice);
+
+    let ready = table
+        .get_ready_endpoints("default", "unnamed-svc", 80, Protocol::Tcp)
+        .expect("get ready endpoints for unnamed port");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].ip, "10.244.0.15");
+    assert_eq!(ready[0].port, 8080);
+
+    // Also verify when EndpointPort has Some("") explicitly
+    let mut table2 = ServiceRoutingTable::new();
+    table2.apply_service(ServiceDefinition::new(
+        "default",
+        "manual-svc",
+        ServiceType::ClusterIP,
+        Some("10.43.0.89".to_string()),
+        vec![ServicePort {
+            name: None,
+            protocol: Protocol::Tcp,
+            port: 80,
+            target_port: 8080,
+            node_port: None,
+        }],
+    ));
+    table2.apply_endpoint_slice(EndpointSliceDefinition::new(
+        "default",
+        "manual-slice",
+        "manual-svc",
+        vec![EndpointPort {
+            name: Some(String::new()),
+            port: Some(8080),
+            protocol: Some(Protocol::Tcp),
+        }],
+        vec![EndpointItem::new(
+            vec!["10.244.0.16".to_string()],
+            true,
+            None,
+        )],
+    ));
+
+    let ready2 = table2
+        .get_ready_endpoints("default", "manual-svc", 80, Protocol::Tcp)
+        .expect("get ready endpoints with explicit Some('')");
+    assert_eq!(ready2.len(), 1);
+    assert_eq!(ready2[0].ip, "10.244.0.16");
+    assert_eq!(ready2[0].port, 8080);
+}

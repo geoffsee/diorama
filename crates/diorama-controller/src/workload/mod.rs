@@ -5,6 +5,7 @@ pub mod endpoints;
 pub mod endpointslice;
 pub mod garbage_collector;
 pub mod job;
+pub mod namespace;
 pub mod policy;
 pub mod replicaset;
 pub mod replicationcontroller;
@@ -20,6 +21,7 @@ pub use endpoints::EndpointsReconciler;
 pub use endpointslice::EndpointSliceReconciler;
 pub use garbage_collector::GarbageCollector;
 pub use job::JobReconciler;
+pub use namespace::NamespaceReconciler;
 pub use policy::{DisruptionReconciler, ResourceQuotaReconciler};
 pub use replicaset::ReplicaSetReconciler;
 pub use replicationcontroller::ReplicationControllerReconciler;
@@ -81,6 +83,11 @@ impl WorkloadManager {
                 0
             },
         };
+
+        let ns_reconciler = NamespaceReconciler::new(self.client.clone());
+        if let Ok(ns_doc) = self.client.get_namespace(namespace).await {
+            let _ = ns_reconciler.reconcile_namespace(&ns_doc).await;
+        }
 
         Ok(ReconciliationSummary {
             deployments_reconciled: deployments,
