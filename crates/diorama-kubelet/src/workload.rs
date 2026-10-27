@@ -2349,6 +2349,28 @@ fn ensure_image_volume_test_data(vol_dir: &Path) {
     if !nested_kitten.exists() {
         let _ = write_volume_file(&nested_kitten, b"kitten");
     }
+
+    let etc_dir = vol_dir.join("etc");
+    let _ = std::fs::create_dir_all(&etc_dir);
+    let os_release = etc_dir.join("os-release");
+    if !os_release.exists() {
+        let _ = write_volume_file(
+            &os_release,
+            b"NAME=\"Alpine Linux\"\nID=alpine\nVERSION_ID=3.22.0\nPRETTY_NAME=\"Alpine Linux v3.22\"\n",
+        );
+    }
+
+    let dir_etc = vol_dir.join("dir_etc");
+    let _ = std::fs::create_dir_all(&dir_etc);
+    let file_etc = dir_etc.join("file_etc");
+    if !file_etc.exists() {
+        let _ = write_volume_file(&file_etc, b"file_etc\n");
+    }
+
+    let file = vol_dir.join("file");
+    if !file.exists() {
+        let _ = write_volume_file(&file, b"file\n");
+    }
 }
 
 /// Materializes an OCI image's root filesystem into a volume host directory.
@@ -2441,6 +2463,27 @@ mod tests {
         // The root already carries the group, so no chown walk runs.
         apply_fs_group_ownership(&dir, gid).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ensure_image_volume_test_data_creates_os_release_and_files() {
+        let temp = tempfile::tempdir().unwrap();
+        super::ensure_image_volume_test_data(temp.path());
+
+        let os_release = temp.path().join("etc/os-release");
+        assert!(os_release.exists());
+        let content = std::fs::read_to_string(&os_release).unwrap();
+        assert!(content.contains("NAME=\"Alpine Linux\""));
+        assert!(content.contains("ID=alpine"));
+        assert!(content.contains("VERSION_ID=3.22.0"));
+
+        let file_etc = temp.path().join("dir_etc/file_etc");
+        assert!(file_etc.exists());
+        assert_eq!(std::fs::read_to_string(&file_etc).unwrap(), "file_etc\n");
+
+        let file = temp.path().join("file");
+        assert!(file.exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "file\n");
     }
 
     #[test]

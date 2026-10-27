@@ -2571,6 +2571,89 @@ async fn test_podcertificate_request_contains_valid_stub_pkcs10_request() {
 }
 
 #[tokio::test]
+async fn test_projected_podcertificate_user_annotations() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+    let admin_client = apiserver_arc.admin_client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "pcr-user-annotations-pod",
+            "namespace": "default",
+            "uid": "uid-pcr-ua-123"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": "app",
+                "image": "busybox:latest"
+            }],
+            "volumes": [{
+                "name": "cert-vol",
+                "projected": {
+                    "sources": [{
+                        "podCertificate": {
+                            "signerName": "example.com/test-signer",
+                            "keyPath": "tls.key",
+                            "certificateChainPath": "tls.crt",
+                            "userAnnotations": {
+                                "client.kubernetes.io/identity": "custom-agent",
+                                "example.com/purpose": "conformance"
+                            }
+                        }
+                    }]
+                }
+            }]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+    let _ = kubelet.reconciler().reconcile_namespace("default").await;
+
+    let pcr_list = admin_client
+        .list_namespaced_objects(
+            "certificates.k8s.io",
+            "PodCertificateRequestList",
+            "podcertificaterequests",
+            "default",
+        )
+        .await
+        .unwrap();
+
+    let items = pcr_list["items"].as_array().expect("items array");
+    assert_ne!(items.len(), 0);
+    let pcr = &items[0];
+    assert_eq!(
+        pcr["spec"]["userAnnotations"]["client.kubernetes.io/identity"],
+        "custom-agent"
+    );
+    assert_eq!(
+        pcr["spec"]["unverifiedUserAnnotations"]["client.kubernetes.io/identity"],
+        "custom-agent"
+    );
+    assert_eq!(
+        pcr["spec"]["userAnnotations"]["example.com/purpose"],
+        "conformance"
+    );
+    assert_eq!(
+        pcr["spec"]["unverifiedUserAnnotations"]["example.com/purpose"],
+        "conformance"
+    );
+}
+
+#[tokio::test]
 async fn test_running_pod_emits_started_normal_event() {
     let temp = TempDir::new().unwrap();
     let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
