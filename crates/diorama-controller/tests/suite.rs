@@ -376,6 +376,10 @@ mod deployment_and_rc_lifecycle {
             "metadata": { "name": "prop-deploy", "namespace": ns },
             "spec": {
                 "replicas": 10,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "maxSurge": 0 }
+                },
                 "selector": { "matchLabels": { "app": "prop" } },
                 "template": {
                     "metadata": { "labels": { "app": "prop" } },
@@ -692,6 +696,7 @@ mod workload_conformance_lane_t07 {
     use std::net::IpAddr;
     use std::sync::Arc;
 
+    use diorama_apiserver::client::KubernetesApiClient;
     use diorama_apiserver::{ApiserverConfig, ApiserverService, KubernetesStorage};
     use diorama_controller::{ControllerManagerConfig, ControllerManagerService};
     use diorama_datastore::{DatastoreConfig, DatastoreEngine};
@@ -719,6 +724,28 @@ mod workload_conformance_lane_t07 {
         let apiserver_arc = Arc::new(apiserver_service);
 
         ControllerManagerService::new(controller_config, apiserver_arc)
+    }
+
+    async fn mark_pod_ready(client: &KubernetesApiClient, ns: &str, pod_name: &str) {
+        let mut pod = client.get_pod(ns, pod_name).await.unwrap();
+        pod["status"] = json!({
+            "phase": "Running",
+            "conditions": [
+                { "type": "Ready", "status": "True" }
+            ]
+        });
+        client.update_pod(ns, pod_name, pod).await.unwrap();
+    }
+
+    async fn mark_all_pods_ready(client: &KubernetesApiClient, ns: &str) {
+        let list = client.list_pods(ns).await.unwrap();
+        if let Some(items) = list.get("items").and_then(Value::as_array) {
+            for pod in items {
+                if let Some(name) = pod.pointer("/metadata/name").and_then(Value::as_str) {
+                    mark_pod_ready(client, ns, name).await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1936,5 +1963,389 @@ mod workload_conformance_lane_t07 {
         if let Some(conds) = fixed_conditions {
             assert!(conds.iter().all(|c| c["type"] != "ReplicaFailure"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_service_named_targetport_not_found_on_pod_produces_empty_endpoints_and_slice() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "svc-named-tp-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "named-tp-pod",
+                "namespace": ns,
+                "labels": { "app": "named-tp" }
+            },
+            "spec": {
+                "containers": [{
+                    "name": "nginx",
+                    "image": "nginx:1.27",
+                    "ports": [{
+                        "name": "http",
+                        "containerPort": 8080,
+                        "protocol": "TCP"
+                    }]
+                }]
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+        mark_pod_ready(&client, ns, "named-tp-pod").await;
+
+        let svc_obj = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "named-tp-svc",
+                "namespace": ns
+            },
+            "spec": {
+                "selector": { "app": "named-tp" },
+                "ports": [{
+                    "name": "http-port",
+                    "port": 80,
+                    "targetPort": "non-existent-port",
+                    "protocol": "TCP"
+                }]
+            }
+        });
+        client.create_service(ns, svc_obj).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Endpoints subsets must be empty because the pod lacks the named targetPort
+        let ep = client.get_endpoints(ns, "named-tp-svc").await.unwrap();
+        let subsets = ep.get("subsets").and_then(Value::as_array);
+        assert!(
+            subsets.is_none_or(Vec::is_empty),
+            "Endpoints subsets must be empty when named targetPort is not found on pod"
+        );
+
+        // EndpointSlice endpoints must be empty
+        let slices = client.list_endpointslices(ns).await.unwrap();
+        let slice_items = slices.get("items").and_then(Value::as_array).unwrap();
+        assert!(!slice_items.is_empty(), "EndpointSlice must exist");
+        for slice in slice_items {
+            let eps = slice.get("endpoints").and_then(Value::as_array);
+            assert!(
+                eps.is_none_or(Vec::is_empty),
+                "EndpointSlice endpoints must be empty when named targetPort is not found on pod"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deployment_proportional_scaling_with_max_surge() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "dep-prop-surge-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let dep = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "surge-deploy", "namespace": ns },
+            "spec": {
+                "replicas": 10,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "maxSurge": 5, "maxUnavailable": 2 }
+                },
+                "selector": { "matchLabels": { "app": "surge" } },
+                "template": {
+                    "metadata": { "labels": { "app": "surge" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx:1.27" }] }
+                }
+            }
+        });
+        client.create_deployment(ns, dep).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let dep_obj = client.get_deployment(ns, "surge-deploy").await.unwrap();
+        let dep_uid = dep_obj
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let old_rs = client.get_replicaset(ns, "surge-deploy-rs").await.unwrap();
+        let mut old_scaled = old_rs.clone();
+        old_scaled["spec"]["replicas"] = json!(2);
+        client
+            .update_replicaset(ns, "surge-deploy-rs", old_scaled)
+            .await
+            .unwrap();
+
+        let new_rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "surge-deploy-newhash",
+                "namespace": ns,
+                "labels": { "app": "surge", "pod-template-hash": "newhash" },
+                "annotations": { "deployment.kubernetes.io/revision": "2" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "surge-deploy",
+                    "uid": dep_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {
+                "replicas": 8,
+                "selector": { "matchLabels": { "app": "surge", "pod-template-hash": "newhash" } },
+                "template": {
+                    "metadata": { "labels": { "app": "surge", "pod-template-hash": "newhash" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx:1.28" }] }
+                }
+            }
+        });
+        client.create_replicaset(ns, new_rs).await.unwrap();
+
+        // Scale deployment from 10 to 20 replicas.
+        // max_total_replicas = 20 + 5 = 25.
+        // Old RS proportion: 2/10 * 25 = 5.
+        // New RS proportion: 8/10 * 25 = 20.
+        let mut dep_scaled = client.get_deployment(ns, "surge-deploy").await.unwrap();
+        dep_scaled["spec"]["replicas"] = json!(20);
+        dep_scaled["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.28");
+        client
+            .update_deployment(ns, "surge-deploy", dep_scaled)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let old_after = client.get_replicaset(ns, "surge-deploy-rs").await.unwrap();
+        assert_eq!(
+            old_after["spec"]["replicas"], 5,
+            "Old RS must scale proportionally to 5 (20% of 25)"
+        );
+        let new_after = client
+            .get_replicaset(ns, "surge-deploy-newhash")
+            .await
+            .unwrap();
+        assert_eq!(
+            new_after["spec"]["replicas"], 20,
+            "New RS must scale proportionally to 20 (80% of 25)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_canary_partition_recreates_pod_at_current_revision() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ss-canary-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "canary-ss", "namespace": ns },
+            "spec": {
+                "replicas": 3,
+                "serviceName": "canary-svc",
+                "selector": { "matchLabels": { "app": "canary" } },
+                "updateStrategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "partition": 0 }
+                },
+                "template": {
+                    "metadata": { "labels": { "app": "canary" } },
+                    "spec": { "containers": [{ "name": "app", "image": "nginx:1.27" }] }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Mark pods 0, 1, 2 ready
+        mark_all_pods_ready(&client, ns).await;
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let ss_obj = client.get_statefulset(ns, "canary-ss").await.unwrap();
+        let initial_rev = ss_obj
+            .pointer("/status/currentRevision")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        // Verify ControllerRevision exists for initial revision
+        let cr = client
+            .get_namespaced_object("apps", "controllerrevisions", ns, &initial_rev)
+            .await;
+        assert!(
+            cr.is_ok(),
+            "ControllerRevision for initial revision must exist"
+        );
+
+        // Now update template to nginx:1.28 with partition = 2
+        let mut ss_updated = ss_obj.clone();
+        ss_updated["spec"]["updateStrategy"]["rollingUpdate"]["partition"] = json!(2);
+        ss_updated["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.28");
+        client
+            .update_statefulset(ns, "canary-ss", ss_updated)
+            .await
+            .unwrap();
+
+        // Reconcile: pod 2 is rolled to new revision, pods 0 and 1 remain at initial_rev
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Verify pod-0 is at initial revision
+        let pod0 = client.get_pod(ns, "canary-ss-0").await.unwrap();
+        assert_eq!(
+            pod0.pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str),
+            Some(initial_rev.as_str())
+        );
+
+        // Delete pod-0 while partition is still 2!
+        client.delete_pod(ns, "canary-ss-0").await.unwrap();
+
+        // Reconcile: pod-0 must be recreated with initial_rev template and hash!
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pod0_recreated = client.get_pod(ns, "canary-ss-0").await.unwrap();
+        assert_eq!(
+            pod0_recreated
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str),
+            Some(initial_rev.as_str()),
+            "Recreated pod-0 at ordinal < partition must preserve currentRevision hash"
+        );
+        let pod0_image = pod0_recreated
+            .pointer("/spec/containers/0/image")
+            .and_then(Value::as_str);
+        assert_eq!(
+            pod0_image,
+            Some("nginx:1.27"),
+            "Recreated pod-0 must use currentRevision template (nginx:1.27), not new template"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replicaset_status_patch_preserves_concurrent_spec_and_labels() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "rs-patch-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "patch-rs",
+                "namespace": ns,
+                "labels": { "app": "patch" }
+            },
+            "spec": {
+                "replicas": 2,
+                "selector": { "matchLabels": { "app": "patch" } },
+                "template": {
+                    "metadata": { "labels": { "app": "patch" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx:1.27" }] }
+                }
+            }
+        });
+        client.create_replicaset(ns, rs).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // Simulate concurrent user update to spec.replicas and metadata.labels
+        let mut concurrent_update = client.get_replicaset(ns, "patch-rs").await.unwrap();
+        concurrent_update["spec"]["replicas"] = json!(5);
+        concurrent_update["metadata"]["labels"]["user-label"] = json!("concurrent-value");
+        client
+            .update_replicaset(ns, "patch-rs", concurrent_update)
+            .await
+            .unwrap();
+
+        // Reconcile ReplicaSet status
+        let reconciler =
+            diorama_controller::workload::ReplicaSetReconciler::new(Arc::new(client.clone()));
+        let rs_before_reconcile = client.get_replicaset(ns, "patch-rs").await.unwrap();
+        reconciler
+            .reconcile_replicaset(ns, &rs_before_reconcile)
+            .await
+            .unwrap();
+
+        let final_rs = client.get_replicaset(ns, "patch-rs").await.unwrap();
+        assert_eq!(
+            final_rs.pointer("/spec/replicas").and_then(Value::as_i64),
+            Some(5),
+            "Status update must not overwrite concurrent spec.replicas modification"
+        );
+        assert_eq!(
+            final_rs
+                .pointer("/metadata/labels/user-label")
+                .and_then(Value::as_str),
+            Some("concurrent-value"),
+            "Status update must not overwrite concurrent label modification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_namespace_ordered_pod_deletion_on_terminating_namespace() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let ns = "term-clean-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "term-pod-1",
+                "namespace": ns,
+                "labels": { "app": "term" }
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox:latest" }] }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        // Mark namespace as Terminating and reconcile with NamespaceReconciler
+        let mut ns_doc = client.get_namespace(ns).await.unwrap();
+        ns_doc["metadata"]["deletionTimestamp"] = json!("2026-10-27T00:00:00Z");
+        ns_doc["status"] = json!({ "phase": "Terminating" });
+
+        let ns_reconciler =
+            diorama_controller::workload::NamespaceReconciler::new(Arc::new(client.clone()));
+        let reconciled = ns_reconciler.reconcile_namespace(&ns_doc).await.unwrap();
+        assert!(reconciled, "Terminating namespace should be reconciled");
+
+        // Pods must be deleted
+        let pods = client.list_pods(ns).await.unwrap();
+        let pod_count = pods
+            .get("items")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            pod_count, 0,
+            "All pods in terminating namespace must be deleted"
+        );
+
+        // Namespace itself must be deleted from storage
+        let ns_res = client.get_namespace(ns).await;
+        assert!(
+            ns_res.is_err(),
+            "Terminating namespace must be deleted once empty"
+        );
     }
 }

@@ -343,15 +343,33 @@ impl DeploymentReconciler {
                 || current_total_spec < ctx.desired_replicas)
             && current_total_spec > 0
         {
-            self.apply_proportional_scale(
-                ctx.namespace,
-                new_rs.as_mut(),
-                old_rs,
-                ctx.desired_replicas,
-            )
-            .await;
+            let scaled = self
+                .apply_proportional_scale(
+                    ctx.namespace,
+                    new_rs.as_mut(),
+                    old_rs,
+                    max_total_replicas,
+                )
+                .await;
+            if scaled {
+                return Ok(());
+            }
         }
 
+        self.ensure_and_scale_new_rs(ctx, new_rs, old_rs, max_total_replicas)
+            .await?;
+        self.reconcile_scale_down_old(ctx, new_rs.as_ref(), old_rs, max_unavailable)
+            .await;
+        Ok(())
+    }
+
+    async fn ensure_and_scale_new_rs(
+        &self,
+        ctx: &RolloutContext<'_>,
+        new_rs: &mut Option<Value>,
+        old_rs: &[Value],
+        max_total_replicas: i64,
+    ) -> Result<(), ControllerError> {
         if new_rs.is_none() {
             let cur_old: i64 = old_rs.iter().map(get_rs_spec_replicas).sum();
             let initial_new = (max_total_replicas - cur_old)
@@ -387,17 +405,40 @@ impl DeploymentReconciler {
                 *rs = updated;
             }
         }
+        Ok(())
+    }
 
-        let cur_old: i64 = old_rs.iter().map(get_rs_spec_replicas).sum();
-        let new_ready = if let Some(rs) = new_rs {
-            let (ready, _) = self
-                .get_rs_ready_and_available(ctx.namespace, rs, ctx.name)
-                .await;
-            ready
+    async fn reconcile_scale_down_old(
+        &self,
+        ctx: &RolloutContext<'_>,
+        new_rs: Option<&Value>,
+        old_rs: &mut [Value],
+        max_unavailable: i64,
+    ) {
+        let (new_ready, new_avail) = if let Some(rs) = new_rs {
+            self.get_rs_ready_and_available(ctx.namespace, rs, ctx.name)
+                .await
         } else {
-            0
+            (0, 0)
         };
 
+        let mut old_avail_total = 0;
+        for old in old_rs.iter() {
+            let (_, avail) = self
+                .get_rs_ready_and_available(ctx.namespace, old, ctx.name)
+                .await;
+            old_avail_total += avail;
+        }
+
+        let total_available = new_avail + old_avail_total;
+        let min_available = ctx.desired_replicas.saturating_sub(max_unavailable).max(0);
+        let max_scaledown = total_available.saturating_sub(min_available).max(0);
+
+        if max_scaledown == 0 {
+            return;
+        }
+
+        let cur_old: i64 = old_rs.iter().map(get_rs_spec_replicas).sum();
         let target_total_old = if new_ready >= ctx.desired_replicas {
             0
         } else {
@@ -406,15 +447,18 @@ impl DeploymentReconciler {
                 .max(0)
         };
 
+        let desired_scaledown = cur_old.saturating_sub(target_total_old);
+        let allowed_scaledown = desired_scaledown.min(max_scaledown);
+        let actual_target_total_old = cur_old - allowed_scaledown;
+
         scale_down_old_replicasets(
             &self.client,
             ctx.namespace,
             old_rs,
-            target_total_old,
+            actual_target_total_old,
             cur_old,
         )
         .await;
-        Ok(())
     }
 
     async fn apply_proportional_scale(
@@ -423,8 +467,11 @@ impl DeploymentReconciler {
         mut new_rs: Option<&mut Value>,
         old_rs: &mut [Value],
         desired_replicas: i64,
-    ) {
-        scale_proportionally(new_rs.as_deref_mut(), old_rs, desired_replicas);
+    ) -> bool {
+        let changed = scale_proportionally(new_rs.as_deref_mut(), old_rs, desired_replicas);
+        if !changed {
+            return false;
+        }
         if let Some(new) = new_rs {
             let new_name = new
                 .pointer("/metadata/name")
@@ -445,6 +492,7 @@ impl DeploymentReconciler {
                 .update_replicaset(namespace, old_name, old.clone())
                 .await;
         }
+        true
     }
 
     async fn create_child_rs(
@@ -870,11 +918,26 @@ fn scale_proportionally(
         new_targets.push(target);
     }
     let sum_targets: i64 = new_targets.iter().sum();
-    let diff = desired_replicas - sum_targets;
-    if diff != 0
-        && let Some(first) = new_targets.first_mut()
-    {
-        *first += diff;
+    let mut diff = desired_replicas - sum_targets;
+    while diff > 0 {
+        for target in &mut new_targets {
+            if diff == 0 {
+                break;
+            }
+            *target += 1;
+            diff -= 1;
+        }
+    }
+    while diff < 0 {
+        for target in &mut new_targets {
+            if diff == 0 {
+                break;
+            }
+            if *target > 0 {
+                *target -= 1;
+                diff += 1;
+            }
+        }
     }
     let mut changed = false;
     for (rs, target) in all_rs.into_iter().zip(new_targets) {
