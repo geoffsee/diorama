@@ -2240,6 +2240,13 @@ impl KubernetesApiClient {
             if let Some(spec) = current.get_mut("spec").and_then(Value::as_object_mut) {
                 spec.insert("finalizers".to_string(), spec_fin.clone());
             }
+        } else {
+            if current.get("spec").is_none() {
+                current["spec"] = json!({});
+            }
+            if let Some(spec) = current.get_mut("spec").and_then(Value::as_object_mut) {
+                spec.insert("finalizers".to_string(), json!([]));
+            }
         }
         if let Some(meta_fin) = doc.pointer("/metadata/finalizers")
             && let Some(meta) = current.get_mut("metadata").and_then(Value::as_object_mut)
@@ -6727,11 +6734,13 @@ impl KubernetesApiClient {
         let res = self
             .create_workload_options("", "Service", "services", namespace, service, dry_run)
             .await?;
-        if !dry_run
-            && let Some(cip) = res.pointer("/spec/clusterIP").and_then(Value::as_str)
-            && let Some(name) = res.pointer("/metadata/name").and_then(Value::as_str)
-        {
-            let _ = self.create_service_ip_address(cip, namespace, name).await;
+        if !dry_run {
+            if let Some(cip) = res.pointer("/spec/clusterIP").and_then(Value::as_str)
+                && let Some(name) = res.pointer("/metadata/name").and_then(Value::as_str)
+            {
+                let _ = self.create_service_ip_address(cip, namespace, name).await;
+            }
+            self.sync_service_endpoints_and_slice(namespace, &res).await;
         }
         Ok(res)
     }
@@ -6780,8 +6789,83 @@ impl KubernetesApiClient {
                     let _ = self.create_service_ip_address(new, namespace, name).await;
                 }
             }
+            self.sync_service_endpoints_and_slice(namespace, &res).await;
         }
         Ok(res)
+    }
+
+    async fn sync_service_endpoints_and_slice(&self, namespace: &str, service: &Value) {
+        if namespace == "portainer" {
+            return;
+        }
+        let Some(name) = service.pointer("/metadata/name").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(selector) = service.pointer("/spec/selector").and_then(Value::as_object) else {
+            return;
+        };
+        if selector.is_empty() {
+            return;
+        }
+
+        let svc_ports = service
+            .pointer("/spec/ports")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (endpoint_ports, slice_ports) = service_endpoint_and_slice_ports(&svc_ports);
+
+        let pods = self.list_pods(namespace).await.unwrap_or_default();
+        let pod_items = pods
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let (ready_addresses, endpoints_slice_endpoints) =
+            match_service_pod_endpoints(&pod_items, selector, namespace);
+        if ready_addresses.is_empty() {
+            return;
+        }
+
+        let uid = service
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let ep_doc =
+            build_service_endpoints_doc(name, namespace, uid, &ready_addresses, &endpoint_ports);
+        let slice_name = format!("{name}-1");
+        let slice_doc = build_service_slice_doc(
+            name,
+            &slice_name,
+            namespace,
+            uid,
+            &slice_ports,
+            &endpoints_slice_endpoints,
+        );
+
+        match self.get_endpoints(namespace, name).await {
+            Ok(_) => {
+                let _ = self.update_endpoints(namespace, name, ep_doc).await;
+            },
+            Err(ApiserverError::NotFound { .. }) => {
+                let _ = self.create_endpoints(namespace, ep_doc).await;
+            },
+            Err(_) => {},
+        }
+
+        match self.get_endpointslice(namespace, &slice_name).await {
+            Ok(_) => {
+                let _ = self
+                    .update_endpointslice(namespace, &slice_name, slice_doc)
+                    .await;
+            },
+            Err(ApiserverError::NotFound { .. }) => {
+                let _ = self.create_endpointslice(namespace, slice_doc).await;
+            },
+            Err(_) => {},
+        }
     }
     pub async fn patch_service_status(
         &self,
@@ -9351,6 +9435,168 @@ impl KubernetesApiClient {
         );
         Ok(self.storage.watch(&full_prefix).await)
     }
+}
+
+fn service_endpoint_and_slice_ports(svc_ports: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let mut endpoint_ports = Vec::new();
+    let mut slice_ports = Vec::new();
+    for p in svc_ports {
+        let port_num = p.get("port").and_then(Value::as_i64).unwrap_or(80);
+        let port_name = p.get("name").and_then(Value::as_str);
+        let proto = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+        let mut endpoint_port = json!({
+            "port": port_num,
+            "protocol": proto
+        });
+        if let Some(pn) = port_name {
+            endpoint_port["name"] = json!(pn);
+        }
+        endpoint_ports.push(endpoint_port);
+
+        let mut slice_port = json!({
+            "port": port_num,
+            "protocol": proto
+        });
+        if let Some(pn) = port_name {
+            slice_port["name"] = json!(pn);
+        }
+        slice_ports.push(slice_port);
+    }
+    (endpoint_ports, slice_ports)
+}
+
+fn match_service_pod_endpoints(
+    pod_items: &[Value],
+    selector: &serde_json::Map<String, Value>,
+    namespace: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut ready_addresses = Vec::new();
+    let mut endpoints_slice_endpoints = Vec::new();
+
+    for pod in pod_items {
+        let labels = pod.pointer("/metadata/labels").and_then(Value::as_object);
+        let matches = selector
+            .iter()
+            .all(|(k, v)| labels.and_then(|m| m.get(k)).and_then(Value::as_str) == v.as_str());
+        if !matches {
+            continue;
+        }
+
+        let pod_ip = pod
+            .pointer("/status/podIP")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                pod.pointer("/metadata/annotations/cni.projectcalico.org~1podIP")
+                    .and_then(Value::as_str)
+            });
+        let Some(ip) = pod_ip else {
+            continue;
+        };
+        if ip.is_empty() {
+            continue;
+        }
+
+        let pod_name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let pod_uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let target_ref = json!({
+            "kind": "Pod",
+            "name": pod_name,
+            "namespace": namespace,
+            "uid": pod_uid,
+        });
+
+        ready_addresses.push(json!({
+            "ip": ip,
+            "targetRef": target_ref
+        }));
+
+        endpoints_slice_endpoints.push(json!({
+            "addresses": [ip],
+            "conditions": {
+                "ready": true,
+                "serving": true,
+                "terminating": false
+            },
+            "targetRef": target_ref
+        }));
+    }
+
+    (ready_addresses, endpoints_slice_endpoints)
+}
+
+fn build_service_endpoints_doc(
+    name: &str,
+    namespace: &str,
+    uid: &str,
+    ready_addresses: &[Value],
+    endpoint_ports: &[Value],
+) -> Value {
+    let subsets = if ready_addresses.is_empty() {
+        json!([])
+    } else {
+        json!([{
+            "addresses": ready_addresses,
+            "ports": endpoint_ports
+        }])
+    };
+
+    json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "kubernetes.io/service-name": name
+            },
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "Service",
+                "name": name,
+                "uid": uid,
+                "controller": true
+            }]
+        },
+        "subsets": subsets
+    })
+}
+
+fn build_service_slice_doc(
+    name: &str,
+    slice_name: &str,
+    namespace: &str,
+    uid: &str,
+    slice_ports: &[Value],
+    endpoints_slice_endpoints: &[Value],
+) -> Value {
+    json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": slice_name,
+            "namespace": namespace,
+            "labels": {
+                "kubernetes.io/service-name": name,
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            },
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "Service",
+                "name": name,
+                "uid": uid,
+                "controller": true
+            }]
+        },
+        "addressType": "IPv4",
+        "ports": slice_ports,
+        "endpoints": endpoints_slice_endpoints
+    })
 }
 
 #[cfg(test)]

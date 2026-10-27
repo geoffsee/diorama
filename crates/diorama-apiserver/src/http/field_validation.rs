@@ -199,11 +199,12 @@ fn format_strict_errors(unknown_fields: &[String], duplicate_fields: &[String]) 
         all_errors.push(format!(".{f}: field not declared in schema"));
     }
     for dup in duplicate_fields {
-        let d = dup
+        if let Some(d) = dup
             .strip_prefix("duplicate field \"")
             .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(dup);
-        all_errors.push(format!(".{d}: duplicate entries for key"));
+        {
+            all_errors.push(format!(".{d}: duplicate entries for key"));
+        }
     }
     format!("strict decoding error: {}", all_errors.join(", "))
 }
@@ -445,6 +446,11 @@ fn decode_yaml_mapping<'a>(
                     if ctx.has_path {
                         ctx.duplicate_fields
                             .push(format!("duplicate field \"{field_path}\""));
+                        ctx.duplicate_fields.push(format!(
+                            "line {}: key \"{}\" already set in map",
+                            key_span.start.line(),
+                            key_str
+                        ));
                     } else {
                         return Err(ApiserverError::BadRequest {
                             message: format!(
