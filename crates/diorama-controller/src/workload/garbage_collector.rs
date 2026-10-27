@@ -390,8 +390,17 @@ impl GarbageCollector {
         };
 
         let mut deleted = 0;
-        for rs in items {
-            if !self.is_eligible_dependent(namespace, rs).await {
+        for mut rs in items.clone() {
+            if !self
+                .evaluate_and_prune_dependent(
+                    namespace,
+                    &mut rs,
+                    "apps",
+                    "ReplicaSet",
+                    "replicasets",
+                )
+                .await
+            {
                 continue;
             }
             let Some(name) = rs
@@ -417,8 +426,11 @@ impl GarbageCollector {
         };
 
         let mut deleted = 0;
-        for job in items {
-            if !self.is_eligible_dependent(namespace, job).await {
+        for mut job in items.clone() {
+            if !self
+                .evaluate_and_prune_dependent(namespace, &mut job, "batch", "Job", "jobs")
+                .await
+            {
                 continue;
             }
             let Some(name) = job
@@ -444,8 +456,11 @@ impl GarbageCollector {
         };
 
         let mut deleted = 0;
-        for pod in items {
-            if !self.is_eligible_dependent(namespace, pod).await {
+        for mut pod in items.clone() {
+            if !self
+                .evaluate_and_prune_dependent(namespace, &mut pod, "", "Pod", "pods")
+                .await
+            {
                 continue;
             }
             let Some(name) = pod
@@ -472,8 +487,17 @@ impl GarbageCollector {
         };
 
         let mut deleted = 0;
-        for item in items {
-            if !self.is_eligible_dependent(namespace, item).await {
+        for mut item in items.clone() {
+            if !self
+                .evaluate_and_prune_dependent(
+                    namespace,
+                    &mut item,
+                    "discovery.k8s.io",
+                    "EndpointSlice",
+                    "endpointslices",
+                )
+                .await
+            {
                 continue;
             }
             let Some(name) = item
@@ -504,8 +528,11 @@ impl GarbageCollector {
         };
 
         let mut deleted = 0;
-        for item in items {
-            if !self.is_eligible_dependent(namespace, item).await {
+        for mut item in items.clone() {
+            if !self
+                .evaluate_and_prune_dependent(namespace, &mut item, "", "Endpoints", "endpoints")
+                .await
+            {
                 continue;
             }
             let Some(name) = item
@@ -522,65 +549,36 @@ impl GarbageCollector {
         deleted
     }
 
-    async fn check_owner_exists(
+    async fn get_owner_object(
         &self,
         namespace: &str,
         kind: &str,
         name: &str,
-        expected_uid: Option<&str>,
-    ) -> bool {
+    ) -> Result<Value, ApiserverError> {
         match kind {
-            "Deployment" => owner_present(
-                self.client.get_deployment(namespace, name).await,
-                expected_uid,
-            ),
-            "ReplicaSet" => owner_present(
-                self.client.get_replicaset(namespace, name).await,
-                expected_uid,
-            ),
-            "StatefulSet" => owner_present(
-                self.client.get_statefulset(namespace, name).await,
-                expected_uid,
-            ),
-            "DaemonSet" => owner_present(
-                self.client.get_daemonset(namespace, name).await,
-                expected_uid,
-            ),
-            "Job" => owner_present(self.client.get_job(namespace, name).await, expected_uid),
-            "CronJob" => {
-                owner_present(self.client.get_cronjob(namespace, name).await, expected_uid)
-            },
-            "Service" => {
-                owner_present(self.client.get_service(namespace, name).await, expected_uid)
-            },
-            "ReplicationController" => owner_present(
-                self.client.get_replicationcontroller(namespace, name).await,
-                expected_uid,
-            ),
-            "Pod" => owner_present(self.client.get_pod(namespace, name).await, expected_uid),
-            "ConfigMap" => owner_present(
-                self.client.get_configmap(namespace, name).await,
-                expected_uid,
-            ),
-            "Secret" => owner_present(self.client.get_secret(namespace, name).await, expected_uid),
-            "PersistentVolumeClaim" => {
-                owner_present(self.client.get_pvc(namespace, name).await, expected_uid)
-            },
-            "Lease" => owner_present(self.client.get_lease(namespace, name).await, expected_uid),
-            _ => {
-                self.check_crd_owner_exists(namespace, kind, name, expected_uid)
-                    .await
-            },
+            "Deployment" => self.client.get_deployment(namespace, name).await,
+            "ReplicaSet" => self.client.get_replicaset(namespace, name).await,
+            "StatefulSet" => self.client.get_statefulset(namespace, name).await,
+            "DaemonSet" => self.client.get_daemonset(namespace, name).await,
+            "Job" => self.client.get_job(namespace, name).await,
+            "CronJob" => self.client.get_cronjob(namespace, name).await,
+            "Service" => self.client.get_service(namespace, name).await,
+            "ReplicationController" => self.client.get_replicationcontroller(namespace, name).await,
+            "Pod" => self.client.get_pod(namespace, name).await,
+            "ConfigMap" => self.client.get_configmap(namespace, name).await,
+            "Secret" => self.client.get_secret(namespace, name).await,
+            "PersistentVolumeClaim" => self.client.get_pvc(namespace, name).await,
+            "Lease" => self.client.get_lease(namespace, name).await,
+            _ => self.get_crd_owner_object(namespace, kind, name).await,
         }
     }
 
-    async fn check_crd_owner_exists(
+    async fn get_crd_owner_object(
         &self,
         namespace: &str,
         kind: &str,
         name: &str,
-        expected_uid: Option<&str>,
-    ) -> bool {
+    ) -> Result<Value, ApiserverError> {
         if let Ok(crd_list) = self.client.list_crds().await
             && let Some(items) = crd_list.get("items").and_then(Value::as_array)
         {
@@ -595,18 +593,68 @@ impl GarbageCollector {
                         .pointer("/spec/names/plural")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let res = self
+                    return self
                         .client
                         .get_custom_resource(group, plural, namespace, name)
                         .await;
-                    return owner_present(res, expected_uid);
                 }
             }
         }
-        true
+        Err(ApiserverError::NotFound {
+            resource: kind.to_string(),
+            name: name.to_string(),
+        })
     }
 
-    async fn is_eligible_dependent(&self, namespace: &str, resource: &Value) -> bool {
+    async fn check_owner_exists(
+        &self,
+        namespace: &str,
+        kind: &str,
+        name: &str,
+        expected_uid: Option<&str>,
+    ) -> bool {
+        owner_present(
+            self.get_owner_object(namespace, kind, name).await,
+            expected_uid,
+        )
+    }
+
+    async fn partition_owner_references(
+        &self,
+        namespace: &str,
+        owner_refs: &[Value],
+    ) -> (Vec<Value>, Vec<Value>) {
+        let mut valid_owners = Vec::new();
+        let mut missing_owners = Vec::new();
+
+        for owner in owner_refs {
+            let Some(o_kind) = owner.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(o_name) = owner.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let expected_uid = owner.get("uid").and_then(Value::as_str);
+
+            let res = self.get_owner_object(namespace, o_kind, o_name).await;
+            if owner_present(res, expected_uid) {
+                valid_owners.push(owner.clone());
+            } else {
+                missing_owners.push(owner.clone());
+            }
+        }
+
+        (valid_owners, missing_owners)
+    }
+
+    async fn evaluate_and_prune_dependent(
+        &self,
+        namespace: &str,
+        resource: &mut Value,
+        group: &str,
+        kind: &str,
+        plural: &str,
+    ) -> bool {
         if resource
             .get("metadata")
             .and_then(|m| m.get("deletionTimestamp"))
@@ -624,6 +672,7 @@ impl GarbageCollector {
             .get("metadata")
             .and_then(|m| m.get("ownerReferences"))
             .and_then(Value::as_array)
+            .cloned()
         else {
             return false;
         };
@@ -632,26 +681,35 @@ impl GarbageCollector {
             return false;
         }
 
-        let mut valid_owner_count = 0;
-        for owner in owner_refs {
-            let Some(kind) = owner.get("kind").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(name) = owner.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            valid_owner_count += 1;
-            let expected_uid = owner.get("uid").and_then(Value::as_str);
+        let (valid_owners, missing_owners) = self
+            .partition_owner_references(namespace, &owner_refs)
+            .await;
 
-            if self
-                .check_owner_exists(namespace, kind, name, expected_uid)
-                .await
-            {
-                return false;
+        if !valid_owners.is_empty() {
+            if !missing_owners.is_empty() {
+                if let Some(meta) = resource.get_mut("metadata").and_then(Value::as_object_mut) {
+                    meta.insert("ownerReferences".to_string(), Value::Array(valid_owners));
+                }
+                if let Some(name) = resource.pointer("/metadata/name").and_then(Value::as_str)
+                    && !plural.is_empty()
+                {
+                    let _ = self
+                        .client
+                        .replace_namespaced_object(
+                            group,
+                            kind,
+                            plural,
+                            namespace,
+                            name,
+                            resource.clone(),
+                        )
+                        .await;
+                }
             }
+            return false;
         }
 
-        valid_owner_count > 0
+        valid_owners.is_empty() && !missing_owners.is_empty()
     }
 
     async fn reconcile_custom_resources(&self, namespace: &str) -> usize {
@@ -680,8 +738,11 @@ impl GarbageCollector {
             let Some(items) = list.get("items").and_then(Value::as_array) else {
                 continue;
             };
-            for item in items {
-                if !self.is_eligible_dependent(namespace, item).await {
+            for mut item in items.clone() {
+                if !self
+                    .evaluate_and_prune_dependent(namespace, &mut item, group, "", plural)
+                    .await
+                {
                     continue;
                 }
                 let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {

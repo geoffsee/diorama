@@ -103,6 +103,7 @@ impl DaemonSetReconciler {
         let cfg = DaemonSetConfig {
             name: p.name,
             uid: p.uid,
+            generation: p.generation,
             has_nodes,
             use_generic_pod_name,
             rev_hash: &rev_hash,
@@ -321,10 +322,7 @@ impl DaemonSetReconciler {
         revision: i64,
     ) -> Result<(), ControllerError> {
         let cr_name = format!("{}-{hash}", p.name);
-        let mut tpl_patch = p.template.clone();
-        if let Some(obj) = tpl_patch.as_object_mut() {
-            obj.insert("$patch".to_string(), json!("replace"));
-        }
+        let tpl_patch = normalize_daemonset_template_patch(&p.template);
         let mut cr_labels = p.template_labels.clone();
         if let Some(obj) = cr_labels.as_object_mut() {
             obj.insert("controller-revision-hash".to_string(), json!(hash));
@@ -495,7 +493,8 @@ impl DaemonSetReconciler {
         };
 
         let mut pod_name = base_name.clone();
-        if failed_or_deleted_names.iter().any(|n| n == &pod_name)
+        if !failed_or_deleted_names.is_empty()
+            || failed_or_deleted_names.iter().any(|n| n == &pod_name)
             || self
                 .is_pod_terminating_or_failed(namespace, &pod_name)
                 .await
@@ -530,7 +529,15 @@ impl DaemonSetReconciler {
                 json!(pod_name),
             );
             l_obj.insert("controller-revision-hash".to_string(), json!(cfg.rev_hash));
+            l_obj.insert(
+                "controller.kubernetes.io/hash".to_string(),
+                json!(cfg.rev_hash),
+            );
             l_obj.insert("pod-template-hash".to_string(), json!(cfg.rev_hash));
+            l_obj.insert(
+                "pod-template-generation".to_string(),
+                json!(cfg.generation.to_string()),
+            );
         }
 
         let new_pod = json!({
@@ -573,6 +580,7 @@ impl DaemonSetReconciler {
 struct DaemonSetConfig<'a> {
     name: &'a str,
     uid: &'a str,
+    generation: i64,
     has_nodes: bool,
     use_generic_pod_name: bool,
     rev_hash: &'a str,
@@ -712,7 +720,11 @@ fn get_pod_node<'a>(pod: &'a Value, ds_name: &str) -> Option<&'a str> {
     }
     let pname = pod.pointer("/metadata/name").and_then(Value::as_str)?;
     let prefix = format!("{ds_name}-");
-    pname.strip_prefix(&prefix)
+    let rest = pname.strip_prefix(&prefix)?;
+    if rest == "node" || rest.starts_with("node-") {
+        return Some("node");
+    }
+    Some(rest)
 }
 
 fn node_matches_daemonset(node: &Value, template_spec: &Value) -> bool {
@@ -832,6 +844,7 @@ fn compare_node_int(
 struct DaemonSetParams<'a> {
     name: &'a str,
     uid: &'a str,
+    generation: i64,
     deleting: bool,
     template: Value,
     template_labels: Value,
@@ -855,6 +868,11 @@ fn parse_daemonset_params(ds: &Value) -> Result<DaemonSetParams<'_>, ControllerE
         .and_then(|m| m.get("uid"))
         .and_then(Value::as_str)
         .unwrap_or("");
+
+    let generation = ds
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
 
     let deleting = ds
         .pointer("/metadata/deletionTimestamp")
@@ -892,6 +910,7 @@ fn parse_daemonset_params(ds: &Value) -> Result<DaemonSetParams<'_>, ControllerE
     Ok(DaemonSetParams {
         name,
         uid,
+        generation,
         deleting,
         template,
         template_labels,
@@ -957,18 +976,61 @@ fn cr_matches_template(cr: &Value, current_template: &Value) -> bool {
     clean_template_for_comparison(cr_tpl) == clean_template_for_comparison(current_template)
 }
 
+fn normalize_daemonset_template_patch(template: &Value) -> Value {
+    let mut tpl_patch = if template.is_object() {
+        template.clone()
+    } else {
+        json!({})
+    };
+
+    if let Some(obj) = tpl_patch.as_object_mut() {
+        obj.insert("$patch".to_string(), json!("replace"));
+
+        let meta = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj
+                .entry("creationTimestamp".to_string())
+                .or_insert(Value::Null);
+
+            if let Some(labels) = meta_obj.get_mut("labels").and_then(Value::as_object_mut) {
+                labels.remove("controller-revision-hash");
+                labels.remove("pod-template-hash");
+                labels.remove("controller.kubernetes.io/hash");
+                labels.remove("pod-template-generation");
+            }
+        }
+
+        if let Some(spec) = obj.get_mut("spec").and_then(Value::as_object_mut) {
+            normalize_container_resources(spec, "containers");
+            normalize_container_resources(spec, "initContainers");
+        }
+    }
+
+    tpl_patch
+}
+
+fn normalize_container_resources(spec: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(containers) = spec.get_mut(key).and_then(Value::as_array_mut) {
+        for c in containers {
+            if let Some(c_obj) = c.as_object_mut() {
+                match c_obj.get_mut("resources") {
+                    Some(res) if res.is_null() => *res = json!({}),
+                    None => {
+                        c_obj.insert("resources".to_string(), json!({}));
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+}
+
 fn clean_template_for_comparison(val: &Value) -> Value {
-    let mut clean = val.clone();
+    let mut clean = normalize_daemonset_template_patch(val);
     if let Some(obj) = clean.as_object_mut() {
         obj.remove("$patch");
-    }
-    if let Some(labels) = clean
-        .pointer_mut("/metadata/labels")
-        .and_then(Value::as_object_mut)
-    {
-        labels.remove("controller-revision-hash");
-        labels.remove("pod-template-hash");
-        labels.remove("controller.kubernetes.io/hash");
     }
     clean
 }

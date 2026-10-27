@@ -3403,4 +3403,245 @@ mod workload_conformance_lane_t07 {
         let eps = client.get_endpoints(ns, "dep-svc").await.unwrap();
         assert!(eps["subsets"].as_array().is_some_and(|s| !s.is_empty()));
     }
+
+    #[tokio::test]
+    async fn test_daemonset_controller_revision_patch_normalization_and_labels() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "ds-norm-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "node-norm-worker" }
+        });
+        client.create_node(node).await.unwrap();
+
+        let ds = json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {
+                "name": "ds-norm",
+                "namespace": ns,
+                "generation": 3
+            },
+            "spec": {
+                "selector": { "matchLabels": { "app": "ds-norm" } },
+                "template": {
+                    "metadata": { "labels": { "app": "ds-norm" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx:1.26" }] }
+                }
+            }
+        });
+        client.create_daemonset(ns, ds).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // 1. Verify ControllerRevision normalization
+        let revs = client
+            .list_namespaced_objects("apps", "ControllerRevisionList", "controllerrevisions", ns)
+            .await
+            .unwrap();
+        let items = revs["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let tpl = &items[0]["data"]["spec"]["template"];
+        assert_eq!(tpl["$patch"], "replace");
+        assert_eq!(tpl["metadata"]["creationTimestamp"], Value::Null);
+        assert_eq!(tpl["spec"]["containers"][0]["resources"], json!({}));
+        let meta_labels = tpl["metadata"]["labels"].as_object().unwrap();
+        assert!(!meta_labels.contains_key("controller-revision-hash"));
+        assert!(!meta_labels.contains_key("pod-template-hash"));
+        assert!(!meta_labels.contains_key("controller.kubernetes.io/hash"));
+        assert!(!meta_labels.contains_key("pod-template-generation"));
+
+        // 2. Verify Pod labels
+        let pods = client.list_pods(ns).await.unwrap();
+        let pod_items = pods["items"].as_array().unwrap();
+        assert_eq!(pod_items.len(), 1);
+        let p_labels = pod_items[0]["metadata"]["labels"].as_object().unwrap();
+        assert!(p_labels.contains_key("controller-revision-hash"));
+        assert!(p_labels.contains_key("controller.kubernetes.io/hash"));
+        assert_eq!(
+            p_labels
+                .get("pod-template-generation")
+                .and_then(Value::as_str),
+            Some("3")
+        );
+
+        // 3. Verify RollingUpdate pod replacement in the same pass
+        let mut ds_v2 = client.get_daemonset(ns, "ds-norm").await.unwrap();
+        ds_v2["metadata"]["generation"] = json!(4);
+        ds_v2["spec"]["template"]["spec"]["containers"][0]["image"] = json!("nginx:1.27");
+        client.update_daemonset(ns, "ds-norm", ds_v2).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let pods_v2 = client.list_pods(ns).await.unwrap();
+        let pod_items_v2 = pods_v2["items"].as_array().unwrap();
+        assert_eq!(
+            pod_items_v2.len(),
+            1,
+            "RollingUpdate must replace pod without leaving 0 pods"
+        );
+        assert_eq!(
+            pod_items_v2[0]["spec"]["containers"][0]["image"],
+            "nginx:1.27"
+        );
+        let p_labels_v2 = pod_items_v2[0]["metadata"]["labels"].as_object().unwrap();
+        assert_eq!(
+            p_labels_v2
+                .get("pod-template-generation")
+                .and_then(Value::as_str),
+            Some("4")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_garbage_collector_multi_owner_retention_and_pruning() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "gc-multi-owner-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let rc1 = rc_stub("rc-del", ns, "rc-del-uid");
+        let rc2 = rc_stub("rc-stay", ns, "rc-stay-uid");
+        client.create_replicationcontroller(ns, rc1).await.unwrap();
+        client.create_replicationcontroller(ns, rc2).await.unwrap();
+
+        // Create pod-dual owned by both rc1 and rc2
+        let pod_dual = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-dual",
+                "namespace": ns,
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "rc-del",
+                        "uid": "rc-del-uid",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    },
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "rc-stay",
+                        "uid": "rc-stay-uid"
+                    }
+                ]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        client.create_pod(ns, pod_dual).await.unwrap();
+
+        // Create pod-single owned only by rc1
+        let pod_single = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-single",
+                "namespace": ns,
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "rc-del",
+                        "uid": "rc-del-uid",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    }
+                ]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        client.create_pod(ns, pod_single).await.unwrap();
+
+        // Mark rc1 for foreground deletion
+        let mut rc1_del = client
+            .get_replicationcontroller(ns, "rc-del")
+            .await
+            .unwrap();
+        rc1_del["metadata"]["deletionTimestamp"] = json!("2026-10-27T00:00:00Z");
+        rc1_del["metadata"]["finalizers"] = json!(["foregroundDeletion"]);
+        client
+            .update_replicationcontroller(ns, "rc-del", rc1_del)
+            .await
+            .unwrap();
+
+        // Run reconciliation (which runs GC)
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        // pod-single must be deleted
+        assert!(client.get_pod(ns, "pod-single").await.is_err());
+
+        // pod-dual must NOT be deleted, and rc-del must be stripped from ownerReferences
+        let dual_after = client.get_pod(ns, "pod-dual").await.unwrap();
+        let owners = dual_after["metadata"]["ownerReferences"]
+            .as_array()
+            .unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0]["name"], "rc-stay");
+
+        // After pod-single is deleted and pod-dual is disowned, rc-del should be finalized
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        assert!(
+            client
+                .get_replicationcontroller(ns, "rc-del")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replicationcontroller_fast_batch_scale_and_early_stop() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "rc-fast-scale-ns";
+        client.create_namespace(ns).await.unwrap();
+
+        let rc = json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "rc-fast", "namespace": ns },
+            "spec": {
+                "replicas": 40,
+                "selector": { "app": "rc-fast" },
+                "template": {
+                    "metadata": { "labels": { "app": "rc-fast" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+        client.create_replicationcontroller(ns, rc).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let pods = client.list_pods(ns).await.unwrap();
+        assert_eq!(pods["items"].as_array().unwrap().len(), 40);
+    }
+
+    fn rc_stub(name: &str, ns: &str, uid: &str) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": name, "namespace": ns, "uid": uid },
+            "spec": {
+                "replicas": 0,
+                "selector": { "app": name },
+                "template": {
+                    "metadata": { "labels": { "app": name } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        })
+    }
 }
