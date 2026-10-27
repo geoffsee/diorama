@@ -130,11 +130,651 @@ impl FieldDef {
 
 include!("generated/k8s_proto_schema.rs");
 
+static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
+    (
+        "k8s.io.api.apidiscovery.v2.APIGroupDiscovery",
+        &[FieldDef::typed(
+            1,
+            "metadata",
+            WireKind::Message,
+            "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+        )],
+    ),
+    (
+        "k8s.io.api.apidiscovery.v2.APIGroupDiscoveryList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.apidiscovery.v2.APIGroupDiscovery",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.BoundObjectReference",
+        &[
+            FieldDef::scalar(1, "kind", WireKind::String),
+            FieldDef::scalar(2, "apiVersion", WireKind::String),
+            FieldDef::scalar(3, "name", WireKind::String),
+            FieldDef::scalar(4, "uid", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.SelfSubjectReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.SelfSubjectReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.SelfSubjectReviewStatus",
+        &[FieldDef::typed(
+            1,
+            "userInfo",
+            WireKind::Message,
+            "k8s.io.api.authentication.v1.UserInfo",
+        )],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenRequest",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.TokenRequestSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.TokenRequestStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenRequestSpec",
+        &[
+            FieldDef::repeated_scalar(1, "audiences", WireKind::String),
+            FieldDef::scalar(2, "expirationSeconds", WireKind::Int64),
+            FieldDef::typed(
+                3,
+                "boundObjectRef",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.BoundObjectReference",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenRequestStatus",
+        &[
+            FieldDef::scalar(1, "token", WireKind::String),
+            FieldDef::typed(
+                2,
+                "expirationTimestamp",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.Time",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.TokenReviewSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.TokenReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenReviewSpec",
+        &[
+            FieldDef::scalar(1, "token", WireKind::String),
+            FieldDef::repeated_scalar(2, "audiences", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.TokenReviewStatus",
+        &[
+            FieldDef::scalar(1, "authenticated", WireKind::Bool),
+            FieldDef::typed(
+                2,
+                "user",
+                WireKind::Message,
+                "k8s.io.api.authentication.v1.UserInfo",
+            ),
+            FieldDef::repeated_scalar(3, "audiences", WireKind::String),
+            FieldDef::scalar(4, "error", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authentication.v1.UserInfo",
+        &[
+            FieldDef::scalar(1, "username", WireKind::String),
+            FieldDef::scalar(2, "uid", WireKind::String),
+            FieldDef::repeated_scalar(3, "groups", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.LocalSubjectAccessReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectAccessReviewSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectAccessReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.NonResourceAttributes",
+        &[
+            FieldDef::scalar(1, "path", WireKind::String),
+            FieldDef::scalar(2, "verb", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.NonResourceRule",
+        &[
+            FieldDef::repeated_scalar(1, "verbs", WireKind::String),
+            FieldDef::repeated_scalar(2, "nonResourceURLs", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.ResourceAttributes",
+        &[
+            FieldDef::scalar(1, "namespace", WireKind::String),
+            FieldDef::scalar(2, "verb", WireKind::String),
+            FieldDef::scalar(3, "group", WireKind::String),
+            FieldDef::scalar(4, "version", WireKind::String),
+            FieldDef::scalar(5, "resource", WireKind::String),
+            FieldDef::scalar(6, "subresource", WireKind::String),
+            FieldDef::scalar(7, "name", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.ResourceRule",
+        &[
+            FieldDef::repeated_scalar(1, "verbs", WireKind::String),
+            FieldDef::repeated_scalar(2, "apiGroups", WireKind::String),
+            FieldDef::repeated_scalar(3, "resources", WireKind::String),
+            FieldDef::repeated_scalar(4, "resourceNames", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SelfSubjectAccessReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SelfSubjectAccessReviewSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectAccessReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SelfSubjectAccessReviewSpec",
+        &[
+            FieldDef::typed(
+                1,
+                "resourceAttributes",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.ResourceAttributes",
+            ),
+            FieldDef::typed(
+                2,
+                "nonResourceAttributes",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.NonResourceAttributes",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SelfSubjectRulesReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SelfSubjectRulesReviewSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectRulesReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SelfSubjectRulesReviewSpec",
+        &[FieldDef::scalar(1, "namespace", WireKind::String)],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SubjectAccessReview",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectAccessReviewSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.SubjectAccessReviewStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SubjectAccessReviewSpec",
+        &[
+            FieldDef::typed(
+                1,
+                "resourceAttributes",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.ResourceAttributes",
+            ),
+            FieldDef::typed(
+                2,
+                "nonResourceAttributes",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.NonResourceAttributes",
+            ),
+            FieldDef::scalar(3, "user", WireKind::String),
+            FieldDef::repeated_scalar(4, "groups", WireKind::String),
+            FieldDef::scalar(5, "uid", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SubjectAccessReviewStatus",
+        &[
+            FieldDef::scalar(1, "allowed", WireKind::Bool),
+            FieldDef::scalar(2, "denied", WireKind::Bool),
+            FieldDef::scalar(3, "reason", WireKind::String),
+            FieldDef::scalar(4, "evaluationError", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.authorization.v1.SubjectRulesReviewStatus",
+        &[
+            FieldDef::repeated_typed(
+                1,
+                "resourceRules",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.ResourceRule",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "nonResourceRules",
+                WireKind::Message,
+                "k8s.io.api.authorization.v1.NonResourceRule",
+            ),
+            FieldDef::scalar(3, "incomplete", WireKind::Bool),
+            FieldDef::scalar(4, "evaluationError", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.ClusterTrustBundle",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.ClusterTrustBundleSpec",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.ClusterTrustBundleList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.ClusterTrustBundle",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.ClusterTrustBundleSpec",
+        &[
+            FieldDef::scalar(1, "signerName", WireKind::String),
+            FieldDef::scalar(2, "trustBundle", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.PodCertificateRequest",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.PodCertificateRequestSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.PodCertificateRequestStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.PodCertificateRequestList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.PodCertificateRequest",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.PodCertificateRequestSpec",
+        &[
+            FieldDef::scalar(1, "signerName", WireKind::String),
+            FieldDef::scalar(2, "pkcs10", WireKind::Bytes),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1alpha1.PodCertificateRequestStatus",
+        &[FieldDef::scalar(1, "certificate", WireKind::Bytes)],
+    ),
+    (
+        "k8s.io.api.certificates.v1beta1.ClusterTrustBundle",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.ClusterTrustBundleSpec",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1beta1.ClusterTrustBundleList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1beta1.ClusterTrustBundle",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1beta1.PodCertificateRequest",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.PodCertificateRequestSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1alpha1.PodCertificateRequestStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.certificates.v1beta1.PodCertificateRequestList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.certificates.v1beta1.PodCertificateRequest",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.FlowSchema",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.FlowSchemaSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.FlowSchemaStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.FlowSchemaList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.FlowSchema",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.FlowSchemaSpec",
+        &[FieldDef::scalar(1, "matchingPrecedence", WireKind::Int32)],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.FlowSchemaStatus",
+        &[FieldDef::repeated_typed(
+            1,
+            "conditions",
+            WireKind::Message,
+            "k8s.io.apimachinery.pkg.apis.meta.v1.Condition",
+        )],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfiguration",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ),
+            FieldDef::typed(
+                2,
+                "spec",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationSpec",
+            ),
+            FieldDef::typed(
+                3,
+                "status",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationStatus",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationList",
+        &[
+            FieldDef::typed(
+                1,
+                "metadata",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "items",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.PriorityLevelConfiguration",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationSpec",
+        &[FieldDef::scalar(1, "type", WireKind::String)],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationStatus",
+        &[FieldDef::repeated_typed(
+            1,
+            "conditions",
+            WireKind::Message,
+            "k8s.io.apimachinery.pkg.apis.meta.v1.Condition",
+        )],
+    ),
+];
+
+fn lookup_extra_message(name: &str) -> Option<&'static [FieldDef]> {
+    EXTRA_MESSAGES
+        .binary_search_by_key(&name, |(message, _)| *message)
+        .ok()
+        .map(|index| EXTRA_MESSAGES[index].1)
+}
+
 fn lookup_message(name: &str) -> Option<&'static [FieldDef]> {
     MESSAGES
         .binary_search_by_key(&name, |(message, _)| *message)
         .ok()
         .map(|index| MESSAGES[index].1)
+        .or_else(|| lookup_extra_message(name))
 }
 
 fn lookup_field(fields: &'static [FieldDef], number: u32) -> Option<&'static FieldDef> {
@@ -234,6 +874,12 @@ fn message_for_gvk(api_version: &str, kind: &str) -> Option<String> {
             "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1"
         },
         ("apiregistration.k8s.io", "v1") => "k8s.io.kube_aggregator.pkg.apis.apiregistration.v1",
+        ("certificates.k8s.io", "v1alpha1") => "k8s.io.api.certificates.v1alpha1",
+        ("certificates.k8s.io", "v1beta1") => "k8s.io.api.certificates.v1beta1",
+        ("authentication.k8s.io", "v1") => "k8s.io.api.authentication.v1",
+        ("authorization.k8s.io", "v1") => "k8s.io.api.authorization.v1",
+        ("flowcontrol.apiserver.k8s.io", "v1") => "k8s.io.api.flowcontrol.v1",
+        ("apidiscovery.k8s.io", "v2" | "v2beta1") => "k8s.io.api.apidiscovery.v2",
         _ => return None,
     };
     Some(format!("{package}.{kind}"))

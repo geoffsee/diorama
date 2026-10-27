@@ -30,6 +30,9 @@ const GROUP_DOCS: &[(&str, &str)] = &[
     ("apiextensions.k8s.io", "v1"),
     ("admissionregistration.k8s.io", "v1"),
     ("apiregistration.k8s.io", "v1"),
+    ("authentication.k8s.io", "v1"),
+    ("authorization.k8s.io", "v1"),
+    ("flowcontrol.apiserver.k8s.io", "v1"),
 ];
 
 /// `GET /openapi/v3`: discovery of per-group documents.
@@ -699,6 +702,7 @@ fn v3_crd_operation(group: &str, version: &str, kind: &str, def_key: &str) -> Va
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn group_kinds(group: &str, version: &str) -> Vec<(&'static str, &'static str, bool)> {
     match (group, version) {
         ("apps", "v1") => vec![
@@ -784,6 +788,28 @@ fn group_kinds(group: &str, version: &str) -> Vec<(&'static str, &'static str, b
             ("CSIStorageCapacity", "csistoragecapacities", true),
             ("VolumeAttachment", "volumeattachments", false),
             ("VolumeAttributesClass", "volumeattributesclasses", false),
+        ],
+        ("authentication.k8s.io", "v1") => vec![
+            ("TokenReview", "tokenreviews", false),
+            ("SelfSubjectReview", "selfsubjectreviews", false),
+        ],
+        ("authorization.k8s.io", "v1") => vec![
+            ("SubjectAccessReview", "subjectaccessreviews", false),
+            ("SelfSubjectAccessReview", "selfsubjectaccessreviews", false),
+            (
+                "LocalSubjectAccessReview",
+                "localsubjectaccessreviews",
+                true,
+            ),
+            ("SelfSubjectRulesReview", "selfsubjectrulesreviews", false),
+        ],
+        ("flowcontrol.apiserver.k8s.io", "v1") => vec![
+            ("FlowSchema", "flowschemas", false),
+            (
+                "PriorityLevelConfiguration",
+                "prioritylevelconfigurations",
+                false,
+            ),
         ],
         _ => Vec::new(),
     }

@@ -26,6 +26,8 @@ pub struct PodLogOptions {
     pub previous: bool,
     /// Stream logs as they arrive.
     pub follow: bool,
+    /// Maximum bytes of log output to return.
+    pub limit_bytes: Option<usize>,
 }
 
 impl PodLogOptions {
@@ -45,6 +47,10 @@ impl PodLogOptions {
             follow: params
                 .get("follow")
                 .is_some_and(|v| v == "true" || v == "1"),
+            limit_bytes: params
+                .get("limitBytes")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0),
         }
     }
 }
@@ -74,6 +80,7 @@ mod tests {
             ("sinceSeconds", "30"),
             ("previous", "true"),
             ("follow", "false"),
+            ("limitBytes", "1024"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -85,6 +92,7 @@ mod tests {
         assert_eq!(options.since_seconds, Some(30));
         assert!(options.previous);
         assert!(!options.follow);
+        assert_eq!(options.limit_bytes, Some(1024));
         assert_eq!(
             PodLogOptions::from_params(&BTreeMap::new()),
             PodLogOptions::default()

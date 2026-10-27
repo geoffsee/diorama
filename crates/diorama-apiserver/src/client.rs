@@ -277,7 +277,11 @@ impl KubernetesApiClient {
         &self.aggregation
     }
 
-    fn current_user_info(&self) -> UserInfo {
+    pub(crate) fn token_service(&self) -> Option<&Arc<TokenService>> {
+        self.token_service.as_ref()
+    }
+
+    pub(crate) fn current_user_info(&self) -> UserInfo {
         match &self.identity {
             ClientIdentity::AdminCertificate => UserInfo {
                 username: "system:admin".to_string(),
@@ -669,6 +673,15 @@ impl KubernetesApiClient {
                     "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 },
                 {
+                    "name": "serviceaccounts/token",
+                    "singularName": "",
+                    "namespaced": true,
+                    "group": "authentication.k8s.io",
+                    "version": "v1",
+                    "kind": "TokenRequest",
+                    "verbs": ["create"]
+                },
+                {
                     "name": "nodes",
                     "singularName": "node",
                     "namespaced": false,
@@ -809,9 +822,32 @@ impl KubernetesApiClient {
             json!({
                 "name": "certificates.k8s.io",
                 "versions": [
-                    { "groupVersion": "certificates.k8s.io/v1", "version": "v1" }
+                    { "groupVersion": "certificates.k8s.io/v1", "version": "v1" },
+                    { "groupVersion": "certificates.k8s.io/v1beta1", "version": "v1beta1" },
+                    { "groupVersion": "certificates.k8s.io/v1alpha1", "version": "v1alpha1" }
                 ],
                 "preferredVersion": { "groupVersion": "certificates.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "authentication.k8s.io",
+                "versions": [
+                    { "groupVersion": "authentication.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "authentication.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "authorization.k8s.io",
+                "versions": [
+                    { "groupVersion": "authorization.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "authorization.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "flowcontrol.apiserver.k8s.io",
+                "versions": [
+                    { "groupVersion": "flowcontrol.apiserver.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "flowcontrol.apiserver.k8s.io/v1", "version": "v1" }
             }),
             json!({
                 "name": "scheduling.k8s.io",
@@ -1041,6 +1077,20 @@ impl KubernetesApiClient {
                 ] {
                     resources.push(Self::cluster_resource(name, singular, kind));
                 }
+                resources.push(json!({
+                    "name": "validatingadmissionpolicies/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "ValidatingAdmissionPolicy",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(json!({
+                    "name": "mutatingadmissionpolicies/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "MutatingAdmissionPolicy",
+                    "verbs": ["get", "patch", "update"]
+                }));
             },
             ("apiregistration.k8s.io", "v1") => {
                 resources.push(Self::cluster_resource(
@@ -1171,11 +1221,116 @@ impl KubernetesApiClient {
                     "certificatesigningrequest",
                     "CertificateSigningRequest",
                 ));
+                resources.push(json!({
+                    "name": "certificatesigningrequests/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "CertificateSigningRequest",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(json!({
+                    "name": "certificatesigningrequests/approval",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "CertificateSigningRequest",
+                    "verbs": ["patch", "update"]
+                }));
                 resources.push(Self::cluster_resource(
                     "clustertrustbundles",
                     "clustertrustbundle",
                     "ClusterTrustBundle",
                 ));
+            },
+            ("certificates.k8s.io", "v1alpha1" | "v1beta1") => {
+                resources.push(Self::cluster_resource(
+                    "clustertrustbundles",
+                    "clustertrustbundle",
+                    "ClusterTrustBundle",
+                ));
+                resources.push(Self::namespaced_resource(
+                    "podcertificaterequests",
+                    "podcertificaterequest",
+                    "PodCertificateRequest",
+                ));
+                resources.push(json!({
+                    "name": "podcertificaterequests/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "PodCertificateRequest",
+                    "verbs": ["get", "patch", "update"]
+                }));
+            },
+            ("authentication.k8s.io", "v1") => {
+                resources.push(json!({
+                    "name": "tokenreviews",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "TokenReview",
+                    "verbs": ["create"]
+                }));
+                resources.push(json!({
+                    "name": "selfsubjectreviews",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "SelfSubjectReview",
+                    "verbs": ["create"]
+                }));
+            },
+            ("authorization.k8s.io", "v1") => {
+                resources.push(json!({
+                    "name": "subjectaccessreviews",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "SubjectAccessReview",
+                    "verbs": ["create"]
+                }));
+                resources.push(json!({
+                    "name": "selfsubjectaccessreviews",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "SelfSubjectAccessReview",
+                    "verbs": ["create"]
+                }));
+                resources.push(json!({
+                    "name": "localsubjectaccessreviews",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "LocalSubjectAccessReview",
+                    "verbs": ["create"]
+                }));
+                resources.push(json!({
+                    "name": "selfsubjectrulesreviews",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "SelfSubjectRulesReview",
+                    "verbs": ["create"]
+                }));
+            },
+            ("flowcontrol.apiserver.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "flowschemas",
+                    "flowschema",
+                    "FlowSchema",
+                ));
+                resources.push(json!({
+                    "name": "flowschemas/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "FlowSchema",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(Self::cluster_resource(
+                    "prioritylevelconfigurations",
+                    "prioritylevelconfiguration",
+                    "PriorityLevelConfiguration",
+                ));
+                resources.push(json!({
+                    "name": "prioritylevelconfigurations/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "PriorityLevelConfiguration",
+                    "verbs": ["get", "patch", "update"]
+                }));
             },
             ("scheduling.k8s.io", "v1") => {
                 resources.push(Self::cluster_resource(
@@ -2209,6 +2364,59 @@ impl KubernetesApiClient {
         Ok(())
     }
 
+    pub async fn create_token_request(
+        &self,
+        namespace: &str,
+        sa_name: &str,
+        mut doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        let sa = self.get_service_account(namespace, sa_name).await?;
+        let sa_uid = sa
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("sa-uid");
+        let audiences: Vec<String> = doc
+            .pointer("/spec/audiences")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exp_secs = doc
+            .pointer("/spec/expirationSeconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(3600);
+        let lifetime = std::time::Duration::from_secs(exp_secs);
+        let ts = self
+            .token_service
+            .as_ref()
+            .ok_or_else(|| ApiserverError::Config {
+                reason: "token service unavailable".to_string(),
+            })?;
+        let token = ts.issue_token(namespace, sa_name, sa_uid, &audiences, lifetime)?;
+        let now_unix = crate::time::now_unix();
+        let exp_timestamp = crate::time::rfc3339_seconds(now_unix + exp_secs);
+
+        doc["apiVersion"] = json!("authentication.k8s.io/v1");
+        doc["kind"] = json!("TokenRequest");
+        if doc.get("metadata").is_none() {
+            doc["metadata"] = json!({});
+        }
+        if let Some(meta_obj) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta_obj
+                .entry("creationTimestamp".to_string())
+                .or_insert_with(|| json!(crate::time::now_rfc3339()));
+        }
+        doc["status"] = json!({
+            "token": token,
+            "expirationTimestamp": exp_timestamp,
+        });
+        Ok(doc)
+    }
+
     // --- Pod CRUD with Admission ---
 
     fn is_valid_sysctl_name(name: &str) -> bool {
@@ -2269,6 +2477,17 @@ impl KubernetesApiClient {
             .or_insert_with(|| json!("Always"));
         spec.entry("dnsPolicy".to_string())
             .or_insert_with(|| json!("ClusterFirst"));
+
+        let sa = spec
+            .get("serviceAccountName")
+            .or_else(|| spec.get("serviceAccount"))
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        spec.entry("serviceAccountName".to_string())
+            .or_insert_with(|| json!(sa));
+        spec.entry("serviceAccount".to_string())
+            .or_insert_with(|| json!(sa));
 
         for containers_key in ["containers", "initContainers"] {
             let Some(containers) = spec.get_mut(containers_key).and_then(Value::as_array_mut)
@@ -2466,6 +2685,73 @@ impl KubernetesApiClient {
         }
     }
 
+    async fn admit_limit_ranges(&self, namespace: &str, pod: &mut Value) {
+        let prefix = format!("{}/limitranges/{namespace}/", self.storage.prefix());
+        let Ok(kvs) = self.storage.list(&prefix).await else {
+            return;
+        };
+        for kv in kvs {
+            let Ok(lr_doc) = serde_json::from_slice::<Value>(&kv.value) else {
+                continue;
+            };
+            let Some(limits) = lr_doc.pointer("/spec/limits").and_then(Value::as_array) else {
+                continue;
+            };
+            for limit in limits {
+                if limit.get("type").and_then(Value::as_str) == Some("Container") {
+                    let def_lim = limit.get("default").and_then(Value::as_object);
+                    let def_req = limit.get("defaultRequest").and_then(Value::as_object);
+                    Self::apply_limit_range_to_pod(pod, def_lim, def_req);
+                }
+            }
+        }
+    }
+
+    fn merge_resource_map(
+        parent: &mut serde_json::Map<String, Value>,
+        key: &str,
+        defaults: &serde_json::Map<String, Value>,
+    ) {
+        let target = parent.entry(key.to_string()).or_insert_with(|| json!({}));
+        if let Some(target_map) = target.as_object_mut() {
+            for (k, v) in defaults {
+                target_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    fn apply_limit_range_to_pod(
+        pod: &mut Value,
+        def_lim: Option<&serde_json::Map<String, Value>>,
+        def_req: Option<&serde_json::Map<String, Value>>,
+    ) {
+        if def_lim.is_none() && def_req.is_none() {
+            return;
+        }
+        let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut) else {
+            return;
+        };
+        for c_key in ["containers", "initContainers"] {
+            let Some(containers) = spec.get_mut(c_key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for c in containers.iter_mut().filter_map(Value::as_object_mut) {
+                let res = c
+                    .entry("resources".to_string())
+                    .or_insert_with(|| json!({}));
+                let Some(resources_map) = res.as_object_mut() else {
+                    continue;
+                };
+                if let Some(limits) = def_lim {
+                    Self::merge_resource_map(resources_map, "limits", limits);
+                }
+                if let Some(requests) = def_req.or(def_lim) {
+                    Self::merge_resource_map(resources_map, "requests", requests);
+                }
+            }
+        }
+    }
+
     pub async fn create_pod(&self, namespace: &str, pod: Value) -> Result<Value, ApiserverError> {
         self.create_pod_options(namespace, pod, false).await
     }
@@ -2482,6 +2768,7 @@ impl KubernetesApiClient {
 
         self.check_auth_detailed("create", "", "pods", Some(namespace), Some(&name))?;
         Self::default_pod_spec(&mut pod);
+        self.admit_limit_ranges(namespace, &mut pod).await;
         Self::validate_pod_spec(&pod)?;
         self.admit_runtime_class(&mut pod).await?;
 
@@ -3006,6 +3293,7 @@ impl KubernetesApiClient {
             meta.insert("namespace".to_string(), json!(namespace));
             Self::stamp_creation_and_uid(meta, plural, &name, cur_rev);
         }
+        Self::init_generation(&mut doc);
         if doc
             .get("kind")
             .and_then(Value::as_str)
@@ -3169,7 +3457,45 @@ impl KubernetesApiClient {
             .await
     }
 
+    pub(crate) fn init_generation(doc: &mut Value) {
+        if doc.get("spec").is_some() {
+            if doc.get("metadata").is_none() {
+                doc["metadata"] = json!({});
+            }
+            if let Some(meta_obj) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                let gen_num = meta_obj
+                    .get("generation")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if gen_num <= 0 {
+                    meta_obj.insert("generation".to_string(), json!(1));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn update_generation(doc: &mut Value, old_doc: &Value) {
+        if old_doc.pointer("/metadata/generation").is_some()
+            || doc.get("spec").is_some()
+            || old_doc.get("spec").is_some()
+        {
+            let old_gen = old_doc
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            let new_gen = if doc.get("spec").is_some() && doc.get("spec") != old_doc.get("spec") {
+                old_gen + 1
+            } else {
+                old_gen
+            };
+            if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.insert("generation".to_string(), json!(new_gen));
+            }
+        }
+    }
+
     fn merge_updated_doc_metadata(doc: &mut Value, old_doc: &Value, namespace: &str, name: &str) {
+        Self::update_generation(doc, old_doc);
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("namespace".to_string(), json!(namespace));
             meta.insert("name".to_string(), json!(name));
@@ -3383,6 +3709,38 @@ impl KubernetesApiClient {
                 name: name.to_string(),
             })?;
         let old_doc: Value = serde_json::from_slice(&existing.value)?;
+        Self::update_generation(&mut doc, &old_doc);
+        if plural == "validatingadmissionpolicies" {
+            let gen_num = doc
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            let mut status = doc.get("status").cloned().unwrap_or_else(|| json!({}));
+            if let Some(status_obj) = status.as_object_mut() {
+                status_obj.insert("observedGeneration".to_string(), json!(gen_num));
+                if !status_obj.contains_key("typeChecking") {
+                    status_obj.insert("typeChecking".to_string(), json!({}));
+                }
+            }
+            doc["status"] = status;
+        }
+        if plural == "priorityclasses" {
+            if doc.get("preemptionPolicy").is_none() {
+                doc["preemptionPolicy"] = json!("PreemptLowerPriority");
+            }
+            if doc.get("value") != old_doc.get("value") {
+                return Err(ApiserverError::InvalidInput {
+                    field: "value".to_string(),
+                    reason: "PriorityClass value is immutable".to_string(),
+                });
+            }
+            if doc.get("preemptionPolicy") != old_doc.get("preemptionPolicy") {
+                return Err(ApiserverError::InvalidInput {
+                    field: "preemptionPolicy".to_string(),
+                    reason: "PriorityClass preemptionPolicy is immutable".to_string(),
+                });
+            }
+        }
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("name".to_string(), json!(name));
             if let Some(old_uid) = old_doc.get("metadata").and_then(|m| m.get("uid")) {
@@ -3536,6 +3894,24 @@ impl KubernetesApiClient {
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             Self::stamp_creation_and_uid(meta, plural, &name, cur_rev);
+        }
+        Self::init_generation(&mut doc);
+        if plural == "validatingadmissionpolicies" {
+            let gen_num = doc
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            let mut status = doc.get("status").cloned().unwrap_or_else(|| json!({}));
+            if let Some(status_obj) = status.as_object_mut() {
+                status_obj.insert("observedGeneration".to_string(), json!(gen_num));
+                if !status_obj.contains_key("typeChecking") {
+                    status_obj.insert("typeChecking".to_string(), json!({}));
+                }
+            }
+            doc["status"] = status;
+        }
+        if plural == "priorityclasses" && doc.get("preemptionPolicy").is_none() {
+            doc["preemptionPolicy"] = json!("PreemptLowerPriority");
         }
         if doc
             .get("kind")
@@ -4306,6 +4682,7 @@ impl KubernetesApiClient {
         if let Some(meta) = pv.get_mut("metadata").and_then(Value::as_object_mut) {
             Self::stamp_creation_and_uid(meta, "persistentvolumes", &name, cur_rev);
         }
+        Self::init_generation(&mut pv);
 
         let key = format!("{}/persistentvolumes/{name}", self.storage.prefix());
         let bytes = serde_json::to_vec(&pv)?;
@@ -5315,6 +5692,7 @@ impl KubernetesApiClient {
         if let Some(meta) = crd.get_mut("metadata").and_then(Value::as_object_mut) {
             Self::stamp_creation_and_uid(meta, "customresourcedefinitions", &name, cur_rev);
         }
+        Self::init_generation(&mut crd);
         if crd
             .pointer("/status/conditions")
             .and_then(Value::as_array)
@@ -5780,6 +6158,7 @@ impl KubernetesApiClient {
         mut resource: Value,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("create", group, plural, Some(namespace), Some(name))?;
+        Self::init_generation(&mut resource);
 
         // Admission reviews
         let mut adm_req = AdmissionRequest {
@@ -5876,6 +6255,9 @@ impl KubernetesApiClient {
 
         let old_bytes = self.storage.get(&key).await?;
         let old_obj: Option<Value> = old_bytes.and_then(|b| serde_json::from_slice(&b.value).ok());
+        if let Some(old) = &old_obj {
+            Self::update_generation(&mut resource, old);
+        }
 
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{}", self.storage.current_revision().await + 1),

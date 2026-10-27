@@ -414,6 +414,7 @@ struct BufferedWatchEvent {
     event_type: String, // "ADDED", "MODIFIED", "DELETED"
     key: String,
     object: Value,
+    prev_object: Option<Value>,
 }
 
 static WATCH_HUBS: LazyLock<Mutex<HashMap<usize, Arc<WatchHub>>>> =
@@ -472,10 +473,14 @@ async fn watch_hub_loop(hub: Arc<WatchHub>, mut raw_rx: WatchReceiver) {
         };
 
         let mut object = serde_json::from_slice(&event.kv.value).unwrap_or(Value::Null);
+        let prev_object: Option<Value> = event
+            .prev_kv
+            .as_ref()
+            .and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok());
         if object.is_null()
-            && let Some(prev) = &event.prev_kv
+            && let Some(prev) = &prev_object
         {
-            object = serde_json::from_slice(&prev.value).unwrap_or(Value::Null);
+            object = prev.clone();
         }
         if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert(
@@ -489,6 +494,7 @@ async fn watch_hub_loop(hub: Arc<WatchHub>, mut raw_rx: WatchReceiver) {
             event_type,
             key: event.kv.key,
             object,
+            prev_object,
         });
 
         if inner.buffer.len() >= 10_000 {
@@ -529,6 +535,7 @@ async fn watch_response(
             .get("fieldSelector")
             .and_then(|selector| selector.strip_prefix("metadata.name="))
             .map(str::to_owned),
+        field_selector: params.get("fieldSelector").cloned().unwrap_or_default(),
         label_selector: params.get("labelSelector").cloned().unwrap_or_default(),
         since: params
             .get("resourceVersion")
@@ -608,6 +615,7 @@ fn dispatch_is_namespaced(resource: &str) -> bool {
 struct WatchFilter {
     name: Option<String>,
     label_selector: String,
+    field_selector: String,
     since: u64,
     send_initial_events: bool,
     namespaced: bool,
@@ -634,10 +642,7 @@ impl WatchFilter {
         self.name.as_deref().is_none_or(|wanted| {
             object.pointer("/metadata/name").and_then(Value::as_str) == Some(wanted)
         }) && dispatch::matches_label_selector(object, &self.label_selector)
-    }
-
-    fn has_selector(&self) -> bool {
-        self.name.is_some() || !self.label_selector.trim().is_empty()
+            && dispatch::matches_field_selector(object, &self.field_selector)
     }
 }
 
@@ -730,19 +735,33 @@ async fn stream_watch(
         let mut kind = event.event_type.as_str();
         if !filter.accepts(&object) {
             if kind == "MODIFIED"
-                && event.resource_version > filter.since
-                && sent.remove(&key).is_some()
-                && send_event(&mut sender, "DELETED", &object).await.is_err()
+                && (event
+                    .prev_object
+                    .as_ref()
+                    .is_some_and(|prev| filter.accepts(prev))
+                    || sent.remove(&key).is_some())
             {
-                return;
+                sent.remove(&key);
+                if send_event(&mut sender, "DELETED", &object).await.is_err() {
+                    return;
+                }
             }
             continue;
         }
         found = true;
-        if kind == "MODIFIED" && !sent.contains_key(&key) && filter.has_selector() {
+        if kind == "MODIFIED"
+            && event
+                .prev_object
+                .as_ref()
+                .is_some_and(|prev| !filter.accepts(prev))
+        {
             kind = "ADDED";
         }
-        sent.insert(key, event.resource_version);
+        if kind == "DELETED" {
+            sent.remove(&key);
+        } else {
+            sent.insert(key, event.resource_version);
+        }
         last_delivered_rv = event.resource_version;
         if send_event(&mut sender, kind, &object).await.is_err() {
             return;
@@ -811,18 +830,32 @@ async fn stream_watch(
                 let mut kind = event.event_type.as_str();
                 if !filter.accepts(&object) {
                     if kind == "MODIFIED"
-                        && event.resource_version > filter.since
-                        && sent.remove(&key).is_some()
-                        && send_event(&mut sender, "DELETED", &object).await.is_err()
+                        && (event
+                            .prev_object
+                            .as_ref()
+                            .is_some_and(|prev| filter.accepts(prev))
+                            || sent.remove(&key).is_some())
                     {
-                        return;
+                        sent.remove(&key);
+                        if send_event(&mut sender, "DELETED", &object).await.is_err() {
+                            return;
+                        }
                     }
                     continue;
                 }
-                if kind == "MODIFIED" && !sent.contains_key(&key) && filter.has_selector() {
+                if kind == "MODIFIED"
+                    && event
+                        .prev_object
+                        .as_ref()
+                        .is_some_and(|prev| !filter.accepts(prev))
+                {
                     kind = "ADDED";
                 }
-                sent.insert(key, event.resource_version);
+                if kind == "DELETED" {
+                    sent.remove(&key);
+                } else {
+                    sent.insert(key, event.resource_version);
+                }
                 last_delivered_rv = event.resource_version;
                 if send_event(&mut sender, kind, &object).await.is_err() {
                     return;
@@ -1191,37 +1224,73 @@ fn group_item(group: &str, version: &str, resources: &Value) -> Value {
 }
 
 fn group_version_item(group: &str, version: &str, resources: &Value) -> Value {
-    let entries = resources
+    let empty_vec = Vec::new();
+    let items = resources
         .get("resources")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|resource| {
-                    json!({
-                        "resource": resource["name"],
-                        "singularResource": resource["singularName"],
-                        "shortNames": resource.get("shortNames").cloned().unwrap_or(json!([])),
-                        "responseKind": {
-                            "group": group,
-                            "version": version,
-                            "kind": resource["kind"]
-                        },
-                        "scope": if resource["namespaced"].as_bool() == Some(true) {
-                            "Namespaced"
-                        } else {
-                            "Cluster"
-                        },
-                        "verbs": resource["verbs"]
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .unwrap_or(&empty_vec);
+
+    let mut subresources_map: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for r in items {
+        let name = r.get("name").and_then(Value::as_str).unwrap_or_default();
+        if let Some((parent, sub)) = name.split_once('/') {
+            let (resp_group, resp_version, resp_kind) = if sub == "scale" {
+                ("autoscaling", "v1", "Scale")
+            } else {
+                (
+                    group,
+                    version,
+                    r.get("kind").and_then(Value::as_str).unwrap_or(""),
+                )
+            };
+            let sub_entry = json!({
+                "subresource": sub,
+                "responseKind": {
+                    "group": resp_group,
+                    "version": resp_version,
+                    "kind": resp_kind,
+                },
+                "verbs": r.get("verbs").cloned().unwrap_or_else(|| json!([]))
+            });
+            subresources_map
+                .entry(parent.to_string())
+                .or_default()
+                .push(sub_entry);
+        }
+    }
+
+    let mut top_resources = Vec::new();
+    for r in items {
+        let name = r.get("name").and_then(Value::as_str).unwrap_or_default();
+        if !name.contains('/') {
+            let subs = subresources_map.remove(name).unwrap_or_default();
+            let mut entry = json!({
+                "resource": name,
+                "singularResource": r.get("singularName").and_then(Value::as_str).unwrap_or_default(),
+                "shortNames": r.get("shortNames").cloned().unwrap_or_else(|| json!([])),
+                "responseKind": {
+                    "group": group,
+                    "version": version,
+                    "kind": r.get("kind").and_then(Value::as_str).unwrap_or_default()
+                },
+                "scope": if r["namespaced"].as_bool() == Some(true) {
+                    "Namespaced"
+                } else {
+                    "Cluster"
+                },
+                "verbs": r["verbs"]
+            });
+            if !subs.is_empty() {
+                entry["subresources"] = json!(subs);
+            }
+            top_resources.push(entry);
+        }
+    }
+
     json!({
         "version": version,
         "freshness": "Current",
-        "resources": entries
+        "resources": top_resources
     })
 }
 
@@ -1269,9 +1338,8 @@ fn error_response(err: &ApiserverError) -> Response<Body> {
         },
         ApiserverError::NotFound { .. } => (StatusCode::NOT_FOUND, "NotFound"),
         ApiserverError::Conflict { .. } => (StatusCode::CONFLICT, "AlreadyExists"),
-        ApiserverError::BadRequest { .. } | ApiserverError::InvalidInput { .. } => {
-            (StatusCode::BAD_REQUEST, "BadRequest")
-        },
+        ApiserverError::BadRequest { .. } => (StatusCode::BAD_REQUEST, "BadRequest"),
+        ApiserverError::InvalidInput { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "Invalid"),
         ApiserverError::Expired { continue_token } => {
             return json_response(
                 StatusCode::GONE,

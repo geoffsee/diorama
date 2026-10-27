@@ -8,6 +8,8 @@ mod api_crud_watch;
 mod apiserver_startup;
 #[path = "auth_rbac.rs"]
 mod auth_rbac;
+#[path = "conformance_c08.rs"]
+mod conformance_c08;
 #[path = "https_gateway.rs"]
 mod https_gateway;
 #[path = "patch_put_scale.rs"]
