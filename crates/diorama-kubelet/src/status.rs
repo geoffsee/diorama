@@ -147,6 +147,17 @@ fn collect_unready_containers<'a>(
 }
 
 /// Builds a Pod status from the latest container attempts.
+fn init_container_status_json(provider: &str, view: &ContainerView<'_>, pending: bool) -> Value {
+    let mut s = container_status_json(provider, view, pending);
+    if s.pointer("/state/terminated/exitCode")
+        .and_then(Value::as_i64)
+        == Some(0)
+    {
+        s["ready"] = json!(true);
+    }
+    s
+}
+
 #[must_use]
 pub fn pod_status(
     pod: &Value,
@@ -163,7 +174,7 @@ pub fn pod_status(
 
     let init_container_statuses: Vec<Value> = init_views
         .iter()
-        .map(|view| container_status_json(provider, view, !init_complete))
+        .map(|view| init_container_status_json(provider, view, !init_complete))
         .collect();
 
     let container_statuses: Vec<Value> = regular_views
@@ -326,29 +337,31 @@ fn effective_container_resources(spec: &Value) -> (Value, Option<Value>) {
     let Some(res_obj) = spec.get("resources").and_then(Value::as_object) else {
         return (json!({}), None);
     };
-    let limits = res_obj.get("limits").and_then(Value::as_object).cloned();
-    let mut requests = res_obj
+    let limits = res_obj
+        .get("limits")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+        .cloned();
+    let requests = res_obj
         .get("requests")
         .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    if let Some(lim) = &limits {
-        for (k, v) in lim {
-            requests.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    }
+        .filter(|m| !m.is_empty())
+        .cloned();
+
     let mut out = serde_json::Map::new();
-    if let Some(lim) = limits
-        && !lim.is_empty()
-    {
+    if let Some(lim) = limits.clone() {
         out.insert("limits".to_string(), Value::Object(lim));
     }
-    let alloc = if requests.is_empty() {
-        None
-    } else {
-        out.insert("requests".to_string(), Value::Object(requests.clone()));
-        Some(Value::Object(requests))
+    if let Some(req) = requests.clone() {
+        out.insert("requests".to_string(), Value::Object(req));
+    }
+
+    let alloc = match (requests, limits) {
+        (Some(req), _) => Some(Value::Object(req)),
+        (None, Some(lim)) => Some(Value::Object(lim)),
+        (None, None) => None,
     };
+
     (Value::Object(out), alloc)
 }
 
@@ -428,7 +441,14 @@ fn container_status_json(
         status["cpuset"] = json!(cpu.cpuset);
         status["exclusiveCPU"] = json!(cpu.exclusive);
         if cpu.exclusive {
-            status["allocatedResources"] = json!({ "cpu": cpu.cpuset });
+            if let Some(obj) = status
+                .get_mut("allocatedResources")
+                .and_then(Value::as_object_mut)
+            {
+                obj.insert("cpu".to_string(), json!(cpu.cpuset));
+            } else {
+                status["allocatedResources"] = json!({ "cpu": cpu.cpuset });
+            }
         }
     }
     status
@@ -503,6 +523,9 @@ pub fn observed_conditions(
         });
         if !reason.is_empty() {
             value["reason"] = json!(reason);
+        } else if kind == "PodScheduled" && status == "True" {
+            value["reason"] = Value::Null;
+            value["message"] = Value::Null;
         }
         if !message.is_empty() {
             value["message"] = json!(message);
@@ -551,15 +574,21 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
             {
                 waiting["message"] = json!(message);
             }
-            json!({
+            let (res, alloc) = effective_container_resources(c);
+            let mut s = json!({
                 "name": c.get("name").and_then(Value::as_str).unwrap_or("init"),
                 "image": c.get("image").and_then(Value::as_str).unwrap_or("unknown"),
                 "imageID": "",
                 "ready": false,
                 "started": false,
                 "restartCount": 0,
-                "state": { "waiting": waiting }
-            })
+                "state": { "waiting": waiting },
+                "resources": res,
+            });
+            if let Some(alloc_res) = alloc {
+                s["allocatedResources"] = alloc_res;
+            }
+            s
         })
         .collect();
 
@@ -575,15 +604,21 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
             if !has_inits && let Some(message) = message {
                 waiting["message"] = json!(message);
             }
-            json!({
+            let (res, alloc) = effective_container_resources(c);
+            let mut s = json!({
                 "name": c.get("name").and_then(Value::as_str).unwrap_or("main"),
                 "image": c.get("image").and_then(Value::as_str).unwrap_or("unknown"),
                 "imageID": "",
                 "ready": false,
                 "started": false,
                 "restartCount": 0,
-                "state": { "waiting": waiting }
-            })
+                "state": { "waiting": waiting },
+                "resources": res,
+            });
+            if let Some(alloc_res) = alloc {
+                s["allocatedResources"] = alloc_res;
+            }
+            s
         })
         .collect();
     let unready: Vec<&str> = statuses.iter().filter_map(|s| s["name"].as_str()).collect();
@@ -942,5 +977,99 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ContainerCreating")
         );
+    }
+
+    #[test]
+    fn test_init_container_terminated_success_is_ready() {
+        let pod = json!({
+            "metadata": { "name": "init-pod", "namespace": "default" },
+            "spec": {
+                "initContainers": [
+                    { "name": "init-1", "image": "busybox" }
+                ],
+                "containers": [
+                    { "name": "app", "image": "nginx" }
+                ]
+            }
+        });
+        let init_spec = &pod["spec"]["initContainers"][0];
+        let c_status = cri::ContainerStatus {
+            id: "c-init".to_string(),
+            metadata: Some(cri::ContainerMetadata {
+                name: "init-1".to_string(),
+                attempt: 0,
+            }),
+            state: cri::ContainerState::ContainerExited as i32,
+            exit_code: 0,
+            started_at: 1_000_000,
+            finished_at: 2_000_000,
+            reason: "Completed".to_string(),
+            image: Some(cri::ImageSpec {
+                image: "busybox".to_string(),
+                user_specified_image: "busybox".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let init_view = ContainerView {
+            spec: init_spec,
+            latest: Some(&c_status),
+            previous: None,
+            ready: false,
+            backoff: None,
+            waiting: None,
+            cpu: None,
+        };
+        let init_views = [init_view];
+        let views = PodViews {
+            containers: &[],
+            init_containers: &init_views,
+            ephemeral_containers: &[],
+        };
+        let status = pod_status(
+            &pod,
+            "mock",
+            "192.168.1.10",
+            Some("10.244.0.15"),
+            true,
+            RestartPolicy::Always,
+            views,
+        );
+        let inits = status
+            .pointer("/initContainerStatuses")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0]["ready"], true);
+    }
+
+    #[test]
+    fn test_effective_container_resources_omitted_keys() {
+        let container = json!({
+            "name": "app",
+            "image": "nginx",
+            "resources": {
+                "limits": { "memory": "256Mi" },
+                "requests": { "memory": "128Mi" }
+            }
+        });
+        let (res, alloc) = effective_container_resources(&container);
+        assert!(res.pointer("/requests/cpu").is_none());
+        assert!(res.pointer("/limits/cpu").is_none());
+        assert_eq!(
+            res.pointer("/requests/memory").and_then(Value::as_str),
+            Some("128Mi")
+        );
+        assert_eq!(
+            res.pointer("/limits/memory").and_then(Value::as_str),
+            Some("256Mi")
+        );
+        if let Some(alloc_res) = alloc {
+            assert!(alloc_res.get("cpu").is_none());
+            assert_eq!(
+                alloc_res.get("memory").and_then(Value::as_str),
+                Some("128Mi")
+            );
+        }
     }
 }
