@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 
 use diorama_apiserver::time::{now_rfc3339, rfc3339_seconds};
 
-use crate::workload::{PodQoSClass, RestartPolicy, cri, determine_pod_qos, secs_from_nanos};
+use crate::workload::{
+    PodQoSClass, RestartPolicy, cri, determine_pod_qos, is_restartable_init, secs_from_nanos,
+};
 
 /// CPU-manager placement reported on a container status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,77 @@ pub struct PodViews<'a> {
     pub init_containers: &'a [ContainerView<'a>],
 }
 
+fn derive_init_state<'a>(
+    init_views: &'a [ContainerView<'a>],
+    policy: RestartPolicy,
+) -> (bool, bool, Vec<&'a str>) {
+    let init_complete = init_views.is_empty()
+        || init_views.iter().all(|v| {
+            if is_restartable_init(v.spec) {
+                v.latest.is_some_and(|s| {
+                    state_of(s) == cri::ContainerState::ContainerRunning
+                        || (state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0)
+                })
+            } else {
+                v.latest.is_some_and(|s| {
+                    state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
+                })
+            }
+        });
+
+    let init_failed = init_views.iter().any(|v| {
+        if is_restartable_init(v.spec) {
+            false
+        } else {
+            v.latest.is_some_and(|s| {
+                state_of(s) == cri::ContainerState::ContainerExited
+                    && s.exit_code != 0
+                    && !policy.restarts(s.exit_code)
+            })
+        }
+    });
+
+    let unready_init: Vec<&'a str> = init_views
+        .iter()
+        .filter(|v| {
+            if is_restartable_init(v.spec) {
+                !v.latest.is_some_and(|s| {
+                    state_of(s) == cri::ContainerState::ContainerRunning
+                        || (state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0)
+                })
+            } else {
+                !v.latest.is_some_and(|s| {
+                    state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
+                })
+            }
+        })
+        .filter_map(|v| v.spec.get("name").and_then(Value::as_str))
+        .collect();
+
+    (init_complete, init_failed, unready_init)
+}
+
+fn collect_unready_containers<'a>(
+    regular_statuses: &'a [Value],
+    init_views: &'a [ContainerView<'_>],
+    init_statuses: &'a [Value],
+) -> Vec<&'a str> {
+    let mut unready: Vec<&'a str> = regular_statuses
+        .iter()
+        .filter(|s| s["ready"].as_bool() != Some(true))
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    for (view, s) in init_views.iter().zip(init_statuses.iter()) {
+        if is_restartable_init(view.spec)
+            && s["ready"].as_bool() != Some(true)
+            && let Some(n) = s["name"].as_str()
+        {
+            unready.push(n);
+        }
+    }
+    unready
+}
+
 /// Builds a Pod status from the latest container attempts.
 #[must_use]
 pub fn pod_status(
@@ -85,30 +158,7 @@ pub fn pod_status(
 ) -> Value {
     let init_views = views.init_containers;
     let regular_views = views.containers;
-    let init_complete = init_views.is_empty()
-        || init_views.iter().all(|v| {
-            v.latest.is_some_and(|s| {
-                state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
-            })
-        });
-
-    let init_failed = init_views.iter().any(|v| {
-        v.latest.is_some_and(|s| {
-            state_of(s) == cri::ContainerState::ContainerExited
-                && s.exit_code != 0
-                && !policy.restarts(s.exit_code)
-        })
-    });
-
-    let unready_init: Vec<&str> = init_views
-        .iter()
-        .filter(|v| {
-            !v.latest.is_some_and(|s| {
-                state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
-            })
-        })
-        .filter_map(|v| v.spec.get("name").and_then(Value::as_str))
-        .collect();
+    let (init_complete, init_failed, unready_init) = derive_init_state(init_views, policy);
 
     let init_container_statuses: Vec<Value> = init_views
         .iter()
@@ -133,11 +183,8 @@ pub fn pod_status(
         "Pending"
     };
 
-    let unready: Vec<&str> = container_statuses
-        .iter()
-        .filter(|s| s["ready"].as_bool() != Some(true))
-        .filter_map(|s| s["name"].as_str())
-        .collect();
+    let unready =
+        collect_unready_containers(&container_statuses, init_views, &init_container_statuses);
 
     let conditions = observed_conditions(
         pod,
@@ -170,6 +217,10 @@ pub fn pod_status(
         } else {
             vec![json!({ "ip": pod_ip })]
         };
+    let generation = pod
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
     let mut status = json!({
         "phase": phase,
         "qosClass": qos,
@@ -179,7 +230,8 @@ pub fn pod_status(
         "podIPs": pod_ips,
         "startTime": start_time,
         "conditions": conditions,
-        "containerStatuses": container_statuses
+        "containerStatuses": container_statuses,
+        "observedGeneration": generation,
     });
     if let Some(resize_status) = determine_resize_status(pod, &container_statuses) {
         status["resize"] = json!(resize_status.as_str());
@@ -321,7 +373,15 @@ fn container_status_json(
                 json!({ "waiting": { "reason": "ContainerCreating" } })
             },
             cri::ContainerState::ContainerRunning => {
-                status["ready"] = json!(view.ready);
+                let ready = if is_restartable_init(view.spec)
+                    && view.spec.get("readinessProbe").is_none()
+                    && view.spec.get("startupProbe").is_none()
+                {
+                    true
+                } else {
+                    view.ready
+                };
+                status["ready"] = json!(ready);
                 status["started"] = json!(true);
                 json!({ "running": { "startedAt": nanos_to_rfc3339(latest.started_at) } })
             },
@@ -400,6 +460,10 @@ pub fn observed_conditions(
         };
         ("False", "ContainersNotInitialized", msg)
     };
+    let generation = pod
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
     let condition = |kind: &str, status: &str, reason: &str, message: &str| {
         let transition = existing
             .iter()
@@ -411,7 +475,8 @@ pub fn observed_conditions(
             "type": kind,
             "status": status,
             "lastProbeTime": Value::Null,
-            "lastTransitionTime": transition
+            "lastTransitionTime": transition,
+            "observedGeneration": generation,
         });
         if !reason.is_empty() {
             value["reason"] = json!(reason);
@@ -503,6 +568,10 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
         PodQoSClass::Burstable => "Burstable",
         PodQoSClass::BestEffort => "BestEffort",
     };
+    let generation = pod
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
     let mut status = json!({
         "phase": "Pending",
         "qosClass": qos,
@@ -510,7 +579,8 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
         "hostIPs": [{ "ip": node_ip }],
         "startTime": pod.pointer("/status/startTime").cloned().unwrap_or_else(|| json!(now_rfc3339())),
         "conditions": observed_conditions(pod, "Pending", &unready, false, !has_inits, &unready_inits),
-        "containerStatuses": statuses
+        "containerStatuses": statuses,
+        "observedGeneration": generation,
     });
     if let Some(pip) = pod
         .pointer("/status/podIP")

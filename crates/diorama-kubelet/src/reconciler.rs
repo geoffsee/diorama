@@ -8,13 +8,14 @@
 //! period, removes the sandbox and deletes the Pod object.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use diorama_apiserver::time::{now_unix, parse_rfc3339_seconds};
+use diorama_apiserver::time::{now_rfc3339, now_unix, parse_rfc3339_seconds};
 use diorama_apiserver::{ApiserverError, ApiserverService, KubernetesApiClient};
 
 use crate::config::{
@@ -30,11 +31,11 @@ use crate::workload::{
     LABEL_POD_NAME, LABEL_POD_NAMESPACE, LABEL_POD_UID, LogOptions, MANAGED_BY, ReconcileReport,
     RestartPolicy, RuntimeProvider, WorkloadRestartReport, apply_fs_group_ownership_with_options,
     check_pod_restart_need, chmod_volume_file, container_labels, cri, determine_pod_qos,
-    is_container_cpu_pinning_eligible, parse_cpu_quantity_milli, parse_memory_quantity_bytes,
-    pod_fs_group, prune_stale_volume_files, resolve_downward_field_path,
-    resolve_downward_resource_field, safe_volume_path, sandbox_labels, secs_from_nanos,
-    stage_configmap_files, stage_projected_clustertrustbundle, stage_projected_downward_api,
-    stage_projected_sa_token, stage_secret_files, write_volume_file,
+    is_container_cpu_pinning_eligible, is_restartable_init, parse_cpu_quantity_milli,
+    parse_memory_quantity_bytes, pod_fs_group, prune_stale_volume_files,
+    resolve_downward_field_path, resolve_downward_resource_field, safe_volume_path, sandbox_labels,
+    secs_from_nanos, stage_configmap_files, stage_projected_clustertrustbundle,
+    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files, write_volume_file,
 };
 
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 10;
@@ -1338,7 +1339,7 @@ fn container_config_with_env(
         .unwrap_or(&empty_vec);
     let default_root = Path::new("/var/lib/kubelet");
     let root = root_dir.unwrap_or(default_root);
-    let mounts = build_container_mounts(container, spec_volumes, root, uid, &envs)?;
+    let mounts = build_container_mounts(container, spec_volumes, root, uid, &envs, pod)?;
     let resources = build_container_resources(container);
     let security_context = build_security_context(pod, container)?;
     let linux =
@@ -1455,54 +1456,175 @@ fn validate_sub_path(sub_path: &str) -> Result<(), KubeletError> {
     Ok(())
 }
 
+fn generate_etc_hosts_content(pod: &Value, pod_ip: &str) -> String {
+    let mut content =
+        String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+    let ns = pod
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("localhost");
+    let hostname = pod.pointer("/spec/hostname").and_then(Value::as_str);
+    let subdomain = pod.pointer("/spec/subdomain").and_then(Value::as_str);
+    let ip = if pod_ip.is_empty() {
+        "127.0.0.1"
+    } else {
+        pod_ip
+    };
+
+    if let (Some(h), Some(s)) = (hostname, subdomain) {
+        if !h.is_empty() && !s.is_empty() {
+            let _ = writeln!(content, "{ip}\t{h}.{s}.{ns}.svc.cluster.local\t{h}");
+        } else {
+            let host = hostname.unwrap_or(pod_name);
+            let _ = writeln!(content, "{ip}\t{host}");
+        }
+    } else {
+        let host = hostname.unwrap_or(pod_name);
+        let _ = writeln!(content, "{ip}\t{host}");
+    }
+
+    if let Some(host_aliases) = pod.pointer("/spec/hostAliases").and_then(Value::as_array) {
+        content.push_str(&format_host_aliases(host_aliases));
+    }
+    content
+}
+
+fn format_host_aliases(host_aliases: &[Value]) -> String {
+    let mut out = String::new();
+    if host_aliases.is_empty() {
+        return out;
+    }
+    out.push_str("# Entries added by HostAliases.\n");
+    for ha in host_aliases {
+        let (Some(ha_ip), Some(hostnames)) = (
+            ha.get("ip").and_then(Value::as_str),
+            ha.get("hostnames").and_then(Value::as_array),
+        ) else {
+            continue;
+        };
+        let names: Vec<&str> = hostnames.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            let _ = writeln!(out, "{ha_ip}\t{}", names.join("\t"));
+        }
+    }
+    out
+}
+
+fn generate_etc_hosts(pod_dir: &Path, pod: &Value, pod_ip: &str) -> std::io::Result<()> {
+    let content = generate_etc_hosts_content(pod, pod_ip);
+    let hosts_path = pod_dir.join("etc-hosts");
+    std::fs::write(&hosts_path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&hosts_path, std::fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
+}
+
+fn count_volume_mounts(container: &Value, vol_name: &str) -> (usize, usize) {
+    let mut total = 0;
+    let mut subpath = 0;
+    let Some(mounts) = container.get("volumeMounts").and_then(Value::as_array) else {
+        return (0, 0);
+    };
+    for mount in mounts {
+        if mount.get("name").and_then(Value::as_str) == Some(vol_name) {
+            total += 1;
+            if mount.get("subPath").is_some() || mount.get("subPathExpr").is_some() {
+                subpath += 1;
+            }
+        }
+    }
+    (total, subpath)
+}
+
+fn is_subpath_only_volume(pod: &Value, vol_name: &str) -> bool {
+    let mut mount_count = 0;
+    let mut subpath_count = 0;
+    for key in ["/spec/containers", "/spec/initContainers"] {
+        let Some(containers) = pod.pointer(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for container in containers {
+            let (tot, sub) = count_volume_mounts(container, vol_name);
+            mount_count += tot;
+            subpath_count += sub;
+        }
+    }
+    mount_count > 0 && mount_count == subpath_count
+}
+
 fn build_container_mounts(
     container: &Value,
     spec_volumes: &[Value],
     root: &Path,
     uid: &str,
     envs: &[cri::KeyValue],
+    pod: &Value,
 ) -> Result<Vec<cri::Mount>, KubeletError> {
     let mut mounts = Vec::new();
-    let Some(vol_mounts) = container.get("volumeMounts").and_then(Value::as_array) else {
-        return Ok(mounts);
-    };
-    for vm in vol_mounts {
-        let Some(mount_path) = vm.get("mountPath").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(vol_name) = vm.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let readonly = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false);
-        let sub_path_expr = vm.get("subPathExpr").and_then(Value::as_str).unwrap_or("");
-        let resolved_sub_path = if sub_path_expr.is_empty() {
-            vm.get("subPath")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        } else {
-            expand_k8s_env(sub_path_expr, envs)
-        };
-        validate_sub_path(&resolved_sub_path)?;
+    let vol_mounts = container.get("volumeMounts").and_then(Value::as_array);
+    if let Some(vol_mounts) = vol_mounts {
+        for vm in vol_mounts {
+            let Some(mount_path) = vm.get("mountPath").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(vol_name) = vm.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let readonly = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false);
+            let sub_path_expr = vm.get("subPathExpr").and_then(Value::as_str).unwrap_or("");
+            let resolved_sub_path = if sub_path_expr.is_empty() {
+                vm.get("subPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                expand_k8s_env(sub_path_expr, envs)
+            };
+            validate_sub_path(&resolved_sub_path)?;
 
-        let Some(vol) = spec_volumes
-            .iter()
-            .find(|v| v.get("name").and_then(Value::as_str) == Some(vol_name))
-        else {
-            continue;
-        };
+            let Some(vol) = spec_volumes
+                .iter()
+                .find(|v| v.get("name").and_then(Value::as_str) == Some(vol_name))
+            else {
+                continue;
+            };
 
-        if let Some(host_path) =
-            resolve_volume_host_path(root, uid, vol, vol_name, &resolved_sub_path)
-        {
+            if let Some(host_path) =
+                resolve_volume_host_path(root, uid, vol, vol_name, &resolved_sub_path)
+            {
+                mounts.push(cri::Mount {
+                    container_path: mount_path.to_string(),
+                    host_path: host_path.to_string_lossy().to_string(),
+                    readonly,
+                    ..cri::Mount::default()
+                });
+            }
+        }
+    }
+
+    let host_network = pod
+        .pointer("/spec/hostNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !host_network && !mounts.iter().any(|m| m.container_path == "/etc/hosts") {
+        let host_etc_hosts = root.join("pods").join(uid).join("etc-hosts");
+        if host_etc_hosts.exists() {
             mounts.push(cri::Mount {
-                container_path: mount_path.to_string(),
-                host_path: host_path.to_string_lossy().to_string(),
-                readonly,
+                container_path: "/etc/hosts".to_string(),
+                host_path: host_etc_hosts.to_string_lossy().to_string(),
+                readonly: false,
                 ..cri::Mount::default()
             });
         }
     }
+
     Ok(mounts)
 }
 
@@ -3129,23 +3251,114 @@ impl PodReconciler {
         Ok(())
     }
 
-    /// Executes a container's preStop hook command synchronously if configured.
-    async fn execute_pre_stop_hook(&self, container_id: &str, container: &Value) {
-        if let Some(cmd) = container
-            .pointer("/lifecycle/preStop/exec/command")
-            .and_then(Value::as_array)
-        {
-            let command: Vec<String> = cmd
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect();
+    async fn execute_lifecycle_hook(
+        &self,
+        container_id: &str,
+        container: &Value,
+        hook_val: &Value,
+        pod_ip: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(exec) = hook_val.get("exec") {
+            let cmd_arr = exec.get("command").and_then(Value::as_array);
+            let command: Vec<String> = cmd_arr
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             if !command.is_empty() {
-                let _ = self
+                let timeout = hook_val
+                    .get("timeoutSeconds")
+                    .and_then(Value::as_i64)
+                    .filter(|t| *t > 0)
+                    .unwrap_or(EXEC_TIMEOUT_SECS);
+                let res = self
                     .runtime
-                    .exec_sync(container_id, &command, EXEC_TIMEOUT_SECS)
-                    .await;
+                    .exec_sync(container_id, &command, timeout)
+                    .await
+                    .map_err(|e| format!("exec hook failed: {e}"))?;
+                if res.exit_code != 0 {
+                    return Err(format!("exec hook exited with status {}", res.exit_code));
+                }
             }
+            return Ok(());
+        }
+        if let Some(http) = hook_val.get("httpGet") {
+            let ok = http_probe(&self.runtime, container_id, pod_ip, container, http).await;
+            if !ok {
+                return Err("httpGet hook failed or returned non-2xx/3xx status".to_string());
+            }
+            return Ok(());
+        }
+        if let Some(sleep) = hook_val.get("sleep") {
+            let seconds = sleep.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+            let clamped = seconds.min(30);
+            if clamped > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(clamped)).await;
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn emit_failed_post_start_event(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        err: &str,
+    ) {
+        let now = now_rfc3339();
+        let event_name = format!("{}.{:x}", pod_name, now_unix());
+        let doc = json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": event_name,
+                "namespace": namespace,
+            },
+            "involvedObject": {
+                "kind": "Pod",
+                "name": pod_name,
+                "namespace": namespace,
+                "uid": pod_uid,
+                "apiVersion": "v1",
+                "fieldPath": format!("spec.containers{{{container_name}}}"),
+            },
+            "reason": "FailedPostStartHook",
+            "message": format!("failed to execute postStart hook for container {container_name}: {err}"),
+            "type": "Warning",
+            "firstTimestamp": now,
+            "lastTimestamp": now,
+            "count": 1,
+        });
+        if let Some(apiserver) = &self.apiserver {
+            let _ = apiserver
+                .admin_client()
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        } else {
+            let _ = self
+                .client
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        }
+    }
+
+    /// Executes a container's preStop hook synchronously if configured.
+    async fn execute_pre_stop_hook(
+        &self,
+        container_id: &str,
+        container: &Value,
+        pod_ip: Option<&str>,
+    ) {
+        if let Some(pre_stop) = container.pointer("/lifecycle/preStop") {
+            let _ = self
+                .execute_lifecycle_hook(container_id, container, pre_stop, pod_ip)
+                .await;
         }
     }
 
@@ -3213,6 +3426,7 @@ impl PodReconciler {
         pod: &Value,
         container: &Value,
         attempt: u32,
+        pod_ip: Option<&str>,
     ) -> Result<String, StartFailure> {
         self.ensure_image(container, sandbox_config).await?;
         let namespace = pod
@@ -3252,6 +3466,25 @@ impl PodReconciler {
                 reason: "RunContainerError",
                 message: e.to_string(),
             })?;
+        if let Some(post_start) = container.pointer("/lifecycle/postStart")
+            && let Err(err) = self
+                .execute_lifecycle_hook(&id, container, post_start, pod_ip)
+                .await
+        {
+            let _ = self.runtime.stop_container(&id, 0).await;
+            let _ = self.runtime.remove_container(&id).await;
+            let c_name = container_name_of(container);
+            let uid = pod
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            self.emit_failed_post_start_event(namespace, name, uid, c_name, &err)
+                .await;
+            return Err(StartFailure {
+                reason: "FailedPostStartHook",
+                message: format!("failed postStart hook for container {c_name}: {err}"),
+            });
+        }
         Ok(id)
     }
 
@@ -3338,6 +3571,22 @@ impl PodReconciler {
             .filter(|ip| !ip.is_empty())
     }
 
+    async fn resolve_pod_ip(&self, sandbox_id: &str, pod: &Value) -> Option<String> {
+        if let Some(ip) = self.fetch_sandbox_pod_ip(sandbox_id).await {
+            return Some(ip);
+        }
+        if pod
+            .pointer("/spec/hostNetwork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Some(self.node_ip.clone());
+        }
+        pod.pointer("/status/podIP")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     async fn probe_and_prune(
         &self,
         sandbox_id: &str,
@@ -3369,14 +3618,19 @@ impl PodReconciler {
         if matches!(phase, Some("Running" | "Succeeded" | "Failed")) {
             return;
         }
+        let generation = orig_pod
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
         let msg = err.to_string();
         let status = json!({
             "phase": "Pending",
+            "observedGeneration": generation,
             "conditions": [
-                { "type": "PodScheduled", "status": "True" },
-                { "type": "Initialized", "status": "True" },
-                { "type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": msg },
-                { "type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": msg },
+                { "type": "PodScheduled", "status": "True", "observedGeneration": generation },
+                { "type": "Initialized", "status": "True", "observedGeneration": generation },
+                { "type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": msg, "observedGeneration": generation },
+                { "type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": msg, "observedGeneration": generation },
             ],
         });
         let _ = self
@@ -3415,12 +3669,13 @@ impl PodReconciler {
                 return Err(e);
             },
         };
-        let pod_ip = self.fetch_sandbox_pod_ip(&sandbox_id).await;
+        let pod_ip = self.resolve_pod_ip(&sandbox_id, &enriched).await;
         if let Some(ip) = &pod_ip
             && enriched.pointer("/status/podIP").and_then(Value::as_str) != Some(ip.as_str())
         {
             enriched["status"]["podIP"] = json!(ip);
         }
+        self.sync_etc_hosts(&enriched, pod_ip.as_deref())?;
         let pod = &enriched;
         let empty = Vec::new();
         let spec_init_containers = pod
@@ -3450,6 +3705,13 @@ impl PodReconciler {
         if all_inits_complete {
             self.reconcile_app_containers(&ctx, spec_containers, &statuses, &mut state)
                 .await?;
+            self.stop_sidecars_if_app_completed(
+                &ctx,
+                spec_init_containers,
+                spec_containers,
+                &mut statuses,
+            )
+            .await?;
         }
 
         self.probe_and_prune(
@@ -3461,13 +3723,46 @@ impl PodReconciler {
             &mut state,
         )
         .await?;
-        let views = self.build_views(namespace, pod, spec_containers, &statuses, &state);
-        let init_views = self.build_views(namespace, pod, spec_init_containers, &statuses, &state);
+        self.publish_synced_status(
+            &ctx,
+            orig_pod,
+            spec_containers,
+            spec_init_containers,
+            &statuses,
+            &state,
+        )
+        .await
+    }
+
+    fn sync_etc_hosts(&self, enriched: &Value, pod_ip: Option<&str>) -> Result<(), KubeletError> {
+        let host_network = enriched
+            .pointer("/spec/hostNetwork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !host_network {
+            let pod_dir = self.root_dir.join("pods").join(pod_uid(enriched)?);
+            let effective_ip = pod_ip.unwrap_or("");
+            let _ = generate_etc_hosts(&pod_dir, enriched, effective_ip);
+        }
+        Ok(())
+    }
+
+    async fn publish_synced_status(
+        &self,
+        ctx: &SyncContext<'_>,
+        orig_pod: &Value,
+        spec_containers: &[Value],
+        spec_inits: &[Value],
+        statuses: &[cri::ContainerStatus],
+        state: &SyncState,
+    ) -> Result<(), KubeletError> {
+        let views = self.build_views(ctx.namespace, ctx.pod, spec_containers, statuses, state);
+        let init_views = self.build_views(ctx.namespace, ctx.pod, spec_inits, statuses, state);
         let mut status = pod_status(
             orig_pod,
             self.runtime.provider_name(),
             &self.node_ip,
-            pod_ip.as_deref(),
+            ctx.pod_ip.as_deref(),
             true,
             RestartPolicy::of(orig_pod),
             PodViews {
@@ -3481,8 +3776,161 @@ impl PodReconciler {
         {
             status["nominatedNodeName"] = json!(nom);
         }
-        self.patch_status_if_changed(namespace, name, orig_pod, status)
+        self.patch_status_if_changed(ctx.namespace, pod_name(orig_pod), orig_pod, status)
             .await
+    }
+
+    async fn start_init_attempt(
+        &self,
+        ctx: &SyncContext<'_>,
+        init_container: &Value,
+        attempt: u32,
+        state: &mut SyncState,
+    ) -> Result<(), KubeletError> {
+        let c_name = container_name_of(init_container);
+        match self
+            .start_attempt(
+                ctx.sandbox_id,
+                ctx.sandbox_config,
+                ctx.pod,
+                init_container,
+                attempt,
+                ctx.pod_ip.as_deref(),
+            )
+            .await
+        {
+            Ok(_) => {
+                state.started_now.insert(c_name.to_string());
+            },
+            Err(failure) => {
+                state
+                    .waiting
+                    .insert(c_name.to_string(), (failure.reason, failure.message));
+            },
+        }
+        Ok(())
+    }
+
+    fn schedule_restart_always(
+        &self,
+        namespace: &str,
+        pod: &Value,
+        c_name: &str,
+        latest: &cri::ContainerStatus,
+        state: &mut SyncState,
+    ) -> Option<u32> {
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self.restart_decision(namespace, pod_name(pod), uid, c_name, latest) {
+            Ok(attempt) => Some(attempt),
+            Err(message) => {
+                state.backoffs.insert(c_name.to_string(), message);
+                None
+            },
+        }
+    }
+
+    async fn check_sidecar_init_started(
+        &self,
+        latest: &cri::ContainerStatus,
+        init_container: &Value,
+        pod_ip: Option<&str>,
+        state: &mut SyncState,
+    ) -> Result<bool, KubeletError> {
+        let started_at_secs = secs_from_nanos(latest.started_at).unwrap_or(0);
+        let c_name = container_name_of(init_container);
+        if let Some(startup) = init_container.get("startupProbe") {
+            let now = now_unix();
+            let startup_ok = self
+                .evaluate_single_probe(
+                    &latest.id,
+                    init_container,
+                    startup,
+                    "startup",
+                    started_at_secs,
+                    now,
+                    pod_ip,
+                )
+                .await?;
+            state.ready.insert(c_name.to_string(), startup_ok);
+            Ok(startup_ok)
+        } else {
+            let (_, is_ready) = self
+                .evaluate_container_probes(&latest.id, init_container, started_at_secs, pod_ip)
+                .await?;
+            state.ready.insert(c_name.to_string(), is_ready);
+            Ok(true)
+        }
+    }
+
+    async fn reconcile_sidecar_init(
+        &self,
+        ctx: &SyncContext<'_>,
+        init_container: &Value,
+        latest: Option<&cri::ContainerStatus>,
+        is_terminating: bool,
+        all_apps_terminated: bool,
+        state: &mut SyncState,
+    ) -> Result<bool, KubeletError> {
+        let c_name = container_name_of(init_container);
+        let Some(status) = latest else {
+            self.start_init_attempt(ctx, init_container, 0, state)
+                .await?;
+            return Ok(false);
+        };
+        match state_of(status) {
+            cri::ContainerState::ContainerRunning => {
+                let started = self
+                    .check_sidecar_init_started(
+                        status,
+                        init_container,
+                        ctx.pod_ip.as_deref(),
+                        state,
+                    )
+                    .await?;
+                Ok(started)
+            },
+            cri::ContainerState::ContainerCreated => {
+                self.runtime.start_container(&status.id).await?;
+                state.started_now.insert(c_name.to_string());
+                Ok(false)
+            },
+            cri::ContainerState::ContainerExited => {
+                if is_terminating || all_apps_terminated {
+                    return Ok(true);
+                }
+                let Some(attempt) =
+                    self.schedule_restart_always(ctx.namespace, ctx.pod, c_name, status, state)
+                else {
+                    return Ok(false);
+                };
+                self.start_init_attempt(ctx, init_container, attempt, state)
+                    .await?;
+                Ok(false)
+            },
+            cri::ContainerState::ContainerUnknown => Ok(false),
+        }
+    }
+
+    fn are_all_app_containers_terminated(pod: &Value, statuses: &[cri::ContainerStatus]) -> bool {
+        let empty = Vec::new();
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        if containers.is_empty() {
+            return false;
+        }
+        let grouped = attempts_by_name(statuses);
+        containers.iter().all(|c| {
+            let name = container_name_of(c);
+            grouped
+                .get(name)
+                .and_then(|a| a.last())
+                .is_some_and(|s| state_of(s) == cri::ContainerState::ContainerExited)
+        })
     }
 
     async fn reconcile_init_containers(
@@ -3492,52 +3940,98 @@ impl PodReconciler {
         statuses: &[cri::ContainerStatus],
         state: &mut SyncState,
     ) -> Result<bool, KubeletError> {
+        let is_terminating = ctx.pod.pointer("/metadata/deletionTimestamp").is_some();
+        let all_apps_terminated = Self::are_all_app_containers_terminated(ctx.pod, statuses);
+
         for init_container in spec_init_containers {
             let c_name = container_name_of(init_container);
             let latest = attempts_by_name(statuses)
                 .get(c_name)
                 .and_then(|attempts| attempts.last().copied());
-            let is_complete = latest.is_some_and(|s| {
-                state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
-            });
-            if is_complete {
-                continue;
-            }
-            let Some(attempt) = self
-                .next_attempt(
-                    ctx.namespace,
-                    ctx.pod,
-                    init_container,
-                    latest,
-                    ctx.pod_ip.as_deref(),
-                    state,
-                )
-                .await?
-            else {
+
+            if is_restartable_init(init_container) {
+                let ready_to_proceed = self
+                    .reconcile_sidecar_init(
+                        ctx,
+                        init_container,
+                        latest,
+                        is_terminating,
+                        all_apps_terminated,
+                        state,
+                    )
+                    .await?;
+                if !ready_to_proceed {
+                    return Ok(false);
+                }
+            } else {
+                let is_complete = latest.is_some_and(|s| {
+                    state_of(s) == cri::ContainerState::ContainerExited && s.exit_code == 0
+                });
+                if is_complete {
+                    continue;
+                }
+                let Some(attempt) = self
+                    .next_attempt(
+                        ctx.namespace,
+                        ctx.pod,
+                        init_container,
+                        latest,
+                        ctx.pod_ip.as_deref(),
+                        state,
+                    )
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                self.start_init_attempt(ctx, init_container, attempt, state)
+                    .await?;
                 return Ok(false);
-            };
-            match self
-                .start_attempt(
-                    ctx.sandbox_id,
-                    ctx.sandbox_config,
-                    ctx.pod,
-                    init_container,
-                    attempt,
-                )
-                .await
-            {
-                Ok(_) => {
-                    state.started_now.insert(c_name.to_string());
-                },
-                Err(failure) => {
-                    state
-                        .waiting
-                        .insert(c_name.to_string(), (failure.reason, failure.message));
-                },
             }
-            return Ok(false);
         }
         Ok(true)
+    }
+
+    async fn stop_sidecars_if_app_completed(
+        &self,
+        ctx: &SyncContext<'_>,
+        spec_init_containers: &[Value],
+        spec_containers: &[Value],
+        statuses: &mut Vec<cri::ContainerStatus>,
+    ) -> Result<(), KubeletError> {
+        let policy = RestartPolicy::of(ctx.pod);
+        if spec_containers.is_empty() {
+            return Ok(());
+        }
+        let grouped = attempts_by_name(statuses);
+        let all_apps_done = spec_containers.iter().all(|c| {
+            let name = container_name_of(c);
+            grouped.get(name).and_then(|a| a.last()).is_some_and(|s| {
+                state_of(s) == cri::ContainerState::ContainerExited
+                    && (policy == RestartPolicy::Never || s.exit_code == 0)
+            })
+        });
+        if !all_apps_done {
+            return Ok(());
+        }
+        let mut stopped_any = false;
+        for init in spec_init_containers {
+            if !is_restartable_init(init) {
+                continue;
+            }
+            let name = container_name_of(init);
+            if let Some(latest) = grouped.get(name).and_then(|a| a.last())
+                && state_of(latest) == cri::ContainerState::ContainerRunning
+            {
+                self.execute_pre_stop_hook(&latest.id, init, ctx.pod_ip.as_deref())
+                    .await;
+                self.runtime.stop_container(&latest.id, 0).await?;
+                stopped_any = true;
+            }
+        }
+        if stopped_any {
+            *statuses = self.container_statuses(ctx.sandbox_id).await?;
+        }
+        Ok(())
     }
 
     async fn reconcile_app_containers(
@@ -3572,6 +4066,7 @@ impl PodReconciler {
                     ctx.pod,
                     container,
                     attempt,
+                    ctx.pod_ip.as_deref(),
                 )
                 .await
             {
@@ -3653,7 +4148,8 @@ impl PodReconciler {
                     state.ready.insert(c_name.to_string(), is_ready);
                     return Ok(None);
                 }
-                self.execute_pre_stop_hook(&latest.id, container).await;
+                self.execute_pre_stop_hook(&latest.id, container, pod_ip)
+                    .await;
                 self.runtime.stop_container(&latest.id, 0).await?;
                 state.restarted.insert(c_name.to_string());
                 Ok(self.schedule_restart(namespace, pod, c_name, latest, state))
@@ -3813,8 +4309,9 @@ impl PodReconciler {
                 } else {
                     i64::try_from(deadline.saturating_sub(now)).unwrap_or(0)
                 };
+                let pod_ip = pod.pointer("/status/podIP").and_then(Value::as_str);
                 for (id, spec) in running {
-                    self.execute_pre_stop_hook(&id, &spec).await;
+                    self.execute_pre_stop_hook(&id, &spec, pod_ip).await;
                     self.spawn_stop(id, grace, uid);
                 }
             }
@@ -3956,6 +4453,9 @@ impl PodReconciler {
         }
         if let Some(tcp) = probe.get("tcpSocket") {
             return Ok(tcp_probe(pod_ip, container, tcp).await);
+        }
+        if let Some(grpc) = probe.get("grpc") {
+            return Ok(grpc_probe(pod_ip, container, grpc).await);
         }
         Ok(true)
     }
@@ -4425,6 +4925,10 @@ impl PodReconciler {
         vol: &Value,
     ) -> Result<(), KubeletError> {
         let vol_name = vol.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+        let is_running = pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running");
+        if is_running && is_subpath_only_volume(pod, vol_name) {
+            return Ok(());
+        }
 
         if let Some(sec) = vol.get("secret") {
             let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~secret", vol_name);
@@ -4441,14 +4945,16 @@ impl PodReconciler {
                 .get("secretName")
                 .and_then(Value::as_str)
                 .unwrap_or(vol_name);
-            let sec_obj = self
-                .client
-                .get_secret(namespace, sec_name)
-                .await
-                .map_err(|e| KubeletError::PodReconciliationFailed {
-                    pod: pod_name.to_string(),
-                    reason: format!("failed to fetch secret '{sec_name}': {e}"),
-                })?;
+            let sec_obj = match self.client.get_secret(namespace, sec_name).await {
+                Ok(obj) => obj,
+                Err(_) if is_running && vol_dir.exists() => return Ok(()),
+                Err(e) => {
+                    return Err(KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!("failed to fetch secret '{sec_name}': {e}"),
+                    });
+                },
+            };
             let written: std::collections::HashSet<PathBuf> =
                 stage_secret_files(&vol_dir, sec, &sec_obj)?
                     .into_iter()
@@ -4466,14 +4972,16 @@ impl PodReconciler {
                 }
             })?;
             let cm_name = cm.get("name").and_then(Value::as_str).unwrap_or(vol_name);
-            let cm_obj = self
-                .client
-                .get_configmap(namespace, cm_name)
-                .await
-                .map_err(|e| KubeletError::PodReconciliationFailed {
-                    pod: pod_name.to_string(),
-                    reason: format!("failed to fetch configmap '{cm_name}': {e}"),
-                })?;
+            let cm_obj = match self.client.get_configmap(namespace, cm_name).await {
+                Ok(obj) => obj,
+                Err(_) if is_running && vol_dir.exists() => return Ok(()),
+                Err(e) => {
+                    return Err(KubeletError::PodReconciliationFailed {
+                        pod: pod_name.to_string(),
+                        reason: format!("failed to fetch configmap '{cm_name}': {e}"),
+                    });
+                },
+            };
             let written: std::collections::HashSet<PathBuf> =
                 stage_configmap_files(&vol_dir, cm, &cm_obj)?
                     .into_iter()
@@ -4770,6 +5278,19 @@ impl PodReconciler {
             .and_then(Value::as_str)
             .unwrap_or(name);
 
+        let host_network = pod
+            .pointer("/spec/hostNetwork")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !host_network {
+            let pod_dir = self.root_dir.join("pods").join(pod_uid);
+            let pod_ip = pod
+                .pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let _ = generate_etc_hosts(&pod_dir, pod, pod_ip);
+        }
+
         let Some(volumes) = pod
             .get("spec")
             .and_then(|s| s.get("volumes"))
@@ -4901,6 +5422,133 @@ async fn tcp_probe(pod_ip: Option<&str>, container: &Value, tcp: &Value) -> bool
     )
     .await
     .is_ok_and(|connected| connected.is_ok())
+}
+
+/// Dials a `grpc` probe from the node using HTTP/2 health check RPC.
+async fn grpc_probe(pod_ip: Option<&str>, container: &Value, grpc: &Value) -> bool {
+    let Some(port) = resolve_probe_port(container, grpc.get("port")) else {
+        return false;
+    };
+    let host = grpc.get("host").and_then(Value::as_str);
+    let Some(target) = probe_host(pod_ip, host) else {
+        return false;
+    };
+    let service = grpc.get("service").and_then(Value::as_str).unwrap_or("");
+    tokio::time::timeout(
+        probe_timeout(grpc),
+        execute_grpc_health_check(&target, port, service),
+    )
+    .await
+    .is_ok_and(|res| res.unwrap_or(false))
+}
+
+fn build_grpc_headers() -> Vec<u8> {
+    let mut hpack = Vec::new();
+    hpack.push(0x83); // :method: POST
+    hpack.push(0x86); // :scheme: http
+    hpack.extend_from_slice(&[0x00, 5]);
+    hpack.extend_from_slice(b":path");
+    hpack.push(28);
+    hpack.extend_from_slice(b"/grpc.health.v1.Health/Check");
+    hpack.extend_from_slice(&[0x00, 12]);
+    hpack.extend_from_slice(b"content-type");
+    hpack.push(16);
+    hpack.extend_from_slice(b"application/grpc");
+    hpack.extend_from_slice(&[0x00, 2]);
+    hpack.extend_from_slice(b"te");
+    hpack.push(8);
+    hpack.extend_from_slice(b"trailers");
+    hpack
+}
+
+fn build_grpc_request(service: &str) -> Vec<u8> {
+    let mut request = Vec::with_capacity(128);
+    request.extend_from_slice(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    request.extend_from_slice(&[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    let hpack = build_grpc_headers();
+    let hpack_u32 = u32::try_from(hpack.len()).unwrap_or(0);
+    let [_, h0, h1, h2] = hpack_u32.to_be_bytes();
+    request.extend_from_slice(&[h0, h1, h2, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01]);
+    request.extend_from_slice(&hpack);
+
+    let mut proto_body = Vec::new();
+    if !service.is_empty() {
+        proto_body.push(0x0a);
+        let s_len = u8::try_from(service.len()).unwrap_or(0);
+        proto_body.push(s_len);
+        proto_body.extend_from_slice(service.as_bytes());
+    }
+    let proto_len = u32::try_from(proto_body.len()).unwrap_or(0);
+    let grpc_msg_len = 5 + proto_body.len();
+    let grpc_u32 = u32::try_from(grpc_msg_len).unwrap_or(0);
+    let [_, g0, g1, g2] = grpc_u32.to_be_bytes();
+
+    request.extend_from_slice(&[g0, g1, g2, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00]);
+    request.extend_from_slice(&proto_len.to_be_bytes());
+    request.extend_from_slice(&proto_body);
+
+    request
+}
+
+async fn execute_grpc_health_check(
+    target: &str,
+    port: u16,
+    service: &str,
+) -> Result<bool, std::io::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect((target, port)).await?;
+    let request = build_grpc_request(service);
+    stream.write_all(&request).await?;
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 1024];
+    while buf.len() < 4096 {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if parse_grpc_response(&buf) {
+            return Ok(true);
+        }
+        if is_grpc_failure(&buf) {
+            return Ok(false);
+        }
+    }
+    Ok(parse_grpc_response(&buf))
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn is_grpc_failure(buf: &[u8]) -> bool {
+    if find_subsequence(buf, &[0x08, 0x02]).is_some()
+        || find_subsequence(buf, &[0x08, 0x03]).is_some()
+    {
+        return true;
+    }
+    if let Some(pos) = find_subsequence(buf, b"grpc-status") {
+        let rest = &buf[pos + b"grpc-status".len()..];
+        let trimmed = rest
+            .iter()
+            .skip_while(|&&b| b == b':' || b == b' ' || b < 32);
+        if let Some(&first) = trimmed.take(1).next()
+            && first != b'0'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_grpc_response(buf: &[u8]) -> bool {
+    if is_grpc_failure(buf) {
+        return false;
+    }
+    find_subsequence(buf, &[0x08, 0x01]).is_some()
 }
 
 /// Performs an `httpGet` probe from the node with a minimal `HTTP/1.0`
