@@ -1186,6 +1186,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let err = check_strict_json(json_body, &path).unwrap_err();
@@ -1214,6 +1215,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let err = check_strict_json(json_body, &path).unwrap_err();
@@ -1308,6 +1310,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let val = decode_body_with_directive(
@@ -1366,6 +1369,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let val = decode_body_with_directive(
@@ -1406,6 +1410,7 @@ mod tests {
             resource: "noxus".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let cr_json = br#"{
@@ -1482,6 +1487,7 @@ mod tests {
             resource: "foos".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let cr_json = br#"{
@@ -1515,6 +1521,7 @@ mod tests {
             resource: "noxus2".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         // Unknown fields should be accepted when preserve-unknown-fields is true
@@ -1561,6 +1568,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         // Warn produces 299 warnings for unknown and duplicate fields
@@ -1596,6 +1604,7 @@ mod tests {
             resource: "deployments".to_string(),
             subresource: None,
             name: None,
+            trailing_slash: false,
         };
 
         let json_body = br#"{

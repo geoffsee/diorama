@@ -142,6 +142,7 @@ impl WebhookConfig {
             timeout_seconds: Some(30),
             admission_review_versions: vec!["v1".to_string()],
             reinvocation_policy: Some("IfNeeded".to_string()),
+            ..Default::default()
         };
 
         Ok(MutatingWebhookConfiguration {

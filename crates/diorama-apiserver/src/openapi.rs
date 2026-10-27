@@ -570,7 +570,10 @@ fn build_crd_schema(
                 .get("properties")
                 .and_then(Value::as_object)
                 .is_none_or(serde_json::Map::is_empty);
-        if !preserve_root {
+        if preserve_root && is_v2 {
+            obj.remove("x-kubernetes-preserve-unknown-fields");
+            obj.insert("type".to_string(), json!("object"));
+        } else if !preserve_root {
             obj.insert("type".to_string(), json!("object"));
             let props = obj
                 .entry("properties".to_string())

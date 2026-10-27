@@ -29,7 +29,7 @@ use crate::service::ApiserverService;
 
 use super::dispatch::{self, Payload};
 use super::query;
-use super::route::{self, ResourcePath, Route, wants_aggregated_discovery};
+use super::route::{self, ResourcePath, Route, aggregated_discovery_version};
 use super::tls::{self, PeerIdentity};
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -192,7 +192,11 @@ async fn handle(
             "NotFound",
             "the server could not find the requested resource",
         ),
-        Route::ApiVersions => authenticated_document(&client, || api_versions(service)),
+        Route::ApiVersions => aggregated_or(
+            accept.as_deref(),
+            || core_aggregated(&client),
+            || Ok(api_versions(service)),
+        ),
         Route::OpenApiV2 => {
             let wants_proto = accept.as_deref().is_some_and(|a| {
                 a.contains("proto-openapi.spec.v2")
@@ -242,6 +246,23 @@ async fn handle(
             let params = query::parse(query.as_deref());
             if method == Method::GET && path.name.is_none() && is_watch(&params) {
                 return watch_response(service, &client, &path, &params, shutdown).await;
+            }
+            if method == Method::POST && is_table_request(accept.as_deref()) {
+                let res = path.resource.as_str();
+                if matches!(
+                    res,
+                    "selfsubjectaccessreviews"
+                        | "subjectaccessreviews"
+                        | "localsubjectaccessreviews"
+                        | "tokenreviews"
+                        | "selfsubjectrulesreviews"
+                ) {
+                    return status_response(
+                        StatusCode::NOT_ACCEPTABLE,
+                        "NotAcceptable",
+                        "Table representation is not supported for this resource",
+                    );
+                }
             }
             match dispatch::dispatch(
                 service,
@@ -362,7 +383,7 @@ fn outcome_to_response(
     path: &ResourcePath,
     accept: Option<&str>,
 ) -> Response<Body> {
-    match outcome.body {
+    let mut resp = match outcome.body {
         Payload::Json(body) => {
             if outcome.status.is_success()
                 && is_table_request(accept)
@@ -381,7 +402,11 @@ fn outcome_to_response(
         },
         Payload::Text(body) => text_response(outcome.status, body),
         Payload::ChunkedText(body) => chunked_text_response(outcome.status, body),
+    };
+    for (name, val) in outcome.headers {
+        resp.headers_mut().insert(name, val);
     }
+    resp
 }
 
 fn is_watch(params: &BTreeMap<String, String>) -> bool {
@@ -561,8 +586,12 @@ async fn watch_response(
         .and_then(|value| value.parse().ok())
         .map_or(DEFAULT_WATCH_TIMEOUT, Duration::from_secs);
 
-    let (initial, snapshot_rev, buffered_events) = if filter.since == 0
+    let (initial, snapshot_rev, buffered_events) = if params
+        .get("resourceVersion")
+        .map(String::as_str)
+        == Some("0")
         || filter.send_initial_events
+        || (params.get("resourceVersion").is_none() && filter.label_selector.is_empty())
     {
         let initial_doc =
             match dispatch::dispatch(service, client, &Method::GET, path, None, None, &[]).await {
@@ -927,19 +956,34 @@ fn authenticated_document(
     }
 }
 
-/// Media type clients use to recognise an aggregated discovery document.
+/// Media types clients use to recognise an aggregated discovery document.
 /// client-go falls back to legacy parsing when this is absent.
-const AGGREGATED_DISCOVERY_TYPE: &str =
+const AGGREGATED_DISCOVERY_V2_TYPE: &str =
     "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+const AGGREGATED_DISCOVERY_V2BETA1_TYPE: &str =
+    "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList";
 
 fn aggregated_or(
     accept: Option<&str>,
     aggregated: impl FnOnce() -> Result<Value, ApiserverError>,
     legacy: impl FnOnce() -> Result<Value, ApiserverError>,
 ) -> Response<Body> {
-    if wants_aggregated_discovery(accept) {
+    if let Some(ver) = aggregated_discovery_version(accept) {
         match aggregated() {
-            Ok(body) => json_response_with_type(StatusCode::OK, AGGREGATED_DISCOVERY_TYPE, &body),
+            Ok(mut body) => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "apiVersion".to_string(),
+                        json!(format!("apidiscovery.k8s.io/{ver}")),
+                    );
+                }
+                let content_type = if ver == "v2beta1" {
+                    AGGREGATED_DISCOVERY_V2BETA1_TYPE
+                } else {
+                    AGGREGATED_DISCOVERY_V2_TYPE
+                };
+                json_response_with_type(StatusCode::OK, content_type, &body)
+            },
             Err(err) => error_response(&err),
         }
     } else {
@@ -1861,6 +1905,15 @@ mod tests {
         assert_eq!(
             response.headers()["content-type"],
             "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList"
+        );
+        let response_v2beta1 = super::aggregated_or(
+            Some("application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList"),
+            || Ok(json!({ "items": [] })),
+            || Ok(json!({ "groups": [] })),
+        );
+        assert_eq!(
+            response_v2beta1.headers()["content-type"],
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList"
         );
         let legacy = super::aggregated_or(None, || Ok(json!({})), || Ok(json!({ "groups": [] })));
         assert_eq!(legacy.headers()["content-type"], "application/json");

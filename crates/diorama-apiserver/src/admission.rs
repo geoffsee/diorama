@@ -172,6 +172,30 @@ pub struct WebhookDefinition {
         skip_serializing_if = "Option::is_none"
     )]
     pub reinvocation_policy: Option<String>,
+    #[serde(
+        default,
+        rename = "namespaceSelector",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub namespace_selector: Option<Value>,
+    #[serde(
+        default,
+        rename = "objectSelector",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub object_selector: Option<Value>,
+    #[serde(
+        default,
+        rename = "matchConditions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub match_conditions: Option<Vec<MatchCondition>>,
+    #[serde(
+        default,
+        rename = "matchPolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub match_policy: Option<String>,
 }
 
 impl WebhookDefinition {
@@ -184,11 +208,11 @@ impl WebhookDefinition {
     pub fn matches_request_with_ns(
         &self,
         req: &AdmissionRequest,
-        _ns_labels: Option<&Value>,
+        ns_labels: Option<&Value>,
     ) -> bool {
         let (obj_group, obj_version) = extract_group_version(req);
 
-        self.rules.iter().any(|r| {
+        let rules_match = self.rules.iter().any(|r| {
             let direct = r.matches_scoped(
                 &req.operation,
                 &req.resource.group,
@@ -212,7 +236,29 @@ impl WebhookDefinition {
                 }
             }
             false
-        })
+        });
+        if !rules_match {
+            return false;
+        }
+
+        if !matches_namespace_selector(self.namespace_selector.as_ref(), ns_labels) {
+            return false;
+        }
+
+        let target_obj = req.object.as_ref().or(req.old_object.as_ref());
+        if !matches_object_selector(self.object_selector.as_ref(), target_obj) {
+            return false;
+        }
+
+        if let Some(conds) = &self.match_conditions {
+            for cond in conds {
+                if !evaluate_match_condition(&cond.expression, req) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -1949,10 +1995,65 @@ pub fn validate_match_condition(expression: &str) -> Result<(), ApiserverError> 
             reason: format!("compilation failed: unbalanced tokens in expression '{trimmed}'"),
         });
     }
-    tokenize_cel(trimmed).map_err(|e| ApiserverError::InvalidInput {
+    let tokens = tokenize_cel(trimmed).map_err(|e| ApiserverError::InvalidInput {
         field: "matchConditions.expression".to_string(),
         reason: format!("compilation failed: {e}"),
     })?;
+    if tokens.len() == 1 {
+        match &tokens[0] {
+            CelToken::NumberLit(..) | CelToken::StringLit(..) => {
+                return Err(ApiserverError::InvalidInput {
+                    field: "matchConditions.expression".to_string(),
+                    reason: "compilation failed: expression must evaluate to bool".to_string(),
+                });
+            },
+            _ => {},
+        }
+    }
+    for (i, tok) in tokens.iter().enumerate() {
+        if let CelToken::Ident(name) = tok {
+            let is_root = i == 0
+                || matches!(
+                    &tokens[i - 1],
+                    CelToken::Plus
+                        | CelToken::Minus
+                        | CelToken::Star
+                        | CelToken::Slash
+                        | CelToken::Percent
+                        | CelToken::EqEq
+                        | CelToken::NotEq
+                        | CelToken::Lt
+                        | CelToken::LtEq
+                        | CelToken::Gt
+                        | CelToken::GtEq
+                        | CelToken::AndAnd
+                        | CelToken::OrOr
+                        | CelToken::Bang
+                        | CelToken::LParen
+                        | CelToken::LBracket
+                );
+            if is_root
+                && !matches!(
+                    name.as_str(),
+                    "object"
+                        | "oldObject"
+                        | "request"
+                        | "params"
+                        | "authorizer"
+                        | "namespaceObject"
+                        | "true"
+                        | "false"
+                        | "has"
+                        | "null"
+                )
+            {
+                return Err(ApiserverError::InvalidInput {
+                    field: "matchConditions.expression".to_string(),
+                    reason: format!("compilation failed: undeclared reference to '{name}'"),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2003,12 +2104,22 @@ impl AdmissionEngine {
         guard.push(config);
     }
 
+    pub fn remove_mutating_webhook_config(&self, name: &str) {
+        let mut guard = self.mutating_configs.write().unwrap();
+        guard.retain(|c| c.metadata.get("name").and_then(Value::as_str) != Some(name));
+    }
+
     pub fn add_validating_webhook_config(&self, config: ValidatingWebhookConfiguration) {
         let mut guard = self.validating_configs.write().unwrap();
         if let Some(name) = config.metadata.get("name").and_then(Value::as_str) {
             guard.retain(|c| c.metadata.get("name").and_then(Value::as_str) != Some(name));
         }
         guard.push(config);
+    }
+
+    pub fn remove_validating_webhook_config(&self, name: &str) {
+        let mut guard = self.validating_configs.write().unwrap();
+        guard.retain(|c| c.metadata.get("name").and_then(Value::as_str) != Some(name));
     }
 
     pub fn add_mutating_admission_policy(&self, policy: MutatingAdmissionPolicy) {
@@ -2663,6 +2774,12 @@ impl AdmissionEngine {
         &self,
         req: &mut AdmissionRequest,
     ) -> Result<(), ApiserverError> {
+        if req.resource.resource == "validatingwebhookconfigurations"
+            || req.resource.resource == "mutatingwebhookconfigurations"
+        {
+            return Ok(());
+        }
+
         self.sync_storage_policies().await;
 
         let ns_labels = self
@@ -2724,6 +2841,12 @@ impl AdmissionEngine {
         &self,
         req: &AdmissionRequest,
     ) -> Result<(), ApiserverError> {
+        if req.resource.resource == "validatingwebhookconfigurations"
+            || req.resource.resource == "mutatingwebhookconfigurations"
+        {
+            return Ok(());
+        }
+
         // Validate PriorityLevelConfiguration if invoked during admission
         if let Some(obj) = &req.object {
             let is_flow_control = req.resource.group == "flowcontrol.apiserver.k8s.io"
@@ -3413,6 +3536,7 @@ mod tests {
                 admission_review_versions: vec!["v1".to_string()],
                 side_effects: None,
                 reinvocation_policy: None,
+                ..Default::default()
             }],
         };
         engine.add_mutating_webhook_config(mutating_config);
@@ -3551,6 +3675,7 @@ mod tests {
                 admission_review_versions: vec!["v1".to_string()],
                 side_effects: None,
                 reinvocation_policy: None,
+                ..Default::default()
             }],
         };
         engine.add_mutating_webhook_config(mutating_config);
@@ -3671,6 +3796,7 @@ mod tests {
                     admission_review_versions: vec!["v1".to_string()],
                     side_effects: None,
                     reinvocation_policy: Some("IfNeeded".to_string()),
+                    ..Default::default()
                 },
                 WebhookDefinition {
                     name: "wh2-mutator".to_string(),
@@ -3691,6 +3817,7 @@ mod tests {
                     admission_review_versions: vec!["v1".to_string()],
                     side_effects: None,
                     reinvocation_policy: None,
+                    ..Default::default()
                 },
             ],
         };
