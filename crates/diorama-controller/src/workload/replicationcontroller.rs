@@ -52,6 +52,65 @@ impl ReplicationControllerReconciler {
         })
     }
 
+    async fn is_rc_missing_or_terminating(&self, namespace: &str, name: &str) -> bool {
+        match self.client.get_replicationcontroller(namespace, name).await {
+            Ok(rc_val) => rc_val.pointer("/metadata/deletionTimestamp").is_some(),
+            Err(_) => true,
+        }
+    }
+
+    async fn disown_created_pods(&self, namespace: &str, rc_name: &str, pod_names: &[String]) {
+        for pname in pod_names {
+            self.strip_rc_owner_from_pod(namespace, rc_name, pname)
+                .await;
+        }
+    }
+
+    async fn strip_rc_owner_from_pod(&self, namespace: &str, rc_name: &str, pname: &str) {
+        let Ok(mut pod) = self.client.get_pod(namespace, pname).await else {
+            return;
+        };
+        let Some(owners) = pod
+            .pointer_mut("/metadata/ownerReferences")
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        let initial_len = owners.len();
+        owners.retain(|o| !is_matching_rc_owner(o, rc_name));
+        if owners.len() != initial_len {
+            let _ = self.client.update_pod(namespace, pname, pod).await;
+        }
+    }
+
+    async fn collect_batch_results(
+        join_set: &mut tokio::task::JoinSet<(
+            String,
+            Result<Value, diorama_apiserver::ApiserverError>,
+        )>,
+        created: &mut usize,
+        newly_created: &mut Vec<String>,
+        create_error: &mut Option<String>,
+    ) -> bool {
+        let mut failed = false;
+        while let Some(res) = join_set.join_next().await {
+            let Ok((pname, create_res)) = res else {
+                continue;
+            };
+            match create_res {
+                Ok(_) => {
+                    *created += 1;
+                    newly_created.push(pname);
+                },
+                Err(err) => {
+                    *create_error = Some(err.to_string());
+                    failed = true;
+                },
+            }
+        }
+        failed
+    }
+
     async fn scale_up_pods(
         &self,
         namespace: &str,
@@ -76,46 +135,74 @@ impl ReplicationControllerReconciler {
         let mut created = 0;
         let mut idx = 0;
         let mut create_error = None;
+        let mut newly_created_pod_names = Vec::new();
 
         while created < needed {
-            let pod_name = format!("{name}-{idx}");
-            idx += 1;
-            if self.client.get_pod(namespace, &pod_name).await.is_ok() {
-                continue;
+            if self.is_rc_missing_or_terminating(namespace, name).await {
+                break;
             }
 
-            let new_pod = json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": namespace,
-                    "labels": template_labels,
-                    "ownerReferences": [{
-                        "apiVersion": "v1",
-                        "kind": "ReplicationController",
-                        "name": name,
-                        "uid": uid,
-                        "controller": true,
-                        "blockOwnerDeletion": true
-                    }]
-                },
-                "spec": template_spec,
-                "status": {
-                    "phase": "Pending"
+            let batch_limit = (needed - created).min(20);
+            let mut batch_candidates = Vec::with_capacity(batch_limit);
+            while batch_candidates.len() < batch_limit {
+                let candidate = format!("{name}-{idx}");
+                idx += 1;
+                if self.client.get_pod(namespace, &candidate).await.is_err() {
+                    batch_candidates.push(candidate);
                 }
-            });
+            }
 
-            match self.client.create_pod(namespace, new_pod).await {
-                Ok(_) => {
-                    created += 1;
-                },
-                Err(err) => {
-                    create_error = Some(err.to_string());
-                    break;
-                },
+            let mut join_set = tokio::task::JoinSet::new();
+            for pod_name in batch_candidates {
+                let client = Arc::clone(&self.client);
+                let ns = namespace.to_string();
+                let new_pod = json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": pod_name,
+                        "namespace": ns,
+                        "labels": template_labels.clone(),
+                        "ownerReferences": [{
+                            "apiVersion": "v1",
+                            "kind": "ReplicationController",
+                            "name": name,
+                            "uid": uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": template_spec.clone(),
+                    "status": {
+                        "phase": "Pending"
+                    }
+                });
+                join_set.spawn(async move {
+                    let res = client.create_pod(&ns, new_pod).await;
+                    (pod_name, res)
+                });
+            }
+
+            let batch_failed = Self::collect_batch_results(
+                &mut join_set,
+                &mut created,
+                &mut newly_created_pod_names,
+                &mut create_error,
+            )
+            .await;
+
+            if batch_failed {
+                break;
             }
         }
+
+        if self.is_rc_missing_or_terminating(namespace, name).await
+            && !newly_created_pod_names.is_empty()
+        {
+            self.disown_created_pods(namespace, name, &newly_created_pod_names)
+                .await;
+        }
+
         Ok(create_error)
     }
 
@@ -414,4 +501,10 @@ fn update_status_conditions(status: &mut Map<String, Value>, creation_error: Opt
         conditions.retain(|c| c.get("type").and_then(Value::as_str) != Some("ReplicaFailure"));
         status.insert("conditions".to_string(), Value::Array(conditions));
     }
+}
+
+fn is_matching_rc_owner(o: &Value, rc_name: &str) -> bool {
+    let matches_kind = o.get("kind").and_then(Value::as_str) == Some("ReplicationController");
+    let matches_name = o.get("name").and_then(Value::as_str) == Some(rc_name);
+    matches_kind && matches_name
 }
