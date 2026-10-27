@@ -30,6 +30,8 @@ pub const SUBPROTOCOL_V4: &str = "v4.channel.k8s.io";
 pub const SUBPROTOCOL_V3: &str = "v3.channel.k8s.io";
 pub const SUBPROTOCOL_V2: &str = "v2.channel.k8s.io";
 pub const SUBPROTOCOL_V1: &str = "v1.channel.k8s.io";
+pub const SUBPROTOCOL_CHANNEL: &str = "channel.k8s.io";
+pub const SUBPROTOCOL_BASE64: &str = "base64.channel.k8s.io";
 pub const SUBPROTOCOL_PORTFORWARD: &str = "portforward.k8s.io";
 
 /// Captured output of one synchronous container exec.
@@ -62,6 +64,7 @@ pub struct PodExecOptions {
     pub stdout: bool,
     pub stderr: bool,
     pub tty: bool,
+    pub protocol: Option<String>,
 }
 
 impl PodExecOptions {
@@ -75,6 +78,7 @@ impl PodExecOptions {
             stdout: true,
             stderr: true,
             tty: false,
+            protocol: None,
         };
         for (key, value) in pairs {
             match key.as_str() {
@@ -103,10 +107,7 @@ impl PodExecOptions {
             .cloned()
             .unwrap_or_default();
         if let Some(wanted) = self.container.as_deref().filter(|c| !c.is_empty()) {
-            if containers
-                .iter()
-                .any(|c| c.get("name").and_then(Value::as_str) == Some(wanted))
-            {
+            if find_container_by_name(pod, wanted) {
                 return Ok(wanted.to_string());
             }
             return Err(ApiserverError::BadRequest {
@@ -122,6 +123,23 @@ impl PodExecOptions {
                 message: "pod has no containers to exec into".to_string(),
             })
     }
+}
+
+fn find_container_by_name(pod: &Value, wanted: &str) -> bool {
+    for pointer in [
+        "/spec/containers",
+        "/spec/ephemeralContainers",
+        "/spec/initContainers",
+    ] {
+        if let Some(containers) = pod.pointer(pointer).and_then(Value::as_array)
+            && containers
+                .iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(wanted))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_truthy(value: &str) -> bool {
@@ -142,6 +160,8 @@ pub fn select_subprotocol(header: Option<&str>) -> Option<String> {
         SUBPROTOCOL_V3,
         SUBPROTOCOL_V2,
         SUBPROTOCOL_V1,
+        SUBPROTOCOL_CHANNEL,
+        SUBPROTOCOL_BASE64,
         SUBPROTOCOL_PORTFORWARD,
     ] {
         if offered.iter().any(|o| o == wanted) {
@@ -249,10 +269,7 @@ impl PodAttachOptions {
             .cloned()
             .unwrap_or_default();
         if let Some(wanted) = self.container.as_deref().filter(|c| !c.is_empty()) {
-            if containers
-                .iter()
-                .any(|c| c.get("name").and_then(Value::as_str) == Some(wanted))
-            {
+            if find_container_by_name(pod, wanted) {
                 return Ok(wanted.to_string());
             }
             return Err(ApiserverError::BadRequest {
@@ -456,8 +473,16 @@ pub async fn serve_exec<S>(
                     .send(channel_message(CHANNEL_STDOUT, &output.stderr))
                     .await;
             }
-            let status = serde_json::to_vec(&exit_status(output.exit_code)).unwrap_or_default();
-            let _ = ws.send(channel_message(CHANNEL_ERROR, &status)).await;
+            let is_v1_protocol = matches!(
+                options.protocol.as_deref(),
+                Some("channel.k8s.io" | "v1.channel.k8s.io" | "base64.channel.k8s.io")
+            );
+            if output.exit_code == 0 && is_v1_protocol {
+                // channel.k8s.io v1 clients expect only stdout/stderr and close on success.
+            } else {
+                let status = serde_json::to_vec(&exit_status(output.exit_code)).unwrap_or_default();
+                let _ = ws.send(channel_message(CHANNEL_ERROR, &status)).await;
+            }
         },
         Err(err) => {
             let status = json!({
@@ -492,7 +517,7 @@ pub async fn serve_exec<S>(
 mod tests {
     use super::{
         CHANNEL_ERROR, CHANNEL_STDERR, CHANNEL_STDOUT, PodExec, PodExecOptions, PodExecResult,
-        exit_status, select_subprotocol, serve_exec,
+        SUBPROTOCOL_CHANNEL, exit_status, select_subprotocol, serve_exec,
     };
     use serde_json::json;
 
@@ -707,5 +732,36 @@ mod tests {
         drop(ws);
         server_task.await.unwrap();
         assert_eq!(status["status"], "Failure");
+    }
+
+    #[tokio::test]
+    async fn serve_exec_omits_status_frame_for_channel_k8s_io_on_success() {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let exec = StaticExec {
+            result: Ok(PodExecResult {
+                exit_code: 0,
+                stdout: b"done\n".to_vec(),
+                stderr: Vec::new(),
+            }),
+        };
+        let mut options = PodExecOptions::from_query(Some("command=echo&command=done")).unwrap();
+        options.protocol = Some(SUBPROTOCOL_CHANNEL.to_string());
+        let server_task = tokio::spawn(serve_exec(
+            server,
+            std::sync::Arc::new(exec),
+            json!({}),
+            options,
+            "app".to_string(),
+        ));
+        let mut ws = client_ws(client).await;
+        let (stdout, stderr, status) = collect_output(&mut ws).await;
+        drop(ws);
+        server_task.await.unwrap();
+        assert_eq!(stdout, b"done\n");
+        assert_eq!(stderr, b"");
+        assert!(
+            status.is_null(),
+            "Status frame must be omitted for channel.k8s.io on exit 0"
+        );
     }
 }

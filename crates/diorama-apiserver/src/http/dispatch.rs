@@ -153,14 +153,20 @@ async fn read(
             if is_crd {
                 convert_custom_resource(&mut val, &path.group, &path.version);
             }
+            if path.resource == "events" {
+                normalize_event_for_group(&mut val, &path.group);
+            }
             Ok(val)
         } else {
             let list = list_cluster(client, &path.group, &path.resource).await?;
-            let list = if is_crd {
+            let mut list = if is_crd {
                 convert_custom_resource_or_list(list, &path.group, &path.version)
             } else {
                 list
             };
+            if path.resource == "events" {
+                normalize_event_list_for_group(&mut list, &path.group);
+            }
             page_list(filter_list(list, query), query)
         }
     } else if let Some(namespace) = &path.namespace {
@@ -170,23 +176,32 @@ async fn read(
             if is_crd {
                 convert_custom_resource(&mut val, &path.group, &path.version);
             }
+            if path.resource == "events" {
+                normalize_event_for_group(&mut val, &path.group);
+            }
             Ok(val)
         } else {
             let list = list_namespaced(client, &path.group, &path.resource, namespace).await?;
-            let list = if is_crd {
+            let mut list = if is_crd {
                 convert_custom_resource_or_list(list, &path.group, &path.version)
             } else {
                 list
             };
+            if path.resource == "events" {
+                normalize_event_list_for_group(&mut list, &path.group);
+            }
             page_list(filter_list(list, query), query)
         }
     } else if path.name.is_none() {
         let list = list_all_namespaces(client, &path.group, &path.resource).await?;
-        let list = if is_crd {
+        let mut list = if is_crd {
             convert_custom_resource_or_list(list, &path.group, &path.version)
         } else {
             list
         };
+        if path.resource == "events" {
+            normalize_event_list_for_group(&mut list, &path.group);
+        }
         page_list(filter_list(list, query), query)
     } else if is_builtin_namespaced(&path.resource) {
         Err(ApiserverError::BadRequest {
@@ -196,6 +211,9 @@ async fn read(
         let mut val = get_cluster(client, &path.group, &path.resource, name).await?;
         if is_crd {
             convert_custom_resource(&mut val, &path.group, &path.version);
+        }
+        if path.resource == "events" {
+            normalize_event_for_group(&mut val, &path.group);
         }
         Ok(val)
     } else {
@@ -672,6 +690,16 @@ async fn delete(
             }
             let updated = persist_object(client, path, name, current).await?;
             return Ok(ok_json(updated));
+        } else if matches!(
+            path.resource.as_str(),
+            "deployments"
+                | "replicasets"
+                | "replicationcontrollers"
+                | "statefulsets"
+                | "daemonsets"
+                | "jobs"
+        ) {
+            cascade_delete_dependents(client, path, namespace, name).await?;
         }
         delete_namespaced(client, &path.group, &path.resource, namespace, name).await?;
     } else if is_builtin_namespaced(&path.resource) {
@@ -713,12 +741,24 @@ fn delete_propagation_policy(body: &[u8], group: &str, resource: &str) -> Option
     None
 }
 
+static ORPHANED_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeSet<(String, String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+
 async fn orphan_dependents(
     client: &KubernetesApiClient,
     path: &ResourcePath,
     namespace: &str,
     name: &str,
 ) -> Result<(), ApiserverError> {
+    let parent_kind = kind_name(&path.resource).unwrap_or_default();
+    if let Ok(mut set) = ORPHANED_OWNERS.lock() {
+        set.insert((
+            namespace.to_string(),
+            parent_kind.to_string(),
+            name.to_string(),
+        ));
+    }
     let Ok(parent) = read_single(client, path, name).await else {
         return Ok(());
     };
@@ -727,7 +767,6 @@ async fn orphan_dependents(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let parent_kind = kind_name(&path.resource).unwrap_or_default();
 
     let matches_owner = |oref: &Value| -> bool {
         let uid_match = !parent_uid.is_empty()
@@ -794,6 +833,233 @@ async fn orphan_dependents(
     Ok(())
 }
 
+fn resource_from_kind(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "Deployment" => "deployments",
+        "ReplicaSet" => "replicasets",
+        "StatefulSet" => "statefulsets",
+        "DaemonSet" => "daemonsets",
+        "Job" => "jobs",
+        "CronJob" => "cronjobs",
+        "ReplicationController" => "replicationcontrollers",
+        "Pod" => "pods",
+        _ => return None,
+    })
+}
+
+fn group_for_kind(kind: &str, api_version: &str) -> &'static str {
+    if let Some((g, _)) = api_version.split_once('/') {
+        match g {
+            "apps" => "apps",
+            "batch" => "batch",
+            _ => "",
+        }
+    } else {
+        match kind {
+            "Deployment" | "ReplicaSet" | "StatefulSet" | "DaemonSet" => "apps",
+            "Job" | "CronJob" => "batch",
+            _ => "",
+        }
+    }
+}
+
+async fn has_live_other_owner(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    orefs: &[Value],
+    parent_uid: &str,
+    parent_kind: &str,
+    parent_name: &str,
+) -> bool {
+    for oref in orefs {
+        let uid = oref.get("uid").and_then(Value::as_str).unwrap_or("");
+        let kind = oref.get("kind").and_then(Value::as_str).unwrap_or("");
+        let name = oref.get("name").and_then(Value::as_str).unwrap_or("");
+        let is_current = (!parent_uid.is_empty() && uid == parent_uid)
+            || (name == parent_name && (parent_kind.is_empty() || kind == parent_kind));
+        if is_current {
+            continue;
+        }
+        let Some(resource) = resource_from_kind(kind) else {
+            return true;
+        };
+        let api_version = oref.get("apiVersion").and_then(Value::as_str).unwrap_or("");
+        let group = group_for_kind(kind, api_version);
+        if let Ok(owner_obj) = get_namespaced(client, group, resource, namespace, name).await
+            && owner_obj.pointer("/metadata/deletionTimestamp").is_none()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn cascade_delete_pod_dependents(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    parent_uid: &str,
+    parent_kind: &str,
+    parent_name: &str,
+) {
+    let Ok(pod_list) = client.list_pods(namespace).await else {
+        return;
+    };
+    let Some(items) = pod_list.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    for mut pod in items.iter().cloned() {
+        let Some(pod_name) = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let orefs = pod
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array);
+        let matches = orefs.is_some_and(|arr| {
+            arr.iter().any(|r| {
+                let uid_match = !parent_uid.is_empty()
+                    && r.get("uid").and_then(Value::as_str) == Some(parent_uid);
+                let name_kind_match = r.get("name").and_then(Value::as_str) == Some(parent_name)
+                    && (parent_kind.is_empty()
+                        || r.get("kind").and_then(Value::as_str) == Some(parent_kind));
+                uid_match || name_kind_match
+            })
+        });
+        if !matches {
+            continue;
+        }
+        let arr = orefs.cloned().unwrap_or_default();
+        if has_live_other_owner(
+            client,
+            namespace,
+            &arr,
+            parent_uid,
+            parent_kind,
+            parent_name,
+        )
+        .await
+        {
+            if let Some(orefs_mut) = pod
+                .pointer_mut("/metadata/ownerReferences")
+                .and_then(Value::as_array_mut)
+            {
+                orefs_mut.retain(|r| {
+                    let uid_match = !parent_uid.is_empty()
+                        && r.get("uid").and_then(Value::as_str) == Some(parent_uid);
+                    let name_kind_match = r.get("name").and_then(Value::as_str)
+                        == Some(parent_name)
+                        && (parent_kind.is_empty()
+                            || r.get("kind").and_then(Value::as_str) == Some(parent_kind));
+                    !(uid_match || name_kind_match)
+                });
+                let _ = client.update_pod(namespace, &pod_name, pod).await;
+            }
+        } else {
+            let _ = client.delete_pod_options(namespace, &pod_name, None).await;
+        }
+    }
+}
+
+async fn cascade_delete_replicaset_dependents(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    parent_uid: &str,
+    parent_kind: &str,
+    parent_name: &str,
+) {
+    let Ok(rs_list) = client.list_replicasets(namespace).await else {
+        return;
+    };
+    let Some(items) = rs_list.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    for mut rs in items.iter().cloned() {
+        let Some(rs_name) = rs
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let orefs = rs
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array);
+        let matches = orefs.is_some_and(|arr| {
+            arr.iter().any(|r| {
+                let uid_match = !parent_uid.is_empty()
+                    && r.get("uid").and_then(Value::as_str) == Some(parent_uid);
+                let name_kind_match = r.get("name").and_then(Value::as_str) == Some(parent_name)
+                    && (parent_kind.is_empty()
+                        || r.get("kind").and_then(Value::as_str) == Some(parent_kind));
+                uid_match || name_kind_match
+            })
+        });
+        if !matches {
+            continue;
+        }
+        let arr = orefs.cloned().unwrap_or_default();
+        if has_live_other_owner(
+            client,
+            namespace,
+            &arr,
+            parent_uid,
+            parent_kind,
+            parent_name,
+        )
+        .await
+        {
+            if let Some(orefs_mut) = rs
+                .pointer_mut("/metadata/ownerReferences")
+                .and_then(Value::as_array_mut)
+            {
+                orefs_mut.retain(|r| {
+                    let uid_match = !parent_uid.is_empty()
+                        && r.get("uid").and_then(Value::as_str) == Some(parent_uid);
+                    let name_kind_match = r.get("name").and_then(Value::as_str)
+                        == Some(parent_name)
+                        && (parent_kind.is_empty()
+                            || r.get("kind").and_then(Value::as_str) == Some(parent_kind));
+                    !(uid_match || name_kind_match)
+                });
+                let _ = client.update_replicaset(namespace, &rs_name, rs).await;
+            }
+        } else {
+            let rs_uid = rs
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            cascade_delete_pod_dependents(client, namespace, rs_uid, "ReplicaSet", &rs_name).await;
+            let _ = client.delete_replicaset(namespace, &rs_name).await;
+        }
+    }
+}
+
+async fn cascade_delete_dependents(
+    client: &KubernetesApiClient,
+    path: &ResourcePath,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ApiserverError> {
+    let Ok(parent) = read_single(client, path, name).await else {
+        return Ok(());
+    };
+    let parent_uid = parent
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parent_kind = kind_name(&path.resource).unwrap_or_default();
+
+    if path.resource == "deployments" {
+        cascade_delete_replicaset_dependents(client, namespace, parent_uid, parent_kind, name)
+            .await;
+    }
+    cascade_delete_pod_dependents(client, namespace, parent_uid, parent_kind, name).await;
+    Ok(())
+}
+
 /// Deletes every object selected by a collection `DELETE`, honouring
 /// `labelSelector`/`fieldSelector` like `GET`. Missing objects are skipped so
 /// clients can clean up by label without knowing exact names.
@@ -847,7 +1113,7 @@ async fn replace(
     client: &KubernetesApiClient,
     path: &ResourcePath,
     query: Option<&str>,
-    doc: Value,
+    mut doc: Value,
 ) -> Result<Value, ApiserverError> {
     let Some(name) = &path.name else {
         return Err(ApiserverError::BadRequest {
@@ -855,6 +1121,9 @@ async fn replace(
         });
     };
     client.validate_crd_schema(&path.group, &path.resource, &doc)?;
+    if path.resource == "events" {
+        normalize_event_for_group(&mut doc, &path.group);
+    }
     let is_crd = is_custom_resource(&path.resource);
     if is_dry_run(query) {
         // Validate the object exists, then echo the replacement without storing.
@@ -863,11 +1132,17 @@ async fn replace(
         if is_crd {
             convert_custom_resource(&mut stamped, &path.group, &path.version);
         }
+        if path.resource == "events" {
+            normalize_event_for_group(&mut stamped, &path.group);
+        }
         return Ok(stamped);
     }
     let mut result = persist_object(client, path, name, doc).await?;
     if is_crd {
         convert_custom_resource(&mut result, &path.group, &path.version);
+    }
+    if path.resource == "events" {
+        normalize_event_for_group(&mut result, &path.group);
     }
     Ok(result)
 }
@@ -983,6 +1258,9 @@ async fn patch(
     if is_crd {
         convert_custom_resource(&mut result, &path.group, &path.version);
     }
+    if path.resource == "events" {
+        normalize_event_for_group(&mut result, &path.group);
+    }
     Ok(result)
 }
 
@@ -1042,7 +1320,11 @@ async fn apply_patch(
             if dry_run {
                 return Ok(current);
             }
-            persist_object(client, path, name, current).await
+            let mut result = persist_object(client, path, name, current).await?;
+            if path.resource == "events" {
+                normalize_event_for_group(&mut result, &path.group);
+            }
+            Ok(result)
         },
     }
 }
@@ -1064,18 +1346,37 @@ async fn create(
     client: &KubernetesApiClient,
     path: &ResourcePath,
     query: Option<&str>,
-    doc: Value,
+    mut doc: Value,
 ) -> Result<Value, ApiserverError> {
     if path.name.is_some() {
         return Err(ApiserverError::BadRequest {
             message: "create does not take a resource name in the path".to_string(),
         });
     }
+    if path.resource == "pods"
+        && let Some(namespace) = &path.namespace
+        && let Ok(set) = ORPHANED_OWNERS.lock()
+        && let Some(orefs) = doc
+            .pointer_mut("/metadata/ownerReferences")
+            .and_then(Value::as_array_mut)
+    {
+        orefs.retain(|oref| {
+            let kind = oref.get("kind").and_then(Value::as_str).unwrap_or("");
+            let name = oref.get("name").and_then(Value::as_str).unwrap_or("");
+            !set.contains(&(namespace.clone(), kind.to_string(), name.to_string()))
+        });
+    }
+    if path.resource == "events" {
+        normalize_event_for_group(&mut doc, &path.group);
+    }
     let is_crd = is_custom_resource(&path.resource);
     if is_dry_run(query) {
         let mut result = dry_run_create(client, path, doc).await?;
         if is_crd {
             convert_custom_resource(&mut result, &path.group, &path.version);
+        }
+        if path.resource == "events" {
+            normalize_event_for_group(&mut result, &path.group);
         }
         return Ok(result);
     }
@@ -1092,6 +1393,9 @@ async fn create(
     };
     if is_crd {
         convert_custom_resource(&mut result, &path.group, &path.version);
+    }
+    if path.resource == "events" {
+        normalize_event_for_group(&mut result, &path.group);
     }
     Ok(result)
 }
@@ -1136,6 +1440,9 @@ async fn dry_run_create(
     }
     if is_custom_resource(&path.resource) {
         convert_custom_resource(&mut doc, &path.group, &path.version);
+    }
+    if path.resource == "events" {
+        normalize_event_for_group(&mut doc, &path.group);
     }
     Ok(doc)
 }
@@ -1191,7 +1498,7 @@ pub(crate) fn is_custom_resource(resource: &str) -> bool {
 }
 
 fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version: &str) {
-    if version == "v1" {
+    if version == "v2" {
         if let Some((h, p)) = spec
             .get("hostPort")
             .and_then(Value::as_str)
@@ -1202,7 +1509,7 @@ fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version
             spec.insert("port".to_string(), json!(p));
             spec.remove("hostPort");
         }
-    } else if version == "v2" {
+    } else if version == "v1" {
         let (Some(h), Some(p)) = (spec.get("host").and_then(Value::as_str), spec.get("port"))
         else {
             return;
@@ -1250,6 +1557,150 @@ pub(crate) fn convert_custom_resource_or_list(mut doc: Value, group: &str, versi
         convert_custom_resource(&mut doc, group, version);
     }
     doc
+}
+
+fn normalize_event_controller(obj: &mut serde_json::Map<String, Value>) {
+    let source_comp = obj
+        .get("source")
+        .and_then(|v| v.get("component"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let dep_comp = obj
+        .get("deprecatedSource")
+        .and_then(|v| v.get("component"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let rep_controller = obj
+        .get("reportingController")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(source_comp)
+        .or(dep_comp);
+
+    if let Some(ref controller) = rep_controller {
+        if !obj.contains_key("reportingController") {
+            obj.insert("reportingController".to_string(), json!(controller));
+        }
+        if obj.get("source").is_none() {
+            obj.insert("source".to_string(), json!({ "component": controller }));
+        } else if let Some(src) = obj.get_mut("source").and_then(Value::as_object_mut)
+            && !src.contains_key("component")
+        {
+            src.insert("component".to_string(), json!(controller));
+        }
+        if obj.get("deprecatedSource").is_none() {
+            obj.insert(
+                "deprecatedSource".to_string(),
+                json!({ "component": controller }),
+            );
+        } else if let Some(dep_src) = obj
+            .get_mut("deprecatedSource")
+            .and_then(Value::as_object_mut)
+            && !dep_src.contains_key("component")
+        {
+            dep_src.insert("component".to_string(), json!(controller));
+        }
+    }
+}
+
+fn normalize_event_instance(obj: &mut serde_json::Map<String, Value>) {
+    let source_host = obj
+        .get("source")
+        .and_then(|v| v.get("host"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let dep_host = obj
+        .get("deprecatedSource")
+        .and_then(|v| v.get("host"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let rep_instance = obj
+        .get("reportingInstance")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(source_host)
+        .or(dep_host);
+
+    if let Some(ref instance) = rep_instance {
+        if !obj.contains_key("reportingInstance") {
+            obj.insert("reportingInstance".to_string(), json!(instance));
+        }
+        if let Some(src) = obj.get_mut("source").and_then(Value::as_object_mut)
+            && !src.contains_key("host")
+        {
+            src.insert("host".to_string(), json!(instance));
+        }
+        if let Some(dep_src) = obj
+            .get_mut("deprecatedSource")
+            .and_then(Value::as_object_mut)
+            && !dep_src.contains_key("host")
+        {
+            dep_src.insert("host".to_string(), json!(instance));
+        }
+    }
+}
+
+pub(crate) fn normalize_event_for_group(doc: &mut Value, group: &str) {
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
+    let api_version = if group == "events.k8s.io" {
+        "events.k8s.io/v1"
+    } else {
+        "v1"
+    };
+    obj.insert("apiVersion".to_string(), json!(api_version));
+
+    normalize_event_controller(obj);
+    normalize_event_instance(obj);
+
+    let note = obj
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            obj.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    if let Some(ref msg) = note {
+        if !obj.contains_key("note") {
+            obj.insert("note".to_string(), json!(msg));
+        }
+        if !obj.contains_key("message") {
+            obj.insert("message".to_string(), json!(msg));
+        }
+    }
+
+    let regarding = obj
+        .get("regarding")
+        .cloned()
+        .or_else(|| obj.get("involvedObject").cloned());
+    if let Some(reg) = regarding {
+        if !obj.contains_key("regarding") {
+            obj.insert("regarding".to_string(), reg.clone());
+        }
+        if !obj.contains_key("involvedObject") {
+            obj.insert("involvedObject".to_string(), reg);
+        }
+    }
+}
+
+pub(crate) fn normalize_event_list_for_group(doc: &mut Value, group: &str) {
+    let api_version = if group == "events.k8s.io" {
+        "events.k8s.io/v1"
+    } else {
+        "v1"
+    };
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("apiVersion".to_string(), json!(api_version));
+        obj.insert("kind".to_string(), json!("EventList"));
+    }
+    if let Some(items) = doc.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            normalize_event_for_group(item, group);
+        }
+    }
 }
 
 async fn list_all_namespaces(
@@ -1349,7 +1800,7 @@ async fn list_namespaced(
         ("", "endpoints") => client.list_endpoints(namespace).await,
         ("", "serviceaccounts") => client.list_service_accounts(namespace).await,
         ("", "persistentvolumeclaims") => client.list_pvcs(namespace).await,
-        ("", "events") => {
+        ("" | "events.k8s.io", "events") => {
             client
                 .list_namespaced_objects("", "EventList", "events", namespace)
                 .await
@@ -1362,11 +1813,6 @@ async fn list_namespaced(
         ("batch", "jobs") => client.list_jobs(namespace).await,
         ("batch", "cronjobs") => client.list_cronjobs(namespace).await,
         ("coordination.k8s.io", "leases") => client.list_leases(namespace).await,
-        ("events.k8s.io", "events") => {
-            client
-                .list_namespaced_objects("events.k8s.io", "EventList", "events", namespace)
-                .await
-        },
         ("rbac.authorization.k8s.io", "roles") => {
             client
                 .list_namespaced_objects(
@@ -1411,7 +1857,7 @@ async fn get_namespaced(
         ("", "endpoints") => client.get_endpoints(namespace, name).await,
         ("", "serviceaccounts") => client.get_service_account(namespace, name).await,
         ("", "persistentvolumeclaims") => client.get_pvc(namespace, name).await,
-        ("", "events") => {
+        ("" | "events.k8s.io", "events") => {
             client
                 .get_namespaced_object("", "events", namespace, name)
                 .await
@@ -1424,11 +1870,6 @@ async fn get_namespaced(
         ("batch", "jobs") => client.get_job(namespace, name).await,
         ("batch", "cronjobs") => client.get_cronjob(namespace, name).await,
         ("coordination.k8s.io", "leases") => client.get_lease(namespace, name).await,
-        ("events.k8s.io", "events") => {
-            client
-                .get_namespaced_object("events.k8s.io", "events", namespace, name)
-                .await
-        },
         ("rbac.authorization.k8s.io", "roles") => {
             client
                 .get_namespaced_object("rbac.authorization.k8s.io", "roles", namespace, name)
@@ -1464,7 +1905,7 @@ async fn delete_namespaced(
         ("", "endpoints") => client.delete_endpoints(namespace, name).await,
         ("", "serviceaccounts") => client.delete_service_account(namespace, name).await,
         ("", "persistentvolumeclaims") => client.delete_pvc(namespace, name).await,
-        ("", "events") => {
+        ("" | "events.k8s.io", "events") => {
             client
                 .delete_namespaced_object("", "events", namespace, name)
                 .await
@@ -1479,11 +1920,6 @@ async fn delete_namespaced(
         ("batch", "jobs") => client.delete_job(namespace, name).await,
         ("batch", "cronjobs") => client.delete_cronjob(namespace, name).await,
         ("coordination.k8s.io", "leases") => client.delete_lease(namespace, name).await,
-        ("events.k8s.io", "events") => {
-            client
-                .delete_namespaced_object("events.k8s.io", "events", namespace, name)
-                .await
-        },
         ("rbac.authorization.k8s.io", "roles") => {
             client
                 .delete_namespaced_object("rbac.authorization.k8s.io", "roles", namespace, name)
@@ -1556,7 +1992,7 @@ async fn create_namespaced(
         ("", "endpoints") => client.create_endpoints(namespace, doc).await,
         ("", "serviceaccounts") => client.create_service_account(namespace, doc).await,
         ("", "persistentvolumeclaims") => client.create_pvc(namespace, doc).await,
-        ("", "events") => {
+        ("" | "events.k8s.io", "events") => {
             client
                 .create_namespaced_object("", "Event", "events", namespace, doc)
                 .await
@@ -1569,11 +2005,6 @@ async fn create_namespaced(
         ("batch", "jobs") => client.create_job(namespace, doc).await,
         ("batch", "cronjobs") => client.create_cronjob(namespace, doc).await,
         ("coordination.k8s.io", "leases") => client.create_lease(namespace, doc).await,
-        ("events.k8s.io", "events") => {
-            client
-                .create_namespaced_object("events.k8s.io", "Event", "events", namespace, doc)
-                .await
-        },
         ("rbac.authorization.k8s.io", "roles") => {
             client
                 .create_namespaced_object(
@@ -1640,6 +2071,11 @@ async fn update_namespaced(
         ("batch", "jobs") => client.update_job(namespace, name, doc).await,
         ("batch", "cronjobs") => client.update_cronjob(namespace, name, doc).await,
         ("coordination.k8s.io", "leases") => client.update_lease(namespace, name, doc).await,
+        ("" | "events.k8s.io", "events") => {
+            client
+                .replace_namespaced_object("", "Event", "events", namespace, name, doc)
+                .await
+        },
         _ => {
             let kind = kind_name(resource)
                 .map(str::to_owned)
@@ -3231,5 +3667,29 @@ mod tests {
         assert!(matches!(err, ApiserverError::BadRequest { .. }));
         let err_neg = page_list(list, Some("limit=-1")).unwrap_err();
         assert!(matches!(err_neg, ApiserverError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn crd_host_port_conversion_v1_v2() {
+        let mut v1_doc = json!({
+            "spec": {
+                "hostPort": "example.com:8080"
+            }
+        });
+        convert_custom_resource(&mut v1_doc, "example.com", "v2");
+        assert_eq!(v1_doc["spec"]["host"], "example.com");
+        assert_eq!(v1_doc["spec"]["port"], "8080");
+        assert!(v1_doc["spec"].get("hostPort").is_none());
+
+        let mut v2_doc = json!({
+            "spec": {
+                "host": "example.com",
+                "port": 8080
+            }
+        });
+        convert_custom_resource(&mut v2_doc, "example.com", "v1");
+        assert_eq!(v2_doc["spec"]["hostPort"], "example.com:8080");
+        assert!(v2_doc["spec"].get("host").is_none());
+        assert!(v2_doc["spec"].get("port").is_none());
     }
 }

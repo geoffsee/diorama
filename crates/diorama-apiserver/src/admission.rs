@@ -898,6 +898,7 @@ struct WebhookTarget {
     port: u16,
     path: String,
     tls_server_name: String,
+    request_url: String,
 }
 
 fn parse_webhook_url(url_str: &str) -> Result<WebhookTarget, ApiserverError> {
@@ -931,6 +932,7 @@ fn parse_webhook_url(url_str: &str) -> Result<WebhookTarget, ApiserverError> {
         port,
         path: p,
         tls_server_name: h,
+        request_url: url_str.to_string(),
     })
 }
 
@@ -984,12 +986,14 @@ async fn resolve_webhook_service(
             }
         }
     }
+    let request_url = format!("https://{tls_server_name}:{port}{path}");
     WebhookTarget {
         scheme: "https",
         host: resolved_host,
         port,
         path,
         tls_server_name,
+        request_url,
     }
 }
 
@@ -1000,7 +1004,16 @@ async fn send_webhook_http(
     timeout_dur: std::time::Duration,
     webhook_name: &str,
     tcp_stream: tokio::net::TcpStream,
+    url_with_timeout: &str,
 ) -> Result<bytes::Bytes, ApiserverError> {
+    let path_with_timeout = if target.path.contains("timeout=") {
+        target.path.clone()
+    } else if target.path.contains('?') {
+        format!("{}&timeout={}s", target.path, timeout_dur.as_secs())
+    } else {
+        format!("{}?timeout={}s", target.path, timeout_dur.as_secs())
+    };
+
     if target.scheme == "https" {
         let connector = crate::http::tls::tls_connector_for_ca(ca_pem);
         let server_name = rustls::pki_types::ServerName::try_from(target.tls_server_name.clone())
@@ -1012,7 +1025,7 @@ async fn send_webhook_http(
                 .await
                 .map_err(|_| ApiserverError::WebhookFailure {
                     webhook: webhook_name.to_string(),
-                    reason: "TLS handshake timed out".to_string(),
+                    reason: format!("Post \"{url_with_timeout}\": net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded"),
                 })?
                 .map_err(|e| ApiserverError::WebhookFailure {
                     webhook: webhook_name.to_string(),
@@ -1032,7 +1045,7 @@ async fn send_webhook_http(
 
         let http_req = http::Request::builder()
             .method("POST")
-            .uri(&target.path)
+            .uri(&path_with_timeout)
             .header(http::header::HOST, &target.tls_server_name)
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(http_body_util::Full::new(bytes::Bytes::from(body_bytes)))
@@ -1044,7 +1057,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded".to_string(),
+                reason: format!("Post \"{url_with_timeout}\": net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded"),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1072,7 +1085,7 @@ async fn send_webhook_http(
 
         let http_req = http::Request::builder()
             .method("POST")
-            .uri(&target.path)
+            .uri(&path_with_timeout)
             .header(
                 http::header::HOST,
                 format!("{}:{}", target.host, target.port),
@@ -1087,7 +1100,7 @@ async fn send_webhook_http(
             .await
             .map_err(|_| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
-                reason: "net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded".to_string(),
+                reason: format!("Post \"{url_with_timeout}\": net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded"),
             })?
             .map_err(|e| ApiserverError::WebhookFailure {
                 webhook: webhook_name.to_string(),
@@ -1137,6 +1150,14 @@ async fn dispatch_live_webhook(
     let timeout_secs = u64::from(webhook.timeout_seconds.unwrap_or(10));
     let timeout_dur = std::time::Duration::from_secs(timeout_secs);
 
+    let url_with_timeout = if target.request_url.contains("timeout=") {
+        target.request_url.clone()
+    } else if target.request_url.contains('?') {
+        format!("{}&timeout={}s", target.request_url, timeout_secs)
+    } else {
+        format!("{}?timeout={}s", target.request_url, timeout_secs)
+    };
+
     let tcp_stream = tokio::time::timeout(
         timeout_dur,
         tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
@@ -1144,7 +1165,7 @@ async fn dispatch_live_webhook(
     .await
     .map_err(|_| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
-        reason: format!("connection to {}:{} timed out: net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded", target.host, target.port),
+        reason: format!("Post \"{url_with_timeout}\": net/http: request canceled (Client.Timeout exceeded while awaiting headers): context deadline exceeded"),
     })?
     .map_err(|e| ApiserverError::WebhookFailure {
         webhook: webhook.name.clone(),
@@ -1168,6 +1189,7 @@ async fn dispatch_live_webhook(
         timeout_dur,
         &webhook.name,
         tcp_stream,
+        &url_with_timeout,
     )
     .await?;
 

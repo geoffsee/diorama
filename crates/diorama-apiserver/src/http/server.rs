@@ -462,6 +462,8 @@ async fn exec_upgrade(
     );
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     let upgrade = hyper::upgrade::on(request);
+    let mut options = options;
+    options.protocol.clone_from(&protocol);
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
@@ -548,6 +550,7 @@ async fn attach_upgrade(
         stdout: options.stdout,
         stderr: options.stderr,
         tty: options.tty,
+        protocol: protocol.clone(),
     };
     tokio::spawn(async move {
         match upgrade.await {
@@ -807,7 +810,7 @@ async fn watch_hub_loop(hub: Arc<WatchHub>, mut raw_rx: WatchReceiver) {
 }
 
 fn compute_resource_key_prefix(storage_prefix: &str, path: &ResourcePath) -> String {
-    let group_segment = if path.group.is_empty() {
+    let group_segment = if path.group.is_empty() || path.resource == "events" {
         String::new()
     } else {
         format!("/{}", path.group)
@@ -1015,6 +1018,9 @@ async fn stream_watch(
             if filter.is_custom_resource {
                 dispatch::convert_custom_resource(&mut item, &filter.group, &filter.version);
             }
+            if filter.kind == "Event" {
+                dispatch::normalize_event_for_group(&mut item, &filter.group);
+            }
             if !filter.accepts(&item) {
                 continue;
             }
@@ -1071,6 +1077,9 @@ async fn stream_watch(
         if filter.is_custom_resource {
             dispatch::convert_custom_resource(&mut object, &filter.group, &filter.version);
         }
+        if filter.kind == "Event" {
+            dispatch::normalize_event_for_group(&mut object, &filter.group);
+        }
         if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
             continue;
         }
@@ -1080,6 +1089,12 @@ async fn stream_watch(
             event.prev_object.as_ref().map(|po| {
                 let mut c = po.clone();
                 dispatch::convert_custom_resource(&mut c, &filter.group, &filter.version);
+                c
+            })
+        } else if filter.kind == "Event" {
+            event.prev_object.as_ref().map(|po| {
+                let mut c = po.clone();
+                dispatch::normalize_event_for_group(&mut c, &filter.group);
                 c
             })
         } else {
@@ -1177,6 +1192,9 @@ async fn stream_watch(
                 if filter.is_custom_resource {
                     dispatch::convert_custom_resource(&mut object, &filter.group, &filter.version);
                 }
+                if filter.kind == "Event" {
+                    dispatch::normalize_event_for_group(&mut object, &filter.group);
+                }
                 if !filter.namespaced && object.pointer("/metadata/namespace").is_some() {
                     continue;
                 }
@@ -1186,6 +1204,12 @@ async fn stream_watch(
                     event.prev_object.as_ref().map(|po| {
                         let mut c = po.clone();
                         dispatch::convert_custom_resource(&mut c, &filter.group, &filter.version);
+                        c
+                    })
+                } else if filter.kind == "Event" {
+                    event.prev_object.as_ref().map(|po| {
+                        let mut c = po.clone();
+                        dispatch::normalize_event_for_group(&mut c, &filter.group);
                         c
                     })
                 } else {

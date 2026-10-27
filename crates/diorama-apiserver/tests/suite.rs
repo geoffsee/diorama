@@ -20,3 +20,5 @@ mod service_account_tokens;
 mod service_allocation;
 #[path = "storage_readiness.rs"]
 mod storage_readiness;
+#[path = "wave7a_conformance.rs"]
+mod wave7a_conformance;
