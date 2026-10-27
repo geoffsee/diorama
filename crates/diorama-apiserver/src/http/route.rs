@@ -18,7 +18,7 @@ pub(crate) enum Route {
     NotFound,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourcePath {
     pub(crate) group: String,
     pub(crate) namespace: Option<String>,
@@ -26,9 +26,11 @@ pub(crate) struct ResourcePath {
     pub(crate) name: Option<String>,
     /// Trailing segment after the name, such as `log`, `status`, or `proxy/<path>`.
     pub(crate) subresource: Option<String>,
+    pub(crate) trailing_slash: bool,
 }
 
 pub(crate) fn parse(path: &str) -> Route {
+    let trailing_slash = path.ends_with('/');
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     match parts.as_slice() {
         ["healthz" | "livez" | "readyz"] => Route::Health,
@@ -43,7 +45,7 @@ pub(crate) fn parse(path: &str) -> Route {
         },
         ["api"] => Route::ApiVersions,
         ["api", "v1"] => Route::CoreDiscovery,
-        ["api", "v1", rest @ ..] => parse_resource("", rest),
+        ["api", "v1", rest @ ..] => parse_resource("", rest, trailing_slash),
         ["apis"] => Route::ApiGroupList,
         ["apis", group] => Route::ApiGroup {
             group: (*group).to_string(),
@@ -53,7 +55,7 @@ pub(crate) fn parse(path: &str) -> Route {
             version: (*version).to_string(),
         },
         ["apis", group, version, rest @ ..] if is_api_version(version) => {
-            parse_resource(group, rest)
+            parse_resource(group, rest, trailing_slash)
         },
         _ => Route::NotFound,
     }
@@ -64,7 +66,7 @@ fn is_api_version(version: &str) -> bool {
     matches!(chars.next(), Some('v')) && chars.next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
-fn parse_resource(group: &str, parts: &[&str]) -> Route {
+fn parse_resource(group: &str, parts: &[&str], trailing_slash: bool) -> Route {
     if parts.is_empty() {
         return Route::NotFound;
     }
@@ -80,6 +82,7 @@ fn parse_resource(group: &str, parts: &[&str]) -> Route {
             resource: parts[3].to_string(),
             name: Some(parts[4].to_string()),
             subresource: Some(sub),
+            trailing_slash,
         });
     }
     let (namespace, resource, name, subresource) = if parts[0] == "namespaces" && parts.len() >= 3 {
@@ -118,38 +121,41 @@ fn parse_resource(group: &str, parts: &[&str]) -> Route {
         resource,
         name,
         subresource,
+        trailing_slash,
     })
 }
 
 /// Whether the client offers `v2` aggregated discovery (`apidiscovery.k8s.io`).
-///
-/// Only `v2` is served. Clients that offer solely `v2beta1` (client-go older
-/// than 1.28, as vendored by Sonobuoy) fail to parse a `v2` response, so they
-/// receive legacy discovery, which is also in their `Accept` list.
-pub(crate) fn wants_aggregated_discovery(accept: Option<&str>) -> bool {
-    let Some(accept) = accept else {
-        return false;
-    };
-    accept.split(',').any(|entry| {
+/// Matches clients that ask for aggregated discovery (`g=apidiscovery.k8s.io`
+/// with `v=v2` or `v=v2beta1` and `as=APIGroupDiscoveryList`).
+pub(crate) fn aggregated_discovery_version(accept: Option<&str>) -> Option<&'static str> {
+    let accept = accept?;
+    for entry in accept.split(',') {
         let mut group_ok = false;
         let mut as_discovery = false;
-        let mut version_explicit = false;
-        let mut v2_ok = false;
+        let mut version: Option<&'static str> = None;
         for param in entry.split(';') {
             let p = param.trim().replace(' ', "");
             if p == "g=apidiscovery.k8s.io" {
                 group_ok = true;
             } else if p == "as=APIGroupDiscoveryList" {
                 as_discovery = true;
-            } else if p.starts_with("v=") {
-                version_explicit = true;
-                if p == "v=v2" {
-                    v2_ok = true;
-                }
+            } else if p == "v=v2" {
+                version = Some("v2");
+            } else if p == "v=v2beta1" {
+                version = Some("v2beta1");
             }
         }
-        group_ok && (!version_explicit || v2_ok) && (v2_ok || as_discovery)
-    })
+        if group_ok && (as_discovery || version.is_some()) {
+            return Some(version.unwrap_or("v2"));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn wants_aggregated_discovery(accept: Option<&str>) -> bool {
+    aggregated_discovery_version(accept).is_some()
 }
 
 #[cfg(test)]
@@ -227,10 +233,10 @@ mod tests {
         assert!(wants_aggregated_discovery(Some(
             "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList;profile=nopeer"
         )));
-        // Plain JSON and v2beta1-only clients (Sonobuoy's client-go) get legacy.
+        // Plain JSON gets legacy, but v2beta1 is accepted.
         assert!(!wants_aggregated_discovery(None));
         assert!(!wants_aggregated_discovery(Some("application/json")));
-        assert!(!wants_aggregated_discovery(Some(
+        assert!(wants_aggregated_discovery(Some(
             "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json"
         )));
     }

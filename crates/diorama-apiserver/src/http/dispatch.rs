@@ -20,6 +20,7 @@ pub(crate) enum Payload {
 pub(crate) struct Outcome {
     pub(crate) status: http::StatusCode,
     pub(crate) body: Payload,
+    pub(crate) headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
 }
 
 pub(crate) async fn dispatch(
@@ -1528,6 +1529,18 @@ async fn update_cluster(
         ("", "nodes") => client.update_node(name, doc).await,
         ("", "persistentvolumes") => client.update_pv(name, doc).await,
         ("storage.k8s.io" | "", "storageclasses") => client.update_storage_class(name, doc).await,
+        ("apiextensions.k8s.io", "customresourcedefinitions") => client.update_crd(name, doc).await,
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            client
+                .update_validating_webhook_configuration(name, doc)
+                .await
+        },
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            client
+                .update_mutating_webhook_configuration(name, doc)
+                .await
+        },
+        ("apiregistration.k8s.io", "apiservices") => client.update_api_service(name, doc).await,
         _ => {
             let kind = kind_name(resource)
                 .map(str::to_owned)
@@ -1716,6 +1729,7 @@ fn ok_json(body: Value) -> Outcome {
     Outcome {
         status: http::StatusCode::OK,
         body: Payload::Json(body),
+        headers: Vec::new(),
     }
 }
 
@@ -1723,6 +1737,7 @@ fn created_json(body: Value) -> Outcome {
     Outcome {
         status: http::StatusCode::CREATED,
         body: Payload::Json(body),
+        headers: Vec::new(),
     }
 }
 
@@ -1738,6 +1753,7 @@ fn status_outcome(status: http::StatusCode, reason: &str, message: &str) -> Outc
             "reason": reason,
             "code": status.as_u16()
         })),
+        headers: Vec::new(),
     }
 }
 
@@ -2003,6 +2019,7 @@ async fn subresource_dispatch(
             Ok(Outcome {
                 status: http::StatusCode::OK,
                 body,
+                headers: Vec::new(),
             })
         },
         ("", "pods", "eviction") => {
@@ -2016,6 +2033,26 @@ async fn subresource_dispatch(
             evict_pod(client, path, body).await
         },
         ("", "pods" | "services", sub) if sub == "proxy" || sub.starts_with("proxy/") => {
+            if sub == "proxy" && !path.trailing_slash {
+                let ns = path.namespace.as_deref().unwrap_or("default");
+                let res = &path.resource;
+                let name = path.name.as_deref().unwrap_or("");
+                let mut location = format!("/api/v1/namespaces/{ns}/{res}/{name}/proxy/");
+                if let Some(q) = query {
+                    location.push('?');
+                    location.push_str(q);
+                }
+                let header_val = http::header::HeaderValue::from_str(&location).map_err(|_| {
+                    ApiserverError::Internal {
+                        reason: "invalid location header".into(),
+                    }
+                })?;
+                return Ok(Outcome {
+                    status: http::StatusCode::MOVED_PERMANENTLY,
+                    body: Payload::Text(String::new()),
+                    headers: vec![(http::header::LOCATION, header_val)],
+                });
+            }
             proxy_subresource(client, method, path, sub, query, content_type, body).await
         },
         (_, "pods", "exec" | "attach" | "portforward") => Err(ApiserverError::BadRequest {
@@ -2105,6 +2142,7 @@ async fn evict_pod(
                     "details": { "causes": [{ "reason": "DisruptionBudget", "message": message }] },
                     "code": 429
                 })),
+                headers: Vec::new(),
             });
         }
         record_pdb_disruption(client, pdb, &counts, namespace, name).await;
@@ -2403,6 +2441,7 @@ async fn proxy_subresource(
     Ok(Outcome {
         status,
         body: Payload::Text(text),
+        headers: Vec::new(),
     })
 }
 

@@ -374,6 +374,43 @@ impl RbacAuthorizer {
                     resource_names: Vec::new(),
                     non_resource_urls: Vec::new(),
                 },
+                PolicyRule {
+                    verbs: vec![
+                        "get".to_string(),
+                        "list".to_string(),
+                        "watch".to_string(),
+                        "create".to_string(),
+                        "update".to_string(),
+                        "patch".to_string(),
+                    ],
+                    api_groups: vec!["certificates.k8s.io".to_string()],
+                    resources: vec![
+                        "clustertrustbundles".to_string(),
+                        "podcertificaterequests".to_string(),
+                        "podcertificaterequests/status".to_string(),
+                        "certificatesigningrequests".to_string(),
+                    ],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec![
+                        "get".to_string(),
+                        "list".to_string(),
+                        "watch".to_string(),
+                        "create".to_string(),
+                        "update".to_string(),
+                        "patch".to_string(),
+                    ],
+                    api_groups: vec![String::new()],
+                    resources: vec![
+                        "serviceaccounts".to_string(),
+                        "namespaces".to_string(),
+                        "events".to_string(),
+                    ],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
             ],
         });
 

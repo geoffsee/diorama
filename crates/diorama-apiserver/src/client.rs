@@ -1504,10 +1504,20 @@ impl KubernetesApiClient {
         })
     }
 
+    fn generate_rfc4122_uuid(cur_rev: u64) -> String {
+        let ts = crate::time::now_unix();
+        let seq = cur_rev;
+        format!(
+            "{ts:08x}-{seq:04x}-4{:03x}-8{:03x}-{ts:012x}",
+            seq & 0xfff,
+            (seq >> 12) & 0xfff
+        )
+    }
+
     fn stamp_creation_and_uid(
         meta: &mut serde_json::Map<String, Value>,
-        plural: &str,
-        name: &str,
+        _plural: &str,
+        _name: &str,
         cur_rev: u64,
     ) {
         let needs_ts = meta
@@ -1527,7 +1537,7 @@ impl KubernetesApiClient {
         if needs_uid {
             meta.insert(
                 "uid".to_string(),
-                json!(format!("uid-{plural}-{name}-{cur_rev}")),
+                json!(Self::generate_rfc4122_uuid(cur_rev)),
             );
         }
     }
@@ -1823,7 +1833,7 @@ impl KubernetesApiClient {
                 "name": name,
                 "namespace": namespace,
                 "creationTimestamp": crate::time::now_rfc3339(),
-                "uid": format!("uid-configmaps-{name}-{cur_rev}")
+                "uid": Self::generate_rfc4122_uuid(cur_rev)
             },
             "data": data
         });
@@ -3333,6 +3343,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         self.admission.run_validating_admission(&adm_req).await?;
 
@@ -3622,6 +3633,7 @@ impl KubernetesApiClient {
         } else if group.is_empty() && plural == "secrets" {
             Self::validate_secret_doc(&doc)?;
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         self.admission.run_validating_admission(&adm_req).await?;
 
@@ -3850,6 +3862,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
@@ -3951,6 +3964,7 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
@@ -5739,6 +5753,7 @@ impl KubernetesApiClient {
             .write()
             .unwrap()
             .insert(name.clone(), result.clone());
+        Self::sync_crd_schema_to_field_validation(&result);
         Ok(result)
     }
 
@@ -5767,6 +5782,74 @@ impl KubernetesApiClient {
             );
         }
         Ok(doc)
+    }
+
+    pub async fn update_crd(&self, name: &str, mut crd: Value) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed(
+            "update",
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            None,
+            Some(name),
+        )?;
+
+        let body_name = crd
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str);
+        if body_name != Some(name) {
+            return Err(ApiserverError::InvalidInput {
+                field: "metadata.name".to_string(),
+                reason: format!("body name {body_name:?} does not match '{name}'"),
+            });
+        }
+
+        let key = format!("{}/customresourcedefinitions/{name}", self.storage.prefix());
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "customresourcedefinitions".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        Self::update_generation(&mut crd, &old);
+        if let Some(meta) = crd.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            for k in ["uid", "creationTimestamp"] {
+                if let Some(v) = old.get("metadata").and_then(|m| m.get(k)) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        if crd.get("status").is_none_or(Value::is_null)
+            && let Some(s) = old.get("status").filter(|s| !s.is_null())
+        {
+            crd["status"] = s.clone();
+        }
+
+        let expected_version = crd
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let bytes = serde_json::to_vec(&crd)?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        if let Some(meta) = crd.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        self.crd_registry
+            .write()
+            .unwrap()
+            .insert(name.to_string(), crd.clone());
+        Self::sync_crd_schema_to_field_validation(&crd);
+        Ok(crd)
     }
 
     pub async fn list_crds(&self) -> Result<Value, ApiserverError> {
@@ -5818,6 +5901,9 @@ impl KubernetesApiClient {
             });
         }
         let crd_opt = self.crd_registry.write().unwrap().remove(name);
+        if let Some(crd) = &crd_opt {
+            Self::remove_crd_schema_from_field_validation(crd);
+        }
         if let Some(crd) = crd_opt
             && let Some(spec) = crd.get("spec")
             && let Some(group) = spec.get("group").and_then(Value::as_str)
@@ -5833,6 +5919,40 @@ impl KubernetesApiClient {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn sync_crd_schema_to_field_validation(crd: &Value) {
+        if let Some(spec) = crd.get("spec")
+            && let Some(group) = spec.get("group").and_then(Value::as_str)
+            && let Some(plural) = spec
+                .get("names")
+                .and_then(|n| n.get("plural"))
+                .and_then(Value::as_str)
+            && let Some(versions) = spec.get("versions").and_then(Value::as_array)
+        {
+            for v in versions {
+                if let Some(schema) = v.get("schema").and_then(|s| s.get("openAPIV3Schema")) {
+                    crate::http::field_validation::register_crd_schema(
+                        group,
+                        plural,
+                        schema.clone(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove_crd_schema_from_field_validation(crd: &Value) {
+        if let Some(spec) = crd.get("spec")
+            && let Some(group) = spec.get("group").and_then(Value::as_str)
+            && let Some(plural) = spec
+                .get("names")
+                .and_then(|n| n.get("plural"))
+                .and_then(Value::as_str)
+        {
+            crate::http::field_validation::unregister_crd_schema(group, plural);
+        }
     }
 
     // --- Dynamic Custom Resources & Schema Validation ---
@@ -5885,9 +6005,22 @@ impl KubernetesApiClient {
         if let Some(enum_vals) = schema.get("enum").and_then(Value::as_array)
             && !enum_vals.contains(data)
         {
+            let val_str = data
+                .as_str()
+                .map_or_else(|| data.to_string(), str::to_owned);
+            let allowed_list: Vec<String> = enum_vals
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => format!("\"{s}\""),
+                    other => other.to_string(),
+                })
+                .collect();
             return Err(ApiserverError::InvalidInput {
                 field: path.to_string(),
-                reason: format!("value '{data}' is not in allowed enum values: {enum_vals:?}"),
+                reason: format!(
+                    "{path}: Unsupported value: \"{val_str}\": supported values: {}",
+                    allowed_list.join(", ")
+                ),
             });
         }
 
@@ -6015,6 +6148,8 @@ impl KubernetesApiClient {
                 if !(preserve_unknown
                     || path.is_empty()
                         && matches!(prop_name.as_str(), "apiVersion" | "kind" | "metadata"))
+                    && crate::http::field_validation::current_directive()
+                        == crate::http::field_validation::FieldValidationDirective::Strict
                 {
                     return Err(ApiserverError::InvalidInput {
                         field: next_path.clone(),
@@ -6149,6 +6284,68 @@ impl KubernetesApiClient {
         Ok(())
     }
 
+    pub(crate) fn apply_schema_defaults(schema: &Value, data: &mut Value) {
+        if let Some(props) = schema.get("properties").and_then(Value::as_object)
+            && let Some(obj) = data.as_object_mut()
+        {
+            for (prop_name, prop_schema) in props {
+                if !obj.contains_key(prop_name)
+                    && let Some(default_val) = prop_schema.get("default")
+                {
+                    obj.insert(prop_name.clone(), default_val.clone());
+                }
+                if let Some(val) = obj.get_mut(prop_name) {
+                    Self::apply_schema_defaults(prop_schema, val);
+                }
+            }
+        }
+        if let Some(items_schema) = schema.get("items")
+            && let Some(arr) = data.as_array_mut()
+        {
+            for item in arr.iter_mut() {
+                Self::apply_schema_defaults(items_schema, item);
+            }
+        }
+    }
+
+    pub fn apply_crd_defaults_to_instance(
+        crd_registry: &Arc<RwLock<BTreeMap<String, Value>>>,
+        group: &str,
+        plural: &str,
+        resource: &mut Value,
+    ) {
+        let registry = crd_registry.read().unwrap();
+        for crd in registry.values() {
+            let Some(spec) = crd.get("spec") else {
+                continue;
+            };
+            if spec.get("group").and_then(Value::as_str) != Some(group)
+                || spec.pointer("/names/plural").and_then(Value::as_str) != Some(plural)
+            {
+                continue;
+            }
+            let Some(versions) = spec.get("versions").and_then(Value::as_array) else {
+                continue;
+            };
+            let target_ver = resource
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .and_then(|av| av.split_once('/').map(|(_, v)| v.to_string()));
+            for ver in versions {
+                if let Some(tv) = &target_ver
+                    && let Some(vn) = ver.get("name").and_then(Value::as_str)
+                    && vn != tv
+                {
+                    continue;
+                }
+                if let Some(schema) = ver.get("schema").and_then(|s| s.get("openAPIV3Schema")) {
+                    Self::apply_schema_defaults(schema, resource);
+                }
+            }
+            break;
+        }
+    }
+
     pub async fn create_custom_resource(
         &self,
         group: &str,
@@ -6159,6 +6356,7 @@ impl KubernetesApiClient {
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("create", group, plural, Some(namespace), Some(name))?;
         Self::init_generation(&mut resource);
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
 
         // Admission reviews
         let mut adm_req = AdmissionRequest {
@@ -6235,6 +6433,7 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Ok(doc)
     }
 
@@ -6248,6 +6447,7 @@ impl KubernetesApiClient {
         expected_version: Option<u64>,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("update", group, plural, Some(namespace), Some(name))?;
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
         let key = format!(
             "{}/{group}/{plural}/{namespace}/{name}",
             self.storage.prefix()
@@ -6320,6 +6520,7 @@ impl KubernetesApiClient {
                     json!(kv.mod_revision.to_string()),
                 );
             }
+            Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
             items.push(doc);
         }
         let cur_rev = self.storage.current_revision().await;
@@ -6383,6 +6584,13 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::ValidatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
+        for wh in &typed.webhooks {
+            if let Some(conds) = &wh.match_conditions {
+                for c in conds {
+                    crate::admission::validate_match_condition(&c.expression)?;
+                }
+            }
+        }
         self.admission.add_validating_webhook_config(typed);
 
         let key = format!(
@@ -6432,6 +6640,82 @@ impl KubernetesApiClient {
             );
         }
         Ok(doc)
+    }
+
+    pub async fn update_validating_webhook_configuration(
+        &self,
+        name: &str,
+        mut config: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed(
+            "update",
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            None,
+            Some(name),
+        )?;
+
+        let body_name = config
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str);
+        if body_name != Some(name) {
+            return Err(ApiserverError::InvalidInput {
+                field: "metadata.name".to_string(),
+                reason: format!("body name {body_name:?} does not match '{name}'"),
+            });
+        }
+
+        let key = format!(
+            "{}/validatingwebhookconfigurations/{name}",
+            self.storage.prefix()
+        );
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "validatingwebhookconfigurations".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        if let Some(meta) = config.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            for k in ["uid", "creationTimestamp"] {
+                if let Some(v) = old.get("metadata").and_then(|m| m.get(k)) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+
+        let typed: crate::admission::ValidatingWebhookConfiguration =
+            serde_json::from_value(config.clone())?;
+        for wh in &typed.webhooks {
+            if let Some(conds) = &wh.match_conditions {
+                for c in conds {
+                    crate::admission::validate_match_condition(&c.expression)?;
+                }
+            }
+        }
+
+        let expected_version = config
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let bytes = serde_json::to_vec(&config)?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        self.admission.add_validating_webhook_config(typed);
+        let mut result = config;
+        if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        Ok(result)
     }
 
     pub async fn list_validating_webhook_configurations(&self) -> Result<Value, ApiserverError> {
@@ -6488,6 +6772,7 @@ impl KubernetesApiClient {
                 name: name.to_string(),
             });
         }
+        self.admission.remove_validating_webhook_config(name);
         Ok(())
     }
 
@@ -6517,6 +6802,13 @@ impl KubernetesApiClient {
 
         let typed: crate::admission::MutatingWebhookConfiguration =
             serde_json::from_value(config.clone())?;
+        for wh in &typed.webhooks {
+            if let Some(conds) = &wh.match_conditions {
+                for c in conds {
+                    crate::admission::validate_match_condition(&c.expression)?;
+                }
+            }
+        }
         self.admission.add_mutating_webhook_config(typed);
 
         let key = format!(
@@ -6571,7 +6863,7 @@ impl KubernetesApiClient {
     pub async fn update_mutating_webhook_configuration(
         &self,
         name: &str,
-        config: Value,
+        mut config: Value,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed(
             "update",
@@ -6592,15 +6884,47 @@ impl KubernetesApiClient {
             });
         }
 
-        let typed: crate::admission::MutatingWebhookConfiguration =
-            serde_json::from_value(config.clone())?;
-
         let key = format!(
             "{}/mutatingwebhookconfigurations/{name}",
             self.storage.prefix()
         );
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "mutatingwebhookconfigurations".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        if let Some(meta) = config.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            for k in ["uid", "creationTimestamp"] {
+                if let Some(v) = old.get("metadata").and_then(|m| m.get(k)) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+
+        let typed: crate::admission::MutatingWebhookConfiguration =
+            serde_json::from_value(config.clone())?;
+        for wh in &typed.webhooks {
+            if let Some(conds) = &wh.match_conditions {
+                for c in conds {
+                    crate::admission::validate_match_condition(&c.expression)?;
+                }
+            }
+        }
+
+        let expected_version = config
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok());
+
         let bytes = serde_json::to_vec(&config)?;
-        let kv = self.storage.update(&key, bytes, None).await?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
         self.admission.add_mutating_webhook_config(typed);
         let mut result = config;
         if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -6666,6 +6990,7 @@ impl KubernetesApiClient {
                 name: name.to_string(),
             });
         }
+        self.admission.remove_mutating_webhook_config(name);
         Ok(())
     }
 
@@ -6730,6 +7055,76 @@ impl KubernetesApiClient {
             );
         }
         Ok(doc)
+    }
+
+    pub async fn update_api_service(
+        &self,
+        name: &str,
+        mut service: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed(
+            "update",
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            Some(name),
+        )?;
+
+        let body_name = service
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str);
+        if body_name != Some(name) {
+            return Err(ApiserverError::InvalidInput {
+                field: "metadata.name".to_string(),
+                reason: format!("body name {body_name:?} does not match '{name}'"),
+            });
+        }
+
+        let key = format!("{}/apiservices/{name}", self.storage.prefix());
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "apiservices".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        if let Some(meta) = service.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("name".to_string(), json!(name));
+            for k in ["uid", "creationTimestamp"] {
+                if let Some(v) = old.get("metadata").and_then(|m| m.get(k)) {
+                    meta.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        if service.get("status").is_none_or(Value::is_null)
+            && let Some(s) = old.get("status").filter(|s| !s.is_null())
+        {
+            service["status"] = s.clone();
+        }
+
+        let typed: APIService = serde_json::from_value(service.clone())?;
+        self.aggregation.register_api_service(typed);
+
+        let expected_version = service
+            .get("metadata")
+            .and_then(|m| m.get("resourceVersion"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let bytes = serde_json::to_vec(&service)?;
+        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        let mut result = service;
+        if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(kv.mod_revision.to_string()),
+            );
+        }
+        Ok(result)
     }
 
     pub async fn list_api_services(&self) -> Result<Value, ApiserverError> {

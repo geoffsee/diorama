@@ -55,6 +55,28 @@ async fn tls_request(
     content_type: Option<&str>,
     body: &str,
 ) -> (u16, String) {
+    let (status, _headers, resp_body) = tls_request_raw(
+        addr,
+        pki,
+        method,
+        path,
+        "application/json",
+        content_type,
+        body,
+    )
+    .await;
+    (status, resp_body)
+}
+
+async fn tls_request_raw(
+    addr: std::net::SocketAddr,
+    pki: &std::path::Path,
+    method: &str,
+    path: &str,
+    accept: &str,
+    content_type: Option<&str>,
+    body: &str,
+) -> (u16, String, String) {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(&pki.join("ca.crt")) {
         roots.add(cert).unwrap();
@@ -72,13 +94,13 @@ async fn tls_request(
     let mut tls = connector.connect(server_name, tcp).await.unwrap();
     let ct = content_type.unwrap_or("application/json");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: {accept}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tls.write_all(req.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     tls.read_to_end(&mut response).await.unwrap();
-    let text = String::from_utf8(response).unwrap();
+    let text = String::from_utf8_lossy(&response).to_string();
     let status = text
         .lines()
         .next()
@@ -86,7 +108,16 @@ async fn tls_request(
         .and_then(|code| code.parse().ok())
         .unwrap_or(0);
     let body_start = text.find("\r\n\r\n").map_or(0, |i| i + 4);
-    (status, text[body_start..].to_string())
+    let headers_part = if body_start > 4 {
+        &text[..body_start - 4]
+    } else {
+        ""
+    };
+    (
+        status,
+        headers_part.to_string(),
+        text[body_start..].to_string(),
+    )
 }
 
 fn parse_json(text: &str) -> Value {
@@ -137,6 +168,16 @@ impl TestServer {
     async fn request(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
         let (status, text) = tls_request(self.addr, &self.pki_dir, method, path, None, body).await;
         (status, parse_json(&text))
+    }
+
+    async fn request_raw(
+        &self,
+        method: &str,
+        path: &str,
+        accept: &str,
+        body: &str,
+    ) -> (u16, String, String) {
+        tls_request_raw(self.addr, &self.pki_dir, method, path, accept, None, body).await
     }
 
     async fn stop(self) {
@@ -518,6 +559,450 @@ async fn conformance_csr_approval_preserves_spec() {
     assert_eq!(s, 200);
     assert_eq!(approved["spec"]["signerName"], "example.com/signer");
     assert_eq!(approved["status"]["conditions"][0]["type"], "Approved");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_aggregated_discovery_v2_and_v2beta1() {
+    let server = TestServer::start().await;
+
+    let (s_v2, _, body_v2) = server
+        .request_raw(
+            "GET",
+            "/api",
+            "application/json;g=apidiscovery.k8s.io;v=v2",
+            "",
+        )
+        .await;
+    assert_eq!(s_v2, 200);
+    let json_v2 = parse_json(&body_v2);
+    assert_eq!(json_v2["kind"], "APIGroupDiscoveryList");
+    assert_eq!(json_v2["apiVersion"], "apidiscovery.k8s.io/v2");
+
+    let (s_beta, _, body_beta) = server
+        .request_raw(
+            "GET",
+            "/api",
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+            "",
+        )
+        .await;
+    assert_eq!(s_beta, 200);
+    let json_beta = parse_json(&body_beta);
+    assert_eq!(json_beta["kind"], "APIGroupDiscoveryList");
+    assert_eq!(json_beta["apiVersion"], "apidiscovery.k8s.io/v2beta1");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_table_post_rejected_with_406() {
+    let server = TestServer::start().await;
+
+    let sar = json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SubjectAccessReview",
+        "spec": {
+            "resourceAttributes": {
+                "verb": "get",
+                "resource": "pods"
+            },
+            "user": "alice"
+        }
+    });
+
+    let (s, _, _) = server
+        .request_raw(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            "application/json;as=Table;v=v1;g=meta.k8s.io",
+            &sar.to_string(),
+        )
+        .await;
+    assert_eq!(
+        s, 406,
+        "POST with Table accept header on SAR must be rejected with 406 Not Acceptable"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_proxy_redirect_without_trailing_slash() {
+    let server = TestServer::start().await;
+
+    // Create a pod in default namespace
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "proxy-pod", "namespace": "default" },
+        "spec": {
+            "containers": [{ "name": "web", "image": "nginx" }]
+        }
+    });
+    let (s, _) = server
+        .request("POST", "/api/v1/namespaces/default/pods", &pod.to_string())
+        .await;
+    assert_eq!(s, 201);
+
+    // Request pod proxy without trailing slash
+    let (s, headers, _) = server
+        .request_raw(
+            "GET",
+            "/api/v1/namespaces/default/pods/proxy-pod/proxy",
+            "application/json",
+            "",
+        )
+        .await;
+    assert_eq!(s, 301, "Pod proxy without trailing slash must 301 redirect");
+    assert!(
+        headers.contains("location: /api/v1/namespaces/default/pods/proxy-pod/proxy/")
+            || headers.contains("Location: /api/v1/namespaces/default/pods/proxy-pod/proxy/"),
+        "Redirect must supply Location header with trailing slash, got headers: {headers}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_crd_update_and_instance_defaulting() {
+    let server = TestServer::start().await;
+
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": { "name": "widgets.example.com" },
+        "spec": {
+            "group": "example.com",
+            "names": {
+                "plural": "widgets",
+                "singular": "widget",
+                "kind": "Widget"
+            },
+            "scope": "Namespaced",
+            "versions": [
+                {
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "replicas": {
+                                            "type": "integer",
+                                            "default": 3
+                                        },
+                                        "description": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    });
+
+    let (s, created_crd) = server
+        .request(
+            "POST",
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            &crd.to_string(),
+        )
+        .await;
+    assert_eq!(s, 201);
+    assert_eq!(created_crd["metadata"]["generation"], 1);
+    let uid = created_crd["metadata"]["uid"].as_str().unwrap().to_string();
+
+    // Update CRD spec and ensure generation increments and UID is preserved
+    let mut updated_crd = created_crd.clone();
+    updated_crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+        ["description"]["default"] = json!("standard-widget");
+    let (s, res_updated) = server
+        .request(
+            "PUT",
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com",
+            &updated_crd.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_updated["metadata"]["generation"], 2);
+    assert_eq!(res_updated["metadata"]["uid"], uid);
+
+    // Create a Widget instance without spec.replicas to verify schema defaulting
+    let widget = json!({
+        "apiVersion": "example.com/v1",
+        "kind": "Widget",
+        "metadata": { "name": "my-widget", "namespace": "default" },
+        "spec": {}
+    });
+    let (s, created_widget) = server
+        .request(
+            "POST",
+            "/apis/example.com/v1/namespaces/default/widgets",
+            &widget.to_string(),
+        )
+        .await;
+    assert_eq!(s, 201);
+    assert_eq!(
+        created_widget["spec"]["replicas"], 3,
+        "Schema default must be applied to CR instance"
+    );
+    assert_eq!(
+        created_widget["spec"]["description"], "standard-widget",
+        "Updated schema default must be applied"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_validating_webhook_configuration_validation_and_lifecycle() {
+    let server = TestServer::start().await;
+
+    // Reject validating webhook with invalid CEL match condition
+    let invalid_wh = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": { "name": "invalid-wh" },
+        "webhooks": [
+            {
+                "name": "check.example.com",
+                "clientConfig": { "url": "https://127.0.0.1:9443/check" },
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods"]
+                }],
+                "admissionReviewVersions": ["v1"],
+                "sideEffects": "None",
+                "matchConditions": [
+                    { "name": "bad-cond", "expression": "12345" }
+                ]
+            }
+        ]
+    });
+    let (s, _) = server
+        .request(
+            "POST",
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+            &invalid_wh.to_string(),
+        )
+        .await;
+    assert!(
+        (400..500).contains(&s),
+        "Invalid CEL match condition must be rejected with 4xx, got {s}"
+    );
+
+    // Create valid validating webhook configuration
+    let valid_wh = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": { "name": "valid-vwc" },
+        "webhooks": [
+            {
+                "name": "valid.example.com",
+                "clientConfig": { "url": "https://127.0.0.1:9443/check" },
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods"]
+                }],
+                "admissionReviewVersions": ["v1"],
+                "sideEffects": "None",
+                "matchConditions": [
+                    { "name": "good-cond", "expression": "request.operation == 'CREATE'" }
+                ]
+            }
+        ]
+    });
+    let (s, created) = server
+        .request(
+            "POST",
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+            &valid_wh.to_string(),
+        )
+        .await;
+    assert_eq!(s, 201);
+    let uid = created["metadata"]["uid"].as_str().unwrap().to_string();
+
+    // Update VWC and verify UID is preserved
+    let mut updated = created.clone();
+    updated["webhooks"][0]["timeoutSeconds"] = json!(5);
+    let (s, res_updated) = server
+        .request(
+            "PUT",
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/valid-vwc",
+            &updated.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_updated["metadata"]["uid"], uid);
+
+    // Delete VWC
+    let (s, _) = server
+        .request(
+            "DELETE",
+            "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations/valid-vwc",
+            "",
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_mutating_webhook_configuration_validation_and_lifecycle() {
+    let server = TestServer::start().await;
+
+    // Reject mutating webhook with invalid CEL match condition
+    let invalid_mwc = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": { "name": "invalid-mwc" },
+        "webhooks": [
+            {
+                "name": "mutator.example.com",
+                "clientConfig": { "url": "https://127.0.0.1:9443/mutate" },
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods"]
+                }],
+                "admissionReviewVersions": ["v1"],
+                "sideEffects": "None",
+                "matchConditions": [
+                    { "name": "bad-cond", "expression": "unknown_var == true" }
+                ]
+            }
+        ]
+    });
+    let (s, _) = server
+        .request(
+            "POST",
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+            &invalid_mwc.to_string(),
+        )
+        .await;
+    assert!(
+        (400..500).contains(&s),
+        "Invalid CEL match condition must be rejected with 4xx, got {s}"
+    );
+
+    // Create valid mutating webhook configuration
+    let valid_mwc = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": { "name": "valid-mwc" },
+        "webhooks": [
+            {
+                "name": "mutator.example.com",
+                "clientConfig": { "url": "https://127.0.0.1:9443/mutate" },
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods"]
+                }],
+                "admissionReviewVersions": ["v1"],
+                "sideEffects": "None",
+                "matchConditions": [
+                    { "name": "op-create", "expression": "request.operation == 'CREATE'" }
+                ]
+            }
+        ]
+    });
+    let (s, created) = server
+        .request(
+            "POST",
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+            &valid_mwc.to_string(),
+        )
+        .await;
+    assert_eq!(s, 201);
+    let uid = created["metadata"]["uid"].as_str().unwrap().to_string();
+
+    // Update MWC and verify UID preserved
+    let mut updated = created.clone();
+    updated["webhooks"][0]["timeoutSeconds"] = json!(8);
+    let (s, res_up) = server
+        .request(
+            "PUT",
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/valid-mwc",
+            &updated.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_up["metadata"]["uid"], uid);
+
+    // Delete MWC
+    let (s, _) = server
+        .request(
+            "DELETE",
+            "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/valid-mwc",
+            "",
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_apiservice_update_lifecycle() {
+    let server = TestServer::start().await;
+
+    let apisvc = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": { "name": "v1alpha1.custom.example.com" },
+        "spec": {
+            "group": "custom.example.com",
+            "version": "v1alpha1",
+            "groupPriorityMinimum": 1000,
+            "versionPriority": 15,
+            "service": {
+                "name": "custom-service",
+                "namespace": "default",
+                "port": 443
+            }
+        }
+    });
+
+    let (s, created) = server
+        .request(
+            "POST",
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            &apisvc.to_string(),
+        )
+        .await;
+    assert_eq!(s, 201);
+    let uid = created["metadata"]["uid"].as_str().unwrap().to_string();
+
+    // Update APIService
+    let mut updated = created.clone();
+    updated["spec"]["versionPriority"] = json!(20);
+    let (s, res_updated) = server
+        .request(
+            "PUT",
+            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.custom.example.com",
+            &updated.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_updated["spec"]["versionPriority"], 20);
+    assert_eq!(res_updated["metadata"]["uid"], uid);
 
     server.stop().await;
 }

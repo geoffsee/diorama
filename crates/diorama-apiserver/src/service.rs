@@ -288,6 +288,7 @@ impl ApiserverService {
                 .and_then(|m| m.get("name"))
                 .and_then(Value::as_str)
             {
+                crate::client::KubernetesApiClient::sync_crd_schema_to_field_validation(&crd);
                 guard.insert(name.to_string(), crd);
             }
         }

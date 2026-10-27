@@ -655,6 +655,17 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
         ],
     ),
     (
+        "k8s.io.api.flowcontrol.v1.ExemptPriorityLevelConfiguration",
+        &[
+            FieldDef::scalar(1, "nominalConcurrencyShares", WireKind::Int32),
+            FieldDef::scalar(2, "lendablePercent", WireKind::Int32),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.FlowDistinguisherMethod",
+        &[FieldDef::scalar(1, "type", WireKind::String)],
+    ),
+    (
         "k8s.io.api.flowcontrol.v1.FlowSchema",
         &[
             FieldDef::typed(
@@ -678,6 +689,21 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
         ],
     ),
     (
+        "k8s.io.api.flowcontrol.v1.FlowSchemaCondition",
+        &[
+            FieldDef::scalar(1, "type", WireKind::String),
+            FieldDef::scalar(2, "status", WireKind::String),
+            FieldDef::typed(
+                3,
+                "lastTransitionTime",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.Time",
+            ),
+            FieldDef::scalar(4, "reason", WireKind::String),
+            FieldDef::scalar(5, "message", WireKind::String),
+        ],
+    ),
+    (
         "k8s.io.api.flowcontrol.v1.FlowSchemaList",
         &[
             FieldDef::typed(
@@ -696,7 +722,27 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
     ),
     (
         "k8s.io.api.flowcontrol.v1.FlowSchemaSpec",
-        &[FieldDef::scalar(1, "matchingPrecedence", WireKind::Int32)],
+        &[
+            FieldDef::typed(
+                1,
+                "priorityLevelConfiguration",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationReference",
+            ),
+            FieldDef::scalar(2, "matchingPrecedence", WireKind::Int32),
+            FieldDef::typed(
+                3,
+                "distinguisherMethod",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.FlowDistinguisherMethod",
+            ),
+            FieldDef::repeated_typed(
+                4,
+                "rules",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.PolicyRulesWithSubjects",
+            ),
+        ],
     ),
     (
         "k8s.io.api.flowcontrol.v1.FlowSchemaStatus",
@@ -704,8 +750,68 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
             1,
             "conditions",
             WireKind::Message,
-            "k8s.io.apimachinery.pkg.apis.meta.v1.Condition",
+            "k8s.io.api.flowcontrol.v1.FlowSchemaCondition",
         )],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.GroupSubject",
+        &[FieldDef::scalar(1, "name", WireKind::String)],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.LimitResponse",
+        &[
+            FieldDef::scalar(1, "type", WireKind::String),
+            FieldDef::typed(
+                2,
+                "queuing",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.QueuingConfiguration",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.LimitedPriorityLevelConfiguration",
+        &[
+            FieldDef::scalar(1, "nominalConcurrencyShares", WireKind::Int32),
+            FieldDef::typed(
+                2,
+                "limitResponse",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.LimitResponse",
+            ),
+            FieldDef::scalar(3, "lendablePercent", WireKind::Int32),
+            FieldDef::scalar(4, "borrowingLimitPercent", WireKind::Int32),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.NonResourcePolicyRule",
+        &[
+            FieldDef::repeated_scalar(1, "verbs", WireKind::String),
+            FieldDef::repeated_scalar(2, "nonResourceURLs", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.PolicyRulesWithSubjects",
+        &[
+            FieldDef::repeated_typed(
+                1,
+                "subjects",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.Subject",
+            ),
+            FieldDef::repeated_typed(
+                2,
+                "resourceRules",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.ResourcePolicyRule",
+            ),
+            FieldDef::repeated_typed(
+                3,
+                "nonResourceRules",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.NonResourcePolicyRule",
+            ),
+        ],
     ),
     (
         "k8s.io.api.flowcontrol.v1.PriorityLevelConfiguration",
@@ -731,6 +837,21 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
         ],
     ),
     (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationCondition",
+        &[
+            FieldDef::scalar(1, "type", WireKind::String),
+            FieldDef::scalar(2, "status", WireKind::String),
+            FieldDef::typed(
+                3,
+                "lastTransitionTime",
+                WireKind::Message,
+                "k8s.io.apimachinery.pkg.apis.meta.v1.Time",
+            ),
+            FieldDef::scalar(4, "reason", WireKind::String),
+            FieldDef::scalar(5, "message", WireKind::String),
+        ],
+    ),
+    (
         "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationList",
         &[
             FieldDef::typed(
@@ -748,8 +869,26 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
         ],
     ),
     (
+        "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationReference",
+        &[FieldDef::scalar(1, "name", WireKind::String)],
+    ),
+    (
         "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationSpec",
-        &[FieldDef::scalar(1, "type", WireKind::String)],
+        &[
+            FieldDef::scalar(1, "type", WireKind::String),
+            FieldDef::typed(
+                2,
+                "limited",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.LimitedPriorityLevelConfiguration",
+            ),
+            FieldDef::typed(
+                3,
+                "exempt",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.ExemptPriorityLevelConfiguration",
+            ),
+        ],
     ),
     (
         "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationStatus",
@@ -757,8 +896,61 @@ static EXTRA_MESSAGES: &[(&str, &[FieldDef])] = &[
             1,
             "conditions",
             WireKind::Message,
-            "k8s.io.apimachinery.pkg.apis.meta.v1.Condition",
+            "k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationCondition",
         )],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.QueuingConfiguration",
+        &[
+            FieldDef::scalar(1, "queues", WireKind::Int32),
+            FieldDef::scalar(2, "handSize", WireKind::Int32),
+            FieldDef::scalar(3, "queueLengthLimit", WireKind::Int32),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.ResourcePolicyRule",
+        &[
+            FieldDef::repeated_scalar(1, "verbs", WireKind::String),
+            FieldDef::repeated_scalar(2, "apiGroups", WireKind::String),
+            FieldDef::repeated_scalar(3, "resources", WireKind::String),
+            FieldDef::scalar(4, "clusterScope", WireKind::Bool),
+            FieldDef::repeated_scalar(5, "namespaces", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.ServiceAccountSubject",
+        &[
+            FieldDef::scalar(1, "namespace", WireKind::String),
+            FieldDef::scalar(2, "name", WireKind::String),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.Subject",
+        &[
+            FieldDef::scalar(1, "kind", WireKind::String),
+            FieldDef::typed(
+                2,
+                "user",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.UserSubject",
+            ),
+            FieldDef::typed(
+                3,
+                "group",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.GroupSubject",
+            ),
+            FieldDef::typed(
+                4,
+                "serviceAccount",
+                WireKind::Message,
+                "k8s.io.api.flowcontrol.v1.ServiceAccountSubject",
+            ),
+        ],
+    ),
+    (
+        "k8s.io.api.flowcontrol.v1.UserSubject",
+        &[FieldDef::scalar(1, "name", WireKind::String)],
     ),
 ];
 
@@ -1126,19 +1318,23 @@ fn decode_special(name: &str, bytes: &[u8]) -> Result<Option<Value>, ApiserverEr
         },
         "k8s.io.apimachinery.pkg.apis.meta.v1.Time"
         | "k8s.io.apimachinery.pkg.apis.meta.v1.Timestamp" => {
-            let seconds = varint_field(bytes, 1).unwrap_or(0) as i64;
-            let nanos = varint_field(bytes, 2).unwrap_or(0) as i32;
-            if seconds <= 0 && nanos <= 0 {
+            let seconds_opt = varint_field(bytes, 1);
+            let nanos_opt = varint_field(bytes, 2);
+            if seconds_opt.is_none() && nanos_opt.is_none() {
                 return Ok(Some(Value::Null));
             }
+            let seconds = seconds_opt.unwrap_or(0) as i64;
+            let nanos = nanos_opt.unwrap_or(0) as i32;
             Ok(Some(json!(rfc3339(seconds, nanos))))
         },
         "k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime" => {
-            let seconds = varint_field(bytes, 1).unwrap_or(0) as i64;
-            let nanos = varint_field(bytes, 2).unwrap_or(0) as i32;
-            if seconds <= 0 && nanos <= 0 {
+            let seconds_opt = varint_field(bytes, 1);
+            let nanos_opt = varint_field(bytes, 2);
+            if seconds_opt.is_none() && nanos_opt.is_none() {
                 return Ok(Some(Value::Null));
             }
+            let seconds = seconds_opt.unwrap_or(0) as i64;
+            let nanos = nanos_opt.unwrap_or(0) as i32;
             Ok(Some(json!(rfc3339_micro(seconds, nanos))))
         },
         "k8s.io.apimachinery.pkg.util.intstr.IntOrString" => {
@@ -1462,9 +1658,6 @@ fn truncated() -> ApiserverError {
 }
 
 fn rfc3339(seconds: i64, nanos: i32) -> String {
-    if seconds < 0 {
-        return format!("{seconds}");
-    }
     let days = seconds.div_euclid(86_400);
     let tod = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -1479,9 +1672,6 @@ fn rfc3339(seconds: i64, nanos: i32) -> String {
 }
 
 fn rfc3339_micro(seconds: i64, nanos: i32) -> String {
-    if seconds < 0 {
-        return format!("{seconds}");
-    }
     let days = seconds.div_euclid(86_400);
     let tod = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -1690,5 +1880,17 @@ mod tests {
         )
         .expect_err("deep nesting must be rejected");
         assert!(err.to_string().contains("maximum nesting depth"));
+    }
+
+    #[test]
+    fn protobuf_pre_1970_microtime_decodes() {
+        use super::decode_special;
+        let sec: i64 = -2_208_988_800;
+        let mut msg = varint(1 << 3);
+        msg.extend(varint(sec as u64));
+        let decoded = decode_special("k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime", &msg)
+            .expect("decode")
+            .expect("some value");
+        assert_eq!(decoded, serde_json::json!("1900-01-01T00:00:00.000000Z"));
     }
 }

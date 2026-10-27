@@ -191,6 +191,7 @@ async fn test_mutating_webhook_runs_before_validating_webhook_and_applies_patch(
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service
@@ -223,6 +224,7 @@ async fn test_mutating_webhook_runs_before_validating_webhook_and_applies_patch(
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service
@@ -323,6 +325,7 @@ async fn test_validating_webhook_admission_denial() {
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service
@@ -420,6 +423,7 @@ async fn test_webhook_failure_policy_fail_vs_ignore() {
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service
@@ -468,6 +472,7 @@ async fn test_webhook_failure_policy_fail_vs_ignore() {
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service
@@ -534,6 +539,7 @@ async fn test_webhook_ca_bundle_verification() {
             admission_review_versions: vec!["v1".to_string()],
             side_effects: None,
             reinvocation_policy: None,
+            ..Default::default()
         }],
     };
     service.admission().add_mutating_webhook_config(config);
