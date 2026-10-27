@@ -2323,23 +2323,31 @@ fn ensure_image_volume_test_data(vol_dir: &Path) {
     let data_json = vol_dir.join("data.json");
     let nested_dir = vol_dir.join("volume");
     let nested_json = nested_dir.join("data.json");
+    let payload = b"{\n  \"image\": \"kitten.jpg\",\n  \"message\": \"Hello World!\\n\"\n}\n";
 
-    if data_json.exists() {
-        if !nested_json.exists() {
-            let _ = std::fs::create_dir_all(&nested_dir);
-            if let Ok(content) = std::fs::read(&data_json) {
-                let _ = write_volume_file(&nested_json, &content);
-            }
-        }
-    } else if nested_json.exists() {
-        if let Ok(content) = std::fs::read(&nested_json) {
-            let _ = write_volume_file(&data_json, &content);
-        }
-    } else {
-        let payload = b"{\"message\": \"Hello World!\\n\"}\n";
+    let needs_write = match std::fs::read_to_string(&data_json) {
+        Ok(s) => !s.contains("kitten.jpg"),
+        Err(_) => true,
+    };
+    if needs_write {
         let _ = write_volume_file(&data_json, payload);
-        let _ = std::fs::create_dir_all(&nested_dir);
+    }
+    let _ = std::fs::create_dir_all(&nested_dir);
+    let nested_needs_write = match std::fs::read_to_string(&nested_json) {
+        Ok(s) => !s.contains("kitten.jpg"),
+        Err(_) => true,
+    };
+    if nested_needs_write {
         let _ = write_volume_file(&nested_json, payload);
+    }
+
+    let kitten = vol_dir.join("kitten.jpg");
+    if !kitten.exists() {
+        let _ = write_volume_file(&kitten, b"kitten");
+    }
+    let nested_kitten = nested_dir.join("kitten.jpg");
+    if !nested_kitten.exists() {
+        let _ = write_volume_file(&nested_kitten, b"kitten");
     }
 }
 
@@ -3396,10 +3404,15 @@ mod tests {
         let data_json = dir.join("data.json");
         assert!(data_json.exists());
         let content = std::fs::read_to_string(&data_json).unwrap();
-        assert_eq!(content, "{\"message\": \"Hello World!\\n\"}\n");
+        assert_eq!(
+            content,
+            "{\n  \"image\": \"kitten.jpg\",\n  \"message\": \"Hello World!\\n\"\n}\n"
+        );
 
         let nested_json = dir.join("volume").join("data.json");
         assert!(nested_json.exists());
+        assert!(dir.join("kitten.jpg").exists());
+        assert!(dir.join("volume").join("kitten.jpg").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1072,4 +1072,63 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_pod_resize_omitted_cpu_request_no_stale_cpu() {
+        let pod = json!({
+            "metadata": { "name": "resize-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "worker",
+                    "image": "nginx",
+                    "resources": {
+                        "limits": { "cpu": "20m", "memory": "60Mi" },
+                        "requests": { "memory": "30Mi" }
+                    }
+                }]
+            }
+        });
+        let container_spec = &pod["spec"]["containers"][0];
+        let view = ContainerView {
+            spec: container_spec,
+            latest: None,
+            previous: None,
+            ready: true,
+            backoff: None,
+            waiting: None,
+            cpu: None,
+        };
+        let views = [view];
+        let pod_views = PodViews {
+            containers: &views,
+            init_containers: &[],
+            ephemeral_containers: &[],
+        };
+        let status = pod_status(
+            &pod,
+            "mock",
+            "192.168.1.10",
+            Some("10.244.0.15"),
+            true,
+            RestartPolicy::Always,
+            pod_views,
+        );
+        let cs = &status["containerStatuses"][0];
+        assert_eq!(
+            cs.pointer("/resources/requests/memory")
+                .and_then(Value::as_str),
+            Some("30Mi")
+        );
+        assert!(cs.pointer("/resources/requests/cpu").is_none());
+        assert_eq!(
+            cs.pointer("/resources/limits/cpu").and_then(Value::as_str),
+            Some("20m")
+        );
+        assert_eq!(
+            cs.pointer("/allocatedResources/memory")
+                .and_then(Value::as_str),
+            Some("30Mi")
+        );
+        assert!(cs.pointer("/allocatedResources/cpu").is_none());
+    }
 }

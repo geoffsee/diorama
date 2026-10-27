@@ -2477,3 +2477,258 @@ async fn test_conformance_hostname_truncation_optional_volumes_and_etc_hosts() {
         .join("termination-log");
     assert!(term_log.exists());
 }
+
+#[tokio::test]
+async fn test_podcertificate_request_contains_valid_stub_pkcs10_request() {
+    use diorama_pki::x509_parser::prelude::FromDer;
+
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+    let admin_client = apiserver_arc.admin_client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "pcr-pod",
+            "namespace": "default",
+            "uid": "uid-pcr-test-123"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": "app",
+                "image": "busybox:latest"
+            }],
+            "volumes": [{
+                "name": "cert-vol",
+                "projected": {
+                    "sources": [{
+                        "podCertificate": {
+                            "signerName": "example.com/test-signer",
+                            "keyPath": "tls.key",
+                            "certificateChainPath": "tls.crt"
+                        }
+                    }]
+                }
+            }]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+    let _ = kubelet.reconciler().reconcile_namespace("default").await;
+
+    let pcr_list = admin_client
+        .list_namespaced_objects(
+            "certificates.k8s.io",
+            "PodCertificateRequestList",
+            "podcertificaterequests",
+            "default",
+        )
+        .await
+        .unwrap();
+
+    let items = pcr_list["items"].as_array().expect("items array");
+    assert_ne!(items.len(), 0);
+    let pcr = &items[0];
+    let stub_b64 = pcr["spec"]["stubPKCS10Request"]
+        .as_str()
+        .expect("stubPKCS10Request in spec");
+    assert_ne!(stub_b64, "");
+
+    let der_bytes = diorama_pki::base64_decode(stub_b64).expect("decode base64 CSR");
+    let (_, parsed_csr) =
+        diorama_pki::x509_parser::certification_request::X509CertificationRequest::from_der(
+            &der_bytes,
+        )
+        .expect("parse DER PKCS#10 CSR");
+    assert_eq!(parsed_csr.certification_request_info.version.0, 0);
+
+    let pkix_pub_b64 = pcr["spec"]["pkixPublicKey"]
+        .as_str()
+        .expect("pkixPublicKey");
+    let pkix_pub_der = diorama_pki::base64_decode(pkix_pub_b64).expect("decode pkixPublicKey");
+    assert_eq!(
+        parsed_csr.certification_request_info.subject_pki.raw,
+        pkix_pub_der.as_slice()
+    );
+
+    let spki = &parsed_csr.certification_request_info.subject_pki;
+    let alg = &parsed_csr.signature_algorithm;
+    let sig = &parsed_csr.signature_value;
+    let tbs = parsed_csr.certification_request_info.raw;
+    assert!(diorama_pki::x509_parser::verify::verify_signature(spki, alg, sig, tbs).is_ok());
+}
+
+#[tokio::test]
+async fn test_running_pod_emits_started_normal_event() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+    let admin_client = apiserver_arc.admin_client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "started-pod",
+            "namespace": "default",
+            "uid": "uid-started-test-456"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": "nginx",
+                "image": "nginx:1.27"
+            }]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+    let count = kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Verify Started event
+    let events = admin_client
+        .list_namespaced_objects("", "EventList", "events", "default")
+        .await
+        .unwrap();
+    let items = events["items"].as_array().expect("events items array");
+    let started_event = items
+        .iter()
+        .find(|ev| {
+            ev.pointer("/reason").and_then(serde_json::Value::as_str) == Some("Started")
+                && ev
+                    .pointer("/involvedObject/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("started-pod")
+        })
+        .expect("Started event should be emitted");
+
+    assert_eq!(started_event["type"], "Normal");
+    assert_eq!(started_event["message"], "Started container nginx");
+    assert_eq!(
+        started_event["involvedObject"]["fieldPath"],
+        "spec.containers{nginx}"
+    );
+    assert_eq!(started_event["source"]["component"], "kubelet");
+}
+
+#[tokio::test]
+async fn test_bound_pod_hostport_conflict_is_failed_podfitshostports() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let pod1 = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "first-port-pod",
+            "namespace": "default",
+            "uid": "uid-port-1"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": "c1",
+                "image": "nginx:1.27",
+                "ports": [{
+                    "containerPort": 80,
+                    "hostPort": 9090,
+                    "protocol": "TCP"
+                }]
+            }]
+        }
+    });
+    client.create_pod("default", pod1).await.unwrap();
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    // Now create second pod bound to same node with conflicting hostPort
+    let pod2 = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "conflicting-port-pod",
+            "namespace": "default",
+            "uid": "uid-port-2"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": "c2",
+                "image": "nginx:1.27",
+                "ports": [{
+                    "containerPort": 80,
+                    "hostPort": 9090,
+                    "protocol": "TCP"
+                }]
+            }]
+        }
+    });
+    client.create_pod("default", pod2).await.unwrap();
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let pod2_state = client
+        .get_pod("default", "conflicting-port-pod")
+        .await
+        .unwrap();
+    assert_eq!(
+        pod2_state
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str),
+        Some("Failed")
+    );
+    assert_eq!(
+        pod2_state
+            .pointer("/status/reason")
+            .and_then(serde_json::Value::as_str),
+        Some("PodFitsHostPorts")
+    );
+    assert_eq!(
+        pod2_state
+            .pointer("/status/message")
+            .and_then(serde_json::Value::as_str),
+        Some("Pod Node didn't have enough resource: pods, requested: 1")
+    );
+}
