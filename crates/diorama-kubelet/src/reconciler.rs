@@ -2273,15 +2273,10 @@ pub struct PodReconciler {
     probe_trackers: Arc<Mutex<BTreeMap<String, ProbeTracker>>>,
     registered_nodes: Arc<Mutex<BTreeSet<String>>>,
     pod_certificates: PodCertificateCache,
+    started_pods: Arc<Mutex<BTreeSet<String>>>,
 }
 
-#[derive(Clone, Debug)]
-struct CachedPodCertificateKey {
-    key_pem: String,
-    pkix_b64: String,
-    pop_b64: String,
-}
-
+type CachedPodCertificateKey = diorama_pki::PodCertificateKeyData;
 type PodCertificateCache = Arc<Mutex<BTreeMap<(String, String, String), CachedPodCertificateKey>>>;
 
 #[derive(Debug, Clone)]
@@ -2328,6 +2323,7 @@ impl PodReconciler {
             probe_trackers: Arc::new(Mutex::new(BTreeMap::new())),
             registered_nodes: Arc::new(Mutex::new(BTreeSet::new())),
             pod_certificates: Arc::new(Mutex::new(BTreeMap::new())),
+            started_pods: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -2556,13 +2552,7 @@ impl PodReconciler {
             if pod.pointer("/metadata/deletionTimestamp").is_none()
                 && has_conflicting_earlier_pod_on_node(pod, assigned_node, &items)
             {
-                self.mark_unschedulable(
-                    namespace,
-                    pod,
-                    "node(s) didn't have free ports for the requested pod ports",
-                    1,
-                )
-                .await;
+                self.mark_bound_pod_failed_hostport(namespace, pod).await;
                 continue;
             }
             let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
@@ -2825,7 +2815,7 @@ impl PodReconciler {
     async fn reconcile_bound_pod(
         &self,
         pod: &Value,
-        node_count: usize,
+        _node_count: usize,
         all_current_pods: &[Value],
         report: &mut ReconcileReport,
     ) {
@@ -2845,13 +2835,7 @@ impl PodReconciler {
         if pod.pointer("/metadata/deletionTimestamp").is_none()
             && has_conflicting_earlier_pod_on_node(pod, assigned, all_current_pods)
         {
-            self.mark_unschedulable(
-                namespace,
-                pod,
-                "node(s) didn't have free ports for the requested pod ports",
-                node_count,
-            )
-            .await;
+            self.mark_bound_pod_failed_hostport(namespace, pod).await;
             return;
         }
 
@@ -3217,6 +3201,26 @@ impl PodReconciler {
         committed
     }
 
+    async fn mark_bound_pod_failed_hostport(&self, namespace: &str, pod: &Value) {
+        let name = pod_name(pod);
+        let current_phase = pod.pointer("/status/phase").and_then(Value::as_str);
+        let current_reason = pod.pointer("/status/reason").and_then(Value::as_str);
+        if current_phase == Some("Failed") && current_reason == Some("PodFitsHostPorts") {
+            return;
+        }
+        let mut status = pod
+            .get("status")
+            .cloned()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        status["phase"] = json!("Failed");
+        status["reason"] = json!("PodFitsHostPorts");
+        status["message"] = json!("Pod Node didn't have enough resource: pods, requested: 1");
+        let _ = self
+            .patch_status_if_changed(namespace, name, pod, status)
+            .await;
+    }
+
     /// Records `PodScheduled=False/Unschedulable` once for a pod that cannot fit.
     async fn mark_unschedulable(
         &self,
@@ -3567,6 +3571,65 @@ impl PodReconciler {
             "reason": reason,
             "message": message,
             "type": "Warning",
+            "firstTimestamp": now,
+            "lastTimestamp": now,
+            "count": 1,
+        });
+        if let Some(apiserver) = &self.apiserver {
+            let _ = apiserver
+                .admin_client()
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        } else {
+            let _ = self
+                .client
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        }
+    }
+
+    async fn emit_started_event_if_needed(&self, namespace: &str, pod: &Value) {
+        let name = pod_name(pod);
+        let Ok(uid) = pod_uid(pod) else {
+            return;
+        };
+        {
+            let mut started = self
+                .started_pods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !started.insert(uid.to_string()) {
+                return;
+            }
+        }
+        let first_container_name = pod
+            .pointer("/spec/containers/0/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let now = now_rfc3339();
+        let event_name = format!("{name}.started");
+        let doc = json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": event_name,
+                "namespace": namespace,
+            },
+            "involvedObject": {
+                "kind": "Pod",
+                "name": name,
+                "namespace": namespace,
+                "uid": uid,
+                "apiVersion": "v1",
+                "fieldPath": format!("spec.containers{{{first_container_name}}}"),
+            },
+            "reason": "Started",
+            "message": format!("Started container {first_container_name}"),
+            "type": "Normal",
+            "source": {
+                "component": "kubelet",
+                "host": &self.node_name,
+            },
             "firstTimestamp": now,
             "lastTimestamp": now,
             "count": 1,
@@ -4035,6 +4098,9 @@ impl PodReconciler {
             pod.pointer("/status/phase").and_then(Value::as_str),
             Some("Succeeded" | "Failed")
         ) {
+            if pod.pointer("/status/phase").and_then(Value::as_str) == Some("Succeeded") {
+                self.emit_started_event_if_needed(namespace, pod).await;
+            }
             return Ok(());
         }
         if is_active_deadline_exceeded(pod) {
@@ -4184,6 +4250,11 @@ impl PodReconciler {
             .and_then(Value::as_str)
         {
             status["nominatedNodeName"] = json!(nom);
+        }
+        let phase = status.get("phase").and_then(Value::as_str);
+        if matches!(phase, Some("Running" | "Succeeded")) {
+            self.emit_started_event_if_needed(ctx.namespace, orig_pod)
+                .await;
         }
         self.patch_status_if_changed(ctx.namespace, pod_name(orig_pod), orig_pod, status)
             .await
@@ -4875,6 +4946,10 @@ impl PodReconciler {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(uid);
+            self.started_pods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(uid);
             return Ok(());
         }
         self.finish_deletion(namespace, name, uid).await
@@ -4890,6 +4965,10 @@ impl PodReconciler {
             .cpu_manager
             .release_pod_cpus(&format!("{namespace}/{name}/"));
         self.terminating
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uid);
+        self.started_pods
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(uid);
@@ -5382,6 +5461,7 @@ impl PodReconciler {
                 "keyType": key_type,
                 "pkixPublicKey": key_data.pkix_b64,
                 "proofOfPossession": key_data.pop_b64,
+                "stubPKCS10Request": key_data.stub_pkcs10_b64,
                 "maxExpirationSeconds": max_exp,
                 "unverifiedUserAnnotations": annotations
             }
@@ -5450,6 +5530,10 @@ impl PodReconciler {
             pod_name.to_string(),
             signer_name.to_string(),
         );
+        let key_type = pod_cert
+            .get("keyType")
+            .and_then(Value::as_str)
+            .unwrap_or("RSA3072");
         let key_data = {
             let mut cache = self
                 .pod_certificates
@@ -5458,7 +5542,7 @@ impl PodReconciler {
             if let Some(cached) = cache.get(&cache_key) {
                 cached.clone()
             } else {
-                let generated_key = generate_pod_certificate_key(pod_uid)?;
+                let generated_key = generate_pod_certificate_key(pod_uid, key_type)?;
                 cache.insert(cache_key.clone(), generated_key.clone());
                 generated_key
             }
@@ -5983,43 +6067,15 @@ fn validate_pod_cert_path(path: &str) -> Result<(), KubeletError> {
     Ok(())
 }
 
-fn generate_pod_certificate_key(pod_uid: &str) -> Result<CachedPodCertificateKey, KubeletError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let key_path = std::env::temp_dir().join(format!("diorama-pcr-{pod_uid}-{now}.key"));
-    diorama_pki::ensure_service_account_key(&key_path).map_err(|e| {
+fn generate_pod_certificate_key(
+    pod_uid: &str,
+    key_type: &str,
+) -> Result<CachedPodCertificateKey, KubeletError> {
+    diorama_pki::generate_pod_certificate_key_data(pod_uid, key_type).map_err(|e| {
         KubeletError::PodReconciliationFailed {
             pod: pod_uid.to_string(),
-            reason: format!("failed to generate RSA key: {e}"),
+            reason: format!("failed to generate pod certificate key data: {e}"),
         }
-    })?;
-    let key_pem = std::fs::read_to_string(&key_path).map_err(KubeletError::Io)?;
-    let _ = std::fs::remove_file(&key_path);
-    let pub_pem =
-        diorama_pki::token::public_key_pem_from_private_key_pem(&key_pem).map_err(|e| {
-            KubeletError::PodReconciliationFailed {
-                pod: pod_uid.to_string(),
-                reason: format!("failed to extract public key: {e}"),
-            }
-        })?;
-    let lines: Vec<&str> = pub_pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect();
-    let pkix_b64 = lines.join("");
-    let sig = diorama_pki::token::sign_with_rsa_key(&key_pem, pod_uid.as_bytes()).map_err(|e| {
-        KubeletError::PodReconciliationFailed {
-            pod: pod_uid.to_string(),
-            reason: format!("failed to sign proof-of-possession: {e}"),
-        }
-    })?;
-    let pop_b64 = diorama_pki::base64_encode(&sig);
-    Ok(CachedPodCertificateKey {
-        key_pem,
-        pkix_b64,
-        pop_b64,
     })
 }
 
@@ -7286,18 +7342,18 @@ mod tests {
             .expect("get pod2");
         assert_eq!(
             pod2_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
+            Some("Failed")
         );
-        let conds = pod2_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched_cond = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched_cond["status"], "False");
-        assert_eq!(sched_cond["reason"], "Unschedulable");
+        assert_eq!(
+            pod2_state.pointer("/status/reason").and_then(Value::as_str),
+            Some("PodFitsHostPorts")
+        );
+        assert_eq!(
+            pod2_state
+                .pointer("/status/message")
+                .and_then(Value::as_str),
+            Some("Pod Node didn't have enough resource: pods, requested: 1")
+        );
     }
 
     #[tokio::test]

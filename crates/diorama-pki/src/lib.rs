@@ -13,6 +13,7 @@ pub mod leaf;
 pub mod profile;
 pub mod rotate;
 pub mod token;
+pub use x509_parser;
 
 #[derive(Debug)]
 pub enum PkiError {
@@ -105,6 +106,53 @@ fn to_pkcs1_pem(pkcs8_pem: &str) -> Result<String, PkiError> {
 
     let pkcs1_pem = pem::encode(&pem::Pem::new("RSA PRIVATE KEY", pkcs8_doc.private_key));
     Ok(pkcs1_pem)
+}
+
+#[derive(Clone, Debug)]
+pub struct PodCertificateKeyData {
+    pub key_pem: String,
+    pub pkix_b64: String,
+    pub pop_b64: String,
+    pub stub_pkcs10_b64: String,
+}
+
+pub fn generate_pod_certificate_key_data(
+    pod_uid: &str,
+    key_type: &str,
+) -> Result<PodCertificateKeyData, PkiError> {
+    use rcgen::SigningKey;
+
+    let key_pair = match key_type {
+        "RSA3072" => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_3072)?,
+        "RSA4096" => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_4096)?,
+        "ECDSA256" | "P256" => KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?,
+        "ECDSA384" | "P384" => KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)?,
+        _ => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?,
+    };
+
+    let pkcs8_pem = key_pair.serialize_pem();
+    let key_pem = to_pkcs1_pem(&pkcs8_pem).unwrap_or(pkcs8_pem);
+
+    let pub_pem = key_pair.public_key_pem();
+    let lines: Vec<&str> = pub_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let pkix_b64 = lines.join("");
+
+    let sig = key_pair.sign(pod_uid.as_bytes())?;
+    let pop_b64 = base64_encode(&sig);
+
+    let params = CertificateParams::default();
+    let csr = params.serialize_request(&key_pair)?;
+    let stub_pkcs10_b64 = base64_encode(csr.der());
+
+    Ok(PodCertificateKeyData {
+        key_pem,
+        pkix_b64,
+        pop_b64,
+        stub_pkcs10_b64,
+    })
 }
 
 pub fn validate_certificate_pem(bytes: &[u8]) -> Result<(), PkiError> {
@@ -420,5 +468,70 @@ mod tests {
             .self_signed(&untrusted_pair)
             .unwrap();
         assert!(verify_certificate_chain(&leaf_cert.pem(), &untrusted_ca.pem()).is_err());
+    }
+
+    #[test]
+    fn test_generate_csr() {
+        use x509_parser::prelude::FromDer;
+        let key_pair = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
+        let params = CertificateParams::default();
+        let csr = params.serialize_request(&key_pair).unwrap();
+        let der = csr.der();
+        assert!(!der.is_empty());
+        let parsed =
+            x509_parser::certification_request::X509CertificationRequest::from_der(der).unwrap();
+        assert_eq!(parsed.1.certification_request_info.version.0, 0);
+
+        let pub_pem = key_pair.public_key_pem();
+        let lines: Vec<&str> = pub_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let pkix_b64 = lines.join("");
+        let pkix_der = base64_decode(&pkix_b64).unwrap();
+        assert_eq!(
+            parsed.1.certification_request_info.subject_pki.raw,
+            pkix_der.as_slice()
+        );
+
+        let spki = &parsed.1.certification_request_info.subject_pki;
+        let alg = &parsed.1.signature_algorithm;
+        let sig = &parsed.1.signature_value;
+        let tbs = parsed.1.certification_request_info.raw;
+        assert!(x509_parser::verify::verify_signature(spki, alg, sig, tbs).is_ok());
+    }
+
+    #[test]
+    fn test_generate_pod_certificate_key_data() {
+        use x509_parser::prelude::FromDer;
+        let uid = "test-pod-uid-12345";
+        let data = generate_pod_certificate_key_data(uid, "RSA3072").unwrap();
+        assert!(data.key_pem.contains("PRIVATE KEY"));
+        assert_ne!(data.pkix_b64, "");
+        assert_ne!(data.pop_b64, "");
+        assert_ne!(data.stub_pkcs10_b64, "");
+
+        let csr_der = base64_decode(&data.stub_pkcs10_b64).unwrap();
+        let parsed =
+            x509_parser::certification_request::X509CertificationRequest::from_der(&csr_der)
+                .unwrap();
+        assert_eq!(parsed.1.certification_request_info.version.0, 0);
+
+        let pkix_der = base64_decode(&data.pkix_b64).unwrap();
+        assert_eq!(
+            parsed.1.certification_request_info.subject_pki.raw,
+            pkix_der.as_slice()
+        );
+
+        let spki = &parsed.1.certification_request_info.subject_pki;
+        let alg = &parsed.1.signature_algorithm;
+        let sig = &parsed.1.signature_value;
+        let tbs = parsed.1.certification_request_info.raw;
+        assert!(x509_parser::verify::verify_signature(spki, alg, sig, tbs).is_ok());
+
+        // Also test ECDSA key type
+        let ec_data = generate_pod_certificate_key_data(uid, "ECDSA256").unwrap();
+        assert!(ec_data.key_pem.contains("PRIVATE KEY"));
+        assert_ne!(ec_data.stub_pkcs10_b64, "");
     }
 }
