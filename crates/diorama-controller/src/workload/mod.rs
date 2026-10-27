@@ -300,7 +300,12 @@ pub fn matches_label_selector(selector: &Value, labels: Option<&Value>) -> bool 
     }
 }
 
-fn is_pod_owned_by(pod: &Value, owner_kind: &str, owner_name: &str, owner_uid: &str) -> bool {
+pub(crate) fn is_pod_owned_by(
+    pod: &Value,
+    owner_kind: &str,
+    owner_name: &str,
+    owner_uid: &str,
+) -> bool {
     pod.get("metadata")
         .and_then(|m| m.get("ownerReferences"))
         .and_then(Value::as_array)

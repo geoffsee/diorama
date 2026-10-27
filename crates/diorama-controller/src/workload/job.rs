@@ -157,6 +157,7 @@ impl JobReconciler {
             .and_then(Value::as_str)
             .is_some();
 
+        let selector = resolve_job_selector(job, uid);
         let owned_pods = super::adopt_and_release_pods(
             &self.client,
             namespace,
@@ -165,7 +166,7 @@ impl JobReconciler {
             name,
             uid,
             deleting,
-            job.pointer("/spec/selector"),
+            selector.as_ref(),
         )
         .await?;
 
@@ -197,19 +198,25 @@ impl JobReconciler {
                     "message": "Job suspended"
                 }
             ]);
+            let terminating = count_terminating_pods(&self.client, namespace, name, uid).await;
             return self
                 .update_job_status(
                     namespace,
                     name,
                     job,
-                    0,
-                    0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    Some(conditions),
-                    false,
+                    JobStatusCounts {
+                        active: 0,
+                        ready: 0,
+                        terminating,
+                        succeeded: 0,
+                        failed: 0,
+                    },
+                    JobStatusOptions {
+                        completed_indexes: None,
+                        failed_indexes: None,
+                        conditions: Some(conditions),
+                        completed: false,
+                    },
                 )
                 .await;
         }
@@ -387,19 +394,26 @@ impl JobReconciler {
                     "message": message
                 }
             ]);
+            let terminating = count_terminating_pods(&self.client, namespace, name, uid).await;
             return self
                 .update_job_status(
                     namespace,
                     name,
                     job,
-                    0,
-                    0,
-                    succeeded_pods.len(),
-                    failed_pods.len(),
-                    indexed.then(|| format_index_set(&succeeded_indexes)),
-                    (!failed_indexes.is_empty()).then(|| format_index_set(&failed_indexes)),
-                    Some(conditions),
-                    false,
+                    JobStatusCounts {
+                        active: 0,
+                        ready: 0,
+                        terminating,
+                        succeeded: succeeded_pods.len(),
+                        failed: failed_pods.len(),
+                    },
+                    JobStatusOptions {
+                        completed_indexes: indexed.then(|| format_index_set(&succeeded_indexes)),
+                        failed_indexes: (!failed_indexes.is_empty())
+                            .then(|| format_index_set(&failed_indexes)),
+                        conditions: Some(conditions),
+                        completed: false,
+                    },
                 )
                 .await;
         }
@@ -429,19 +443,26 @@ impl JobReconciler {
                     "message": "Job completed"
                 }
             ]);
+            let terminating = count_terminating_pods(&self.client, namespace, name, uid).await;
             return self
                 .update_job_status(
                     namespace,
                     name,
                     job,
-                    0,
-                    0,
-                    succeeded_pods.len(),
-                    failed_pods.len(),
-                    indexed.then(|| format_index_set(&succeeded_indexes)),
-                    (!failed_indexes.is_empty()).then(|| format_index_set(&failed_indexes)),
-                    Some(conditions),
-                    true,
+                    JobStatusCounts {
+                        active: 0,
+                        ready: 0,
+                        terminating,
+                        succeeded: succeeded_pods.len(),
+                        failed: failed_pods.len(),
+                    },
+                    JobStatusOptions {
+                        completed_indexes: indexed.then(|| format_index_set(&succeeded_indexes)),
+                        failed_indexes: (!failed_indexes.is_empty())
+                            .then(|| format_index_set(&failed_indexes)),
+                        conditions: Some(conditions),
+                        completed: true,
+                    },
                 )
                 .await;
         }
@@ -498,7 +519,7 @@ impl JobReconciler {
             name,
             uid,
             deleting,
-            job.pointer("/spec/selector"),
+            selector.as_ref(),
         )
         .await?;
 
@@ -520,36 +541,36 @@ impl JobReconciler {
             active_count
         };
 
+        let terminating = count_terminating_pods(&self.client, namespace, name, uid).await;
         self.update_job_status(
             namespace,
             name,
             job,
-            active_count,
-            ready_count,
-            succeeded_pods.len(),
-            failed_pods.len(),
-            indexed.then(|| format_index_set(&succeeded_indexes)),
-            (!failed_indexes.is_empty()).then(|| format_index_set(&failed_indexes)),
-            None,
-            false,
+            JobStatusCounts {
+                active: active_count,
+                ready: ready_count,
+                terminating,
+                succeeded: succeeded_pods.len(),
+                failed: failed_pods.len(),
+            },
+            JobStatusOptions {
+                completed_indexes: indexed.then(|| format_index_set(&succeeded_indexes)),
+                failed_indexes: (!failed_indexes.is_empty())
+                    .then(|| format_index_set(&failed_indexes)),
+                conditions: None,
+                completed: false,
+            },
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn update_job_status(
         &self,
         namespace: &str,
         name: &str,
         job: &Value,
-        active: usize,
-        ready: usize,
-        succeeded: usize,
-        failed: usize,
-        completed_indexes: Option<String>,
-        failed_indexes: Option<String>,
-        conditions: Option<Value>,
-        completed: bool,
+        counts: JobStatusCounts,
+        opts: JobStatusOptions,
     ) -> Result<Value, ControllerError> {
         let is_suspended = job
             .pointer("/spec/suspend")
@@ -576,25 +597,26 @@ impl JobReconciler {
             if let Some(st) = start_time {
                 status.insert("startTime".to_string(), json!(st));
             }
-            status.insert("active".to_string(), json!(active));
-            status.insert("ready".to_string(), json!(ready));
-            status.insert("succeeded".to_string(), json!(succeeded));
-            status.insert("failed".to_string(), json!(failed));
+            status.insert("active".to_string(), json!(counts.active));
+            status.insert("ready".to_string(), json!(counts.ready));
+            status.insert("terminating".to_string(), json!(counts.terminating));
+            status.insert("succeeded".to_string(), json!(counts.succeeded));
+            status.insert("failed".to_string(), json!(counts.failed));
             status.insert("uncountedTerminatedPods".to_string(), json!({}));
-            if let Some(ci) = completed_indexes {
+            if let Some(ci) = opts.completed_indexes {
                 status.insert("completedIndexes".to_string(), json!(ci));
             }
-            if let Some(fi) = failed_indexes {
+            if let Some(fi) = opts.failed_indexes {
                 status.insert("failedIndexes".to_string(), json!(fi));
             }
-            if let Some(conds) = conditions {
+            if let Some(conds) = opts.conditions {
                 status.insert("conditions".to_string(), conds);
             } else if let Some(existing_conds) =
                 status.get_mut("conditions").and_then(Value::as_array_mut)
             {
                 resume_suspended_conditions(existing_conds, &now);
             }
-            if completed {
+            if opts.completed {
                 status
                     .entry("completionTime".to_string())
                     .or_insert_with(|| json!(now));
@@ -1011,4 +1033,67 @@ fn resume_suspended_conditions(conds: &mut [Value], now: &str) {
             c["lastTransitionTime"] = json!(now);
         }
     }
+}
+
+struct JobStatusCounts {
+    active: usize,
+    ready: usize,
+    terminating: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+struct JobStatusOptions {
+    completed_indexes: Option<String>,
+    failed_indexes: Option<String>,
+    conditions: Option<Value>,
+    completed: bool,
+}
+
+fn resolve_job_selector(job: &Value, uid: &str) -> Option<Value> {
+    if let Some(selector) = job.pointer("/spec/selector").cloned() {
+        return Some(selector);
+    }
+    if let Some(labels) = job
+        .pointer("/spec/template/metadata/labels")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+    {
+        return Some(json!({ "matchLabels": labels }));
+    }
+    if !uid.is_empty() {
+        return Some(json!({
+            "matchLabels": {
+                "batch.kubernetes.io/controller-uid": uid
+            }
+        }));
+    }
+    None
+}
+
+async fn count_terminating_pods(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    name: &str,
+    uid: &str,
+) -> usize {
+    let Ok(pod_list) = client.list_pods(namespace).await else {
+        return 0;
+    };
+    let items = pod_list
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter(|p| {
+            super::is_pod_owned_by(p, "Job", name, uid)
+                && p.pointer("/metadata/deletionTimestamp").is_some()
+                && !matches!(
+                    p.pointer("/status/phase").and_then(Value::as_str),
+                    Some("Succeeded" | "Failed")
+                )
+        })
+        .count()
 }

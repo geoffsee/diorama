@@ -695,9 +695,7 @@ fn extract_service_slice_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
         let protocol = sp.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
 
         let mut port_obj = Map::new();
-        if let Some(pn) = port_name.filter(|s| !s.is_empty()) {
-            port_obj.insert("name".to_string(), json!(pn));
-        }
+        port_obj.insert("name".to_string(), json!(port_name.unwrap_or("")));
         port_obj.insert("port".to_string(), json!(port_num));
         port_obj.insert("protocol".to_string(), json!(protocol));
         if let Some(ap) = sp.get("appProtocol").and_then(Value::as_str) {
@@ -715,9 +713,7 @@ fn parse_subset_port(p: &Value) -> (String, Value) {
     let key = format!("{port_name}:{protocol}");
 
     let mut p_obj = Map::new();
-    if !port_name.is_empty() {
-        p_obj.insert("name".to_string(), json!(port_name));
-    }
+    p_obj.insert("name".to_string(), json!(port_name));
     p_obj.insert("port".to_string(), json!(port_num));
     p_obj.insert("protocol".to_string(), json!(protocol));
     if let Some(ap) = p.get("appProtocol").and_then(Value::as_str) {
@@ -949,6 +945,19 @@ mod tests {
         assert_eq!(ports[0]["appProtocol"], "http");
         assert_eq!(ports[1]["name"], "https");
         assert_eq!(ports[1]["port"], 8443);
+    }
+
+    #[test]
+    fn test_extract_service_slice_ports_unnamed_port() {
+        let svc = json!({
+            "spec": {
+                "ports": [{ "port": 80, "protocol": "TCP" }]
+            }
+        });
+        let ports = extract_service_slice_ports(&svc, &[]);
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0]["name"], "");
+        assert_eq!(ports[0]["port"], 80);
     }
 
     #[test]

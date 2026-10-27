@@ -1192,4 +1192,368 @@ mod workload_conformance_lane_t07 {
             "PVC for pruned ordinal must be deleted under whenScaled: Delete"
         );
     }
+
+    #[tokio::test]
+    async fn test_endpointslice_unnamed_port_has_name_empty_string() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-eps-unnamed-port";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "unnamed-port-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "web" },
+                "ports": [{ "port": 80, "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "web-pod-1", "namespace": ns, "labels": { "app": "web" } },
+            "spec": { "containers": [{ "name": "c", "image": "test:latest" }] },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.244.0.11",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+        wm.reconcile_namespace(ns).await.unwrap();
+
+        let slice = client
+            .get_endpointslice(ns, "unnamed-port-svc-1")
+            .await
+            .unwrap();
+        let ports = slice.get("ports").and_then(Value::as_array).unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0]["name"], "");
+        assert_eq!(ports[0]["port"], 80);
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_concurrency_policy_allow_schedules_concurrent_jobs() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-cj-allow";
+        client.create_namespace(ns).await.unwrap();
+
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "my-cj", "namespace": ns },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{ "name": "c", "image": "busybox" }]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        client.create_cronjob(ns, cj).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let cj1 = client.get_cronjob(ns, "my-cj").await.unwrap();
+        let active1 = cj1
+            .pointer("/status/active")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(active1.len(), 1);
+        assert_eq!(active1[0]["name"], "my-cj-scheduled");
+        assert!(client.get_job(ns, "my-cj-scheduled").await.is_ok());
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let cj2 = client.get_cronjob(ns, "my-cj").await.unwrap();
+        let active2 = cj2
+            .pointer("/status/active")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(active2.len(), 2);
+        assert!(active2.iter().any(|j| j["name"] == "my-cj-scheduled"));
+        assert!(active2.iter().any(|j| j["name"] == "my-cj-scheduled-1"));
+        assert!(client.get_job(ns, "my-cj-scheduled-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_concurrency_policy_replace_replaces_old_job_with_distinct_name() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-cj-replace";
+        client.create_namespace(ns).await.unwrap();
+
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "replace-cj", "namespace": ns },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Replace",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{ "name": "c", "image": "busybox" }]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        client.create_cronjob(ns, cj).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let cj1 = client.get_cronjob(ns, "replace-cj").await.unwrap();
+        let active1 = cj1
+            .pointer("/status/active")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(active1.len(), 1);
+        let first_job_name = active1[0]["name"].as_str().unwrap().to_string();
+        assert_eq!(first_job_name, "replace-cj-scheduled");
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "replace-cj-pod-1",
+                "namespace": ns,
+                "labels": { "job-name": first_job_name },
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": first_job_name,
+                    "uid": "fake-uid"
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+
+        let past_time = diorama_apiserver::time::rfc3339_seconds(
+            diorama_apiserver::time::now_unix().saturating_sub(5),
+        );
+        let mut cj_modified = cj1.clone();
+        cj_modified["status"]["lastScheduleTime"] = json!(past_time);
+        client
+            .update_cronjob(ns, "replace-cj", cj_modified)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let cj2 = client.get_cronjob(ns, "replace-cj").await.unwrap();
+        let active2 = cj2
+            .pointer("/status/active")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(active2.len(), 1);
+        let second_job_name = active2[0]["name"].as_str().unwrap().to_string();
+        assert_ne!(first_job_name, second_job_name);
+        assert_eq!(second_job_name, "replace-cj-scheduled-1");
+
+        assert!(client.get_job(ns, &first_job_name).await.is_err());
+        assert!(client.get_pod(ns, "replace-cj-pod-1").await.is_err());
+        assert!(client.get_job(ns, &second_job_name).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_scale_down_unready_pod() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-ss-scale-unready";
+        client.create_namespace(ns).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "ss-unready", "namespace": ns },
+            "spec": {
+                "replicas": 2,
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [{ "name": "c", "image": "test:latest" }] }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        assert!(client.get_pod(ns, "ss-unready-0").await.is_ok());
+        assert!(client.get_pod(ns, "ss-unready-1").await.is_ok());
+
+        let mut pod1 = client.get_pod(ns, "ss-unready-1").await.unwrap();
+        pod1["status"]["conditions"] = json!([{ "type": "Ready", "status": "False" }]);
+        client.update_pod(ns, "ss-unready-1", pod1).await.unwrap();
+
+        let mut ss_scale = client.get_statefulset(ns, "ss-unready").await.unwrap();
+        ss_scale["spec"]["replicas"] = json!(0);
+        client
+            .update_statefulset(ns, "ss-unready", ss_scale)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        assert!(
+            client.get_pod(ns, "ss-unready-1").await.is_err(),
+            "Unready pod-1 should be pruned during scale-down to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_rolling_update_current_revision_tracking() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-ss-revisions";
+        client.create_namespace(ns).await.unwrap();
+
+        let ss = json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "ss-rev", "namespace": ns },
+            "spec": {
+                "replicas": 3,
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [{ "name": "c", "image": "v1" }] }
+                }
+            }
+        });
+        client.create_statefulset(ns, ss).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let ss1 = client.get_statefulset(ns, "ss-rev").await.unwrap();
+        let rev1 = ss1
+            .pointer("/status/currentRevision")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let update1 = ss1
+            .pointer("/status/updateRevision")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(rev1, update1);
+
+        let mut ss_patch = ss1.clone();
+        ss_patch["spec"]["template"]["spec"]["containers"][0]["image"] = json!("v2");
+        ss_patch["spec"]["updateStrategy"] = json!({
+            "type": "RollingUpdate",
+            "rollingUpdate": { "partition": 2 }
+        });
+        client
+            .update_statefulset(ns, "ss-rev", ss_patch)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let ss2 = client.get_statefulset(ns, "ss-rev").await.unwrap();
+        let current_rev2 = ss2
+            .pointer("/status/currentRevision")
+            .and_then(Value::as_str)
+            .unwrap();
+        let update_rev2 = ss2
+            .pointer("/status/updateRevision")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert_eq!(current_rev2, rev1);
+        assert_ne!(current_rev2, update_rev2);
+    }
+
+    #[tokio::test]
+    async fn test_job_status_terminating_field_and_orphan_adoption_fallback_selector() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-job-orphan-terminating";
+        client.create_namespace(ns).await.unwrap();
+
+        let orphan_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "worker-orphan-pod",
+                "namespace": ns,
+                "labels": { "app": "worker-orphan" }
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] },
+            "status": { "phase": "Running" }
+        });
+        client.create_pod(ns, orphan_pod).await.unwrap();
+
+        let job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "orphan-adopting-job", "namespace": ns },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "worker-orphan" } },
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{ "name": "c", "image": "busybox" }]
+                    }
+                }
+            }
+        });
+        client.create_job(ns, job).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let adopted_pod = client.get_pod(ns, "worker-orphan-pod").await.unwrap();
+        let owners = adopted_pod
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(
+            owners
+                .iter()
+                .any(|o| o["kind"] == "Job" && o["name"] == "orphan-adopting-job"),
+            "Orphan pod should have been adopted by the Job"
+        );
+
+        let job_status = client.get_job(ns, "orphan-adopting-job").await.unwrap();
+        assert_eq!(job_status.pointer("/status/terminating"), Some(&json!(0)));
+
+        let mut term_pod = adopted_pod.clone();
+        term_pod["metadata"]["deletionTimestamp"] = json!(diorama_apiserver::time::now_rfc3339());
+        client
+            .update_pod(ns, "worker-orphan-pod", term_pod)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let job_status_after = client.get_job(ns, "orphan-adopting-job").await.unwrap();
+        assert_eq!(
+            job_status_after.pointer("/status/terminating"),
+            Some(&json!(1)),
+            "status.terminating should count terminating pods"
+        );
+    }
 }
