@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use diorama_apiserver::client::KubernetesApiClient;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::error::ControllerError;
 use crate::workload::ReconcileOutcome;
@@ -71,7 +71,10 @@ impl ReplicaSetReconciler {
         .await
     }
 
-    async fn scale_up_pods(&self, p: ScalePodsParams<'_>) -> Result<(), ControllerError> {
+    async fn scale_up_pods(
+        &self,
+        p: ScalePodsParams<'_>,
+    ) -> Result<Option<String>, ControllerError> {
         let mut template_labels = p
             .template
             .get("metadata")
@@ -98,6 +101,7 @@ impl ReplicaSetReconciler {
         let needed = p.desired_replicas.saturating_sub(p.current_count);
         let mut created = 0;
         let mut idx = 0;
+        let mut create_error = None;
 
         while created < needed {
             let pod_name = format!("{}-{idx}", p.name);
@@ -128,16 +132,17 @@ impl ReplicaSetReconciler {
                 }
             });
 
-            self.client
-                .create_pod(p.namespace, new_pod)
-                .await
-                .map_err(|e| ControllerError::ReconciliationFailed {
-                    resource: format!("pods/{pod_name}"),
-                    reason: e.to_string(),
-                })?;
-            created += 1;
+            match self.client.create_pod(p.namespace, new_pod).await {
+                Ok(_) => {
+                    created += 1;
+                },
+                Err(err) => {
+                    create_error = Some(err.to_string());
+                    break;
+                },
+            }
         }
-        Ok(())
+        Ok(create_error)
     }
 
     async fn scale_down_pods(
@@ -209,30 +214,33 @@ impl ReplicaSetReconciler {
             .await?;
         let current_count = owned_pods.len();
 
+        let mut creation_error = None;
         if !deleting {
             if current_count < desired_replicas {
                 let rs_labels = replicaset.pointer("/metadata/labels");
-                self.scale_up_pods(ScalePodsParams {
-                    namespace,
-                    name,
-                    uid,
-                    current_count,
-                    desired_replicas,
-                    template: &template,
-                    rs_labels,
-                })
-                .await?;
+                creation_error = self
+                    .scale_up_pods(ScalePodsParams {
+                        namespace,
+                        name,
+                        uid,
+                        current_count,
+                        desired_replicas,
+                        template: &template,
+                        rs_labels,
+                    })
+                    .await?;
             } else if current_count > desired_replicas {
                 self.scale_down_pods(namespace, &owned_pods, desired_replicas)
                     .await?;
             }
         }
-        let updated_owned_pods = if current_count == desired_replicas || deleting {
-            owned_pods
-        } else {
-            self.get_owned_pods(namespace, name, uid, deleting, selector)
-                .await?
-        };
+        let updated_owned_pods =
+            if (current_count == desired_replicas && creation_error.is_none()) || deleting {
+                owned_pods
+            } else {
+                self.get_owned_pods(namespace, name, uid, deleting, selector)
+                    .await?
+            };
         let actual_replicas = updated_owned_pods.len();
         let ready_replicas = updated_owned_pods
             .iter()
@@ -246,13 +254,13 @@ impl ReplicaSetReconciler {
             .unwrap_or(1);
 
         let mut updated_rs = replicaset.clone();
-        apply_rs_status(
-            &mut updated_rs,
+        let metrics = RsStatusMetrics {
             actual_replicas,
             fully_labeled_replicas,
             ready_replicas,
             observed_generation,
-        );
+        };
+        apply_rs_status(&mut updated_rs, &metrics, creation_error.as_deref());
 
         if updated_rs.get("status") == replicaset.get("status") {
             return Ok(updated_rs);
@@ -296,33 +304,88 @@ fn count_fully_labeled(pods: &[Value], template: &Value) -> usize {
         .count()
 }
 
-fn apply_rs_status(
-    updated_rs: &mut Value,
+struct RsStatusMetrics {
     actual_replicas: usize,
     fully_labeled_replicas: usize,
     ready_replicas: usize,
     observed_generation: i64,
+}
+
+fn apply_rs_status(
+    updated_rs: &mut Value,
+    metrics: &RsStatusMetrics,
+    creation_error: Option<&str>,
 ) {
     if let Some(status) = updated_rs.get_mut("status").and_then(Value::as_object_mut) {
-        status.insert("replicas".to_string(), json!(actual_replicas));
+        status.insert("replicas".to_string(), json!(metrics.actual_replicas));
         status.insert(
             "fullyLabeledReplicas".to_string(),
-            json!(fully_labeled_replicas),
+            json!(metrics.fully_labeled_replicas),
         );
-        status.insert("readyReplicas".to_string(), json!(ready_replicas));
-        status.insert("availableReplicas".to_string(), json!(ready_replicas));
-        status.insert("observedGeneration".to_string(), json!(observed_generation));
+        status.insert("readyReplicas".to_string(), json!(metrics.ready_replicas));
+        status.insert(
+            "availableReplicas".to_string(),
+            json!(metrics.ready_replicas),
+        );
+        status.insert(
+            "observedGeneration".to_string(),
+            json!(metrics.observed_generation),
+        );
+        update_status_conditions(status, creation_error);
     } else if let Some(rs_obj) = updated_rs.as_object_mut() {
-        rs_obj.insert(
-            "status".to_string(),
-            json!({
-                "replicas": actual_replicas,
-                "fullyLabeledReplicas": fully_labeled_replicas,
-                "readyReplicas": ready_replicas,
-                "availableReplicas": ready_replicas,
-                "observedGeneration": observed_generation
-            }),
+        let mut status_map = Map::new();
+        status_map.insert("replicas".to_string(), json!(metrics.actual_replicas));
+        status_map.insert(
+            "fullyLabeledReplicas".to_string(),
+            json!(metrics.fully_labeled_replicas),
         );
+        status_map.insert("readyReplicas".to_string(), json!(metrics.ready_replicas));
+        status_map.insert(
+            "availableReplicas".to_string(),
+            json!(metrics.ready_replicas),
+        );
+        status_map.insert(
+            "observedGeneration".to_string(),
+            json!(metrics.observed_generation),
+        );
+        update_status_conditions(&mut status_map, creation_error);
+        rs_obj.insert("status".to_string(), Value::Object(status_map));
+    }
+}
+
+fn update_status_conditions(status: &mut Map<String, Value>, creation_error: Option<&str>) {
+    let mut conditions: Vec<Value> = status
+        .get("conditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(err_msg) = creation_error {
+        let existing = conditions
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("ReplicaFailure"));
+
+        let last_transition_time = if let Some(existing) = existing
+            && existing.get("status").and_then(Value::as_str) == Some("True")
+            && let Some(t) = existing.get("lastTransitionTime").and_then(Value::as_str)
+        {
+            t.to_string()
+        } else {
+            diorama_apiserver::time::now_rfc3339()
+        };
+
+        conditions.retain(|c| c.get("type").and_then(Value::as_str) != Some("ReplicaFailure"));
+        conditions.push(json!({
+            "type": "ReplicaFailure",
+            "status": "True",
+            "lastTransitionTime": last_transition_time,
+            "reason": "FailedCreate",
+            "message": err_msg,
+        }));
+        status.insert("conditions".to_string(), Value::Array(conditions));
+    } else if status.contains_key("conditions") {
+        conditions.retain(|c| c.get("type").and_then(Value::as_str) != Some("ReplicaFailure"));
+        status.insert("conditions".to_string(), Value::Array(conditions));
     }
 }
 

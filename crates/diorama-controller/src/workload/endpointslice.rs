@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use diorama_apiserver::ApiserverError;
 use diorama_apiserver::client::KubernetesApiClient;
 use serde_json::{Map, Value, json};
 
@@ -133,7 +134,7 @@ impl EndpointSliceReconciler {
         let (endpoints, matching_pods) = self
             .extract_matching_pod_endpoints(namespace, selector, publish_not_ready)
             .await?;
-        let slice_ports = extract_service_slice_ports(service, &matching_pods);
+        let groups = build_service_slice_groups(service, &endpoints, &matching_pods);
 
         let existing_slices = self
             .client
@@ -150,45 +151,60 @@ impl EndpointSliceReconciler {
             .cloned()
             .unwrap_or_default();
 
-        let matching_existing = existing_items
+        let existing_managed: Vec<Value> = existing_items
             .into_iter()
-            .find(|es| is_matching_endpointslice(es, name, uid));
+            .filter(|es| is_matching_endpointslice(es, name, uid))
+            .collect();
 
-        let slice_name = matching_existing
-            .as_ref()
-            .and_then(|es| es.get("metadata"))
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-            .map_or_else(|| format!("{name}-1"), ToString::to_string);
+        let (assignments, excess_names) =
+            assign_slice_groups_to_existing(name, &groups, &existing_managed);
 
-        let desired_slice = json!({
-            "apiVersion": "discovery.k8s.io/v1",
-            "kind": "EndpointSlice",
-            "metadata": {
-                "name": slice_name,
-                "namespace": namespace,
-                "labels": {
-                    LABEL_SERVICE_NAME: name,
-                    LABEL_MANAGED_BY: MANAGED_BY_CONTROLLER,
+        for excess in excess_names {
+            let _ = self.client.delete_endpointslice(namespace, &excess).await;
+        }
+
+        let mut primary_result = None;
+        for assign in assignments {
+            let desired_slice = json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": assign.slice_name,
+                    "namespace": namespace,
+                    "labels": {
+                        LABEL_SERVICE_NAME: name,
+                        LABEL_MANAGED_BY: MANAGED_BY_CONTROLLER,
+                    },
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Service",
+                            "name": name,
+                            "uid": uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true,
+                        }
+                    ]
                 },
-                "ownerReferences": [
-                    {
-                        "apiVersion": "v1",
-                        "kind": "Service",
-                        "name": name,
-                        "uid": uid,
-                        "controller": true,
-                        "blockOwnerDeletion": true,
-                    }
-                ]
-            },
-            "addressType": "IPv4",
-            "ports": slice_ports,
-            "endpoints": endpoints,
-        });
+                "addressType": "IPv4",
+                "ports": assign.group.ports,
+                "endpoints": assign.group.endpoints,
+            });
 
-        self.apply_endpointslice(namespace, &slice_name, matching_existing, desired_slice)
-            .await
+            let res = self
+                .apply_endpointslice(
+                    namespace,
+                    &assign.slice_name,
+                    assign.existing,
+                    desired_slice,
+                )
+                .await?;
+            if primary_result.is_none() {
+                primary_result = res;
+            }
+        }
+
+        Ok(primary_result)
     }
 
     /// Reconciles all mirrored `EndpointSlice` objects for custom `Endpoints` resources.
@@ -353,6 +369,21 @@ impl EndpointSliceReconciler {
             .cloned()
             .unwrap_or_default();
 
+        let has_manual_slice = existing_items.iter().any(|es| {
+            let labels = es.get("metadata").and_then(|m| m.get("labels"));
+            let is_svc = labels
+                .and_then(|l| l.get(LABEL_SERVICE_NAME))
+                .and_then(Value::as_str)
+                == Some(ep_name);
+            let managed_by = labels
+                .and_then(|l| l.get(LABEL_MANAGED_BY))
+                .and_then(Value::as_str);
+            is_svc && managed_by != Some(MANAGED_BY_MIRROR)
+        });
+        if has_manual_slice {
+            return Ok(None);
+        }
+
         let matching_existing = existing_items.into_iter().find(|es| {
             let labels = es.get("metadata").and_then(|m| m.get("labels"));
             let is_svc = labels
@@ -471,13 +502,48 @@ impl EndpointSliceReconciler {
             tokio::time::sleep(self.batch_period).await;
         }
 
-        if let Some(existing) = matching_existing {
+        let existing = if let Some(existing) = matching_existing {
+            Some(existing)
+        } else {
+            match self.client.get_endpointslice(namespace, slice_name).await {
+                Ok(v) => Some(v),
+                Err(ApiserverError::NotFound { .. }) => None,
+                Err(e) => {
+                    return Err(ControllerError::ReconciliationFailed {
+                        resource: "endpointslices".to_string(),
+                        reason: e.to_string(),
+                    });
+                },
+            }
+        };
+
+        if let Some(existing) = existing {
+            let existing_managed = existing
+                .pointer("/metadata/labels/endpointslice.kubernetes.io~1managed-by")
+                .and_then(Value::as_str);
+            let desired_managed = desired_slice
+                .pointer("/metadata/labels/endpointslice.kubernetes.io~1managed-by")
+                .and_then(Value::as_str);
+
+            if existing_managed != desired_managed {
+                return Ok(Some(existing));
+            }
+
             let existing_eps = existing.get("endpoints").unwrap_or(&Value::Null);
             let existing_ports = existing.get("ports").unwrap_or(&Value::Null);
             let desired_eps = desired_slice.get("endpoints").unwrap_or(&Value::Null);
             let desired_ports = desired_slice.get("ports").unwrap_or(&Value::Null);
+            let existing_owners = existing
+                .pointer("/metadata/ownerReferences")
+                .unwrap_or(&Value::Null);
+            let desired_owners = desired_slice
+                .pointer("/metadata/ownerReferences")
+                .unwrap_or(&Value::Null);
 
-            if existing_eps == desired_eps && existing_ports == desired_ports {
+            if existing_eps == desired_eps
+                && existing_ports == desired_ports
+                && existing_owners == desired_owners
+            {
                 return Ok(Some(existing));
             }
 
@@ -584,7 +650,7 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value, publish_not_ready: bool
         has_ready_condition
     };
 
-    Some(json!({
+    let mut ep = json!({
         "addresses": [pod_ip],
         "conditions": {
             "ready": is_ready,
@@ -598,7 +664,18 @@ fn build_endpoint_from_pod(namespace: &str, pod: &Value, publish_not_ready: bool
             "uid": puid,
         },
         "nodeName": node_name,
-    }))
+    });
+
+    if let Some(hostname) = pod
+        .pointer("/spec/hostname")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        && let Some(obj) = ep.as_object_mut()
+    {
+        obj.insert("hostname".to_string(), json!(hostname));
+    }
+
+    Some(ep)
 }
 
 pub(crate) fn resolve_service_target_port(sp: &Value, pods: &[Value]) -> i64 {
@@ -678,6 +755,152 @@ fn find_named_container_port(pods: &[Value], name: &str, protocol: &str) -> Opti
         }
     }
     None
+}
+
+#[derive(Clone, Debug)]
+struct ServiceSliceGroup {
+    ports: Vec<Value>,
+    endpoints: Vec<Value>,
+}
+
+fn build_service_slice_groups(
+    service: &Value,
+    endpoints: &[Value],
+    matching_pods: &[Value],
+) -> Vec<ServiceSliceGroup> {
+    use std::collections::BTreeMap;
+
+    if endpoints.is_empty() {
+        let ports = extract_service_slice_ports(service, &[]);
+        return vec![ServiceSliceGroup {
+            ports,
+            endpoints: Vec::new(),
+        }];
+    }
+
+    let pod_for = |ep: &Value| -> Option<&Value> {
+        let name = ep.pointer("/targetRef/name").and_then(Value::as_str)?;
+        matching_pods
+            .iter()
+            .find(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(name))
+    };
+
+    let mut groups: BTreeMap<String, ServiceSliceGroup> = BTreeMap::new();
+    for ep in endpoints {
+        let pod_slice: Vec<Value> = pod_for(ep).cloned().into_iter().collect();
+        let ports = extract_service_slice_ports(service, &pod_slice);
+        let key = serde_json::to_string(&ports).unwrap_or_default();
+        let entry = groups.entry(key).or_insert_with(|| ServiceSliceGroup {
+            ports,
+            endpoints: Vec::new(),
+        });
+        entry.endpoints.push(ep.clone());
+    }
+
+    groups.into_values().collect()
+}
+
+struct SliceAssignment {
+    group: ServiceSliceGroup,
+    existing: Option<Value>,
+    slice_name: String,
+}
+
+fn assign_slice_groups_to_existing(
+    name: &str,
+    groups: &[ServiceSliceGroup],
+    existing_managed: &[Value],
+) -> (Vec<SliceAssignment>, Vec<String>) {
+    let mut assignments = Vec::new();
+    let mut used_existing = std::collections::HashSet::new();
+    let mut used_names = std::collections::HashSet::new();
+
+    // Pass 1: exact ports match
+    for group in groups {
+        let g_ports_json = serde_json::to_string(&group.ports).unwrap_or_default();
+        for (idx, existing) in existing_managed.iter().enumerate() {
+            if used_existing.contains(&idx) {
+                continue;
+            }
+            let e_ports = existing.get("ports").unwrap_or(&Value::Null);
+            let e_ports_json = serde_json::to_string(e_ports).unwrap_or_default();
+            if g_ports_json == e_ports_json {
+                let sname = existing
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                used_existing.insert(idx);
+                used_names.insert(sname.clone());
+                assignments.push(SliceAssignment {
+                    group: group.clone(),
+                    existing: Some(existing.clone()),
+                    slice_name: sname,
+                });
+                break;
+            }
+        }
+    }
+
+    // Pass 2: remaining groups match to remaining existing slices or allocate new name
+    for group in groups {
+        let already_matched = assignments.iter().any(|a| {
+            serde_json::to_string(&a.group.ports).unwrap_or_default()
+                == serde_json::to_string(&group.ports).unwrap_or_default()
+        });
+        if already_matched {
+            continue;
+        }
+
+        let unused_existing = existing_managed
+            .iter()
+            .enumerate()
+            .find(|(idx, _)| !used_existing.contains(idx));
+
+        if let Some((idx, existing)) = unused_existing {
+            let sname = existing
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            used_existing.insert(idx);
+            used_names.insert(sname.clone());
+            assignments.push(SliceAssignment {
+                group: group.clone(),
+                existing: Some(existing.clone()),
+                slice_name: sname,
+            });
+        } else {
+            let candidate = find_next_slice_name(name, &used_names);
+            used_names.insert(candidate.clone());
+            assignments.push(SliceAssignment {
+                group: group.clone(),
+                existing: None,
+                slice_name: candidate,
+            });
+        }
+    }
+
+    let mut excess_names = Vec::new();
+    for (idx, existing) in existing_managed.iter().enumerate() {
+        if !used_existing.contains(&idx)
+            && let Some(sname) = existing.pointer("/metadata/name").and_then(Value::as_str)
+        {
+            excess_names.push(sname.to_string());
+        }
+    }
+
+    (assignments, excess_names)
+}
+
+fn find_next_slice_name(name: &str, used_names: &std::collections::HashSet<String>) -> String {
+    let mut n = 1;
+    let mut candidate = format!("{name}-{n}");
+    while used_names.contains(&candidate) {
+        n += 1;
+        candidate = format!("{name}-{n}");
+    }
+    candidate
 }
 
 fn extract_service_slice_ports(service: &Value, pods: &[Value]) -> Vec<Value> {
@@ -1009,5 +1232,73 @@ mod tests {
             }
         });
         assert!(!is_matching_endpointslice(&non_managed, "svc", ""));
+    }
+
+    #[test]
+    fn test_build_endpoint_with_hostname() {
+        let pod = json!({
+            "metadata": { "name": "pod-h", "uid": "uid-h" },
+            "spec": {
+                "hostname": "pod-hostname",
+                "subdomain": "different-subdomain",
+                "nodeName": "node-worker"
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.88",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+
+        let ep = build_endpoint_from_pod("default", &pod, false).expect("ep");
+        assert_eq!(ep["hostname"], "pod-hostname");
+        assert_eq!(ep["addresses"][0], "10.42.0.88");
+        assert_eq!(ep["nodeName"], "node-worker");
+    }
+
+    #[test]
+    fn test_build_service_slice_groups_partitions_by_resolved_pod_ports() {
+        let svc = json!({
+            "metadata": { "name": "my-svc" },
+            "spec": {
+                "ports": [{ "name": "port100", "port": 80, "targetPort": "port100", "protocol": "TCP" }]
+            }
+        });
+
+        let pod1 = json!({
+            "metadata": { "name": "pod-1" },
+            "spec": {
+                "containers": [{
+                    "ports": [{ "name": "port100", "containerPort": 100, "protocol": "TCP" }]
+                }]
+            }
+        });
+        let pod2 = json!({
+            "metadata": { "name": "pod-2" },
+            "spec": {
+                "containers": [{
+                    "ports": [{ "name": "port100", "containerPort": 101, "protocol": "TCP" }]
+                }]
+            }
+        });
+
+        let ep1 = json!({
+            "addresses": ["10.42.0.1"],
+            "targetRef": { "kind": "Pod", "name": "pod-1" }
+        });
+        let ep2 = json!({
+            "addresses": ["10.42.0.2"],
+            "targetRef": { "kind": "Pod", "name": "pod-2" }
+        });
+
+        let groups = build_service_slice_groups(&svc, &[ep1, ep2], &[pod1, pod2]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].ports[0]["port"], 100);
+        assert_eq!(groups[0].endpoints.len(), 1);
+        assert_eq!(groups[0].endpoints[0]["targetRef"]["name"], "pod-1");
+
+        assert_eq!(groups[1].ports[0]["port"], 101);
+        assert_eq!(groups[1].endpoints.len(), 1);
+        assert_eq!(groups[1].endpoints[0]["targetRef"]["name"], "pod-2");
     }
 }
