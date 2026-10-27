@@ -71,6 +71,12 @@ impl RestartPolicy {
     }
 }
 
+/// Whether an init container specification defines a restartable sidecar container (`restartPolicy: Always`).
+#[must_use]
+pub fn is_restartable_init(spec: &Value) -> bool {
+    spec.get("restartPolicy").and_then(Value::as_str) == Some("Always")
+}
+
 /// Summary of one pass over every pod in the cluster.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconcileReport {

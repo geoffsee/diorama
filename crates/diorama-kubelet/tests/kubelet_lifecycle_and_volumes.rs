@@ -1898,3 +1898,460 @@ async fn test_pod_with_custom_projected_token_still_receives_default_service_acc
         "Default serviceaccount volume must still be mounted at /var/run/secrets/kubernetes.io/serviceaccount"
     );
 }
+
+#[tokio::test]
+async fn test_restartable_init_container_sidecar_lifecycle() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "sidecar-pod",
+            "namespace": "default",
+            "uid": "uid-sidecar-pod"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "restartPolicy": "Never",
+            "initContainers": [
+                {
+                    "name": "vault-agent",
+                    "image": "docker.io/library/vault:latest",
+                    "restartPolicy": "Always"
+                }
+            ],
+            "containers": [
+                {
+                    "name": "worker",
+                    "image": "docker.io/library/busybox:latest"
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    // Pass 1: starts sidecar init container
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let c_ids = runtime.container_ids("uid-sidecar-pod");
+    assert_eq!(c_ids.len(), 1, "Pass 1 starts sidecar init container");
+    let sidecar_id = c_ids[0].clone();
+
+    // Pass 2: sidecar is running, kubelet proceeds to app container
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let c_ids = runtime.container_ids("uid-sidecar-pod");
+    assert_eq!(c_ids.len(), 2, "Pass 2 starts app container");
+    let worker_id = c_ids[1].clone();
+    let sidecar_status =
+        dioramalet::RuntimeProvider::container_status(runtime.as_ref(), &sidecar_id)
+            .await
+            .unwrap();
+    assert_eq!(
+        sidecar_status.state,
+        dioramalet::cri::ContainerState::ContainerRunning as i32
+    );
+
+    let worker_status = dioramalet::RuntimeProvider::container_status(runtime.as_ref(), &worker_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker_status.state,
+        dioramalet::cri::ContainerState::ContainerRunning as i32
+    );
+
+    runtime.set_container_exit("uid-sidecar-pod", "worker", 0);
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let stop_calls = runtime.stop_calls();
+    assert!(
+        stop_calls.iter().any(|(id, _)| id == &sidecar_id),
+        "Sidecar init container must be stopped once main app container completes"
+    );
+}
+
+#[tokio::test]
+async fn test_container_lifecycle_hooks_post_start_failure_emits_event() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    runtime.set_exec_response(
+        "/bin/fail-hook",
+        ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "hook error".to_string(),
+        },
+    );
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "hook-pod",
+            "namespace": "default",
+            "uid": "uid-hook-pod"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "restartPolicy": "Never",
+            "containers": [
+                {
+                    "name": "hook-app",
+                    "image": "docker.io/library/busybox:latest",
+                    "lifecycle": {
+                        "postStart": {
+                            "exec": {
+                                "command": ["/bin/fail-hook"]
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    let _ = kubelet.reconciler().reconcile_namespace("default").await;
+
+    let admin_client = apiserver_arc.admin_client();
+    let events = admin_client
+        .list_namespaced_objects("", "EventList", "events", "default")
+        .await
+        .unwrap();
+    let items = events
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    let failed_hook_event = items.iter().find(|e| {
+        e.pointer("/reason").and_then(serde_json::Value::as_str) == Some("FailedPostStartHook")
+    });
+    assert!(
+        failed_hook_event.is_some(),
+        "FailedPostStartHook event must be emitted"
+    );
+    assert_eq!(
+        failed_hook_event
+            .unwrap()
+            .pointer("/type")
+            .and_then(serde_json::Value::as_str),
+        Some("Warning")
+    );
+}
+
+#[tokio::test]
+async fn test_etc_hosts_and_host_aliases_bind_mount() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "hosts-test-pod",
+            "namespace": "default",
+            "uid": "uid-hosts-test-pod"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "hostname": "test-host",
+            "subdomain": "test-sub",
+            "hostAliases": [
+                {
+                    "ip": "10.99.88.77",
+                    "hostnames": ["service.example.local", "db.example.local"]
+                }
+            ],
+            "containers": [
+                {
+                    "name": "worker",
+                    "image": "docker.io/library/busybox:latest"
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let configs = runtime.container_configs("uid-hosts-test-pod");
+    assert_eq!(configs.len(), 1);
+    let hosts_mount = configs[0]
+        .mounts
+        .iter()
+        .find(|m| m.container_path == "/etc/hosts");
+    assert!(hosts_mount.is_some(), "/etc/hosts mount must be present");
+
+    let host_file = std::path::PathBuf::from(&hosts_mount.unwrap().host_path);
+    assert!(host_file.exists(), "host etc-hosts file must exist on disk");
+    let content = std::fs::read_to_string(&host_file).unwrap();
+    assert!(content.contains("127.0.0.1\tlocalhost"));
+    assert!(content.contains("test-host.test-sub.default.svc.cluster.local\ttest-host"));
+    assert!(content.contains("# Entries added by HostAliases."));
+    assert!(content.contains("10.99.88.77\tservice.example.local\tdb.example.local"));
+}
+
+#[tokio::test]
+async fn test_observed_generation_and_dynamic_volume_refresh() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(
+        kubelet_options.clone(),
+        apiserver_arc.clone(),
+        runtime.clone(),
+    );
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let cm = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "dynamic-cm",
+            "namespace": "default"
+        },
+        "data": {
+            "config.json": "initial-config"
+        }
+    });
+    client.create_configmap_object("default", cm).await.unwrap();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "dynamic-vol-pod",
+            "namespace": "default",
+            "uid": "uid-dynamic-vol-pod",
+            "generation": 3
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [
+                {
+                    "name": "app",
+                    "image": "docker.io/library/busybox:latest",
+                    "volumeMounts": [
+                        {
+                            "name": "cfg-vol",
+                            "mountPath": "/etc/config"
+                        }
+                    ]
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "cfg-vol",
+                    "configMap": {
+                        "name": "dynamic-cm"
+                    }
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let pod_doc = client.get_pod("default", "dynamic-vol-pod").await.unwrap();
+    assert_eq!(
+        pod_doc
+            .pointer("/status/observedGeneration")
+            .and_then(serde_json::Value::as_i64),
+        Some(3)
+    );
+    let conditions = pod_doc
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    for cond in conditions {
+        assert_eq!(
+            cond.get("observedGeneration")
+                .and_then(serde_json::Value::as_i64),
+            Some(3)
+        );
+    }
+
+    let staged_file = kubelet_options
+        .root_dir
+        .join("pods")
+        .join("uid-dynamic-vol-pod")
+        .join("volumes")
+        .join("kubernetes.io~configmap")
+        .join("cfg-vol")
+        .join("config.json");
+    assert!(staged_file.exists());
+    let initial_content = std::fs::read_to_string(&staged_file).unwrap();
+    assert_eq!(initial_content, "initial-config");
+
+    let mut data = std::collections::BTreeMap::new();
+    data.insert("config.json".to_string(), "updated-config-v2".to_string());
+    client
+        .update_configmap("default", "dynamic-cm", data, None)
+        .await
+        .unwrap();
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let refreshed_content = std::fs::read_to_string(&staged_file).unwrap();
+    assert_eq!(refreshed_content, "updated-config-v2");
+}
+
+#[tokio::test]
+async fn test_grpc_probe_health_check() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(&[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    .await;
+                let mut data_frame = vec![
+                    0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                    0x02, 0x08, 0x01,
+                ];
+                data_frame.extend_from_slice(b"grpc-status: 0\r\n");
+                let _ = socket.write_all(&data_frame).await;
+            });
+        }
+    });
+
+    let temp = TempDir::new().unwrap();
+    let (apiserver, mut kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+    kubelet_options.node_ip = "127.0.0.1".to_string();
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "grpc-pod",
+            "namespace": "default",
+            "uid": "uid-grpc-pod"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "hostNetwork": true,
+            "containers": [
+                {
+                    "name": "grpc-service",
+                    "image": "docker.io/library/grpc-health:latest",
+                    "readinessProbe": {
+                        "grpc": {
+                            "port": port
+                        }
+                    }
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+
+    let pod_doc = client.get_pod("default", "grpc-pod").await.unwrap();
+    let conditions = pod_doc
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    let ready_cond = conditions
+        .iter()
+        .find(|c| c.get("type").and_then(serde_json::Value::as_str) == Some("Ready"));
+    assert!(ready_cond.is_some());
+    assert_eq!(
+        ready_cond
+            .unwrap()
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        Some("True")
+    );
+}
