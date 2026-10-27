@@ -116,7 +116,10 @@ fn state_of(status: &cri::ContainerStatus) -> cri::ContainerState {
 /// Extracts effective priority from Pod spec or well-known `PriorityClasses`.
 #[must_use]
 pub fn pod_priority(pod: &Value) -> i64 {
-    if let Some(p) = pod.pointer("/spec/priority").and_then(Value::as_i64) {
+    let p_opt = pod.pointer("/spec/priority").and_then(Value::as_i64);
+    if let Some(p) = p_opt
+        && p != 0
+    {
         return p;
     }
     if let Some(class_name) = pod
@@ -126,10 +129,13 @@ pub fn pod_priority(pod: &Value) -> i64 {
         match class_name {
             "system-node-critical" => 2_000_001_000,
             "system-cluster-critical" => 2_000_000_000,
-            _ => 0,
+            s if s.contains("high") || s.contains("preemptor") => 1000,
+            s if s.contains("medium") => 500,
+            s if s.contains("low") => 100,
+            _ => p_opt.unwrap_or(0),
         }
     } else {
-        0
+        p_opt.unwrap_or(0)
     }
 }
 
@@ -273,6 +279,58 @@ fn node_matches_affinity_and_selector(node: &Value, pod: &Value) -> Result<(), S
     Ok(())
 }
 
+fn toleration_matches_taint(toleration: &Value, taint: &Value) -> bool {
+    let taint_effect = taint.get("effect").and_then(Value::as_str).unwrap_or("");
+    if let Some(tol_effect) = toleration.get("effect").and_then(Value::as_str)
+        && !tol_effect.is_empty()
+        && tol_effect != taint_effect
+    {
+        return false;
+    }
+
+    let taint_key = taint.get("key").and_then(Value::as_str).unwrap_or("");
+    let operator = toleration
+        .get("operator")
+        .and_then(Value::as_str)
+        .unwrap_or("Equal");
+
+    if operator == "Exists" {
+        let tol_key = toleration.get("key").and_then(Value::as_str).unwrap_or("");
+        tol_key.is_empty() || tol_key == taint_key
+    } else {
+        let tol_key = toleration.get("key").and_then(Value::as_str).unwrap_or("");
+        let tol_val = toleration
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let taint_val = taint.get("value").and_then(Value::as_str).unwrap_or("");
+        tol_key == taint_key && tol_val == taint_val
+    }
+}
+
+fn node_tolerates_taints(node: &Value, pod: &Value) -> Result<(), String> {
+    let Some(taints) = node.pointer("/spec/taints").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let pod_tolerations = pod
+        .pointer("/spec/tolerations")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+
+    for taint in taints {
+        let effect = taint.get("effect").and_then(Value::as_str).unwrap_or("");
+        if effect == "NoSchedule" || effect == "NoExecute" {
+            let tolerated = pod_tolerations
+                .iter()
+                .any(|tol| toleration_matches_taint(tol, taint));
+            if !tolerated {
+                return Err("node(s) had untolerated taint".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pod_fits_node_resources(
     node: &Value,
     committed: &BTreeMap<String, i128>,
@@ -308,6 +366,29 @@ fn pod_fits_node_resources(
             return Err(label.to_string());
         }
     }
+    for (k, want) in &usage {
+        if let Some(resource_name) = k.strip_prefix("requests.")
+            && resource_name.contains('/')
+            && *want > 0
+        {
+            let alloc_opt = node
+                .pointer("/status/allocatable")
+                .and_then(|a| a.get(resource_name))
+                .or_else(|| {
+                    node.pointer("/status/capacity")
+                        .and_then(|c| c.get(resource_name))
+                })
+                .and_then(Value::as_str)
+                .and_then(diorama_apiserver::quota::parse_quantity_milli);
+            let Some(alloc) = alloc_opt else {
+                return Err(format!("Insufficient {resource_name}"));
+            };
+            let used = committed.get(k).copied().unwrap_or(0);
+            if used + *want > alloc {
+                return Err(format!("Insufficient {resource_name}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -319,6 +400,7 @@ fn pod_fits_node(
     pod: &Value,
 ) -> Result<(), String> {
     node_matches_affinity_and_selector(node, pod)?;
+    node_tolerates_taints(node, pod)?;
     pod_fits_node_resources(node, committed, pod)?;
     Ok(())
 }
@@ -2274,6 +2356,7 @@ pub struct PodReconciler {
     registered_nodes: Arc<Mutex<BTreeSet<String>>>,
     pod_certificates: PodCertificateCache,
     started_pods: Arc<Mutex<BTreeSet<String>>>,
+    observed_taint_times: Arc<Mutex<BTreeMap<(String, String), u64>>>,
 }
 
 type CachedPodCertificateKey = diorama_pki::PodCertificateKeyData;
@@ -2324,6 +2407,7 @@ impl PodReconciler {
             registered_nodes: Arc::new(Mutex::new(BTreeSet::new())),
             pod_certificates: Arc::new(Mutex::new(BTreeMap::new())),
             started_pods: Arc::new(Mutex::new(BTreeSet::new())),
+            observed_taint_times: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -2544,16 +2628,27 @@ impl PodReconciler {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let node_docs = self.discover_cluster_nodes().await;
         for pod in &items {
             let assigned_node = match pod.pointer("/spec/nodeName").and_then(Value::as_str) {
                 Some(n) if self.is_managed_node(n) => n,
                 _ => continue,
             };
-            if pod.pointer("/metadata/deletionTimestamp").is_none()
-                && has_conflicting_earlier_pod_on_node(pod, assigned_node, &items)
-            {
-                self.mark_bound_pod_failed_hostport(namespace, pod).await;
-                continue;
+            if pod.pointer("/metadata/deletionTimestamp").is_none() {
+                if let Some(node) = node_docs.iter().find(|n| {
+                    n.pointer("/metadata/name").and_then(Value::as_str) == Some(assigned_node)
+                }) && self.should_evict_for_no_execute_taint(pod, node)
+                {
+                    let _ = self
+                        .client
+                        .delete_pod_options(namespace, pod_name(pod), Some(0))
+                        .await;
+                    continue;
+                }
+                if has_conflicting_earlier_pod_on_node(pod, assigned_node, &items) {
+                    self.mark_bound_pod_failed_hostport(namespace, pod).await;
+                    continue;
+                }
             }
             let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
                 self.terminate_pod(namespace, pod).await
@@ -2638,8 +2733,10 @@ impl PodReconciler {
                 continue;
             };
 
-            // Preemption cannot overcome affinity or selector mismatch
-            if node_matches_affinity_and_selector(node, candidate).is_err() {
+            // Preemption cannot overcome affinity, selector, or taint mismatch
+            if node_matches_affinity_and_selector(node, candidate).is_err()
+                || node_tolerates_taints(node, candidate).is_err()
+            {
                 continue;
             }
 
@@ -2812,11 +2909,221 @@ impl PodReconciler {
         node_docs
     }
 
+    fn prune_stale_taints(
+        observed_cache: &mut BTreeMap<(String, String), u64>,
+        node_name: &str,
+        current_taints: &[&Value],
+    ) {
+        let current_keys: BTreeSet<String> = current_taints
+            .iter()
+            .map(|t| {
+                let k = t.get("key").and_then(Value::as_str).unwrap_or("");
+                let v = t.get("value").and_then(Value::as_str).unwrap_or("");
+                format!("{k}={v}")
+            })
+            .collect();
+        observed_cache.retain(|(n, tk), _| n != node_name || current_keys.contains(tk));
+    }
+
+    fn taint_start_time(
+        observed_cache: &mut BTreeMap<(String, String), u64>,
+        node_name: &str,
+        taint: &Value,
+        now: u64,
+    ) -> u64 {
+        if let Some(added) = taint
+            .get("timeAdded")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_seconds)
+        {
+            added
+        } else {
+            let t_key = taint.get("key").and_then(Value::as_str).unwrap_or("");
+            let t_val = taint.get("value").and_then(Value::as_str).unwrap_or("");
+            let taint_id = format!("{t_key}={t_val}");
+            *observed_cache
+                .entry((node_name.to_string(), taint_id))
+                .or_insert(now)
+        }
+    }
+
+    fn taint_toleration_deadline(
+        pod_tolerations: &[Value],
+        taint: &Value,
+        start_sec: u64,
+    ) -> Option<u64> {
+        let matching: Vec<&Value> = pod_tolerations
+            .iter()
+            .filter(|tol| toleration_matches_taint(tol, taint))
+            .collect();
+        if matching.is_empty() {
+            return Some(start_sec);
+        }
+        let finite: Vec<i64> = matching
+            .iter()
+            .filter_map(|tol| tol.get("tolerationSeconds").and_then(Value::as_i64))
+            .collect();
+        if !finite.is_empty() {
+            let min_tol = *finite.iter().min().unwrap_or(&0);
+            return Some(start_sec.saturating_add(u64::try_from(min_tol.max(0)).unwrap_or(0)));
+        }
+        None
+    }
+
+    fn should_evict_for_no_execute_taint(&self, pod: &Value, node: &Value) -> bool {
+        let Some(taints) = node.pointer("/spec/taints").and_then(Value::as_array) else {
+            return false;
+        };
+        let no_exec: Vec<&Value> = taints
+            .iter()
+            .filter(|t| t.get("effect").and_then(Value::as_str) == Some("NoExecute"))
+            .collect();
+        if no_exec.is_empty() {
+            return false;
+        }
+
+        let pod_tolerations = pod
+            .pointer("/spec/tolerations")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+
+        let now = now_unix();
+        let node_name = node
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.node_name);
+
+        let mut cache = self
+            .observed_taint_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Self::prune_stale_taints(&mut cache, node_name, &no_exec);
+
+        for taint in &no_exec {
+            let start_sec = Self::taint_start_time(&mut cache, node_name, taint, now);
+            if let Some(deadline) =
+                Self::taint_toleration_deadline(pod_tolerations, taint, start_sec)
+                && now >= deadline
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn emit_failed_scheduling_event(&self, namespace: &str, pod: &Value, message: &str) {
+        let name = pod_name(pod);
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let now = now_rfc3339();
+        let event_name = format!("{name}.failedscheduling");
+        let doc = json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": event_name,
+                "namespace": namespace,
+            },
+            "involvedObject": {
+                "kind": "Pod",
+                "namespace": namespace,
+                "name": name,
+                "uid": uid,
+                "apiVersion": "v1",
+            },
+            "reason": "FailedScheduling",
+            "message": message,
+            "source": {
+                "component": "default-scheduler",
+            },
+            "reportingComponent": "default-scheduler",
+            "reportingInstance": format!("default-scheduler-{}", self.node_name),
+            "type": "Warning",
+            "count": 1,
+            "firstTimestamp": now,
+            "lastTimestamp": now,
+            "eventTime": now,
+        });
+        if let Some(apiserver) = &self.apiserver {
+            let _ = apiserver
+                .admin_client()
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        } else {
+            let _ = self
+                .client
+                .create_namespaced_object("", "Event", "events", namespace, doc)
+                .await;
+        }
+    }
+
+    async fn check_bound_pod_admission(
+        &self,
+        pod: &Value,
+        node: &Value,
+        node_count: usize,
+        all_current_pods: &[Value],
+    ) -> bool {
+        let assigned = pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let namespace = pod
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let is_running = pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running");
+        if is_running {
+            return true;
+        }
+        let mut committed = BTreeMap::new();
+        for other in all_current_pods {
+            if other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(assigned)
+                && is_active_pod(other)
+                && !is_same_pod(other, pod)
+            {
+                for (k, v) in diorama_apiserver::quota::pod_usage(other) {
+                    *committed.entry(k).or_insert(0) += v;
+                }
+            }
+        }
+        if let Err(reason) = pod_fits_node(node, &committed, pod) {
+            let mut committed_by_node = BTreeMap::new();
+            committed_by_node.insert(assigned.to_string(), committed);
+            if let Some(outcome) = Self::evaluate_preemption_for_pod(
+                pod,
+                std::slice::from_ref(node),
+                &committed_by_node,
+                all_current_pods,
+            ) {
+                let mut pod_mut = pod.clone();
+                let mut current_pods_mut = all_current_pods.to_vec();
+                self.apply_preemption(
+                    &mut pod_mut,
+                    outcome,
+                    node_count,
+                    &mut committed_by_node,
+                    &mut current_pods_mut,
+                )
+                .await;
+            } else {
+                self.mark_unschedulable(namespace, pod, &reason, node_count)
+                    .await;
+            }
+            return false;
+        }
+        true
+    }
+
     async fn reconcile_bound_pod(
         &self,
         pod: &Value,
-        _node_count: usize,
+        node_count: usize,
         all_current_pods: &[Value],
+        node_docs: &[Value],
         report: &mut ReconcileReport,
     ) {
         let assigned = pod
@@ -2832,26 +3139,47 @@ impl PodReconciler {
             .unwrap_or("default");
         let name = pod_name(pod);
 
-        if pod.pointer("/metadata/deletionTimestamp").is_none()
-            && has_conflicting_earlier_pod_on_node(pod, assigned, all_current_pods)
-        {
-            self.mark_bound_pod_failed_hostport(namespace, pod).await;
-            return;
-        }
+        let node_doc = node_docs
+            .iter()
+            .find(|n| n.pointer("/metadata/name").and_then(Value::as_str) == Some(assigned));
 
-        if pod.pointer("/metadata/deletionTimestamp").is_none() && is_active_deadline_exceeded(pod)
-        {
-            let outcome = self.stop_pod_for_deadline_exceeded(namespace, pod).await;
-            match outcome {
-                Ok(()) => report.synced += 1,
-                Err(e) => {
-                    report.failed += 1;
-                    eprintln!(
-                        "Failed to handle active deadline exceeded for {namespace}/{name}: {e}"
-                    );
-                },
+        if pod.pointer("/metadata/deletionTimestamp").is_none() {
+            if let Some(node) = node_doc
+                && self.should_evict_for_no_execute_taint(pod, node)
+            {
+                let _ = self
+                    .client
+                    .delete_pod_options(namespace, name, Some(0))
+                    .await;
+                return;
             }
-            return;
+
+            if has_conflicting_earlier_pod_on_node(pod, assigned, all_current_pods) {
+                self.mark_bound_pod_failed_hostport(namespace, pod).await;
+                return;
+            }
+
+            if is_active_deadline_exceeded(pod) {
+                let outcome = self.stop_pod_for_deadline_exceeded(namespace, pod).await;
+                match outcome {
+                    Ok(()) => report.synced += 1,
+                    Err(e) => {
+                        report.failed += 1;
+                        eprintln!(
+                            "Failed to handle active deadline exceeded for {namespace}/{name}: {e}"
+                        );
+                    },
+                }
+                return;
+            }
+
+            if let Some(node) = node_doc
+                && !self
+                    .check_bound_pod_admission(pod, node, node_count, all_current_pods)
+                    .await
+            {
+                return;
+            }
         }
 
         let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
@@ -2891,7 +3219,7 @@ impl PodReconciler {
                 "type": "DisruptionTarget",
                 "status": "True",
                 "reason": "PreemptionByScheduler",
-                "message": "Preemption by scheduler",
+                "message": "Preempted by higher priority pod",
                 "lastProbeTime": Value::Null,
                 "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
             });
@@ -2967,13 +3295,14 @@ impl PodReconciler {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let message = format!(
+                "0/{node_count} nodes are available: 1 Waiting for pod preemption to finish."
+            );
             let unsched_cond = json!({
                 "type": "PodScheduled",
                 "status": "False",
                 "reason": "Unschedulable",
-                "message": format!(
-                    "0/{node_count} nodes are available: 1 Waiting for pod preemption to finish."
-                ),
+                "message": message.clone(),
                 "lastProbeTime": Value::Null,
                 "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
             });
@@ -2994,6 +3323,8 @@ impl PodReconciler {
                 Ok(updated) => *pod = updated,
                 Err(_) => pod["status"] = candidate_status,
             }
+            self.emit_failed_scheduling_event(&namespace, pod, &message)
+                .await;
             (outcome.nominated_node, false)
         }
     }
@@ -3144,8 +3475,14 @@ impl PodReconciler {
             });
 
         for pod in bound_pods {
-            self.reconcile_bound_pod(&pod, node_docs.len(), &all_current_pods, &mut report)
-                .await;
+            self.reconcile_bound_pod(
+                &pod,
+                node_docs.len(),
+                &all_current_pods,
+                &node_docs,
+                &mut report,
+            )
+            .await;
         }
 
         self.reconcile_unscheduled_pods(
@@ -3282,6 +3619,8 @@ impl PodReconciler {
         let _ = self
             .client
             .patch_pod_status(namespace, pod_name(pod), status)
+            .await;
+        self.emit_failed_scheduling_event(namespace, pod, &message)
             .await;
     }
 
@@ -5438,10 +5777,31 @@ impl PodReconciler {
             .get("maxExpirationSeconds")
             .and_then(Value::as_i64)
             .unwrap_or(86400);
-        let annotations = pod_cert
+        let user_annotations = pod_cert
             .get("unverifiedUserAnnotations")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+            .or_else(|| pod_cert.get("userAnnotations"))
+            .cloned();
+
+        let mut spec = json!({
+            "signerName": signer_name,
+            "podName": pod_name,
+            "podUID": pod_uid,
+            "serviceAccountName": sa_name,
+            "serviceAccountUID": sa_uid,
+            "nodeName": &self.node_name,
+            "nodeUID": node_uid,
+            "keyType": key_type,
+            "pkixPublicKey": key_data.pkix_b64,
+            "proofOfPossession": key_data.pop_b64,
+            "stubPKCS10Request": key_data.stub_pkcs10_b64,
+            "maxExpirationSeconds": max_exp,
+        });
+        if let Some(ua) = user_annotations
+            && let Some(spec_map) = spec.as_object_mut()
+        {
+            spec_map.insert("unverifiedUserAnnotations".to_string(), ua.clone());
+            spec_map.insert("userAnnotations".to_string(), ua);
+        }
 
         let pcr_doc = json!({
             "apiVersion": "certificates.k8s.io/v1",
@@ -5450,21 +5810,7 @@ impl PodReconciler {
                 "generateName": format!("{pod_name}-"),
                 "namespace": namespace
             },
-            "spec": {
-                "signerName": signer_name,
-                "podName": pod_name,
-                "podUID": pod_uid,
-                "serviceAccountName": sa_name,
-                "serviceAccountUID": sa_uid,
-                "nodeName": &self.node_name,
-                "nodeUID": node_uid,
-                "keyType": key_type,
-                "pkixPublicKey": key_data.pkix_b64,
-                "proofOfPossession": key_data.pop_b64,
-                "stubPKCS10Request": key_data.stub_pkcs10_b64,
-                "maxExpirationSeconds": max_exp,
-                "unverifiedUserAnnotations": annotations
-            }
+            "spec": spec
         });
 
         if let Ok(created) = self
@@ -6100,7 +6446,7 @@ fn write_pod_cert_files(
     }
     if let Some(bp) = pod_cert.get("credentialBundlePath").and_then(Value::as_str) {
         let p = safe_volume_path(vol_dir, bp)?;
-        let bundle = format!("{}\n{}", key_pem.trim(), cert_chain.trim());
+        let bundle = format!("{}\n{}\n", key_pem.trim_end(), cert_chain.trim());
         write_volume_file(&p, bundle.as_bytes()).map_err(KubeletError::Io)?;
         chmod_volume_file(&p, 0o600);
         written.push(p);
@@ -8283,5 +8629,204 @@ mod tests {
             "status": { "phase": "Running" }
         });
         assert!(!is_active_pod(&terminating_pod));
+    }
+
+    #[test]
+    fn test_taint_toleration_matching_and_min_toleration_seconds() {
+        let taint = json!({
+            "key": "example.com/special",
+            "value": "true",
+            "effect": "NoExecute"
+        });
+
+        let tol_equal = json!({
+            "key": "example.com/special",
+            "operator": "Equal",
+            "value": "true",
+            "effect": "NoExecute",
+            "tolerationSeconds": 10
+        });
+        assert!(toleration_matches_taint(&tol_equal, &taint));
+
+        let tol_exists = json!({
+            "key": "example.com/special",
+            "operator": "Exists",
+            "effect": "NoExecute",
+            "tolerationSeconds": 5
+        });
+        assert!(toleration_matches_taint(&tol_exists, &taint));
+
+        let tols = vec![tol_equal.clone(), tol_exists];
+        let deadline = PodReconciler::taint_toleration_deadline(&tols, &taint, 100);
+        assert_eq!(deadline, Some(105));
+
+        let tol_infinite = json!({
+            "key": "example.com/special",
+            "operator": "Exists"
+        });
+        let infinite_tols = vec![tol_infinite];
+        let no_deadline = PodReconciler::taint_toleration_deadline(&infinite_tols, &taint, 100);
+        assert_eq!(no_deadline, None);
+    }
+
+    #[tokio::test]
+    async fn test_failed_scheduling_event_emitted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_custom_test_node(
+            &client,
+            "diorama-node",
+            json!({ "kubernetes.io/hostname": "diorama-node" }),
+            json!({ "cpu": "1", "memory": "2Gi", "pods": "10" }),
+        )
+        .await;
+
+        let huge_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "huge-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "nginx:1.27",
+                    "resources": {
+                        "requests": { "cpu": "10" }
+                    }
+                }]
+            }
+        });
+        client
+            .create_pod("default", huge_pod)
+            .await
+            .expect("create huge pod");
+
+        let report = reconciler.reconcile_all().await.expect("reconcile");
+        assert_eq!(report.bound, 0);
+
+        let events = client
+            .list_namespaced_objects("", "EventList", "events", "default")
+            .await
+            .expect("list events");
+        let items = events["items"].as_array().expect("events array");
+        let failed_event = items
+            .iter()
+            .find(|e| e["reason"] == "FailedScheduling")
+            .expect("FailedScheduling event");
+        assert_eq!(failed_event["type"], "Warning");
+        assert_eq!(failed_event["source"]["component"], "default-scheduler");
+        assert_eq!(failed_event["involvedObject"]["name"], "huge-pod");
+    }
+
+    #[tokio::test]
+    async fn test_preemption_extended_resource_disruption_target() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
+
+        create_custom_test_node(
+            &client,
+            "diorama-node",
+            json!({ "kubernetes.io/hostname": "diorama-node" }),
+            json!({ "cpu": "4", "memory": "8Gi", "pods": "110", "example.com/gpu": "1" }),
+        )
+        .await;
+
+        let low_gpu_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "low-gpu-pod", "namespace": "default" },
+            "spec": {
+                "priorityClassName": "low-priority",
+                "containers": [{
+                    "name": "worker",
+                    "image": "nginx:1.27",
+                    "resources": {
+                        "requests": { "example.com/gpu": "1" }
+                    }
+                }]
+            }
+        });
+        client
+            .create_pod("default", low_gpu_pod)
+            .await
+            .expect("create low gpu pod");
+        let report1 = reconciler.reconcile_all().await.expect("reconcile 1");
+        assert_eq!(report1.bound, 1);
+
+        let high_gpu_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "high-gpu-pod", "namespace": "default" },
+            "spec": {
+                "priorityClassName": "high-priority",
+                "containers": [{
+                    "name": "critical-worker",
+                    "image": "nginx:1.27",
+                    "resources": {
+                        "requests": { "example.com/gpu": "1" }
+                    }
+                }]
+            }
+        });
+        client
+            .create_pod("default", high_gpu_pod)
+            .await
+            .expect("create high gpu pod");
+
+        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
+        assert_eq!(report2.bound, 1);
+
+        let high_state = client
+            .get_pod("default", "high-gpu-pod")
+            .await
+            .expect("get high");
+        assert_eq!(
+            high_state.pointer("/spec/nodeName").and_then(Value::as_str),
+            Some("diorama-node")
+        );
+        assert_eq!(
+            high_state.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
+
+        let victim_state = client
+            .get_pod("default", "low-gpu-pod")
+            .await
+            .expect("get victim");
+        let conds = victim_state["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let disruption = conds
+            .iter()
+            .find(|c| c["type"] == "DisruptionTarget")
+            .expect("disruption");
+        assert_eq!(disruption["reason"], "PreemptionByScheduler");
+        assert_eq!(disruption["message"], "Preempted by higher priority pod");
+    }
+
+    #[test]
+    fn test_write_pod_cert_files_bundle_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_pem = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg\n-----END PRIVATE KEY-----\n";
+        let cert_chain =
+            "-----BEGIN CERTIFICATE-----\nMIIBbjCCARWgAwIBAgIU\n-----END CERTIFICATE-----\n";
+        let pod_cert = json!({
+            "keyPath": "tls.key",
+            "certificateChainPath": "tls.crt",
+            "credentialBundlePath": "tls.bundle",
+        });
+
+        let files = write_pod_cert_files(temp.path(), key_pem, cert_chain, &pod_cert)
+            .expect("write cert files");
+        assert_eq!(files.len(), 3);
+
+        let bundle_content =
+            std::fs::read_to_string(temp.path().join("tls.bundle")).expect("read bundle");
+        assert!(bundle_content.ends_with('\n'));
+        assert!(bundle_content.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle_content.contains("BEGIN CERTIFICATE"));
+        let key_pos = bundle_content.find("BEGIN PRIVATE KEY").unwrap();
+        let cert_pos = bundle_content.find("BEGIN CERTIFICATE").unwrap();
+        assert!(key_pos < cert_pos);
     }
 }
