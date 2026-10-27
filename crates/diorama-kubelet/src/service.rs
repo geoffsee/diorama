@@ -540,11 +540,47 @@ impl PodExec for KubeletExecSource {
                 message: "exec requires a command".to_string(),
             });
         }
-        let id = resolve_container(self.runtime.as_ref(), uid, container, false)
-            .await
-            .map_err(|e| ApiserverError::BadRequest {
-                message: format!("{e}"),
-            })?;
+        let id_res = resolve_container(self.runtime.as_ref(), uid, container, false).await;
+        let id = match id_res {
+            Ok(id) => id,
+            Err(e) => {
+                let is_ephemeral = pod
+                    .pointer("/spec/ephemeralContainers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter()
+                            .any(|c| c.get("name").and_then(Value::as_str) == Some(container))
+                    });
+                if is_ephemeral {
+                    let mut fallback = None;
+                    if let Some(spec_containers) =
+                        pod.pointer("/spec/containers").and_then(Value::as_array)
+                    {
+                        for c in spec_containers {
+                            if let Some(c_name) = c.get("name").and_then(Value::as_str)
+                                && let Ok(cid) =
+                                    resolve_container(self.runtime.as_ref(), uid, c_name, false)
+                                        .await
+                            {
+                                fallback = Some(cid);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(cid) = fallback {
+                        cid
+                    } else {
+                        return Err(ApiserverError::BadRequest {
+                            message: format!("{e}"),
+                        });
+                    }
+                } else {
+                    return Err(ApiserverError::BadRequest {
+                        message: format!("{e}"),
+                    });
+                }
+            },
+        };
         // Interactive exec is emulated with one synchronous CRI call; the
         // gateway replays the captured output on the websocket channels.
         let output = self

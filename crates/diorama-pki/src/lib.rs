@@ -130,8 +130,7 @@ pub fn generate_pod_certificate_key_data(
         _ => KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?,
     };
 
-    let pkcs8_pem = key_pair.serialize_pem();
-    let key_pem = to_pkcs1_pem(&pkcs8_pem).unwrap_or(pkcs8_pem);
+    let key_pem = key_pair.serialize_pem();
 
     let pub_pem = key_pair.public_key_pem();
     let lines: Vec<&str> = pub_pem
@@ -506,7 +505,8 @@ mod tests {
         use x509_parser::prelude::FromDer;
         let uid = "test-pod-uid-12345";
         let data = generate_pod_certificate_key_data(uid, "RSA3072").unwrap();
-        assert!(data.key_pem.contains("PRIVATE KEY"));
+        assert!(data.key_pem.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!data.key_pem.contains("BEGIN RSA PRIVATE KEY"));
         assert_ne!(data.pkix_b64, "");
         assert_ne!(data.pop_b64, "");
         assert_ne!(data.stub_pkcs10_b64, "");
