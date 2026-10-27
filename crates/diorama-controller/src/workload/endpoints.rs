@@ -338,7 +338,7 @@ fn build_endpoint_address(
         has_ready_condition
     };
 
-    let addr_obj = json!({
+    let mut addr_obj = json!({
         "ip": pod_ip,
         "targetRef": {
             "kind": "Pod",
@@ -348,6 +348,15 @@ fn build_endpoint_address(
         },
         "nodeName": node_name,
     });
+
+    if let Some(hostname) = pod
+        .pointer("/spec/hostname")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        && let Some(obj) = addr_obj.as_object_mut()
+    {
+        obj.insert("hostname".to_string(), json!(hostname));
+    }
 
     Some((addr_obj, is_ready))
 }
@@ -603,5 +612,27 @@ mod tests {
         assert_eq!(ports[0]["port"], 8088);
         assert_eq!(ports[1]["name"], "metrics");
         assert_eq!(ports[1]["port"], 9090);
+    }
+
+    #[test]
+    fn test_build_endpoint_address_populates_hostname_when_spec_hostname_is_set() {
+        let pod = json!({
+            "metadata": { "name": "pod-host", "uid": "uid-host" },
+            "spec": {
+                "hostname": "custom-hostname",
+                "subdomain": "different-subdomain",
+                "nodeName": "node-1"
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.77"
+            }
+        });
+
+        let (addr, is_ready) = build_endpoint_address("default", &pod, false).expect("addr");
+        assert!(is_ready);
+        assert_eq!(addr["hostname"], "custom-hostname");
+        assert_eq!(addr["ip"], "10.42.0.77");
+        assert_eq!(addr["nodeName"], "node-1");
     }
 }

@@ -1556,4 +1556,385 @@ mod workload_conformance_lane_t07 {
             "status.terminating should count terminating pods"
         );
     }
+
+    #[tokio::test]
+    async fn test_endpointslice_per_pod_port_resolution_distinct_slices() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-eps-per-pod-ports";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "multi-target-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "multi-target" },
+                "ports": [{ "name": "port100", "port": 80, "targetPort": "port100", "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let pod1 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "target-pod-1", "namespace": ns, "labels": { "app": "multi-target" } },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "test:latest",
+                    "ports": [{ "name": "port100", "containerPort": 100, "protocol": "TCP" }]
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.244.0.10",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        let pod2 = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "target-pod-2", "namespace": ns, "labels": { "app": "multi-target" } },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "test:latest",
+                    "ports": [{ "name": "port100", "containerPort": 101, "protocol": "TCP" }]
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.244.0.11",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod1).await.unwrap();
+        client.create_pod(ns, pod2).await.unwrap();
+        wm.reconcile_namespace(ns).await.unwrap();
+
+        let list = client.list_endpointslices(ns).await.unwrap();
+        let items = list["items"].as_array().unwrap();
+        let svc_slices: Vec<&Value> = items
+            .iter()
+            .filter(|s| {
+                s.pointer("/metadata/labels/kubernetes.io~1service-name")
+                    == Some(&json!("multi-target-svc"))
+            })
+            .collect();
+
+        assert_eq!(
+            svc_slices.len(),
+            2,
+            "Expected 2 slices for 2 distinct resolved port numbers"
+        );
+        let ports: Vec<i64> = svc_slices
+            .iter()
+            .map(|s| s.pointer("/ports/0/port").and_then(Value::as_i64).unwrap())
+            .collect();
+        assert!(ports.contains(&100));
+        assert!(ports.contains(&101));
+    }
+
+    #[tokio::test]
+    async fn test_endpoints_and_endpointslice_hostname_populated() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-ep-hostname";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "host-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "host" },
+                "ports": [{ "port": 80, "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "host-pod", "namespace": ns, "labels": { "app": "host" } },
+            "spec": {
+                "hostname": "my-host-name",
+                "subdomain": "not-service-name",
+                "containers": [{ "name": "c", "image": "test:latest" }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.244.0.22",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+        wm.reconcile_namespace(ns).await.unwrap();
+
+        let ep = client.get_endpoints(ns, "host-svc").await.unwrap();
+        let ep_hostname = ep
+            .pointer("/subsets/0/addresses/0/hostname")
+            .and_then(Value::as_str);
+        assert_eq!(ep_hostname, Some("my-host-name"));
+
+        let slice = client.get_endpointslice(ns, "host-svc-1").await.unwrap();
+        let slice_hostname = slice
+            .pointer("/endpoints/0/hostname")
+            .and_then(Value::as_str);
+        assert_eq!(slice_hostname, Some("my-host-name"));
+    }
+
+    #[tokio::test]
+    async fn test_selectorless_service_manual_endpoints_and_slices_preserved() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-manual-headless";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "manual-svc", "namespace": ns },
+            "spec": {
+                "clusterIP": "None",
+                "ports": [{ "port": 443, "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let manual_ep = json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": "manual-svc", "namespace": ns },
+            "subsets": [{
+                "addresses": [{ "ip": "192.168.1.100" }],
+                "ports": [{ "port": 443, "protocol": "TCP" }]
+            }]
+        });
+        client.create_endpoints(ns, manual_ep).await.unwrap();
+
+        let manual_slice = json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "manual-svc-custom",
+                "namespace": ns,
+                "labels": {
+                    "kubernetes.io/service-name": "manual-svc",
+                    "endpointslice.kubernetes.io/managed-by": "custom-admin"
+                }
+            },
+            "addressType": "IPv4",
+            "ports": [{ "port": 443, "protocol": "TCP" }],
+            "endpoints": [{ "addresses": ["192.168.1.100"], "conditions": { "ready": true } }]
+        });
+        client.create_endpointslice(ns, manual_slice).await.unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let ep_after = client.get_endpoints(ns, "manual-svc").await.unwrap();
+        assert_eq!(
+            ep_after.pointer("/subsets/0/addresses/0/ip"),
+            Some(&json!("192.168.1.100"))
+        );
+
+        let slice_after = client
+            .get_endpointslice(ns, "manual-svc-custom")
+            .await
+            .unwrap();
+        assert_eq!(
+            slice_after.pointer("/endpoints/0/addresses/0"),
+            Some(&json!("192.168.1.100"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_port_update_reconciles_promptly() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-service-port-update";
+        client.create_namespace(ns).await.unwrap();
+
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "port-svc", "namespace": ns },
+            "spec": {
+                "selector": { "app": "port-app" },
+                "ports": [{ "name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP" }]
+            }
+        });
+        client.create_service(ns, service).await.unwrap();
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "port-pod", "namespace": ns, "labels": { "app": "port-app" } },
+            "spec": { "containers": [{ "name": "c", "image": "test:latest" }] },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.244.0.33",
+                "conditions": [{ "type": "Ready", "status": "True" }]
+            }
+        });
+        client.create_pod(ns, pod).await.unwrap();
+        wm.reconcile_namespace(ns).await.unwrap();
+
+        let slice1 = client.get_endpointslice(ns, "port-svc-1").await.unwrap();
+        assert_eq!(slice1.pointer("/ports/0/port"), Some(&json!(8080)));
+
+        let mut updated_svc = client.get_service(ns, "port-svc").await.unwrap();
+        updated_svc["spec"]["ports"] =
+            json!([{ "name": "http", "port": 80, "targetPort": 9090, "protocol": "TCP" }]);
+        client
+            .update_service(ns, "port-svc", updated_svc)
+            .await
+            .unwrap();
+
+        wm.reconcile_namespace(ns).await.unwrap();
+
+        let slice2 = client.get_endpointslice(ns, "port-svc-1").await.unwrap();
+        assert_eq!(slice2.pointer("/ports/0/port"), Some(&json!(9090)));
+    }
+
+    #[tokio::test]
+    async fn test_replicationcontroller_replica_failure_condition_on_create_error() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-rc-replica-failure";
+        client.create_namespace(ns).await.unwrap();
+
+        let rc = json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "failing-rc", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "template": {
+                    "metadata": { "labels": { "app": "failing-rc" } },
+                    "spec": {
+                        "runtimeClassName": "non-existent-runtime-class",
+                        "containers": [{ "name": "c", "image": "test:latest" }]
+                    }
+                }
+            }
+        });
+        client.create_replicationcontroller(ns, rc).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let rc_status = client
+            .get_replicationcontroller(ns, "failing-rc")
+            .await
+            .unwrap();
+        let conditions = rc_status
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .unwrap();
+        let fail_cond = conditions
+            .iter()
+            .find(|c| c["type"] == "ReplicaFailure")
+            .expect("ReplicaFailure condition");
+        assert_eq!(fail_cond["status"], "True");
+        assert_eq!(fail_cond["reason"], "FailedCreate");
+
+        let mut fixed_rc = client
+            .get_replicationcontroller(ns, "failing-rc")
+            .await
+            .unwrap();
+        fixed_rc["spec"]["template"]["spec"] = json!({
+            "containers": [{ "name": "c", "image": "test:latest" }]
+        });
+        client
+            .update_replicationcontroller(ns, "failing-rc", fixed_rc)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let rc_fixed = client
+            .get_replicationcontroller(ns, "failing-rc")
+            .await
+            .unwrap();
+        let fixed_conditions = rc_fixed
+            .pointer("/status/conditions")
+            .and_then(Value::as_array);
+        if let Some(conds) = fixed_conditions {
+            assert!(conds.iter().all(|c| c["type"] != "ReplicaFailure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replicaset_replica_failure_condition_on_create_error() {
+        let temp = TempDir::new().unwrap();
+        let svc = setup_controller(&temp);
+        svc.start().await.unwrap();
+        let client = svc.client();
+        let wm = svc.workload_manager();
+        let ns = "test-rs-replica-failure";
+        client.create_namespace(ns).await.unwrap();
+
+        let rs = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "failing-rs", "namespace": ns },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "failing-rs" } },
+                "template": {
+                    "metadata": { "labels": { "app": "failing-rs" } },
+                    "spec": {
+                        "runtimeClassName": "non-existent-runtime-class",
+                        "containers": [{ "name": "c", "image": "test:latest" }]
+                    }
+                }
+            }
+        });
+        client.create_replicaset(ns, rs).await.unwrap();
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+
+        let rs_status = client.get_replicaset(ns, "failing-rs").await.unwrap();
+        let conditions = rs_status
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .unwrap();
+        let fail_cond = conditions
+            .iter()
+            .find(|c| c["type"] == "ReplicaFailure")
+            .expect("ReplicaFailure condition");
+        assert_eq!(fail_cond["status"], "True");
+        assert_eq!(fail_cond["reason"], "FailedCreate");
+
+        let mut fixed_rs = client.get_replicaset(ns, "failing-rs").await.unwrap();
+        fixed_rs["spec"]["template"]["spec"] = json!({
+            "containers": [{ "name": "c", "image": "test:latest" }]
+        });
+        client
+            .update_replicaset(ns, "failing-rs", fixed_rs)
+            .await
+            .unwrap();
+
+        let _ = wm.reconcile_namespace(ns).await.unwrap();
+        let rs_fixed = client.get_replicaset(ns, "failing-rs").await.unwrap();
+        let fixed_conditions = rs_fixed
+            .pointer("/status/conditions")
+            .and_then(Value::as_array);
+        if let Some(conds) = fixed_conditions {
+            assert!(conds.iter().all(|c| c["type"] != "ReplicaFailure"));
+        }
+    }
 }
