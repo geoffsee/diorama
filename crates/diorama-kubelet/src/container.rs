@@ -644,7 +644,10 @@ impl EffectiveSecurityContext {
             || self.privileged
             || self.read_only_root_filesystem
             || !self.capabilities_add.is_empty()
-            || !self.capabilities_drop.is_empty();
+            || !self.capabilities_drop.is_empty()
+            || self.allow_privilege_escalation.is_some()
+            || self.seccomp_profile_type.is_some()
+            || self.seccomp_localhost_profile.is_some();
 
         if !has_any {
             return None;
@@ -663,6 +666,18 @@ impl EffectiveSecurityContext {
             })
         };
 
+        let seccomp = self.seccomp_profile_type.as_deref().map(|pt| {
+            let profile_type = match pt {
+                "Unconfined" => cri::security_profile::ProfileType::Unconfined as i32,
+                "Localhost" => cri::security_profile::ProfileType::Localhost as i32,
+                _ => cri::security_profile::ProfileType::RuntimeDefault as i32,
+            };
+            cri::SecurityProfile {
+                profile_type,
+                localhost_ref: self.seccomp_localhost_profile.clone().unwrap_or_default(),
+            }
+        });
+
         let mut sc = cri::LinuxContainerSecurityContext {
             run_as_user,
             run_as_group,
@@ -671,6 +686,7 @@ impl EffectiveSecurityContext {
             readonly_rootfs: self.read_only_root_filesystem,
             capabilities,
             no_new_privs: self.allow_privilege_escalation.is_some_and(|esc| !esc),
+            seccomp,
             ..cri::LinuxContainerSecurityContext::default()
         };
         #[allow(deprecated)]
@@ -800,6 +816,32 @@ mod tests {
         assert_eq!(
             effective.seccomp_profile_type.as_deref(),
             Some("RuntimeDefault")
+        );
+    }
+
+    #[test]
+    fn test_to_cri_security_context_privilege_escalation_and_seccomp() {
+        let pod = json!({
+            "spec": {
+                "securityContext": {
+                    "seccompProfile": { "type": "RuntimeDefault" }
+                }
+            }
+        });
+        let container = json!({
+            "securityContext": {
+                "allowPrivilegeEscalation": false
+            }
+        });
+
+        let effective = EffectiveSecurityContext::resolve(&pod, &container).unwrap();
+        assert_eq!(effective.allow_privilege_escalation, Some(false));
+        let cri_sc = effective.to_cri_security_context().unwrap();
+        assert!(cri_sc.no_new_privs);
+        assert!(cri_sc.seccomp.is_some());
+        assert_eq!(
+            cri_sc.seccomp.unwrap().profile_type,
+            crate::cri::security_profile::ProfileType::RuntimeDefault as i32
         );
     }
 }

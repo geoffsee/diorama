@@ -72,6 +72,7 @@ fn nanos_to_rfc3339(nanos: i64) -> Value {
 pub struct PodViews<'a> {
     pub containers: &'a [ContainerView<'a>],
     pub init_containers: &'a [ContainerView<'a>],
+    pub ephemeral_containers: &'a [ContainerView<'a>],
 }
 
 fn derive_init_state<'a>(
@@ -162,12 +163,18 @@ pub fn pod_status(
 
     let init_container_statuses: Vec<Value> = init_views
         .iter()
-        .map(|view| container_status_json(provider, view, false))
+        .map(|view| container_status_json(provider, view, !init_complete))
         .collect();
 
     let container_statuses: Vec<Value> = regular_views
         .iter()
         .map(|view| container_status_json(provider, view, !init_complete))
+        .collect();
+
+    let ephemeral_container_statuses: Vec<Value> = views
+        .ephemeral_containers
+        .iter()
+        .map(|view| container_status_json(provider, view, false))
         .collect();
 
     let attempts: Vec<Option<&cri::ContainerStatus>> =
@@ -243,6 +250,13 @@ pub fn pod_status(
     if has_spec_inits || !init_container_statuses.is_empty() {
         status["initContainerStatuses"] = json!(init_container_statuses);
     }
+    let has_spec_ephem = pod
+        .pointer("/spec/ephemeralContainers")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if has_spec_ephem || !ephemeral_container_statuses.is_empty() {
+        status["ephemeralContainerStatuses"] = json!(ephemeral_container_statuses);
+    }
     status
 }
 
@@ -288,15 +302,24 @@ pub fn observed_phase(
 }
 
 fn terminated_state(provider: &str, status: &cri::ContainerStatus) -> Value {
-    json!({
-        "terminated": {
-            "exitCode": status.exit_code,
-            "reason": if status.exit_code == 0 { "Completed" } else { "Error" },
-            "startedAt": nanos_to_rfc3339(status.started_at),
-            "finishedAt": nanos_to_rfc3339(status.finished_at),
-            "containerID": format!("{provider}://{}", status.id)
-        }
-    })
+    let reason = if !status.reason.is_empty() {
+        status.reason.as_str()
+    } else if status.exit_code == 0 {
+        "Completed"
+    } else {
+        "Error"
+    };
+    let mut term = json!({
+        "exitCode": status.exit_code,
+        "reason": reason,
+        "startedAt": nanos_to_rfc3339(status.started_at),
+        "finishedAt": nanos_to_rfc3339(status.finished_at),
+        "containerID": format!("{provider}://{}", status.id)
+    });
+    if !status.message.is_empty() {
+        term["message"] = json!(status.message);
+    }
+    json!({ "terminated": term })
 }
 
 fn effective_container_resources(spec: &Value) -> (Value, Option<Value>) {
@@ -508,6 +531,7 @@ pub fn observed_conditions(
 /// A status with every container waiting for `reason`; used before anything runs
 /// and when sandbox creation fails.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<&str>) -> Value {
     let empty = Vec::new();
     let init_containers = pod
@@ -518,9 +542,13 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
 
     let init_statuses: Vec<Value> = init_containers
         .iter()
-        .map(|c| {
-            let mut waiting = json!({ "reason": reason });
-            if let Some(message) = message {
+        .enumerate()
+        .map(|(idx, c)| {
+            let r = if idx == 0 { reason } else { "PodInitializing" };
+            let mut waiting = json!({ "reason": r });
+            if idx == 0
+                && let Some(message) = message
+            {
                 waiting["message"] = json!(message);
             }
             json!({
@@ -599,6 +627,27 @@ pub fn pending_status(pod: &Value, node_ip: &str, reason: &str, message: Option<
     }
     if has_inits {
         status["initContainerStatuses"] = json!(init_statuses);
+    }
+    if let Some(ephem) = pod
+        .pointer("/spec/ephemeralContainers")
+        .and_then(Value::as_array)
+        && !ephem.is_empty()
+    {
+        let ephem_statuses: Vec<Value> = ephem
+            .iter()
+            .map(|c| {
+                json!({
+                    "name": c.get("name").and_then(Value::as_str).unwrap_or("ephemeral"),
+                    "image": c.get("image").and_then(Value::as_str).unwrap_or("unknown"),
+                    "imageID": "",
+                    "ready": false,
+                    "started": false,
+                    "restartCount": 0,
+                    "state": { "waiting": { "reason": "ContainerCreating" } }
+                })
+            })
+            .collect();
+        status["ephemeralContainerStatuses"] = json!(ephem_statuses);
     }
     status
 }
@@ -844,6 +893,54 @@ mod tests {
         assert_eq!(
             determine_resize_status(&pod_infeasible, &container_statuses_old),
             Some(PodResizeStatus::Infeasible)
+        );
+    }
+
+    #[test]
+    fn test_pending_status_init_containers_pod_initializing() {
+        let pod = json!({
+            "spec": {
+                "initContainers": [
+                    { "name": "init-1", "image": "busybox" },
+                    { "name": "init-2", "image": "busybox" }
+                ],
+                "containers": [
+                    { "name": "app", "image": "nginx" }
+                ],
+                "ephemeralContainers": [
+                    { "name": "debug", "image": "busybox" }
+                ]
+            }
+        });
+        let status = pending_status(&pod, "192.0.2.1", "PodInitializing", None);
+        let inits = status
+            .pointer("/initContainerStatuses")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(inits.len(), 2);
+        assert_eq!(
+            inits[0]
+                .pointer("/state/waiting/reason")
+                .and_then(Value::as_str),
+            Some("PodInitializing")
+        );
+        assert_eq!(
+            inits[1]
+                .pointer("/state/waiting/reason")
+                .and_then(Value::as_str),
+            Some("PodInitializing")
+        );
+
+        let ephem = status
+            .pointer("/ephemeralContainerStatuses")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(ephem.len(), 1);
+        assert_eq!(
+            ephem[0]
+                .pointer("/state/waiting/reason")
+                .and_then(Value::as_str),
+            Some("ContainerCreating")
         );
     }
 }
