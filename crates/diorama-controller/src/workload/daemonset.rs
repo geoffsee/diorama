@@ -59,6 +59,23 @@ impl DaemonSetReconciler {
     ) -> Result<Value, ControllerError> {
         let p = parse_daemonset_params(ds)?;
 
+        let owned_revs = self
+            .adopt_and_release_controller_revisions(
+                namespace,
+                p.name,
+                p.uid,
+                p.deleting,
+                &p.selector_val,
+            )
+            .await?;
+
+        let rev_hash = if p.deleting {
+            String::new()
+        } else {
+            self.ensure_daemonset_revision(namespace, &p, &owned_revs)
+                .await?
+        };
+
         let owned_pods = super::adopt_and_release_pods(
             &self.client,
             namespace,
@@ -88,6 +105,8 @@ impl DaemonSetReconciler {
             uid: p.uid,
             has_nodes,
             use_generic_pod_name,
+            rev_hash: &rev_hash,
+            update_strategy: &p.update_strategy,
         };
 
         if !p.deleting {
@@ -121,6 +140,7 @@ impl DaemonSetReconciler {
             &updated_pods,
             p.name,
             has_nodes,
+            &rev_hash,
         );
 
         let mut updated_ds = ds.clone();
@@ -141,6 +161,213 @@ impl DaemonSetReconciler {
             })
     }
 
+    async fn adopt_and_release_controller_revisions(
+        &self,
+        namespace: &str,
+        ds_name: &str,
+        ds_uid: &str,
+        ds_deleting: bool,
+        selector: &Value,
+    ) -> Result<Vec<Value>, ControllerError> {
+        let rev_list = self
+            .client
+            .list_namespaced_objects(
+                "apps",
+                "ControllerRevisionList",
+                "controllerrevisions",
+                namespace,
+            )
+            .await
+            .map_err(|e| ControllerError::ReconciliationFailed {
+                resource: "controllerrevisions".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let all_revs = rev_list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut owned = Vec::new();
+        for mut rev in all_revs {
+            let not_terminating = rev.pointer("/metadata/deletionTimestamp").is_none();
+            if !not_terminating {
+                continue;
+            }
+            let Some(rev_name) = rev
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+
+            let rev_labels = rev.pointer("/metadata/labels");
+            let label_matches = super::matches_label_selector(selector, rev_labels);
+            let owners = rev
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            let is_owned_by_us = owners.iter().any(|o| {
+                let matches_kind = o.get("kind").and_then(Value::as_str) == Some("DaemonSet");
+                let matches_uid =
+                    !ds_uid.is_empty() && o.get("uid").and_then(Value::as_str) == Some(ds_uid);
+                let matches_name = o.get("name").and_then(Value::as_str) == Some(ds_name);
+                matches_kind && (matches_uid || matches_name)
+            });
+
+            let has_any_controller = owners
+                .iter()
+                .any(|o| o.get("controller").and_then(Value::as_bool) == Some(true));
+
+            if is_owned_by_us {
+                if label_matches {
+                    owned.push(rev);
+                } else {
+                    strip_daemonset_owner_ref(&mut rev, ds_name, ds_uid);
+                    let _ = self
+                        .client
+                        .replace_namespaced_object(
+                            "apps",
+                            "ControllerRevision",
+                            "controllerrevisions",
+                            namespace,
+                            &rev_name,
+                            rev,
+                        )
+                        .await;
+                }
+            } else if !ds_deleting && !has_any_controller && label_matches {
+                add_daemonset_owner_ref(&mut rev, ds_name, ds_uid);
+                if let Ok(updated) = self
+                    .client
+                    .replace_namespaced_object(
+                        "apps",
+                        "ControllerRevision",
+                        "controllerrevisions",
+                        namespace,
+                        &rev_name,
+                        rev.clone(),
+                    )
+                    .await
+                {
+                    owned.push(updated);
+                } else {
+                    owned.push(rev);
+                }
+            }
+        }
+
+        Ok(owned)
+    }
+
+    async fn ensure_daemonset_revision(
+        &self,
+        namespace: &str,
+        p: &DaemonSetParams<'_>,
+        owned_revs: &[Value],
+    ) -> Result<String, ControllerError> {
+        let max_rev = owned_revs
+            .iter()
+            .filter_map(|r| r.get("revision").and_then(Value::as_i64))
+            .max()
+            .unwrap_or(0);
+
+        if let Some(matching) = owned_revs
+            .iter()
+            .find(|r| cr_matches_template(r, &p.template))
+        {
+            let rev_hash = extract_cr_hash(matching, p.name);
+            let rev_num = matching
+                .get("revision")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if rev_num < max_rev {
+                let mut updated = matching.clone();
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert("revision".to_string(), json!(max_rev + 1));
+                }
+                if let Some(name) = matching.pointer("/metadata/name").and_then(Value::as_str) {
+                    let _ = self
+                        .client
+                        .replace_namespaced_object(
+                            "apps",
+                            "ControllerRevision",
+                            "controllerrevisions",
+                            namespace,
+                            name,
+                            updated,
+                        )
+                        .await;
+                }
+            }
+            return Ok(rev_hash);
+        }
+
+        let hash = compute_daemonset_template_hash(&p.template);
+        self.create_daemonset_controller_revision(namespace, p, &hash, max_rev + 1)
+            .await?;
+        Ok(hash)
+    }
+
+    async fn create_daemonset_controller_revision(
+        &self,
+        namespace: &str,
+        p: &DaemonSetParams<'_>,
+        hash: &str,
+        revision: i64,
+    ) -> Result<(), ControllerError> {
+        let cr_name = format!("{}-{hash}", p.name);
+        let mut tpl_patch = p.template.clone();
+        if let Some(obj) = tpl_patch.as_object_mut() {
+            obj.insert("$patch".to_string(), json!("replace"));
+        }
+        let mut cr_labels = p.template_labels.clone();
+        if let Some(obj) = cr_labels.as_object_mut() {
+            obj.insert("controller-revision-hash".to_string(), json!(hash));
+            obj.insert("controller.kubernetes.io/hash".to_string(), json!(hash));
+        }
+
+        let new_cr = json!({
+            "apiVersion": "apps/v1",
+            "kind": "ControllerRevision",
+            "metadata": {
+                "name": cr_name,
+                "namespace": namespace,
+                "labels": cr_labels,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "DaemonSet",
+                    "name": p.name,
+                    "uid": p.uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true,
+                }],
+            },
+            "data": {
+                "spec": {
+                    "template": tpl_patch,
+                }
+            },
+            "revision": revision,
+        });
+
+        let _ = self
+            .client
+            .create_namespaced_object(
+                "apps",
+                "ControllerRevision",
+                "controllerrevisions",
+                namespace,
+                new_cr,
+            )
+            .await;
+        Ok(())
+    }
+
     async fn sync_daemonset_pods(
         &self,
         namespace: &str,
@@ -150,9 +377,39 @@ impl DaemonSetReconciler {
         matching_node_names: &BTreeSet<String>,
         owned_pods: &[Value],
     ) -> Result<(), ControllerError> {
-        // Delete pods on nodes that no longer match or are unschedulable
+        self.cleanup_unschedulable_node_pods(namespace, cfg.name, matching_node_names, owned_pods)
+            .await;
+
+        for node_name in matching_node_names {
+            let (active_exists, failed_or_deleted) = self
+                .sync_node_pods(namespace, cfg, node_name, template_spec, owned_pods)
+                .await;
+
+            if !active_exists {
+                self.ensure_daemonset_pod(
+                    namespace,
+                    cfg,
+                    node_name,
+                    template_spec,
+                    template_labels,
+                    &failed_or_deleted,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_unschedulable_node_pods(
+        &self,
+        namespace: &str,
+        ds_name: &str,
+        matching_node_names: &BTreeSet<String>,
+        owned_pods: &[Value],
+    ) {
         for pod in owned_pods {
-            let p_node = get_pod_node(pod, cfg.name);
+            let p_node = get_pod_node(pod, ds_name);
             let matches = p_node.is_some_and(|n| matching_node_names.contains(n));
             if !matches && let Some(pname) = pod.pointer("/metadata/name").and_then(Value::as_str) {
                 let _ = self
@@ -161,28 +418,65 @@ impl DaemonSetReconciler {
                     .await;
             }
         }
+    }
 
-        // Create pods for matching nodes that lack an active pod
-        for node_name in matching_node_names {
-            let has_pod = owned_pods.iter().any(|pod| {
-                let is_not_deleting = pod.pointer("/metadata/deletionTimestamp").is_none();
-                let matches_node = get_pod_node(pod, cfg.name) == Some(node_name.as_str());
-                is_not_deleting && matches_node
-            });
+    async fn sync_node_pods(
+        &self,
+        namespace: &str,
+        cfg: &DaemonSetConfig<'_>,
+        node_name: &str,
+        template_spec: &Value,
+        owned_pods: &[Value],
+    ) -> (bool, Vec<String>) {
+        let mut active_exists = false;
+        let mut failed_or_deleted = Vec::new();
 
-            if !has_pod {
-                self.ensure_daemonset_pod(
-                    namespace,
-                    cfg,
-                    node_name,
-                    template_spec,
-                    template_labels,
-                )
-                .await?;
+        for pod in owned_pods {
+            if get_pod_node(pod, cfg.name) != Some(node_name) {
+                continue;
+            }
+            let pname = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_terminating = pod.pointer("/metadata/deletionTimestamp").is_some();
+            let is_failed = pod.pointer("/status/phase").and_then(Value::as_str) == Some("Failed");
+
+            if is_terminating || is_failed {
+                failed_or_deleted.push(pname.to_string());
+                let _ = self
+                    .client
+                    .delete_pod_options(namespace, pname, Some(0))
+                    .await;
+                continue;
+            }
+
+            if cfg.update_strategy == "RollingUpdate" {
+                let pod_rev = pod
+                    .pointer("/metadata/labels/controller-revision-hash")
+                    .and_then(Value::as_str);
+                let pod_img = pod
+                    .pointer("/spec/containers/0/image")
+                    .and_then(Value::as_str);
+                let tpl_img = template_spec
+                    .pointer("/containers/0/image")
+                    .and_then(Value::as_str);
+                let rev_matches = pod_rev == Some(cfg.rev_hash) && pod_img == tpl_img;
+                if rev_matches {
+                    active_exists = true;
+                } else {
+                    failed_or_deleted.push(pname.to_string());
+                    let _ = self
+                        .client
+                        .delete_pod_options(namespace, pname, Some(0))
+                        .await;
+                }
+            } else {
+                active_exists = true;
             }
         }
 
-        Ok(())
+        (active_exists, failed_or_deleted)
     }
 
     async fn ensure_daemonset_pod(
@@ -192,12 +486,32 @@ impl DaemonSetReconciler {
         node_name: &str,
         template_spec: &Value,
         template_labels: &Value,
+        failed_or_deleted_names: &[String],
     ) -> Result<(), ControllerError> {
-        let pod_name = if cfg.use_generic_pod_name && !node_name.ends_with("-worker") {
+        let base_name = if cfg.use_generic_pod_name && !node_name.ends_with("-worker") {
             format!("{}-node", cfg.name)
         } else {
             format!("{}-{node_name}", cfg.name)
         };
+
+        let mut pod_name = base_name.clone();
+        if failed_or_deleted_names.iter().any(|n| n == &pod_name)
+            || self
+                .is_pod_terminating_or_failed(namespace, &pod_name)
+                .await
+        {
+            pod_name = format!("{base_name}-{}", cfg.rev_hash);
+            let mut counter = 1;
+            while failed_or_deleted_names.iter().any(|n| n == &pod_name)
+                || self
+                    .is_pod_terminating_or_failed(namespace, &pod_name)
+                    .await
+            {
+                pod_name = format!("{base_name}-{}-{counter}", cfg.rev_hash);
+                counter += 1;
+            }
+        }
+
         if self.client.get_pod(namespace, &pod_name).await.is_ok() {
             return Ok(());
         }
@@ -215,6 +529,8 @@ impl DaemonSetReconciler {
                 "daemonset.kubernetes.io/pod-name".to_string(),
                 json!(pod_name),
             );
+            l_obj.insert("controller-revision-hash".to_string(), json!(cfg.rev_hash));
+            l_obj.insert("pod-template-hash".to_string(), json!(cfg.rev_hash));
         }
 
         let new_pod = json!({
@@ -242,6 +558,16 @@ impl DaemonSetReconciler {
         let _ = self.client.create_pod(namespace, new_pod).await;
         Ok(())
     }
+
+    async fn is_pod_terminating_or_failed(&self, namespace: &str, pod_name: &str) -> bool {
+        if let Ok(pod) = self.client.get_pod(namespace, pod_name).await {
+            let is_terminating = pod.pointer("/metadata/deletionTimestamp").is_some();
+            let is_failed = pod.pointer("/status/phase").and_then(Value::as_str) == Some("Failed");
+            is_terminating || is_failed
+        } else {
+            false
+        }
+    }
 }
 
 struct DaemonSetConfig<'a> {
@@ -249,6 +575,8 @@ struct DaemonSetConfig<'a> {
     uid: &'a str,
     has_nodes: bool,
     use_generic_pod_name: bool,
+    rev_hash: &'a str,
+    update_strategy: &'a str,
 }
 
 fn has_explicit_node_placement(template_spec: &Value) -> bool {
@@ -327,6 +655,7 @@ fn compute_daemonset_status(
     updated_pods: &[Value],
     name: &str,
     has_nodes: bool,
+    rev_hash: &str,
 ) -> Value {
     let desired_number_scheduled = if deleting {
         0
@@ -346,7 +675,12 @@ fn compute_daemonset_status(
 
         if let Some(pod) = node_pod {
             current_number_scheduled += 1;
-            updated_number_scheduled += 1;
+            let pod_rev = pod
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str);
+            if pod_rev == Some(rev_hash) || rev_hash.is_empty() {
+                updated_number_scheduled += 1;
+            }
             if !has_nodes || super::is_pod_ready(pod) {
                 number_ready += 1;
             }
@@ -499,9 +833,11 @@ struct DaemonSetParams<'a> {
     name: &'a str,
     uid: &'a str,
     deleting: bool,
+    template: Value,
     template_labels: Value,
     template_spec: Value,
     selector_val: Value,
+    update_strategy: String,
 }
 
 fn parse_daemonset_params(ds: &Value) -> Result<DaemonSetParams<'_>, ControllerError> {
@@ -547,12 +883,111 @@ fn parse_daemonset_params(ds: &Value) -> Result<DaemonSetParams<'_>, ControllerE
         .cloned()
         .unwrap_or_else(|| json!({ "matchLabels": template_labels }));
 
+    let update_strategy = ds
+        .pointer("/spec/updateStrategy/type")
+        .and_then(Value::as_str)
+        .unwrap_or("RollingUpdate")
+        .to_string();
+
     Ok(DaemonSetParams {
         name,
         uid,
         deleting,
+        template,
         template_labels,
         template_spec,
         selector_val,
+        update_strategy,
     })
+}
+
+fn strip_daemonset_owner_ref(rev: &mut Value, ds_name: &str, ds_uid: &str) {
+    if let Some(owners_mut) = rev
+        .pointer_mut("/metadata/ownerReferences")
+        .and_then(Value::as_array_mut)
+    {
+        owners_mut.retain(|o| {
+            let matches_kind = o.get("kind").and_then(Value::as_str) == Some("DaemonSet");
+            let matches_uid =
+                !ds_uid.is_empty() && o.get("uid").and_then(Value::as_str) == Some(ds_uid);
+            let matches_name = o.get("name").and_then(Value::as_str) == Some(ds_name);
+            let is_controller = o
+                .get("controller")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            !(matches_kind && (matches_uid || matches_name) && is_controller)
+        });
+    }
+}
+
+fn add_daemonset_owner_ref(rev: &mut Value, ds_name: &str, ds_uid: &str) {
+    let mut new_owners = rev
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    new_owners.push(json!({
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "name": ds_name,
+        "uid": ds_uid,
+        "controller": true,
+        "blockOwnerDeletion": true
+    }));
+    if let Some(meta) = rev.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.insert("ownerReferences".to_string(), Value::Array(new_owners));
+    }
+}
+
+fn compute_daemonset_template_hash(template: &Value) -> String {
+    let clean = clean_template_for_comparison(template);
+    let serialized = serde_json::to_string(&clean).unwrap_or_default();
+    let mut hasher: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in serialized.as_bytes() {
+        hasher ^= u64::from(*byte);
+        hasher = hasher.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:010x}", hasher & 0x00ff_ffff_ffff)
+}
+
+fn cr_matches_template(cr: &Value, current_template: &Value) -> bool {
+    let Some(cr_tpl) = cr.pointer("/data/spec/template") else {
+        return false;
+    };
+    clean_template_for_comparison(cr_tpl) == clean_template_for_comparison(current_template)
+}
+
+fn clean_template_for_comparison(val: &Value) -> Value {
+    let mut clean = val.clone();
+    if let Some(obj) = clean.as_object_mut() {
+        obj.remove("$patch");
+    }
+    if let Some(labels) = clean
+        .pointer_mut("/metadata/labels")
+        .and_then(Value::as_object_mut)
+    {
+        labels.remove("controller-revision-hash");
+        labels.remove("pod-template-hash");
+        labels.remove("controller.kubernetes.io/hash");
+    }
+    clean
+}
+
+fn extract_cr_hash(cr: &Value, ds_name: &str) -> String {
+    cr.pointer("/metadata/labels/controller-revision-hash")
+        .or_else(|| cr.pointer("/metadata/labels/controller.kubernetes.io/hash"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                let full_name = cr
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                full_name
+                    .strip_prefix(&format!("{ds_name}-"))
+                    .unwrap_or("rev")
+                    .to_string()
+            },
+            str::to_string,
+        )
 }

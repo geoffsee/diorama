@@ -325,12 +325,24 @@ pub(crate) fn is_pod_owned_by(
         .and_then(|m| m.get("ownerReferences"))
         .and_then(Value::as_array)
         .is_some_and(|owners| {
+            let has_controller = owners
+                .iter()
+                .any(|o| o.get("controller").and_then(Value::as_bool) == Some(true));
+
             owners.iter().any(|o| {
                 let matches_kind = o.get("kind").and_then(Value::as_str) == Some(owner_kind);
                 let matches_uid = !owner_uid.is_empty()
                     && o.get("uid").and_then(Value::as_str) == Some(owner_uid);
                 let matches_name = o.get("name").and_then(Value::as_str) == Some(owner_name);
-                matches_kind && (matches_uid || matches_name)
+                let matches_target = matches_kind && (matches_uid || matches_name);
+                if !matches_target {
+                    return false;
+                }
+                if has_controller {
+                    o.get("controller").and_then(Value::as_bool) == Some(true)
+                } else {
+                    true
+                }
             })
         })
 }
@@ -347,7 +359,12 @@ fn remove_owner_reference(pod: &mut Value, owner_kind: &str, owner_name: &str, o
         let same_uid =
             !owner_uid.is_empty() && o.get("uid").and_then(Value::as_str) == Some(owner_uid);
         let same_name = o.get("name").and_then(Value::as_str) == Some(owner_name);
-        !(same_kind && (same_uid || same_name))
+        let matches = same_kind && (same_uid || same_name);
+        let is_controller = o
+            .get("controller")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        !(matches && is_controller)
     });
 }
 
@@ -441,7 +458,7 @@ pub(crate) async fn adopt_and_release_pods(
                 .is_some_and(|owners| {
                     owners
                         .iter()
-                        .any(|o| o.get("controller").and_then(Value::as_bool).unwrap_or(true))
+                        .any(|o| o.get("controller").and_then(Value::as_bool) == Some(true))
                 });
             if !has_controller && matches_label_selector(sel, pod.pointer("/metadata/labels")) {
                 let owner_ref = json!({

@@ -109,6 +109,7 @@ impl GarbageCollector {
     }
 
     async fn reconcile_pass(&self, namespace: &str) -> Result<usize, ControllerError> {
+        let orphan_count = self.reconcile_orphan_owners(namespace).await;
         let rs_count = self.reconcile_replicasets(namespace).await;
         let job_count = self.reconcile_jobs(namespace).await;
         let pod_count = self.reconcile_pods(namespace).await;
@@ -116,7 +117,6 @@ impl GarbageCollector {
         let endpoint_count = self.reconcile_endpoints(namespace).await;
         let cr_count = self.reconcile_custom_resources(namespace).await;
         let fg_count = self.reconcile_foreground_owners(namespace).await;
-        let orphan_count = self.reconcile_orphan_owners(namespace).await;
         Ok(rs_count
             + job_count
             + pod_count
@@ -455,6 +455,7 @@ impl GarbageCollector {
             else {
                 continue;
             };
+
             if self.client.delete_pod(namespace, name).await.is_ok() {
                 deleted += 1;
             }
@@ -725,6 +726,13 @@ impl GarbageCollector {
         {
             finalized += self
                 .finalize_orphan_owners(namespace, "StatefulSet", items)
+                .await;
+        }
+        if let Ok(list) = self.client.list_replicationcontrollers(namespace).await
+            && let Some(items) = list.get("items").and_then(Value::as_array)
+        {
+            finalized += self
+                .finalize_orphan_owners(namespace, "ReplicationController", items)
                 .await;
         }
         if let Ok(list) = self.client.list_daemonsets(namespace).await
