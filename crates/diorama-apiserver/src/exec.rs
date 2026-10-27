@@ -343,13 +343,26 @@ where
             std::time::Duration::from_millis(50).min(remaining)
         };
         match tokio::time::timeout(idle_timeout, ws.next()).await {
-            Ok(Some(Ok(Message::Binary(data)))) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
-                stdin_bytes.extend_from_slice(&data[1..]);
-                if stdin_bytes.ends_with(b"\n") {
-                    break;
-                }
+            Ok(Some(Ok(msg))) => match msg {
+                Message::Binary(data) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
+                    stdin_bytes.extend_from_slice(&data[1..]);
+                    if stdin_bytes.ends_with(b"\n") {
+                        break;
+                    }
+                },
+                Message::Text(text) => {
+                    let data = text.as_bytes();
+                    if !data.is_empty() && data[0] == CHANNEL_STDIN {
+                        stdin_bytes.extend_from_slice(&data[1..]);
+                        if stdin_bytes.ends_with(b"\n") {
+                            break;
+                        }
+                    }
+                },
+                Message::Close(_) => break,
+                _ => {},
             },
-            Ok(Some(Ok(Message::Close(_))) | None) => break,
+            Ok(None) => break,
             Err(_) if !stdin_bytes.is_empty() => break,
             _ => {},
         }

@@ -52,6 +52,9 @@ pub enum ApiserverError {
     #[error("admission denied: {reason}")]
     AdmissionDenied { reason: String },
 
+    #[error("{reason}")]
+    Forbidden { reason: String },
+
     #[error("webhook call failed for {webhook}: {reason}")]
     WebhookFailure { webhook: String, reason: String },
 
@@ -71,7 +74,7 @@ impl ApiserverError {
             Self::Config { .. } => "apiserver-config-error",
             Self::ReadinessFailed { .. } => "apiserver-readiness-failed",
             Self::Unauthenticated { .. } => "apiserver-unauthenticated",
-            Self::Unauthorized { .. } => "apiserver-unauthorized",
+            Self::Unauthorized { .. } | Self::Forbidden { .. } => "apiserver-unauthorized",
             Self::AdmissionDenied { .. } => "apiserver-admission-denied",
             Self::WebhookFailure { .. } => "apiserver-webhook-failure",
             Self::AggregatedApiError { .. } => "apiserver-aggregated-api-error",

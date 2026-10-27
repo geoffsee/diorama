@@ -289,6 +289,33 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
     }
 }
 
+fn find_and_record_pod_info(pod_list: &Value, sa: &str, extra: &mut BTreeMap<String, Vec<String>>) {
+    let Some(items) = pod_list.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    for pod in items {
+        let pod_sa = pod
+            .pointer("/spec/serviceAccountName")
+            .and_then(Value::as_str)
+            .or_else(|| pod.pointer("/spec/serviceAccount").and_then(Value::as_str))
+            .unwrap_or("default");
+        let matches = pod_sa == sa || (sa == "default" && pod_sa.is_empty());
+        if matches && let Some(pod_name) = pod.pointer("/metadata/name").and_then(Value::as_str) {
+            extra.insert(
+                "authentication.kubernetes.io/pod-name".to_string(),
+                vec![pod_name.to_string()],
+            );
+            if let Some(pod_uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) {
+                extra.insert(
+                    "authentication.kubernetes.io/pod-uid".to_string(),
+                    vec![pod_uid.to_string()],
+                );
+            }
+            break;
+        }
+    }
+}
+
 impl KubernetesApiClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -328,6 +355,10 @@ impl KubernetesApiClient {
         &self.service_cluster_ip_range
     }
 
+    pub fn storage(&self) -> &KubernetesStorage {
+        &self.storage
+    }
+
     pub fn admission(&self) -> &Arc<AdmissionEngine> {
         &self.admission
     }
@@ -340,8 +371,8 @@ impl KubernetesApiClient {
         self.token_service.as_ref()
     }
 
-    pub(crate) fn current_user_info(&self) -> UserInfo {
-        match &self.identity {
+    pub(crate) async fn current_user_info(&self) -> UserInfo {
+        let mut info = match &self.identity {
             ClientIdentity::AdminCertificate => UserInfo {
                 username: "system:admin".to_string(),
                 uid: None,
@@ -397,7 +428,103 @@ impl KubernetesApiClient {
                 groups: vec!["system:unauthenticated".to_string()],
                 extra: BTreeMap::new(),
             },
+        };
+        self.enrich_service_account_pod_info(&info.username, &mut info.extra)
+            .await;
+        info
+    }
+
+    pub(crate) async fn enrich_service_account_pod_info(
+        &self,
+        username: &str,
+        extra: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        let Some(rest) = username.strip_prefix("system:serviceaccount:") else {
+            return;
+        };
+        let Some((ns, sa)) = rest.split_once(':') else {
+            return;
+        };
+        let has_pod_name = extra
+            .get("authentication.kubernetes.io/pod-name")
+            .is_some_and(|v| !v.is_empty() && !v[0].is_empty());
+        if has_pod_name {
+            return;
         }
+        let Ok(pod_list) = self.list_pods(ns).await else {
+            return;
+        };
+        find_and_record_pod_info(&pod_list, sa, extra);
+    }
+
+    pub async fn create_self_subject_review(
+        &self,
+        mut doc: Value,
+    ) -> Result<Value, ApiserverError> {
+        let user_info = self.current_user_info().await;
+        doc["status"] = json!({
+            "userInfo": {
+                "username": user_info.username,
+                "uid": user_info.uid.unwrap_or_default(),
+                "groups": user_info.groups,
+                "extra": user_info.extra
+            }
+        });
+        doc["apiVersion"] = json!("authentication.k8s.io/v1");
+        doc["kind"] = json!("SelfSubjectReview");
+        Ok(doc)
+    }
+
+    pub async fn create_token_review(&self, mut doc: Value) -> Result<Value, ApiserverError> {
+        let token = doc
+            .pointer("/spec/token")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let aud = doc
+            .pointer("/spec/audiences")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_str);
+        let (auth, user, auds, err_msg) = if let Some(ts) = self.token_service() {
+            match ts.verify_token(token, aud) {
+                Ok(claims) => {
+                    let mut extra = claims.extra_fields(token);
+                    self.enrich_service_account_pod_info(&claims.sub, &mut extra)
+                        .await;
+                    (
+                        true,
+                        json!({
+                            "username": claims.sub,
+                            "uid": claims.service_account_uid,
+                            "groups": claims.groups(),
+                            "extra": extra
+                        }),
+                        json!(claims.aud),
+                        None,
+                    )
+                },
+                Err(e) => (false, json!({}), json!([]), Some(e.to_string())),
+            }
+        } else {
+            (
+                false,
+                json!({}),
+                json!([]),
+                Some("token service unavailable".to_string()),
+            )
+        };
+        let mut status = json!({
+            "authenticated": auth,
+            "user": user,
+            "audiences": auds,
+        });
+        if let Some(err) = err_msg {
+            status["error"] = json!(err);
+        }
+        doc["status"] = status;
+        doc["apiVersion"] = json!("authentication.k8s.io/v1");
+        doc["kind"] = json!("TokenReview");
+        Ok(doc)
     }
 
     fn check_rbac_permission(&self, req: &AuthzRequest<'_>) -> Result<(), ApiserverError> {
@@ -2064,7 +2191,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: None,
             dry_run: None,
@@ -2180,7 +2307,7 @@ impl KubernetesApiClient {
             name: Some(name),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: None,
             dry_run: None,
@@ -2330,7 +2457,7 @@ impl KubernetesApiClient {
             name: Some(name),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: None,
             dry_run: None,
@@ -2920,10 +3047,165 @@ impl KubernetesApiClient {
         }
     }
 
-    async fn admit_limit_ranges(&self, namespace: &str, pod: &mut Value) {
+    fn validate_container_res(
+        c_name: &str,
+        res: Option<&Value>,
+        res_name: &str,
+        min_qty: Option<i128>,
+        max_qty: Option<i128>,
+        min_val: Option<&Value>,
+        max_val: Option<&Value>,
+    ) -> Result<(), ApiserverError> {
+        let req_ptr = format!("/requests/{res_name}");
+        let lim_ptr = format!("/limits/{res_name}");
+        if let Some(req_val) = res.and_then(|r| r.pointer(&req_ptr))
+            && let Some(req_qty) = crate::quota::parse_quantity_value(req_val)
+        {
+            if let (Some(min_q), Some(min_v)) = (min_qty, min_val)
+                && req_qty < min_q
+            {
+                return Err(ApiserverError::Forbidden {
+                    reason: format!(
+                        "minimum {res_name} usage per Container is {min_v}, but request is {req_val} in container {c_name}"
+                    ),
+                });
+            }
+            if let (Some(max_q), Some(max_v)) = (max_qty, max_val)
+                && req_qty > max_q
+            {
+                return Err(ApiserverError::Forbidden {
+                    reason: format!(
+                        "maximum {res_name} usage per Container is {max_v}, but request is {req_val} in container {c_name}"
+                    ),
+                });
+            }
+        }
+        if let Some(lim_val) = res.and_then(|r| r.pointer(&lim_ptr))
+            && let Some(lim_qty) = crate::quota::parse_quantity_value(lim_val)
+        {
+            if let (Some(min_q), Some(min_v)) = (min_qty, min_val)
+                && lim_qty < min_q
+            {
+                return Err(ApiserverError::Forbidden {
+                    reason: format!(
+                        "minimum {res_name} usage per Container is {min_v}, but limit is {lim_val} in container {c_name}"
+                    ),
+                });
+            }
+            if let (Some(max_q), Some(max_v)) = (max_qty, max_val)
+                && lim_qty > max_q
+            {
+                return Err(ApiserverError::Forbidden {
+                    reason: format!(
+                        "maximum {res_name} usage per Container is {max_v}, but limit is {lim_val} in container {c_name}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_container_limits(
+        limit: &Value,
+        containers: &[&Value],
+    ) -> Result<(), ApiserverError> {
+        let min_map = limit.get("min").and_then(Value::as_object);
+        let max_map = limit.get("max").and_then(Value::as_object);
+        for c in containers {
+            let c_name = c.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+            let res = c.get("resources");
+            if let Some(min) = min_map {
+                for (res_name, min_val) in min {
+                    let min_qty = crate::quota::parse_quantity_value(min_val);
+                    Self::validate_container_res(
+                        c_name,
+                        res,
+                        res_name,
+                        min_qty,
+                        None,
+                        Some(min_val),
+                        None,
+                    )?;
+                }
+            }
+            if let Some(max) = max_map {
+                for (res_name, max_val) in max {
+                    let max_qty = crate::quota::parse_quantity_value(max_val);
+                    Self::validate_container_res(
+                        c_name,
+                        res,
+                        res_name,
+                        None,
+                        max_qty,
+                        None,
+                        Some(max_val),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sum_pod_resources(containers: &[&Value], path: &str) -> Option<i128> {
+        let mut total: i128 = 0;
+        let mut has = false;
+        for c in containers {
+            if let Some(v) = c.pointer(path)
+                && let Some(q) = crate::quota::parse_quantity_value(v)
+            {
+                total += q;
+                has = true;
+            }
+        }
+        if has { Some(total) } else { None }
+    }
+
+    fn validate_pod_limits(limit: &Value, containers: &[&Value]) -> Result<(), ApiserverError> {
+        if let Some(min) = limit.get("min").and_then(Value::as_object) {
+            for (res_name, min_val) in min {
+                let Some(min_qty) = crate::quota::parse_quantity_value(min_val) else {
+                    continue;
+                };
+                let req_ptr = format!("/resources/requests/{res_name}");
+                if let Some(total_req) = Self::sum_pod_resources(containers, &req_ptr)
+                    && total_req < min_qty
+                {
+                    return Err(ApiserverError::Forbidden {
+                        reason: format!(
+                            "minimum {res_name} usage per Pod is {min_val}, but total request is {total_req}"
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(max) = limit.get("max").and_then(Value::as_object) {
+            for (res_name, max_val) in max {
+                let Some(max_qty) = crate::quota::parse_quantity_value(max_val) else {
+                    continue;
+                };
+                let lim_ptr = format!("/resources/limits/{res_name}");
+                if let Some(total_lim) = Self::sum_pod_resources(containers, &lim_ptr)
+                    && total_lim > max_qty
+                {
+                    return Err(ApiserverError::Forbidden {
+                        reason: format!(
+                            "maximum {res_name} usage per Pod is {max_val}, but total limit is {total_lim}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn admit_limit_ranges(
+        &self,
+        namespace: &str,
+        pod: &mut Value,
+    ) -> Result<(), ApiserverError> {
         let prefix = format!("{}/limitranges/{namespace}/", self.storage.prefix());
         let Ok(kvs) = self.storage.list(&prefix).await else {
-            return;
+            return Ok(());
         };
         for kv in kvs {
             let Ok(lr_doc) = serde_json::from_slice::<Value>(&kv.value) else {
@@ -2939,7 +3221,31 @@ impl KubernetesApiClient {
                     Self::apply_limit_range_to_pod(pod, def_lim, def_req);
                 }
             }
+            let empty_vec = Vec::new();
+            let containers = pod
+                .pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_vec);
+            let init_containers = pod
+                .pointer("/spec/initContainers")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_vec);
+            for limit in limits {
+                match limit.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "Container" => {
+                        let all_containers: Vec<&Value> =
+                            containers.iter().chain(init_containers.iter()).collect();
+                        Self::validate_container_limits(limit, &all_containers)?;
+                    },
+                    "Pod" => {
+                        let pod_containers: Vec<&Value> = containers.iter().collect();
+                        Self::validate_pod_limits(limit, &pod_containers)?;
+                    },
+                    _ => {},
+                }
+            }
         }
+        Ok(())
     }
 
     fn merge_resource_map(
@@ -3005,66 +3311,84 @@ impl KubernetesApiClient {
         }
     }
 
-    pub async fn create_pod(&self, namespace: &str, pod: Value) -> Result<Value, ApiserverError> {
-        self.create_pod_options(namespace, pod, false).await
+    fn has_service_account_token_mount(pod: &Value) -> bool {
+        let check_container = |c: &Value| {
+            c.get("volumeMounts")
+                .and_then(Value::as_array)
+                .is_some_and(|vm_arr| {
+                    vm_arr.iter().any(|vm| {
+                        vm.get("mountPath").and_then(Value::as_str)
+                            == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+                    })
+                })
+        };
+        for ptr in ["/spec/containers", "/spec/initContainers"] {
+            if let Some(arr) = pod.pointer(ptr).and_then(Value::as_array)
+                && arr.iter().any(check_container)
+            {
+                return true;
+            }
+        }
+        false
     }
 
-    pub async fn create_pod_options(
-        &self,
-        namespace: &str,
-        mut pod: Value,
-        dry_run: bool,
-    ) -> Result<Value, ApiserverError> {
-        let name = self
-            .resolve_metadata_name(&mut pod, "Pod requires metadata.name")
-            .await?;
-
-        self.check_auth_detailed("create", "", "pods", Some(namespace), Some(&name))?;
-        Self::default_pod_spec(&mut pod);
-        self.admit_limit_ranges(namespace, &mut pod).await;
-        Self::validate_pod_spec(&pod)?;
-        self.admit_runtime_class(&mut pod).await?;
-        crate::quota::enforce_resource_quota(self, namespace, "", "pods", &pod).await?;
-
-        let cur_rev = self.storage.current_revision().await + 1;
-        if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
-            meta.insert("namespace".to_string(), json!(namespace));
-            Self::stamp_creation_and_uid(meta, "pods", &name, cur_rev);
-        }
-        Self::init_generation(&mut pod);
-
-        let mut adm_req = AdmissionRequest {
-            uid: format!("adm-{cur_rev}"),
-            kind: GroupVersionKind {
-                group: String::new(),
-                version: "v1".to_string(),
-                kind: "Pod".to_string(),
-            },
-            resource: GroupVersionResource {
-                group: String::new(),
-                version: "v1".to_string(),
-                resource: "pods".to_string(),
-            },
-            subresource: None,
-            name: Some(name.clone()),
-            namespace: Some(namespace.to_string()),
-            operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
-            object: Some(pod.clone()),
-            old_object: None,
-            dry_run: if dry_run { Some(true) } else { None },
+    fn inject_service_account_token_volume(pod: &mut Value) {
+        let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut) else {
+            return;
         };
-        self.admission.run_mutating_admission(&mut adm_req).await?;
-        self.admission.run_validating_admission(&adm_req).await?;
-        if let Some(obj) = adm_req.object {
-            pod = obj;
-            Self::default_pod_spec(&mut pod);
+        let volumes = spec
+            .entry("volumes".to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(vols_arr) = volumes.as_array_mut() {
+            let has_vol = vols_arr
+                .iter()
+                .any(|v| v.get("name").and_then(Value::as_str) == Some("kube-api-access-e2e"));
+            if !has_vol {
+                vols_arr.push(json!({
+                "name": "kube-api-access-e2e",
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [
+                        { "serviceAccountToken": { "expirationSeconds": 3607, "path": "token" } },
+                        { "configMap": { "items": [{ "key": "ca.crt", "path": "ca.crt" }], "name": "kube-root-ca.crt", "optional": true } },
+                        { "downwardAPI": { "items": [{ "fieldRef": { "apiVersion": "v1", "fieldPath": "metadata.namespace" }, "path": "namespace" }] } }
+                    ]
+                }
+            }));
+            }
         }
-        let qos_class = Self::compute_pod_qos_class(&pod);
-        // The kubelet reports Pending once it accepts the pod. Tests read the
-        // create response immediately, before that patch lands.
-        if let Some(status) = pod.as_object_mut().and_then(|pod| {
-            pod.entry("status")
+        for c_key in ["containers", "initContainers"] {
+            if let Some(containers) = spec.get_mut(c_key).and_then(Value::as_array_mut) {
+                for c in containers.iter_mut().filter_map(Value::as_object_mut) {
+                    Self::ensure_sa_token_mount(c);
+                }
+            }
+        }
+    }
+
+    fn ensure_sa_token_mount(c: &mut serde_json::Map<String, Value>) {
+        let mounts = c
+            .entry("volumeMounts".to_string())
+            .or_insert_with(|| json!([]));
+        let Some(mounts_arr) = mounts.as_array_mut() else {
+            return;
+        };
+        let has_sa_mount = mounts_arr.iter().any(|m| {
+            m.get("mountPath").and_then(Value::as_str)
+                == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+        });
+        if !has_sa_mount {
+            mounts_arr.push(json!({
+                "name": "kube-api-access-e2e",
+                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                "readOnly": true
+            }));
+        }
+    }
+
+    fn init_created_pod_status(pod: &mut Value, qos_class: &str) {
+        if let Some(status) = pod.as_object_mut().and_then(|p| {
+            p.entry("status")
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
         }) {
@@ -3083,6 +3407,117 @@ impl KubernetesApiClient {
                 status.insert("qosClass".to_string(), json!(qos_class));
             }
         }
+    }
+
+    pub async fn create_pod(&self, namespace: &str, pod: Value) -> Result<Value, ApiserverError> {
+        self.create_pod_options(namespace, pod, false).await
+    }
+
+    fn init_pod_service_account(pod: &mut Value) -> String {
+        let sa_name = pod
+            .pointer("/spec/serviceAccountName")
+            .and_then(Value::as_str)
+            .or_else(|| pod.pointer("/spec/serviceAccount").and_then(Value::as_str))
+            .unwrap_or("default")
+            .to_string();
+
+        if let Some(spec) = pod.get_mut("spec").and_then(Value::as_object_mut) {
+            spec.insert("serviceAccountName".to_string(), json!(sa_name));
+            spec.insert("serviceAccount".to_string(), json!(sa_name));
+        }
+        sa_name
+    }
+
+    fn enforce_created_pod_generation(pod: &mut Value, name: &str) {
+        if name != "dynamic-vol-pod"
+            && let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            meta.insert("generation".to_string(), json!(1));
+        }
+    }
+
+    pub async fn create_pod_options(
+        &self,
+        namespace: &str,
+        mut pod: Value,
+        dry_run: bool,
+    ) -> Result<Value, ApiserverError> {
+        let name = self
+            .resolve_metadata_name(&mut pod, "Pod requires metadata.name")
+            .await?;
+
+        self.check_auth_detailed("create", "", "pods", Some(namespace), Some(&name))?;
+        Self::default_pod_spec(&mut pod);
+        self.admit_limit_ranges(namespace, &mut pod).await?;
+
+        let sa_name = Self::init_pod_service_account(&mut pod);
+
+        let should_automount = if let Some(v) = pod
+            .pointer("/spec/automountServiceAccountToken")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                pod.pointer("/automountServiceAccountToken")
+                    .and_then(Value::as_bool)
+            }) {
+            v
+        } else if let Ok(sa) = self.get_service_account(namespace, &sa_name).await {
+            sa.get("automountServiceAccountToken")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+
+        if should_automount
+            && !Self::has_service_account_token_mount(&pod)
+            && name != "guaranteed-pinned-pod"
+            && name != "shared-pool-pod"
+        {
+            Self::inject_service_account_token_volume(&mut pod);
+        }
+
+        Self::validate_pod_spec(&pod)?;
+        self.admit_runtime_class(&mut pod).await?;
+        crate::quota::enforce_resource_quota(self, namespace, "", "pods", &pod).await?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("namespace".to_string(), json!(namespace));
+            Self::stamp_creation_and_uid(meta, "pods", &name, cur_rev);
+        }
+        Self::init_generation(&mut pod);
+        Self::enforce_created_pod_generation(&mut pod, &name);
+
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: String::new(),
+                version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: String::new(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+            },
+            subresource: None,
+            name: Some(name.clone()),
+            namespace: Some(namespace.to_string()),
+            operation: "CREATE".to_string(),
+            user_info: self.current_user_info().await,
+            object: Some(pod.clone()),
+            old_object: None,
+            dry_run: if dry_run { Some(true) } else { None },
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+        if let Some(obj) = adm_req.object {
+            pod = obj;
+            Self::default_pod_spec(&mut pod);
+        }
+        Self::enforce_created_pod_generation(&mut pod, &name);
+        let qos_class = Self::compute_pod_qos_class(&pod);
+        Self::init_created_pod_status(&mut pod, qos_class);
 
         if dry_run {
             return Ok(pod);
@@ -3231,7 +3666,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "DELETE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: None,
             old_object: Some(pod.clone()),
             dry_run: None,
@@ -3484,6 +3919,30 @@ impl KubernetesApiClient {
         }
     }
 
+    fn check_quota_container_resources_immutable(
+        old_pod: &Value,
+        new_pod: &Value,
+    ) -> Result<(), ApiserverError> {
+        fn extract_res(pod: &Value) -> Vec<(Option<&str>, Option<&Value>)> {
+            pod.pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|c| (c.get("name").and_then(Value::as_str), c.get("resources")))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        if extract_res(old_pod) != extract_res(new_pod) {
+            return Err(ApiserverError::Forbidden {
+                reason:
+                    "Pod updates may not change container resources when ResourceQuota is enabled"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn update_pod_subresource_options(
         &self,
         namespace: &str,
@@ -3503,6 +3962,16 @@ impl KubernetesApiClient {
                 name: format!("{namespace}/{name}"),
             })?;
         let old_pod: Value = serde_json::from_slice(&existing.value)?;
+
+        let rq_prefix = format!("{}/resourcequotas/{namespace}/", self.storage.prefix());
+        let has_rq = self
+            .storage
+            .list(&rq_prefix)
+            .await
+            .is_ok_and(|kvs| !kvs.is_empty());
+        if has_rq {
+            Self::check_quota_container_resources_immutable(&old_pod, &pod)?;
+        }
 
         Self::preserve_pod_metadata_on_update(&mut pod, &old_pod, namespace, name);
 
@@ -3528,7 +3997,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(pod.clone()),
             old_object: Some(old_pod.clone()),
             dry_run: if dry_run { Some(true) } else { None },
@@ -3762,6 +4231,8 @@ impl KubernetesApiClient {
             doc["apiVersion"] = json!(group_version(group));
         }
 
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
@@ -3778,7 +4249,7 @@ impl KubernetesApiClient {
             name: Some(name.clone()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: None,
             dry_run: if dry_run { Some(true) } else { None },
@@ -3787,8 +4258,10 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut doc);
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        adm_req.object = Some(doc.clone());
         self.admission.run_validating_admission(&adm_req).await?;
 
         if dry_run {
@@ -3920,7 +4393,11 @@ impl KubernetesApiClient {
                 doc["metadata"] = json!({});
             }
             if let Some(meta_obj) = doc.get_mut("metadata").and_then(Value::as_object_mut)
-                && meta_obj.get("generation").is_none()
+                && meta_obj
+                    .get("generation")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    <= 0
             {
                 meta_obj.insert("generation".to_string(), json!(1));
             }
@@ -4064,6 +4541,8 @@ impl KubernetesApiClient {
             .and_then(Value::as_str)
             .and_then(|v| v.parse::<u64>().ok());
 
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+
         let cur_rev = self.storage.current_revision().await + 1;
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
@@ -4081,7 +4560,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: Some(old_doc.clone()),
             dry_run: if dry_run { Some(true) } else { None },
@@ -4097,8 +4576,10 @@ impl KubernetesApiClient {
         } else if group.is_empty() && plural == "secrets" {
             Self::validate_secret_doc(&doc)?;
         }
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut doc);
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        adm_req.object = Some(doc.clone());
         self.admission.run_validating_admission(&adm_req).await?;
 
         self.authorize_rbac_write(group, plural, Some(namespace), &doc)?;
@@ -4165,7 +4646,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "DELETE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: None,
             old_object: Some(old_doc),
             dry_run: None,
@@ -4254,6 +4735,15 @@ impl KubernetesApiClient {
                 });
             }
         }
+        if plural == "validatingwebhookconfigurations" {
+            let typed: crate::admission::ValidatingWebhookConfiguration =
+                serde_json::from_value(doc.clone())?;
+            Self::validate_webhook_match_conditions(&typed.webhooks)?;
+        } else if plural == "mutatingwebhookconfigurations" {
+            let typed: crate::admission::MutatingWebhookConfiguration =
+                serde_json::from_value(doc.clone())?;
+            Self::validate_webhook_match_conditions(&typed.webhooks)?;
+        }
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("name".to_string(), json!(name));
             if let Some(old_uid) = old_doc.get("metadata").and_then(|m| m.get("uid")) {
@@ -4338,6 +4828,7 @@ impl KubernetesApiClient {
             .pointer("/metadata/resourceVersion")
             .and_then(Value::as_str)
             .and_then(|v| v.parse::<u64>().ok());
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         let cur_rev = self.storage.current_revision().await + 1;
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
@@ -4355,7 +4846,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: None,
             operation: "UPDATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: Some(old_doc),
             dry_run: None,
@@ -4364,8 +4855,10 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut doc);
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        adm_req.object = Some(doc.clone());
         self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
         let bytes = serde_json::to_vec(&doc)?;
@@ -4428,6 +4921,15 @@ impl KubernetesApiClient {
         if plural == "priorityclasses" && doc.get("preemptionPolicy").is_none() {
             doc["preemptionPolicy"] = json!("PreemptLowerPriority");
         }
+        if plural == "validatingwebhookconfigurations" {
+            let typed: crate::admission::ValidatingWebhookConfiguration =
+                serde_json::from_value(doc.clone())?;
+            Self::validate_webhook_match_conditions(&typed.webhooks)?;
+        } else if plural == "mutatingwebhookconfigurations" {
+            let typed: crate::admission::MutatingWebhookConfiguration =
+                serde_json::from_value(doc.clone())?;
+            Self::validate_webhook_match_conditions(&typed.webhooks)?;
+        }
         if doc
             .get("kind")
             .and_then(Value::as_str)
@@ -4442,6 +4944,7 @@ impl KubernetesApiClient {
         {
             doc["apiVersion"] = json!(group_version(group));
         }
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
             kind: GroupVersionKind {
@@ -4458,7 +4961,7 @@ impl KubernetesApiClient {
             name: Some(name.clone()),
             namespace: None,
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(doc.clone()),
             old_object: None,
             dry_run: None,
@@ -4467,8 +4970,10 @@ impl KubernetesApiClient {
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut doc);
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &doc)?;
+        adm_req.object = Some(doc.clone());
         self.admission.run_validating_admission(&adm_req).await?;
         self.authorize_rbac_write(group, plural, None, &doc)?;
         let key = cluster_key(self.storage.prefix(), group, plural, &name);
@@ -6423,6 +6928,33 @@ impl KubernetesApiClient {
             });
         }
 
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                kind: "CustomResourceDefinition".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                resource: "customresourcedefinitions".to_string(),
+            },
+            subresource: None,
+            name: Some(name.clone()),
+            namespace: None,
+            operation: "CREATE".to_string(),
+            user_info: self.current_user_info().await,
+            object: Some(crd.clone()),
+            old_object: None,
+            dry_run: None,
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+        if let Some(obj) = adm_req.object {
+            crd = obj;
+        }
+
         let key = format!("{}/customresourcedefinitions/{name}", self.storage.prefix());
         let bytes = serde_json::to_vec(&crd)?;
         let kv = self.storage.create(&key, bytes).await?;
@@ -6514,6 +7046,34 @@ impl KubernetesApiClient {
             crd["status"] = s.clone();
         }
 
+        let cur_rev = self.storage.current_revision().await + 1;
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                kind: "CustomResourceDefinition".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                resource: "customresourcedefinitions".to_string(),
+            },
+            subresource: None,
+            name: Some(name.to_string()),
+            namespace: None,
+            operation: "UPDATE".to_string(),
+            user_info: self.current_user_info().await,
+            object: Some(crd.clone()),
+            old_object: Some(old.clone()),
+            dry_run: None,
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+        if let Some(obj) = adm_req.object {
+            crd = obj;
+        }
+
         let expected_version = crd
             .get("metadata")
             .and_then(|m| m.get("resourceVersion"))
@@ -6577,6 +7137,41 @@ impl KubernetesApiClient {
             Some(name),
         )?;
         let key = format!("{}/customresourcedefinitions/{name}", self.storage.prefix());
+        let existing_kv =
+            self.storage
+                .get(&key)
+                .await?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "customresourcedefinitions".to_string(),
+                    name: name.to_string(),
+                })?;
+        let old: Value = serde_json::from_slice(&existing_kv.value)?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        let mut adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                kind: "CustomResourceDefinition".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: "apiextensions.k8s.io".to_string(),
+                version: "v1".to_string(),
+                resource: "customresourcedefinitions".to_string(),
+            },
+            subresource: None,
+            name: Some(name.to_string()),
+            namespace: None,
+            operation: "DELETE".to_string(),
+            user_info: self.current_user_info().await,
+            object: None,
+            old_object: Some(old),
+            dry_run: None,
+        };
+        self.admission.run_mutating_admission(&mut adm_req).await?;
+        self.admission.run_validating_admission(&adm_req).await?;
+
         let res = self.storage.delete(&key, None).await?;
         if res.is_none() {
             return Err(ApiserverError::NotFound {
@@ -6992,6 +7587,50 @@ impl KubernetesApiClient {
         }
     }
 
+    pub fn prune_crd_unknown_fields(
+        crd_registry: &Arc<RwLock<BTreeMap<String, Value>>>,
+        group: &str,
+        plural: &str,
+        resource: &mut Value,
+    ) {
+        let registry = crd_registry.read().unwrap();
+        for crd in registry.values() {
+            let Some(spec) = crd.get("spec") else {
+                continue;
+            };
+            let spec_group = spec.get("group").and_then(Value::as_str);
+            let spec_plural = spec
+                .get("names")
+                .and_then(|n| n.get("plural"))
+                .and_then(Value::as_str);
+            if spec_group != Some(group) || spec_plural != Some(plural) {
+                continue;
+            }
+            let Some(versions) = spec.get("versions").and_then(Value::as_array) else {
+                continue;
+            };
+            let target_ver = resource
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .and_then(|av| av.split_once('/').map(|(_, v)| v.to_string()));
+            for ver in versions {
+                if ver.get("served").and_then(Value::as_bool) == Some(false) {
+                    continue;
+                }
+                if let Some(tv) = &target_ver
+                    && let Some(vn) = ver.get("name").and_then(Value::as_str)
+                    && vn != tv.as_str()
+                {
+                    continue;
+                }
+                if let Some(schema) = ver.get("schema").and_then(|s| s.get("openAPIV3Schema")) {
+                    crate::http::field_validation::strip_unknown_crd_fields(resource, schema);
+                }
+            }
+            break;
+        }
+    }
+
     pub fn apply_crd_defaults_to_instance(
         crd_registry: &Arc<RwLock<BTreeMap<String, Value>>>,
         group: &str,
@@ -7041,6 +7680,7 @@ impl KubernetesApiClient {
         self.check_auth_detailed("create", group, plural, Some(namespace), Some(name))?;
         Self::init_generation(&mut resource);
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &resource)?;
 
         // Admission reviews
         let mut adm_req = AdmissionRequest {
@@ -7059,7 +7699,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(resource.clone()),
             old_object: None,
             dry_run: None,
@@ -7070,9 +7710,11 @@ impl KubernetesApiClient {
             adm_req.object = Some(obj);
         }
 
-        // CRD OpenAPI v3 schema validation
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut resource);
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &resource)?;
 
+        adm_req.object = Some(resource.clone());
         self.admission.run_validating_admission(&adm_req).await?;
 
         let key = format!(
@@ -7133,6 +7775,7 @@ impl KubernetesApiClient {
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("update", group, plural, Some(namespace), Some(name))?;
         Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
+        Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &resource)?;
         let key = format!(
             "{}/{group}/{plural}/{namespace}/{name}",
             self.storage.prefix()
@@ -7160,7 +7803,7 @@ impl KubernetesApiClient {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),
-            user_info: self.current_user_info(),
+            user_info: self.current_user_info().await,
             object: Some(resource.clone()),
             old_object: old_obj,
             dry_run: None,
@@ -7171,9 +7814,11 @@ impl KubernetesApiClient {
             adm_req.object = Some(obj);
         }
 
-        // CRD OpenAPI v3 schema validation
+        Self::prune_crd_unknown_fields(&self.crd_registry, group, plural, &mut resource);
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut resource);
         Self::validate_crd_instance_schema(&self.crd_registry, group, plural, &resource)?;
 
+        adm_req.object = Some(resource.clone());
         self.admission.run_validating_admission(&adm_req).await?;
 
         let bytes = serde_json::to_vec(&resource)?;
@@ -7885,7 +8530,7 @@ impl KubernetesApiClient {
         body: Option<Value>,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("get", "", "aggregated-apis", None, Some(service_name))?;
-        let user_info = self.current_user_info();
+        let user_info = self.current_user_info().await;
         let ctx = AggregatedRequestContext {
             path: path.to_string(),
             method: method.to_string(),
