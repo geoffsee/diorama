@@ -49,5 +49,6 @@ pub use supervisor::{COMPONENT_KUBELET, DEFAULT_STARTUP_TIMEOUT, KubeletAdapter}
 pub use workload::{
     CpuManager, CpuManagerState, ExecResult, LogOptions, PodQoSClass, ReconcileReport,
     RestartPolicy, RuntimeProvider, WorkloadRestartReport, determine_pod_qos,
-    is_container_cpu_pinning_eligible, parse_cpu_quantity_milli, parse_memory_quantity_bytes,
+    is_container_cpu_pinning_eligible, materialize_image_volume, parse_cpu_quantity_milli,
+    parse_memory_quantity_bytes, truncate_pod_hostname,
 };

@@ -2355,3 +2355,125 @@ async fn test_grpc_probe_health_check() {
         Some("True")
     );
 }
+
+#[tokio::test]
+async fn test_conformance_hostname_truncation_optional_volumes_and_etc_hosts() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, kubelet_options, _engine, _pki_dir) = setup_test_environment(&temp);
+
+    apiserver.check_prerequisites().await.unwrap();
+    apiserver.start().unwrap();
+    let apiserver_arc = Arc::new(apiserver);
+
+    let runtime = Arc::new(MockRuntimeProvider::new("managed-containerd"));
+    let kubelet = KubeletService::new(
+        kubelet_options.clone(),
+        apiserver_arc.clone(),
+        runtime.clone(),
+    );
+    kubelet.start().await.unwrap();
+
+    let client = kubelet.client();
+
+    let long_hostname_prefix = "a".repeat(60);
+    let pod_spec = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "c08-conformance-pod",
+            "namespace": "default"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "hostname": format!("{long_hostname_prefix}-extra-long-hostname-suffix-"),
+            "containers": [
+                {
+                    "name": "main",
+                    "image": "busybox:latest",
+                    "volumeMounts": [
+                        { "name": "opt-sec", "mountPath": "/etc/opt-secret" },
+                        { "name": "opt-cm", "mountPath": "/etc/opt-configmap" },
+                        { "name": "img-vol", "mountPath": "/opt/image" }
+                    ]
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "opt-sec",
+                    "secret": {
+                        "secretName": "non-existent-secret",
+                        "optional": true
+                    }
+                },
+                {
+                    "name": "opt-cm",
+                    "configMap": {
+                        "name": "non-existent-cm",
+                        "optional": true
+                    }
+                },
+                {
+                    "name": "img-vol",
+                    "image": {
+                        "reference": "quay.io/mock/image:v1",
+                        "pullPolicy": "IfNotPresent"
+                    }
+                }
+            ]
+        }
+    });
+
+    client.create_pod("default", pod_spec).await.unwrap();
+
+    let count = kubelet
+        .reconciler()
+        .reconcile_namespace("default")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let pod_doc = client
+        .get_pod("default", "c08-conformance-pod")
+        .await
+        .unwrap();
+    let uid = pod_doc
+        .pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+
+    // Check volume directories exist
+    let sec_dir = kubelet.get_pod_volume_dir(uid, "kubernetes.io~secret", "opt-sec");
+    assert!(sec_dir.exists());
+
+    let cm_dir = kubelet.get_pod_volume_dir(uid, "kubernetes.io~configmap", "opt-cm");
+    assert!(cm_dir.exists());
+
+    let img_dir = kubelet.get_pod_volume_dir(uid, "kubernetes.io~image", "img-vol");
+    assert!(img_dir.exists());
+
+    // Check /etc/hosts file generated with Kubernetes-managed header
+    let etc_hosts_path = kubelet_options
+        .root_dir
+        .join("pods")
+        .join(uid)
+        .join("etc-hosts");
+    assert!(etc_hosts_path.exists());
+    let etc_hosts_content = std::fs::read_to_string(&etc_hosts_path).unwrap();
+    assert!(etc_hosts_content.starts_with("# Kubernetes-managed hosts file.\n"));
+    let expected_truncated = dioramalet::truncate_pod_hostname(&format!(
+        "{long_hostname_prefix}-extra-long-hostname-suffix-"
+    ));
+    assert!(expected_truncated.len() <= 63);
+    assert!(!expected_truncated.ends_with('-'));
+    assert!(etc_hosts_content.contains(&expected_truncated));
+
+    // Check termination log file created
+    let term_log = kubelet_options
+        .root_dir
+        .join("pods")
+        .join(uid)
+        .join("containers")
+        .join("main")
+        .join("termination-log");
+    assert!(term_log.exists());
+}

@@ -31,11 +31,12 @@ use crate::workload::{
     LABEL_POD_NAME, LABEL_POD_NAMESPACE, LABEL_POD_UID, LogOptions, MANAGED_BY, ReconcileReport,
     RestartPolicy, RuntimeProvider, WorkloadRestartReport, apply_fs_group_ownership_with_options,
     check_pod_restart_need, chmod_volume_file, container_labels, cri, determine_pod_qos,
-    is_container_cpu_pinning_eligible, is_restartable_init, parse_cpu_quantity_milli,
-    parse_memory_quantity_bytes, pod_fs_group, prune_stale_volume_files,
+    is_container_cpu_pinning_eligible, is_restartable_init, materialize_image_volume,
+    parse_cpu_quantity_milli, parse_memory_quantity_bytes, pod_fs_group, prune_stale_volume_files,
     resolve_downward_field_path, resolve_downward_resource_field, safe_volume_path, sandbox_labels,
     secs_from_nanos, stage_configmap_files, stage_projected_clustertrustbundle,
-    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files, write_volume_file,
+    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files,
+    truncate_pod_hostname, write_volume_file,
 };
 
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 10;
@@ -793,10 +794,11 @@ fn sandbox_config_base(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
         hostname: if pod_bool(pod, "hostNetwork") {
             String::new()
         } else {
-            pod.pointer("/spec/hostname")
+            let raw = pod
+                .pointer("/spec/hostname")
                 .and_then(Value::as_str)
-                .unwrap_or(name)
-                .to_string()
+                .unwrap_or(name);
+            truncate_pod_hostname(raw)
         },
         log_directory: format!("/var/log/pods/{namespace}_{name}_{uid}"),
         labels: sandbox_labels(namespace, name, uid),
@@ -1412,6 +1414,12 @@ fn resolve_volume_host_path(
             .join("volumes")
             .join("kubernetes.io~empty-dir")
             .join(vol_name)
+    } else if vol.get("image").is_some() {
+        root.join("pods")
+            .join(uid)
+            .join("volumes")
+            .join("kubernetes.io~image")
+            .join(vol_name)
     } else if vol.get("persistentVolumeClaim").is_some() {
         let pvc_vol_path = root
             .join("pods")
@@ -1426,7 +1434,10 @@ fn resolve_volume_host_path(
     };
     if !sub_path.is_empty() {
         base.push(sub_path);
-        if vol.get("emptyDir").is_some() || vol.get("hostPath").is_some() {
+        if vol.get("emptyDir").is_some()
+            || vol.get("hostPath").is_some()
+            || vol.get("image").is_some()
+        {
             let _ = std::fs::create_dir_all(&base);
         }
     }
@@ -1457,8 +1468,9 @@ fn validate_sub_path(sub_path: &str) -> Result<(), KubeletError> {
 }
 
 fn generate_etc_hosts_content(pod: &Value, pod_ip: &str) -> String {
-    let mut content =
-        String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+    let mut content = String::from(
+        "# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+    );
     let ns = pod
         .pointer("/metadata/namespace")
         .and_then(Value::as_str)
@@ -1477,13 +1489,14 @@ fn generate_etc_hosts_content(pod: &Value, pod_ip: &str) -> String {
 
     if let (Some(h), Some(s)) = (hostname, subdomain) {
         if !h.is_empty() && !s.is_empty() {
-            let _ = writeln!(content, "{ip}\t{h}.{s}.{ns}.svc.cluster.local\t{h}");
+            let h_trunc = truncate_pod_hostname(h);
+            let _ = writeln!(content, "{ip}\t{h}.{s}.{ns}.svc.cluster.local\t{h_trunc}");
         } else {
-            let host = hostname.unwrap_or(pod_name);
+            let host = truncate_pod_hostname(hostname.unwrap_or(pod_name));
             let _ = writeln!(content, "{ip}\t{host}");
         }
     } else {
-        let host = hostname.unwrap_or(pod_name);
+        let host = truncate_pod_hostname(hostname.unwrap_or(pod_name));
         let _ = writeln!(content, "{ip}\t{host}");
     }
 
@@ -1613,7 +1626,14 @@ fn build_container_mounts(
         .pointer("/spec/hostNetwork")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !host_network && !mounts.iter().any(|m| m.container_path == "/etc/hosts") {
+    let has_custom_etc_hosts = vol_mounts.is_some_and(|vms| {
+        vms.iter().any(|m| {
+            m.get("mountPath")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p == "/etc/hosts" || p == "/etc/hosts/")
+        })
+    }) || mounts.iter().any(|m| m.container_path == "/etc/hosts");
+    if !host_network && !has_custom_etc_hosts {
         let host_etc_hosts = root.join("pods").join(uid).join("etc-hosts");
         if host_etc_hosts.exists() {
             mounts.push(cri::Mount {
@@ -1625,7 +1645,50 @@ fn build_container_mounts(
         }
     }
 
+    attach_termination_log(&mut mounts, root, uid, container);
+
     Ok(mounts)
+}
+
+fn attach_termination_log(mounts: &mut Vec<cri::Mount>, root: &Path, uid: &str, container: &Value) {
+    let c_name = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("container");
+    let term_path = container
+        .get("terminationMessagePath")
+        .and_then(Value::as_str)
+        .unwrap_or("/dev/termination-log");
+    if term_path.is_empty() || mounts.iter().any(|m| m.container_path == term_path) {
+        return;
+    }
+    let term_host_file = root
+        .join("pods")
+        .join(uid)
+        .join("containers")
+        .join(c_name)
+        .join("termination-log");
+    if let Some(parent) = term_host_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !term_host_file.exists() {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&term_host_file);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&term_host_file, std::fs::Permissions::from_mode(0o666));
+    }
+    mounts.push(cri::Mount {
+        container_path: term_path.to_string(),
+        host_path: term_host_file.to_string_lossy().to_string(),
+        readonly: false,
+        ..cri::Mount::default()
+    });
 }
 
 /// Maps pod and container `securityContext` onto the CRI security context.
@@ -3451,6 +3514,29 @@ impl PodReconciler {
                 .get_or_insert_with(cri::LinuxContainerResources::default);
             resources.cpuset_cpus = assignment.cpuset;
         }
+        if let Some(target_name) = container.get("targetContainerName").and_then(Value::as_str) {
+            let filter = cri::ContainerFilter {
+                pod_sandbox_id: sandbox_id.to_string(),
+                ..cri::ContainerFilter::default()
+            };
+            if let Ok(containers) = self.runtime.list_containers(Some(&filter)).await
+                && let Some(target) = containers
+                    .iter()
+                    .find(|c| c.metadata.as_ref().is_some_and(|m| m.name == target_name))
+            {
+                let linux = config
+                    .linux
+                    .get_or_insert_with(cri::LinuxContainerConfig::default);
+                let sec = linux
+                    .security_context
+                    .get_or_insert_with(cri::LinuxContainerSecurityContext::default);
+                sec.namespace_options = Some(cri::NamespaceOption {
+                    pid: cri::NamespaceMode::Target as i32,
+                    target_id: target.id.clone(),
+                    ..cri::NamespaceOption::default()
+                });
+            }
+        }
         let id = self
             .runtime
             .create_container(sandbox_id, &config, sandbox_config)
@@ -3639,6 +3725,7 @@ impl PodReconciler {
     }
 
     /// Synchronizes an individual pod's runtime state and updates its API status.
+    #[allow(clippy::too_many_lines)]
     pub async fn sync_pod(&self, namespace: &str, pod: &Value) -> Result<(), KubeletError> {
         let orig_pod = pod;
         let name = pod_name(pod);
@@ -3702,9 +3789,18 @@ impl PodReconciler {
             .reconcile_init_containers(&ctx, spec_init_containers, &statuses, &mut state)
             .await?;
 
+        let spec_ephemeral = pod
+            .pointer("/spec/ephemeralContainers")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+
         if all_inits_complete {
             self.reconcile_app_containers(&ctx, spec_containers, &statuses, &mut state)
                 .await?;
+            if !spec_ephemeral.is_empty() {
+                self.reconcile_ephemeral_containers(&ctx, spec_ephemeral, &statuses, &mut state)
+                    .await?;
+            }
             self.stop_sidecars_if_app_completed(
                 &ctx,
                 spec_init_containers,
@@ -3723,11 +3819,13 @@ impl PodReconciler {
             &mut state,
         )
         .await?;
+        self.enrich_termination_messages(pod, &mut statuses).await;
         self.publish_synced_status(
             &ctx,
             orig_pod,
             spec_containers,
             spec_init_containers,
+            spec_ephemeral,
             &statuses,
             &state,
         )
@@ -3747,17 +3845,20 @@ impl PodReconciler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn publish_synced_status(
         &self,
         ctx: &SyncContext<'_>,
         orig_pod: &Value,
         spec_containers: &[Value],
         spec_inits: &[Value],
+        spec_ephemeral: &[Value],
         statuses: &[cri::ContainerStatus],
         state: &SyncState,
     ) -> Result<(), KubeletError> {
         let views = self.build_views(ctx.namespace, ctx.pod, spec_containers, statuses, state);
         let init_views = self.build_views(ctx.namespace, ctx.pod, spec_inits, statuses, state);
+        let ephem_views = self.build_views(ctx.namespace, ctx.pod, spec_ephemeral, statuses, state);
         let mut status = pod_status(
             orig_pod,
             self.runtime.provider_name(),
@@ -3768,6 +3869,7 @@ impl PodReconciler {
             PodViews {
                 containers: &views,
                 init_containers: &init_views,
+                ephemeral_containers: &ephem_views,
             },
         );
         if let Some(nom) = orig_pod
@@ -4083,6 +4185,111 @@ impl PodReconciler {
         Ok(())
     }
 
+    async fn reconcile_ephemeral_containers(
+        &self,
+        ctx: &SyncContext<'_>,
+        spec_ephemeral: &[Value],
+        statuses: &[cri::ContainerStatus],
+        state: &mut SyncState,
+    ) -> Result<(), KubeletError> {
+        let grouped = attempts_by_name(statuses);
+        for container in spec_ephemeral {
+            let c_name = container_name_of(container);
+            let attempts = grouped.get(c_name).map_or(&[][..], Vec::as_slice);
+            if attempts.is_empty() {
+                match self
+                    .start_attempt(
+                        ctx.sandbox_id,
+                        ctx.sandbox_config,
+                        ctx.pod,
+                        container,
+                        0,
+                        ctx.pod_ip.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        state.started_now.insert(c_name.to_string());
+                    },
+                    Err(failure) => {
+                        state
+                            .waiting
+                            .insert(c_name.to_string(), (failure.reason, failure.message));
+                    },
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_termination_log_file(term_file: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(term_file).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn find_spec_container<'a>(pod: &'a Value, c_name: &str) -> Option<&'a Value> {
+        for list_key in [
+            "/spec/containers",
+            "/spec/initContainers",
+            "/spec/ephemeralContainers",
+        ] {
+            if let Some(cs) = pod.pointer(list_key).and_then(Value::as_array)
+                && let Some(c) = cs.iter().find(|c| container_name_of(c) == c_name)
+            {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    async fn enrich_termination_messages(
+        &self,
+        pod: &Value,
+        statuses: &mut [cri::ContainerStatus],
+    ) {
+        let uid = pod_uid(pod).unwrap_or("");
+        let pod_dir = self.root_dir.join("pods").join(uid);
+        for s in statuses {
+            if s.state != cri::ContainerState::ContainerExited as i32 {
+                continue;
+            }
+            let c_name = s.metadata.as_ref().map_or("", |m| m.name.as_str());
+            let term_file = pod_dir
+                .join("containers")
+                .join(c_name)
+                .join("termination-log");
+            if let Some(msg) = Self::read_termination_log_file(&term_file) {
+                s.message = msg;
+                continue;
+            }
+            if !s.message.is_empty() || s.exit_code == 0 {
+                continue;
+            }
+            let policy = Self::find_spec_container(pod, c_name)
+                .and_then(|c| c.get("terminationMessagePolicy"))
+                .and_then(Value::as_str)
+                .unwrap_or("File");
+            if policy != "FallbackToLogsOnError" {
+                continue;
+            }
+            let log_opts = LogOptions {
+                tail_lines: Some(20),
+                ..LogOptions::default()
+            };
+            if let Ok(logs) = self.runtime.container_logs(&s.id, &log_opts).await {
+                let trimmed = logs.trim();
+                if !trimmed.is_empty() {
+                    s.message = trimmed.to_string();
+                }
+            }
+        }
+    }
+
     /// Status inputs for every spec container after this pass.
     fn build_views<'a>(
         &self,
@@ -4317,9 +4524,11 @@ impl PodReconciler {
             }
             return Ok(());
         }
+        self.enrich_termination_messages(pod, &mut statuses).await;
         let grouped = attempts_by_name(&statuses);
         let views = dead_container_views(pod, "/spec/containers", &grouped);
         let init_views = dead_container_views(pod, "/spec/initContainers", &grouped);
+        let ephem_views = dead_container_views(pod, "/spec/ephemeralContainers", &grouped);
         let status = pod_status(
             pod,
             self.runtime.provider_name(),
@@ -4330,6 +4539,7 @@ impl PodReconciler {
             PodViews {
                 containers: &views,
                 init_containers: &init_views,
+                ephemeral_containers: &ephem_views,
             },
         );
         self.patch_status_if_changed(namespace, name, pod, status)
@@ -4601,21 +4811,48 @@ impl PodReconciler {
 
         if let Some(cm) = source.get("configMap") {
             let cm_name = cm.get("name").and_then(Value::as_str).unwrap_or("");
-            if let Ok(cm_obj) = self.client.get_configmap(namespace, cm_name).await {
-                let effective = with_default_mode(cm);
-                if let Ok(paths) = stage_configmap_files(vol_dir, &effective, &cm_obj) {
-                    written.extend(paths);
-                }
+            let optional = cm.get("optional").and_then(Value::as_bool).unwrap_or(false);
+            match self.client.get_configmap(namespace, cm_name).await {
+                Ok(cm_obj) => {
+                    let effective = with_default_mode(cm);
+                    if let Ok(paths) = stage_configmap_files(vol_dir, &effective, &cm_obj) {
+                        written.extend(paths);
+                    }
+                },
+                Err(_) if optional => {},
+                Err(e) => {
+                    return Err(KubeletError::PodReconciliationFailed {
+                        pod: pod_name(pod).to_string(),
+                        reason: format!("failed to fetch projected configmap '{cm_name}': {e}"),
+                    });
+                },
             }
         }
 
         if let Some(sec) = source.get("secret") {
-            let sec_name = sec.get("name").and_then(Value::as_str).unwrap_or("");
-            if let Ok(sec_obj) = self.client.get_secret(namespace, sec_name).await {
-                let effective = with_default_mode(sec);
-                if let Ok(paths) = stage_secret_files(vol_dir, &effective, &sec_obj) {
-                    written.extend(paths);
-                }
+            let sec_name = sec
+                .get("name")
+                .or_else(|| sec.get("secretName"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let optional = sec
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match self.client.get_secret(namespace, sec_name).await {
+                Ok(sec_obj) => {
+                    let effective = with_default_mode(sec);
+                    if let Ok(paths) = stage_secret_files(vol_dir, &effective, &sec_obj) {
+                        written.extend(paths);
+                    }
+                },
+                Err(_) if optional => {},
+                Err(e) => {
+                    return Err(KubeletError::PodReconciliationFailed {
+                        pod: pod_name(pod).to_string(),
+                        reason: format!("failed to fetch projected secret '{sec_name}': {e}"),
+                    });
+                },
             }
         }
 
@@ -4725,6 +4962,7 @@ impl PodReconciler {
         stage_projected_clustertrustbundle(vol_dir, ctb_proj, &bundles, vol_spec)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn find_or_create_pcr(
         &self,
         namespace: &str,
@@ -4751,6 +4989,23 @@ impl PodReconciler {
                     && item.pointer("/spec/signerName").and_then(Value::as_str) == Some(signer_name)
             })
         {
+            let pcr_name = existing
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !pcr_name.is_empty()
+                && let Ok(fresh) = self
+                    .client
+                    .get_namespaced_object(
+                        "certificates.k8s.io",
+                        "podcertificaterequests",
+                        namespace,
+                        pcr_name,
+                    )
+                    .await
+            {
+                return Ok(fresh);
+            }
             return Ok(existing.clone());
         }
 
@@ -4794,7 +5049,7 @@ impl PodReconciler {
             .unwrap_or_else(|| json!({}));
 
         let pcr_doc = json!({
-            "apiVersion": "certificates.k8s.io/v1beta1",
+            "apiVersion": "certificates.k8s.io/v1",
             "kind": "PodCertificateRequest",
             "metadata": {
                 "generateName": format!("{pod_name}-"),
@@ -4816,19 +5071,35 @@ impl PodReconciler {
             }
         });
 
-        self.client
+        if let Ok(created) = self
+            .client
             .create_namespaced_object(
                 "certificates.k8s.io",
                 "PodCertificateRequest",
                 "podcertificaterequests",
                 namespace,
-                pcr_doc,
+                pcr_doc.clone(),
             )
             .await
-            .map_err(|e| KubeletError::PodReconciliationFailed {
-                pod: format!("{namespace}/{pod_name}"),
-                reason: format!("failed to create PodCertificateRequest: {e}"),
-            })
+        {
+            Ok(created)
+        } else {
+            let mut v1beta1_doc = pcr_doc;
+            v1beta1_doc["apiVersion"] = json!("certificates.k8s.io/v1beta1");
+            self.client
+                .create_namespaced_object(
+                    "certificates.k8s.io",
+                    "PodCertificateRequest",
+                    "podcertificaterequests",
+                    namespace,
+                    v1beta1_doc,
+                )
+                .await
+                .map_err(|e| KubeletError::PodReconciliationFailed {
+                    pod: format!("{namespace}/{pod_name}"),
+                    reason: format!("failed to create PodCertificateRequest: {e}"),
+                })
+        }
     }
 
     async fn stage_projected_podcertificate(
@@ -4945,8 +5216,13 @@ impl PodReconciler {
                 .get("secretName")
                 .and_then(Value::as_str)
                 .unwrap_or(vol_name);
+            let optional = sec
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let sec_obj = match self.client.get_secret(namespace, sec_name).await {
-                Ok(obj) => obj,
+                Ok(obj) => Some(obj),
+                Err(_) if optional => None,
                 Err(_) if is_running && vol_dir.exists() => return Ok(()),
                 Err(e) => {
                     return Err(KubeletError::PodReconciliationFailed {
@@ -4955,10 +5231,13 @@ impl PodReconciler {
                     });
                 },
             };
-            let written: std::collections::HashSet<PathBuf> =
+            let written: std::collections::HashSet<PathBuf> = if let Some(sec_obj) = sec_obj {
                 stage_secret_files(&vol_dir, sec, &sec_obj)?
                     .into_iter()
-                    .collect();
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             prune_stale_volume_files(&vol_dir, &written);
         } else if let Some(cm) = vol.get("configMap") {
             let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name);
@@ -4972,8 +5251,10 @@ impl PodReconciler {
                 }
             })?;
             let cm_name = cm.get("name").and_then(Value::as_str).unwrap_or(vol_name);
+            let optional = cm.get("optional").and_then(Value::as_bool).unwrap_or(false);
             let cm_obj = match self.client.get_configmap(namespace, cm_name).await {
-                Ok(obj) => obj,
+                Ok(obj) => Some(obj),
+                Err(_) if optional => None,
                 Err(_) if is_running && vol_dir.exists() => return Ok(()),
                 Err(e) => {
                     return Err(KubeletError::PodReconciliationFailed {
@@ -4982,10 +5263,13 @@ impl PodReconciler {
                     });
                 },
             };
-            let written: std::collections::HashSet<PathBuf> =
+            let written: std::collections::HashSet<PathBuf> = if let Some(cm_obj) = cm_obj {
                 stage_configmap_files(&vol_dir, cm, &cm_obj)?
                     .into_iter()
-                    .collect();
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             prune_stale_volume_files(&vol_dir, &written);
         } else if let Some(dw) = vol.get("downwardAPI") {
             let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~downward-api", vol_name);
@@ -5146,6 +5430,23 @@ impl PodReconciler {
             if hp_type == "DirectoryOrCreate" {
                 let _ = std::fs::create_dir_all(path_str);
             }
+        } else if let Some(img_vol) = vol.get("image") {
+            let vol_dir = self.get_pod_volume_dir(pod_uid, "kubernetes.io~image", vol_name);
+            std::fs::create_dir_all(&vol_dir).map_err(|e| {
+                KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!(
+                        "failed to create image volume directory {}: {e}",
+                        vol_dir.display()
+                    ),
+                }
+            })?;
+            self.prepare_image_volume(img_vol, &vol_dir)
+                .await
+                .map_err(|e| KubeletError::PodReconciliationFailed {
+                    pod: pod_name.to_string(),
+                    reason: format!("failed to prepare image volume '{vol_name}': {e}"),
+                })?;
         }
 
         // Managed volumes adopt the pod fsGroup so non-root containers can
@@ -5160,6 +5461,11 @@ impl PodReconciler {
             } else if vol.get("configMap").is_some() {
                 Some((
                     self.get_pod_volume_dir(pod_uid, "kubernetes.io~configmap", vol_name),
+                    true,
+                ))
+            } else if vol.get("image").is_some() {
+                Some((
+                    self.get_pod_volume_dir(pod_uid, "kubernetes.io~image", vol_name),
                     true,
                 ))
             } else if vol.get("downwardAPI").is_some() {
@@ -5205,6 +5511,41 @@ impl PodReconciler {
         }
 
         Ok(())
+    }
+
+    async fn prepare_image_volume(
+        &self,
+        img_vol: &Value,
+        vol_dir: &Path,
+    ) -> Result<(), KubeletError> {
+        let reference = img_vol
+            .get("reference")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if reference.is_empty() {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "image.reference".to_string(),
+                reason: "image volume reference must not be empty".to_string(),
+            });
+        }
+        let pull_policy = img_vol
+            .get("pullPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("IfNotPresent");
+        let spec = cri::ImageSpec {
+            image: reference.to_string(),
+            user_specified_image: reference.to_string(),
+            ..cri::ImageSpec::default()
+        };
+        let should_pull = match pull_policy {
+            "Always" => true,
+            "Never" => false,
+            _ => self.runtime.image_status(&spec).await?.is_none(),
+        };
+        if should_pull {
+            let _ = self.runtime.pull_image(&spec, None).await;
+        }
+        materialize_image_volume(reference, vol_dir)
     }
 
     /// Prepares and populates volume mounts (Secrets, `ConfigMaps`, Projected) on the host filesystem.
