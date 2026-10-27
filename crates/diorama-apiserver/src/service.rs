@@ -172,6 +172,9 @@ impl ApiserverService {
                 }
             }
         }
+        admin
+            .ensure_extension_apiserver_authentication_configmap()
+            .await?;
         Ok(())
     }
 

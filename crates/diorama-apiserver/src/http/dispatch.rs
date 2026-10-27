@@ -70,9 +70,12 @@ async fn maybe_dispatch_aggregated(
         serde_json::from_slice(body).ok()
     };
 
-    let res = client
+    let Ok(res) = client
         .dispatch_aggregated_request(api_svc.name(), &uri_path, method.as_str(), parsed_body)
-        .await?;
+        .await
+    else {
+        return Ok(None);
+    };
 
     let outcome = if *method == Method::POST {
         created_json(res)
@@ -330,11 +333,17 @@ fn filter_list(mut list: Value, query: Option<&str>) -> Value {
 fn extract_crd_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::Cow<'a, str>> {
     match field {
         "hostPort" | "spec.hostPort" => {
-            if let Some(val) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+            if let Some(val) = item
+                .pointer("/spec/hostPort")
+                .or_else(|| item.get("hostPort"))
+                .and_then(Value::as_str)
+            {
                 Some(std::borrow::Cow::Borrowed(val))
             } else if let (Some(h), Some(p)) = (
-                item.pointer("/spec/host").and_then(Value::as_str),
-                item.pointer("/spec/port"),
+                item.pointer("/spec/host")
+                    .or_else(|| item.get("host"))
+                    .and_then(Value::as_str),
+                item.pointer("/spec/port").or_else(|| item.get("port")),
             ) {
                 let p_str = p
                     .as_i64()
@@ -349,9 +358,17 @@ fn extract_crd_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borr
             }
         },
         "host" | "spec.host" => {
-            if let Some(val) = item.pointer("/spec/host").and_then(Value::as_str) {
+            if let Some(val) = item
+                .pointer("/spec/host")
+                .or_else(|| item.get("host"))
+                .and_then(Value::as_str)
+            {
                 Some(std::borrow::Cow::Borrowed(val))
-            } else if let Some(hp) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+            } else if let Some(hp) = item
+                .pointer("/spec/hostPort")
+                .or_else(|| item.get("hostPort"))
+                .and_then(Value::as_str)
+            {
                 hp.split_once(':')
                     .map(|(h, _)| std::borrow::Cow::Borrowed(h))
             } else {
@@ -359,7 +376,7 @@ fn extract_crd_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borr
             }
         },
         "port" | "spec.port" => {
-            if let Some(p) = item.pointer("/spec/port") {
+            if let Some(p) = item.pointer("/spec/port").or_else(|| item.get("port")) {
                 if let Some(n) = p.as_i64() {
                     Some(std::borrow::Cow::Owned(n.to_string()))
                 } else if let Some(s) = p.as_str() {
@@ -367,7 +384,11 @@ fn extract_crd_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borr
                 } else {
                     None
                 }
-            } else if let Some(hp) = item.pointer("/spec/hostPort").and_then(Value::as_str) {
+            } else if let Some(hp) = item
+                .pointer("/spec/hostPort")
+                .or_else(|| item.get("hostPort"))
+                .and_then(Value::as_str)
+            {
                 hp.split_once(':')
                     .map(|(_, p)| std::borrow::Cow::Borrowed(p))
             } else {
@@ -431,30 +452,16 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
                 "false"
             },
         )),
-        "source" => item
+        "source" | "source.component" | "reportingController" | "reportingComponent" => item
             .pointer("/source/component")
             .and_then(Value::as_str)
+            .or_else(|| item.pointer("/reportingComponent").and_then(Value::as_str))
             .or_else(|| item.pointer("/reportingController").and_then(Value::as_str))
-            .map(std::borrow::Cow::Borrowed),
-        "source.component" | "reportingController" | "reportingComponent" => item
-            .pointer("/source/component")
-            .and_then(Value::as_str)
-            .map(std::borrow::Cow::Borrowed)
-            .or_else(|| {
-                item.pointer("/reportingController")
-                    .and_then(Value::as_str)
-                    .map(std::borrow::Cow::Borrowed)
-            })
             .or_else(|| {
                 item.pointer("/deprecatedSource/component")
                     .and_then(Value::as_str)
-                    .map(std::borrow::Cow::Borrowed)
             })
-            .or_else(|| {
-                item.pointer("/reportingComponent")
-                    .and_then(Value::as_str)
-                    .map(std::borrow::Cow::Borrowed)
-            }),
+            .map(std::borrow::Cow::Borrowed),
         "hostPort" | "spec.hostPort" | "host" | "spec.host" | "port" | "spec.port" => {
             extract_crd_field_value(item, field)
         },
@@ -1184,7 +1191,7 @@ pub(crate) fn is_custom_resource(resource: &str) -> bool {
 }
 
 fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version: &str) {
-    if version == "v2" {
+    if version == "v1" {
         if let Some((h, p)) = spec
             .get("hostPort")
             .and_then(Value::as_str)
@@ -1192,14 +1199,10 @@ fn convert_crd_spec_host_port(spec: &mut serde_json::Map<String, Value>, version
             .map(|(h, p)| (h.to_string(), p.to_string()))
         {
             spec.insert("host".to_string(), json!(h));
-            if let Ok(p_num) = p.parse::<i64>() {
-                spec.insert("port".to_string(), json!(p_num));
-            } else {
-                spec.insert("port".to_string(), json!(p));
-            }
+            spec.insert("port".to_string(), json!(p));
             spec.remove("hostPort");
         }
-    } else if version == "v1" {
+    } else if version == "v2" {
         let (Some(h), Some(p)) = (spec.get("host").and_then(Value::as_str), spec.get("port"))
         else {
             return;
@@ -1222,6 +1225,7 @@ pub(crate) fn convert_custom_resource(doc: &mut Value, group: &str, version: &st
     let target_api_version = format!("{group}/{version}");
     if let Some(obj) = doc.as_object_mut() {
         obj.insert("apiVersion".to_string(), json!(target_api_version));
+        convert_crd_spec_host_port(obj, version);
     }
     if let Some(spec) = doc.get_mut("spec").and_then(Value::as_object_mut) {
         convert_crd_spec_host_port(spec, version);
@@ -1836,6 +1840,7 @@ async fn update_cluster(
     doc: Value,
 ) -> Result<Value, ApiserverError> {
     match (group, resource) {
+        ("", "namespaces") => client.update_namespace(name, doc).await,
         ("", "nodes") => client.update_node(name, doc).await,
         ("", "persistentvolumes") => client.update_pv(name, doc).await,
         ("storage.k8s.io" | "", "storageclasses") => client.update_storage_class(name, doc).await,
@@ -2112,6 +2117,79 @@ fn handle_self_subject_rules_review(mut doc: Value) -> Value {
     doc
 }
 
+pub(crate) fn connect_options_object(
+    subresource: &str,
+    query: Option<&str>,
+) -> (String, Option<Value>) {
+    let mut stdin = false;
+    let mut stdout = false;
+    let mut stderr = false;
+    let mut tty = false;
+    let mut container = String::new();
+    let mut command = Vec::new();
+    let mut ports = Vec::new();
+
+    for (k, v) in crate::http::query::parse_pairs(query) {
+        match k.as_str() {
+            "stdin" => stdin = matches!(v.as_str(), "1" | "true" | "TRUE"),
+            "stdout" => stdout = matches!(v.as_str(), "1" | "true" | "TRUE"),
+            "stderr" => stderr = matches!(v.as_str(), "1" | "true" | "TRUE"),
+            "tty" => tty = matches!(v.as_str(), "1" | "true" | "TRUE"),
+            "container" => container = v,
+            "command" => command.push(v),
+            "ports" | "port" => {
+                for p_str in v.split(',') {
+                    if let Ok(p) = p_str.trim().parse::<i64>() {
+                        ports.push(p);
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    match subresource {
+        "exec" => {
+            let mut obj = json!({
+                "kind": "PodExecOptions",
+                "apiVersion": "v1",
+                "stdin": stdin,
+                "stdout": stdout,
+                "stderr": stderr,
+                "tty": tty,
+                "command": command,
+            });
+            if !container.is_empty() {
+                obj["container"] = json!(container);
+            }
+            ("PodExecOptions".to_string(), Some(obj))
+        },
+        "attach" => {
+            let mut obj = json!({
+                "kind": "PodAttachOptions",
+                "apiVersion": "v1",
+                "stdin": stdin,
+                "stdout": stdout,
+                "stderr": stderr,
+                "tty": tty,
+            });
+            if !container.is_empty() {
+                obj["container"] = json!(container);
+            }
+            ("PodAttachOptions".to_string(), Some(obj))
+        },
+        "portforward" => (
+            "PodPortForwardOptions".to_string(),
+            Some(json!({
+                "kind": "PodPortForwardOptions",
+                "apiVersion": "v1",
+                "ports": ports,
+            })),
+        ),
+        _ => ("Pod".to_string(), None),
+    }
+}
+
 /// Serves the subresources kubectl needs: `status` echoes or replaces the stored
 /// object, `scale` reports or sets replicas, and `log` streams captured
 /// container output from the kubelet.
@@ -2209,6 +2287,46 @@ async fn subresource_dispatch(
                 "method is not supported",
             )),
         },
+        ("", "namespaces", "finalize") => match *method {
+            Method::GET => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "finalize requires a resource name".to_string(),
+                    });
+                };
+                client.get_namespace(name).await.map(ok_json)
+            },
+            Method::PUT => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "finalize requires a resource name".to_string(),
+                    });
+                };
+                let doc = decode_body(content_type, query, body, path)?;
+                client
+                    .update_namespace_finalize(name, doc)
+                    .await
+                    .map(ok_json)
+            },
+            Method::PATCH => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "finalize requires a resource name".to_string(),
+                    });
+                };
+                let mut current = client.get_namespace(name).await?;
+                apply_body_patch(&mut current, content_type, body)?;
+                client
+                    .update_namespace_finalize(name, current)
+                    .await
+                    .map(ok_json)
+            },
+            _ => Ok(status_outcome(
+                http::StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "method is not supported",
+            )),
+        },
         (_, _, "status" | "finalize" | "resize" | "approval") => match *method {
             Method::GET => {
                 let object = ResourcePath {
@@ -2231,10 +2349,15 @@ async fn subresource_dispatch(
                     if let Some(status) = doc.get("status") {
                         updated["status"] = status.clone();
                     }
-                    if matches!(subresource, "finalize" | "resize")
-                        && let Some(spec) = doc.get("spec")
-                    {
-                        updated["spec"] = spec.clone();
+                    if matches!(subresource, "finalize" | "resize") {
+                        if let Some(spec) = doc.get("spec") {
+                            updated["spec"] = spec.clone();
+                        } else if let Some(containers) = doc.get("containers") {
+                            updated["spec"]["containers"] = containers.clone();
+                        }
+                    }
+                    if subresource == "resize" {
+                        crate::client::prune_null_values(&mut updated);
                     }
                     if subresource == "status" {
                         let patched_labels = doc.pointer("/metadata/labels").cloned();
@@ -2248,7 +2371,11 @@ async fn subresource_dispatch(
                         }
                     }
                 } else {
-                    apply_body_patch(&mut updated, content_type, body)?;
+                    if subresource == "resize" {
+                        apply_resize_patch(&mut updated, content_type, body)?;
+                    } else {
+                        apply_body_patch(&mut updated, content_type, body)?;
+                    }
                     let patched_labels = updated.pointer("/metadata/labels").cloned();
                     let patched_annotations = updated.pointer("/metadata/annotations").cloned();
                     if matches!(subresource, "status" | "approval") {
@@ -2274,9 +2401,25 @@ async fn subresource_dispatch(
                         }
                     }
                 }
-                persist_object(client, path, name, updated)
-                    .await
-                    .map(ok_json)
+                if subresource == "resize"
+                    && path.resource == "pods"
+                    && let Some(namespace) = &path.namespace
+                {
+                    client
+                        .update_pod_subresource_options(
+                            namespace,
+                            name,
+                            updated,
+                            is_dry_run(query),
+                            Some("resize"),
+                        )
+                        .await
+                        .map(ok_json)
+                } else {
+                    persist_object(client, path, name, updated)
+                        .await
+                        .map(ok_json)
+                }
             },
             _ => Ok(status_outcome(
                 http::StatusCode::METHOD_NOT_ALLOWED,
@@ -2404,12 +2547,13 @@ async fn subresource_dispatch(
         },
         (_, "pods", subresource @ ("exec" | "attach" | "portforward")) => {
             let cur_rev = client.storage().current_revision().await + 1;
+            let (kind_str, obj) = connect_options_object(subresource, query);
             let mut adm_req = AdmissionRequest {
                 uid: format!("adm-{cur_rev}"),
                 kind: GroupVersionKind {
                     group: String::new(),
                     version: "v1".to_string(),
-                    kind: "Pod".to_string(),
+                    kind: kind_str,
                 },
                 resource: GroupVersionResource {
                     group: String::new(),
@@ -2421,7 +2565,7 @@ async fn subresource_dispatch(
                 namespace: path.namespace.clone(),
                 operation: "CONNECT".to_string(),
                 user_info: client.current_user_info().await,
-                object: None,
+                object: obj,
                 old_object: None,
                 dry_run: None,
             };
@@ -2914,6 +3058,29 @@ fn apply_body_patch(
             Ok(())
         },
     }
+}
+
+fn apply_resize_patch(
+    target: &mut Value,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<(), ApiserverError> {
+    if let Ok(mut patch_val) = serde_json::from_slice::<Value>(body)
+        && let Some(containers) = patch_val
+            .as_object_mut()
+            .and_then(|m| m.remove("containers"))
+    {
+        let wrapped_patch = json!({ "spec": { "containers": containers } });
+        let wrapped_bytes =
+            serde_json::to_vec(&wrapped_patch).map_err(|e| ApiserverError::BadRequest {
+                message: e.to_string(),
+            })?;
+        apply_body_patch(target, content_type, &wrapped_bytes)?;
+    } else {
+        apply_body_patch(target, content_type, body)?;
+    }
+    crate::client::prune_null_values(target);
+    Ok(())
 }
 
 async fn persist_object(

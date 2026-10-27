@@ -1116,3 +1116,120 @@ async fn conformance_pod_exec_subresource_requires_websocket() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+async fn conformance_namespaces_status_and_finalize_routes() {
+    let server = TestServer::start().await;
+
+    let ns = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": { "name": "wave6a-test-ns" },
+        "spec": { "finalizers": ["kubernetes"] }
+    });
+    let (s, created) = server
+        .request("POST", "/api/v1/namespaces", &ns.to_string())
+        .await;
+    assert_eq!(s, 201);
+    assert_eq!(created["metadata"]["name"], "wave6a-test-ns");
+
+    // PUT to /status
+    let mut status_doc = created.clone();
+    status_doc["status"] = json!({ "phase": "Active" });
+    let (s, res_status) = server
+        .request(
+            "PUT",
+            "/api/v1/namespaces/wave6a-test-ns/status",
+            &status_doc.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_status["status"]["phase"], "Active");
+
+    // PUT to /finalize with empty finalizers
+    let mut fin_doc = res_status.clone();
+    fin_doc["spec"]["finalizers"] = json!([]);
+    let (s, res_fin) = server
+        .request(
+            "PUT",
+            "/api/v1/namespaces/wave6a-test-ns/finalize",
+            &fin_doc.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(res_fin["spec"]["finalizers"], json!([]));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_extension_apiserver_authentication_configmap() {
+    let server = TestServer::start().await;
+
+    let (s, cm) = server
+        .request(
+            "GET",
+            "/api/v1/namespaces/kube-system/configmaps/extension-apiserver-authentication",
+            "",
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert!(cm["data"]["client-ca-file"].is_string());
+    assert!(cm["data"]["requestheader-client-ca-file"].is_string());
+    let allowed = cm["data"]["requestheader-allowed-names"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(allowed.contains("front-proxy-client"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn conformance_pod_resize_null_request_key_pruned() {
+    let server = TestServer::start().await;
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "resize-test-pod" },
+        "spec": {
+            "containers": [{
+                "name": "app",
+                "image": "alpine:latest",
+                "resources": {
+                    "requests": { "cpu": "100m" }
+                }
+            }]
+        }
+    });
+    let (s, _) = server
+        .request("POST", "/api/v1/namespaces/default/pods", &pod.to_string())
+        .await;
+    assert_eq!(s, 201);
+
+    // Patch resize with null request
+    let patch = json!({
+        "spec": {
+            "containers": [{
+                "name": "app",
+                "resources": {
+                    "requests": null
+                }
+            }]
+        }
+    });
+    let (s, _, body) = server
+        .request_raw(
+            "PATCH",
+            "/api/v1/namespaces/default/pods/resize-test-pod/resize",
+            "application/strategic-merge-patch+json",
+            &patch.to_string(),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let updated: Value = serde_json::from_str(&body).unwrap();
+    let requests = updated.pointer("/spec/containers/0/resources/requests");
+    assert!(requests.is_none() || requests == Some(&Value::Null));
+
+    server.stop().await;
+}
