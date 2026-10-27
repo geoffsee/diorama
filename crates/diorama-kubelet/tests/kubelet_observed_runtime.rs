@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use diorama_apiserver::{
-    ApiserverConfig, ApiserverService, KubernetesApiClient, KubernetesStorage, PodLogOptions,
-    PodLogReader,
+    ApiserverConfig, ApiserverService, KubernetesApiClient, KubernetesStorage, PodExec,
+    PodLogOptions, PodLogReader,
 };
 use diorama_datastore::{DatastoreConfig, DatastoreEngine};
 use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
@@ -407,6 +407,54 @@ async fn log_reader_rejects_pods_that_are_not_running_here() {
         err.to_string()
             .contains("waiting to start: ContainerCreating"),
         "{err}"
+    );
+}
+
+#[tokio::test]
+async fn log_and_exec_sources_accept_companion_node_pods() {
+    let dir = TempDir::new().unwrap();
+    let (apiserver, options) = setup(&dir);
+    let runtime = Arc::new(MockRuntimeProvider::new("mock"));
+    let service = KubeletService::new(options, apiserver, runtime);
+    let log_source = service.log_source();
+    let exec_source = service.exec_source();
+
+    let mut companion_pod = one_shot_pod("worker-pod");
+    companion_pod["metadata"]["uid"] = json!("uid-companion");
+    companion_pod["spec"]["nodeName"] = json!("test-node-worker");
+    companion_pod["status"] = json!({
+        "containerStatuses": [{ "name": "hello", "state": { "waiting": { "reason": "ContainerCreating" } } }]
+    });
+
+    let log_err = log_source
+        .read_pod_log(&companion_pod, &PodLogOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        log_err
+            .to_string()
+            .contains("waiting to start: ContainerCreating"),
+        "expected waiting container error, got: {log_err}"
+    );
+
+    let mut other_pod = companion_pod.clone();
+    other_pod["spec"]["nodeName"] = json!("other-node");
+    let other_log_err = log_source
+        .read_pod_log(&other_pod, &PodLogOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        other_log_err.to_string().contains("not assigned"),
+        "{other_log_err}"
+    );
+
+    let other_exec_err = exec_source
+        .exec_in_pod(&other_pod, "hello", &["ls".to_string()])
+        .await
+        .unwrap_err();
+    assert!(
+        other_exec_err.to_string().contains("not assigned"),
+        "{other_exec_err}"
     );
 }
 

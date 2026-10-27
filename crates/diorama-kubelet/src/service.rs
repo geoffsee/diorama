@@ -434,7 +434,8 @@ impl PodLogReader for KubeletLogSource {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
-        if assigned != Some(self.node_name.as_str()) {
+        let companion_node = crate::config::companion_node_name(&self.node_name);
+        if assigned != Some(self.node_name.as_str()) && assigned != Some(companion_node.as_str()) {
             return Err(ApiserverError::BadRequest {
                 message: format!("pod {name} is not assigned to node {}", self.node_name),
             });
@@ -522,7 +523,8 @@ impl PodExec for KubeletExecSource {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
-        if assigned != Some(self.node_name.as_str()) {
+        let companion_node = crate::config::companion_node_name(&self.node_name);
+        if assigned != Some(self.node_name.as_str()) && assigned != Some(companion_node.as_str()) {
             return Err(ApiserverError::BadRequest {
                 message: format!("pod {name} is not assigned to node {}", self.node_name),
             });
