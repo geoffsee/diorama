@@ -90,9 +90,19 @@ impl NamespaceReconciler {
         }
 
         for pod in &pods {
-            if pod.pointer("/metadata/deletionTimestamp").is_none()
-                && let Some(pname) = pod.pointer("/metadata/name").and_then(Value::as_str)
-            {
+            let Some(pname) = pod.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            let grace = pod
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    pod.pointer("/spec/terminationGracePeriodSeconds")
+                        .and_then(Value::as_i64)
+                });
+            if grace == Some(0) {
+                delete_pod_with_zero_grace(&self.client, name, pname, pod).await;
+            } else if pod.pointer("/metadata/deletionTimestamp").is_none() {
                 let _ = self.client.delete_pod(name, pname).await;
             }
         }
@@ -239,6 +249,28 @@ fn strip_namespace_finalizers(ns: &mut Value) -> bool {
         modified = true;
     }
     modified
+}
+
+async fn delete_pod_with_zero_grace(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    name: &str,
+    pod: &Value,
+) {
+    if pod
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|f| !f.is_empty())
+    {
+        let mut stripped = pod.clone();
+        if let Some(meta) = stripped.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.remove("finalizers");
+        }
+        let _ = client
+            .replace_namespaced_object("", "Pod", "pods", namespace, name, stripped)
+            .await;
+    }
+    let _ = client.delete_pod_options(namespace, name, Some(0)).await;
 }
 
 async fn finalize_namespace(

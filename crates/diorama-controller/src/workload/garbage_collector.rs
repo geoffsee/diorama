@@ -869,7 +869,20 @@ impl GarbageCollector {
         }
 
         let mut deleted = self.cleanup_terminating_workloads(namespace).await;
-        deleted += self.cleanup_terminating_storage_and_crds(namespace).await;
+        let has_pods = self
+            .client
+            .list_pods(namespace)
+            .await
+            .ok()
+            .and_then(|l| {
+                l.get("items")
+                    .and_then(Value::as_array)
+                    .map(|a| !a.is_empty())
+            })
+            .unwrap_or(false);
+        if !has_pods {
+            deleted += self.cleanup_terminating_storage_and_crds(namespace).await;
+        }
         Ok(deleted)
     }
 

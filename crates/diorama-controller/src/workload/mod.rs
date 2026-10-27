@@ -122,6 +122,7 @@ impl WorkloadManager {
 
         let replicasets_pre =
             run_stage(|| replicaset_reconciler.reconcile_all(namespace), errors).await;
+        let _ = self.reconcile_endpoint_resources(namespace, errors).await;
         let deployments =
             run_stage(|| deployment_reconciler.reconcile_all(namespace), errors).await;
         let replicasets_post =
