@@ -32,8 +32,9 @@ use crate::workload::{
     check_pod_restart_need, chmod_volume_file, container_labels, cri, determine_pod_qos,
     is_container_cpu_pinning_eligible, parse_cpu_quantity_milli, parse_memory_quantity_bytes,
     pod_fs_group, prune_stale_volume_files, resolve_downward_field_path,
-    resolve_downward_resource_field, sandbox_labels, secs_from_nanos, stage_configmap_files,
-    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files,
+    resolve_downward_resource_field, safe_volume_path, sandbox_labels, secs_from_nanos,
+    stage_configmap_files, stage_projected_clustertrustbundle, stage_projected_downward_api,
+    stage_projected_sa_token, stage_secret_files, write_volume_file,
 };
 
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 10;
@@ -1081,21 +1082,43 @@ fn automount_service_account_token(pod: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn pod_has_service_account_token(pod: &Value) -> bool {
-    pod.pointer("/spec/volumes")
+fn container_mounts_service_account(container: &Value) -> bool {
+    container
+        .get("volumeMounts")
         .and_then(Value::as_array)
-        .is_some_and(|volumes| {
-            volumes.iter().any(|volume| {
-                volume
-                    .pointer("/projected/sources")
-                    .and_then(Value::as_array)
-                    .is_some_and(|sources| {
-                        sources
-                            .iter()
-                            .any(|source| source.get("serviceAccountToken").is_some())
-                    })
+        .is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                mount.get("mountPath").and_then(Value::as_str) == Some(SERVICE_ACCOUNT_MOUNT_PATH)
             })
         })
+}
+
+fn pod_has_service_account_token(pod: &Value) -> bool {
+    let has_kube_api_volume = pod
+        .pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .is_some_and(|volumes| {
+            volumes.iter().any(|vol| {
+                vol.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.starts_with("kube-api-access"))
+            })
+        });
+    if has_kube_api_volume {
+        return true;
+    }
+
+    for key in ["/spec/containers", "/spec/initContainers"] {
+        let mounted = pod
+            .pointer(key)
+            .and_then(Value::as_array)
+            .is_some_and(|containers| containers.iter().any(container_mounts_service_account));
+        if mounted {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Secrets and config maps already fetched for `valueFrom` and `envFrom` env sources.
@@ -1924,7 +1947,17 @@ pub struct PodReconciler {
     terminating: Arc<Mutex<BTreeSet<String>>>,
     probe_trackers: Arc<Mutex<BTreeMap<String, ProbeTracker>>>,
     registered_nodes: Arc<Mutex<BTreeSet<String>>>,
+    pod_certificates: PodCertificateCache,
 }
+
+#[derive(Clone, Debug)]
+struct CachedPodCertificateKey {
+    key_pem: String,
+    pkix_b64: String,
+    pop_b64: String,
+}
+
+type PodCertificateCache = Arc<Mutex<BTreeMap<(String, String, String), CachedPodCertificateKey>>>;
 
 #[derive(Debug, Clone)]
 struct PreemptionOutcome {
@@ -1969,6 +2002,7 @@ impl PodReconciler {
             terminating: Arc::new(Mutex::new(BTreeSet::new())),
             probe_trackers: Arc::new(Mutex::new(BTreeMap::new())),
             registered_nodes: Arc::new(Mutex::new(BTreeSet::new())),
+            pod_certificates: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -3324,6 +3358,32 @@ impl PodReconciler {
         Ok(())
     }
 
+    async fn handle_prepare_volumes_error(
+        &self,
+        namespace: &str,
+        name: &str,
+        orig_pod: &Value,
+        err: &KubeletError,
+    ) {
+        let phase = orig_pod.pointer("/status/phase").and_then(Value::as_str);
+        if matches!(phase, Some("Running" | "Succeeded" | "Failed")) {
+            return;
+        }
+        let msg = err.to_string();
+        let status = json!({
+            "phase": "Pending",
+            "conditions": [
+                { "type": "PodScheduled", "status": "True" },
+                { "type": "Initialized", "status": "True" },
+                { "type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": msg },
+                { "type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": msg },
+            ],
+        });
+        let _ = self
+            .patch_status_if_changed(namespace, name, orig_pod, status)
+            .await;
+    }
+
     /// Synchronizes an individual pod's runtime state and updates its API status.
     pub async fn sync_pod(&self, namespace: &str, pod: &Value) -> Result<(), KubeletError> {
         let orig_pod = pod;
@@ -3336,7 +3396,11 @@ impl PodReconciler {
             return Ok(());
         }
         let mut enriched = self.enrich_pod_for_sync(pod);
-        self.prepare_pod_volumes(namespace, &enriched).await?;
+        if let Err(e) = self.prepare_pod_volumes(namespace, &enriched).await {
+            self.handle_prepare_volumes_error(namespace, name, orig_pod, &e)
+                .await;
+            return Err(e);
+        }
         let (sandbox_id, sandbox_config) = match self.ensure_sandbox(namespace, &enriched).await {
             Ok(sandbox) => sandbox,
             Err(e) => {
@@ -4064,7 +4128,291 @@ impl PodReconciler {
             )?);
         }
 
+        if let Some(ctb) = source.get("clusterTrustBundle") {
+            let effective = with_default_mode(ctb);
+            let paths = self
+                .stage_projected_clustertrustbundle(vol_dir, &effective, proj)
+                .await?;
+            written.extend(paths);
+        }
+
+        if let Some(pod_cert) = source.get("podCertificate") {
+            let effective = with_default_mode(pod_cert);
+            let paths = self
+                .stage_projected_podcertificate(vol_dir, namespace, pod, &effective)
+                .await?;
+            written.extend(paths);
+        }
+
         Ok(())
+    }
+
+    async fn fetch_ctb_bundles(&self, ctb_proj: &Value) -> Result<Vec<Value>, KubeletError> {
+        let has_name = ctb_proj.get("name").and_then(Value::as_str).is_some();
+        let has_signer = ctb_proj.get("signerName").and_then(Value::as_str).is_some();
+        let has_selector = ctb_proj.get("labelSelector").is_some();
+
+        if has_name && (has_signer || has_selector) {
+            return Err(KubeletError::InvalidConfiguration {
+                field: "clusterTrustBundle".to_string(),
+                reason: "name and signerName/labelSelector are mutually exclusive".to_string(),
+            });
+        }
+
+        let optional = ctb_proj
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if let Some(name) = ctb_proj.get("name").and_then(Value::as_str) {
+            match self
+                .client
+                .get_cluster_object("certificates.k8s.io", "clustertrustbundles", name)
+                .await
+            {
+                Ok(b) => Ok(vec![b]),
+                Err(ApiserverError::NotFound { .. }) => {
+                    if optional {
+                        Ok(Vec::new())
+                    } else {
+                        Err(KubeletError::InvalidConfiguration {
+                            field: "clusterTrustBundle.name".to_string(),
+                            reason: format!("ClusterTrustBundle '{name}' not found"),
+                        })
+                    }
+                },
+                Err(e) => Err(KubeletError::PodReconciliationFailed {
+                    pod: format!("ClusterTrustBundle '{name}'"),
+                    reason: format!("failed to fetch ClusterTrustBundle: {e}"),
+                }),
+            }
+        } else if let Some(signer_name) = ctb_proj.get("signerName").and_then(Value::as_str) {
+            let list = self
+                .client
+                .list_cluster_objects(
+                    "certificates.k8s.io",
+                    "ClusterTrustBundleList",
+                    "clustertrustbundles",
+                )
+                .await
+                .map_err(|e| KubeletError::PodReconciliationFailed {
+                    pod: format!("signerName '{signer_name}'"),
+                    reason: format!("failed to list ClusterTrustBundles: {e}"),
+                })?;
+            let items = list
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Ok(items)
+        } else if optional {
+            Ok(Vec::new())
+        } else {
+            Err(KubeletError::InvalidConfiguration {
+                field: "clusterTrustBundle".to_string(),
+                reason: "either name or signerName must be specified".to_string(),
+            })
+        }
+    }
+
+    async fn stage_projected_clustertrustbundle(
+        &self,
+        vol_dir: &Path,
+        ctb_proj: &Value,
+        vol_spec: &Value,
+    ) -> Result<Vec<PathBuf>, KubeletError> {
+        let bundles = self.fetch_ctb_bundles(ctb_proj).await?;
+        stage_projected_clustertrustbundle(vol_dir, ctb_proj, &bundles, vol_spec)
+    }
+
+    async fn find_or_create_pcr(
+        &self,
+        namespace: &str,
+        pod: &Value,
+        signer_name: &str,
+        pod_cert: &Value,
+        key_data: &CachedPodCertificateKey,
+    ) -> Result<Value, KubeletError> {
+        let pod_name = pod_name(pod);
+        let list = self
+            .client
+            .list_namespaced_objects(
+                "certificates.k8s.io",
+                "PodCertificateRequestList",
+                "podcertificaterequests",
+                namespace,
+            )
+            .await;
+
+        if let Ok(list_val) = list
+            && let Some(items) = list_val.get("items").and_then(Value::as_array)
+            && let Some(existing) = items.iter().find(|item| {
+                item.pointer("/spec/podName").and_then(Value::as_str) == Some(pod_name)
+                    && item.pointer("/spec/signerName").and_then(Value::as_str) == Some(signer_name)
+            })
+        {
+            return Ok(existing.clone());
+        }
+
+        let sa_name = pod
+            .pointer("/spec/serviceAccountName")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let sa_uid = match self.client.get_service_account(namespace, sa_name).await {
+            Ok(sa) => sa
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or(sa_name)
+                .to_string(),
+            Err(_) => sa_name.to_string(),
+        };
+
+        let node_uid = match self.client.get_node(&self.node_name).await {
+            Ok(node) => node
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or(&self.node_name)
+                .to_string(),
+            Err(_) => self.node_name.clone(),
+        };
+
+        let pod_uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or(pod_name);
+        let key_type = pod_cert
+            .get("keyType")
+            .and_then(Value::as_str)
+            .unwrap_or("RSA3072");
+        let max_exp = pod_cert
+            .get("maxExpirationSeconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(86400);
+        let annotations = pod_cert
+            .get("unverifiedUserAnnotations")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let pcr_doc = json!({
+            "apiVersion": "certificates.k8s.io/v1beta1",
+            "kind": "PodCertificateRequest",
+            "metadata": {
+                "generateName": format!("{pod_name}-"),
+                "namespace": namespace
+            },
+            "spec": {
+                "signerName": signer_name,
+                "podName": pod_name,
+                "podUID": pod_uid,
+                "serviceAccountName": sa_name,
+                "serviceAccountUID": sa_uid,
+                "nodeName": &self.node_name,
+                "nodeUID": node_uid,
+                "keyType": key_type,
+                "pkixPublicKey": key_data.pkix_b64,
+                "proofOfPossession": key_data.pop_b64,
+                "maxExpirationSeconds": max_exp,
+                "unverifiedUserAnnotations": annotations
+            }
+        });
+
+        self.client
+            .create_namespaced_object(
+                "certificates.k8s.io",
+                "PodCertificateRequest",
+                "podcertificaterequests",
+                namespace,
+                pcr_doc,
+            )
+            .await
+            .map_err(|e| KubeletError::PodReconciliationFailed {
+                pod: format!("{namespace}/{pod_name}"),
+                reason: format!("failed to create PodCertificateRequest: {e}"),
+            })
+    }
+
+    async fn stage_projected_podcertificate(
+        &self,
+        vol_dir: &Path,
+        namespace: &str,
+        pod: &Value,
+        pod_cert: &Value,
+    ) -> Result<Vec<PathBuf>, KubeletError> {
+        let pod_name = pod_name(pod);
+        let pod_uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or(pod_name);
+        let signer_name = pod_cert
+            .get("signerName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| KubeletError::InvalidConfiguration {
+                field: "podCertificate.signerName".to_string(),
+                reason: "podCertificate projection requires non-empty signerName".to_string(),
+            })?;
+
+        for field in ["keyPath", "certificateChainPath", "credentialBundlePath"] {
+            if let Some(p) = pod_cert.get(field).and_then(Value::as_str) {
+                validate_pod_cert_path(p)?;
+            }
+        }
+
+        let cache_key = (
+            namespace.to_string(),
+            pod_name.to_string(),
+            signer_name.to_string(),
+        );
+        let key_data = {
+            let mut cache = self
+                .pod_certificates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let generated_key = generate_pod_certificate_key(pod_uid)?;
+                cache.insert(cache_key.clone(), generated_key.clone());
+                generated_key
+            }
+        };
+
+        let pcr = self
+            .find_or_create_pcr(namespace, pod, signer_name, pod_cert, &key_data)
+            .await?;
+
+        let cert_chain = pcr
+            .pointer("/status/certificateChain")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        if let Some(chain) = cert_chain {
+            return write_pod_cert_files(vol_dir, &key_data.key_pem, chain, pod_cert);
+        }
+
+        let mut existing_paths = Vec::new();
+        let mut all_exist = true;
+        for field in ["keyPath", "certificateChainPath", "credentialBundlePath"] {
+            if let Some(p) = pod_cert.get(field).and_then(Value::as_str) {
+                let path = safe_volume_path(vol_dir, p)?;
+                if path.exists() {
+                    existing_paths.push(path);
+                } else {
+                    all_exist = false;
+                }
+            }
+        }
+        if all_exist && !existing_paths.is_empty() {
+            return Ok(existing_paths);
+        }
+
+        Err(KubeletError::PodReconciliationFailed {
+            pod: format!("{namespace}/{pod_name}"),
+            reason: format!(
+                "PodCertificateRequest for signer '{signer_name}' waiting for certificate issuance"
+            ),
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4439,6 +4787,85 @@ impl PodReconciler {
     }
 }
 
+fn validate_pod_cert_path(path: &str) -> Result<(), KubeletError> {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('\\') || path.contains("..") {
+        return Err(KubeletError::InvalidConfiguration {
+            field: "podCertificate.path".to_string(),
+            reason: format!("invalid path '{path}'"),
+        });
+    }
+    Ok(())
+}
+
+fn generate_pod_certificate_key(pod_uid: &str) -> Result<CachedPodCertificateKey, KubeletError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let key_path = std::env::temp_dir().join(format!("diorama-pcr-{pod_uid}-{now}.key"));
+    diorama_pki::ensure_service_account_key(&key_path).map_err(|e| {
+        KubeletError::PodReconciliationFailed {
+            pod: pod_uid.to_string(),
+            reason: format!("failed to generate RSA key: {e}"),
+        }
+    })?;
+    let key_pem = std::fs::read_to_string(&key_path).map_err(KubeletError::Io)?;
+    let _ = std::fs::remove_file(&key_path);
+    let pub_pem =
+        diorama_pki::token::public_key_pem_from_private_key_pem(&key_pem).map_err(|e| {
+            KubeletError::PodReconciliationFailed {
+                pod: pod_uid.to_string(),
+                reason: format!("failed to extract public key: {e}"),
+            }
+        })?;
+    let lines: Vec<&str> = pub_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let pkix_b64 = lines.join("");
+    let sig = diorama_pki::token::sign_with_rsa_key(&key_pem, pod_uid.as_bytes()).map_err(|e| {
+        KubeletError::PodReconciliationFailed {
+            pod: pod_uid.to_string(),
+            reason: format!("failed to sign proof-of-possession: {e}"),
+        }
+    })?;
+    let pop_b64 = diorama_pki::base64_encode(&sig);
+    Ok(CachedPodCertificateKey {
+        key_pem,
+        pkix_b64,
+        pop_b64,
+    })
+}
+
+fn write_pod_cert_files(
+    vol_dir: &Path,
+    key_pem: &str,
+    cert_chain: &str,
+    pod_cert: &Value,
+) -> Result<Vec<PathBuf>, KubeletError> {
+    let mut written = Vec::new();
+    if let Some(kp) = pod_cert.get("keyPath").and_then(Value::as_str) {
+        let p = safe_volume_path(vol_dir, kp)?;
+        write_volume_file(&p, key_pem.as_bytes()).map_err(KubeletError::Io)?;
+        chmod_volume_file(&p, 0o600);
+        written.push(p);
+    }
+    if let Some(cp) = pod_cert.get("certificateChainPath").and_then(Value::as_str) {
+        let p = safe_volume_path(vol_dir, cp)?;
+        write_volume_file(&p, cert_chain.as_bytes()).map_err(KubeletError::Io)?;
+        chmod_volume_file(&p, 0o644);
+        written.push(p);
+    }
+    if let Some(bp) = pod_cert.get("credentialBundlePath").and_then(Value::as_str) {
+        let p = safe_volume_path(vol_dir, bp)?;
+        let bundle = format!("{}\n{}", key_pem.trim(), cert_chain.trim());
+        write_volume_file(&p, bundle.as_bytes()).map_err(KubeletError::Io)?;
+        chmod_volume_file(&p, 0o600);
+        written.push(p);
+    }
+    Ok(written)
+}
+
 /// Target host for an `httpGet`/`tcpSocket` probe: the explicit host, with
 /// blank and loopback values meaning the pod IP, as upstream resolves them.
 fn probe_host(pod_ip: Option<&str>, configured: Option<&str>) -> Option<String> {
@@ -4667,6 +5094,80 @@ fn dead_container_views<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_has_service_account_token_custom_projected_tokens() {
+        let pod_custom = json!({
+            "metadata": { "name": "oidc-validator", "namespace": "default" },
+            "spec": {
+                "volumes": [{
+                    "name": "custom-token-vol",
+                    "projected": {
+                        "sources": [{
+                            "serviceAccountToken": {
+                                "path": "custom-token",
+                                "audience": "https://vault.example.com",
+                                "expirationSeconds": 3600
+                            }
+                        }]
+                    }
+                }],
+                "containers": [{
+                    "name": "validator",
+                    "image": "busybox:1.36",
+                    "volumeMounts": [{
+                        "name": "custom-token-vol",
+                        "mountPath": "/var/run/secrets/tokens"
+                    }]
+                }]
+            }
+        });
+        assert!(!pod_has_service_account_token(&pod_custom));
+
+        let pod_kube_api = json!({
+            "metadata": { "name": "kube-app", "namespace": "default" },
+            "spec": {
+                "volumes": [{
+                    "name": "kube-api-access-abc12",
+                    "projected": {
+                        "sources": [{
+                            "serviceAccountToken": {
+                                "path": "token"
+                            }
+                        }]
+                    }
+                }],
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox:1.36",
+                    "volumeMounts": [{
+                        "name": "kube-api-access-abc12",
+                        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"
+                    }]
+                }]
+            }
+        });
+        assert!(pod_has_service_account_token(&pod_kube_api));
+
+        let pod_mounted_sa = json!({
+            "metadata": { "name": "manual-sa", "namespace": "default" },
+            "spec": {
+                "volumes": [{
+                    "name": "my-sa",
+                    "emptyDir": {}
+                }],
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox:1.36",
+                    "volumeMounts": [{
+                        "name": "my-sa",
+                        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"
+                    }]
+                }]
+            }
+        });
+        assert!(pod_has_service_account_token(&pod_mounted_sa));
+    }
 
     #[test]
     fn security_context_maps_users_groups_and_privilege() {
