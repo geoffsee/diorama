@@ -1182,6 +1182,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,
@@ -1211,6 +1212,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,
@@ -1306,6 +1308,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,
@@ -1365,6 +1368,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,
@@ -1406,6 +1410,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "example.com".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "noxus".to_string(),
             subresource: None,
@@ -1483,6 +1488,7 @@ mod tests {
     fn test_crd_without_schema_succeeds_with_unknown_fields() {
         let path = ResourcePath {
             group: "custom.io".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "foos".to_string(),
             subresource: None,
@@ -1517,6 +1523,7 @@ mod tests {
 
         let path = ResourcePath {
             group: "example.com".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "noxus2".to_string(),
             subresource: None,
@@ -1564,6 +1571,7 @@ mod tests {
         let yaml_dup = b"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: dep\nspec:\n  replicas: 1\n  replicas: 2\n  unknownField: bad\n";
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,
@@ -1600,6 +1608,7 @@ mod tests {
     fn test_decode_body_with_validation_picks_up_is_strict_context() {
         let path = ResourcePath {
             group: "apps".to_string(),
+            version: "v1".to_string(),
             namespace: Some("default".to_string()),
             resource: "deployments".to_string(),
             subresource: None,

@@ -33,6 +33,9 @@ const GROUP_DOCS: &[(&str, &str)] = &[
     ("authentication.k8s.io", "v1"),
     ("authorization.k8s.io", "v1"),
     ("flowcontrol.apiserver.k8s.io", "v1"),
+    ("resource.k8s.io", "v1"),
+    ("storagemigration.k8s.io", "v1"),
+    ("storagemigration.k8s.io", "v1alpha1"),
 ];
 
 /// `GET /openapi/v3`: discovery of per-group documents.
@@ -734,6 +737,7 @@ fn group_kinds(group: &str, version: &str) -> Vec<(&'static str, &'static str, b
                 false,
             ),
             ("ClusterTrustBundle", "clustertrustbundles", false),
+            ("PodCertificateRequest", "podcertificaterequests", true),
         ],
         ("scheduling.k8s.io", "v1") => vec![("PriorityClass", "priorityclasses", false)],
         ("node.k8s.io", "v1") => vec![("RuntimeClass", "runtimeclasses", false)],
@@ -814,6 +818,16 @@ fn group_kinds(group: &str, version: &str) -> Vec<(&'static str, &'static str, b
                 false,
             ),
         ],
+        ("resource.k8s.io", "v1") => vec![
+            ("DeviceClass", "deviceclasses", false),
+            ("DeviceTaintRule", "devicetaintrules", false),
+            ("ResourceSlice", "resourceslices", false),
+            ("ResourceClaim", "resourceclaims", true),
+            ("ResourceClaimTemplate", "resourceclaimtemplates", true),
+        ],
+        ("storagemigration.k8s.io", "v1" | "v1alpha1") => {
+            vec![("StorageVersionMigration", "storageversionmigrations", false)]
+        },
         _ => Vec::new(),
     }
 }

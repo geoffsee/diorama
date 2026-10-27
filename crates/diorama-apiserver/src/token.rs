@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use x509_parser::prelude::FromDer;
 
 use crate::error::ApiserverError;
 
@@ -414,6 +416,43 @@ impl TokenService {
         })
     }
 
+    fn extract_rsa_pubkey_components(pem_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(pem_bytes).ok()?;
+        let (_, spki) = x509_parser::prelude::SubjectPublicKeyInfo::from_der(&pem.contents).ok()?;
+        let (_, seq) =
+            x509_parser::asn1_rs::Sequence::from_der(&spki.subject_public_key.data).ok()?;
+        let (rem, n_int) = x509_parser::asn1_rs::Integer::from_der(seq.as_ref()).ok()?;
+        let (_, e_int) = x509_parser::asn1_rs::Integer::from_der(rem).ok()?;
+        let mut n_bytes = n_int.as_ref();
+        if n_bytes.first() == Some(&0) {
+            n_bytes = &n_bytes[1..];
+        }
+        let mut e_bytes = e_int.as_ref();
+        if e_bytes.first() == Some(&0) {
+            e_bytes = &e_bytes[1..];
+        }
+        Some((n_bytes.to_vec(), e_bytes.to_vec()))
+    }
+
+    #[must_use]
+    pub fn jwks(&self) -> Value {
+        if let Some((n_bytes, e_bytes)) =
+            Self::extract_rsa_pubkey_components(self.verification_key_pem.as_bytes())
+        {
+            let n_b64 = diorama_pki::token::base64url_encode(&n_bytes);
+            let e_b64 = diorama_pki::token::base64url_encode(&e_bytes);
+            return json!([{
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "kid": "diorama-sa-key",
+                "n": n_b64,
+                "e": e_b64,
+            }]);
+        }
+        json!([])
+    }
+
     pub fn issue_token(
         &self,
         namespace: &str,
@@ -633,6 +672,10 @@ impl TokenService {
                 let sa_uid = claims.service_account_uid.clone();
                 let groups = claims.groups();
                 let mut extra = HashMap::new();
+                extra.insert(
+                    "authentication.kubernetes.io/credential-id".to_string(),
+                    vec![format!("JTI={}", claims.jti)],
+                );
                 if let Some(pod) = &claims.kubernetes_io.pod {
                     extra.insert(
                         "authentication.kubernetes.io/pod-name".to_string(),

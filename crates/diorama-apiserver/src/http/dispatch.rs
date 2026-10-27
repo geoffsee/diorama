@@ -23,6 +23,64 @@ pub(crate) struct Outcome {
     pub(crate) headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
 }
 
+async fn maybe_dispatch_aggregated(
+    client: &KubernetesApiClient,
+    method: &Method,
+    path: &ResourcePath,
+    query: Option<&str>,
+    body: &[u8],
+) -> Result<Option<Outcome>, ApiserverError> {
+    if path.group.is_empty() {
+        return Ok(None);
+    }
+    let api_services = client.aggregation().list_api_services();
+    let Some(api_svc) = api_services
+        .iter()
+        .find(|s| s.group() == path.group && s.version() == path.version && !s.is_local())
+        .or_else(|| {
+            api_services
+                .iter()
+                .find(|s| s.group() == path.group && !s.is_local())
+        })
+    else {
+        return Ok(None);
+    };
+
+    let mut uri_path = format!("/apis/{}/{}/{}", path.group, path.version, path.resource);
+    if let Some(ns) = &path.namespace {
+        uri_path = format!(
+            "/apis/{}/{}/namespaces/{}/{}",
+            path.group, path.version, ns, path.resource
+        );
+    }
+    if let Some(n) = &path.name {
+        uri_path = format!("{uri_path}/{n}");
+    }
+    if let Some(sub) = &path.subresource {
+        uri_path = format!("{uri_path}/{sub}");
+    }
+    if let Some(q) = query.filter(|s| !s.is_empty()) {
+        uri_path = format!("{uri_path}?{q}");
+    }
+
+    let parsed_body: Option<Value> = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(body).ok()
+    };
+
+    let res = client
+        .dispatch_aggregated_request(api_svc.name(), &uri_path, method.as_str(), parsed_body)
+        .await?;
+
+    let outcome = if *method == Method::POST {
+        created_json(res)
+    } else {
+        ok_json(res)
+    };
+    Ok(Some(outcome))
+}
+
 pub(crate) async fn dispatch(
     service: &ApiserverService,
     client: &KubernetesApiClient,
@@ -32,6 +90,9 @@ pub(crate) async fn dispatch(
     query: Option<&str>,
     body: &[u8],
 ) -> Result<Outcome, ApiserverError> {
+    if let Some(outcome) = maybe_dispatch_aggregated(client, method, path, query, body).await? {
+        return Ok(outcome);
+    }
     if let Some(subresource) = &path.subresource {
         return subresource_dispatch(
             service,
@@ -278,14 +339,31 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
             .get("reason")
             .and_then(Value::as_str)
             .map(std::borrow::Cow::Borrowed),
-        "reportingComponent" => item
-            .get("reportingComponent")
-            .and_then(Value::as_str)
-            .map(std::borrow::Cow::Borrowed),
-        "source" => item
+        "spec.unschedulable" => Some(std::borrow::Cow::Borrowed(
+            if item
+                .pointer("/spec/unschedulable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "true"
+            } else {
+                "false"
+            },
+        )),
+        "source" | "source.component" | "reportingController" | "reportingComponent" => item
             .pointer("/source/component")
             .and_then(Value::as_str)
             .map(std::borrow::Cow::Borrowed)
+            .or_else(|| {
+                item.pointer("/deprecatedSource/component")
+                    .and_then(Value::as_str)
+                    .map(std::borrow::Cow::Borrowed)
+            })
+            .or_else(|| {
+                item.pointer("/reportingController")
+                    .and_then(Value::as_str)
+                    .map(std::borrow::Cow::Borrowed)
+            })
             .or_else(|| {
                 item.pointer("/reportingComponent")
                     .and_then(Value::as_str)
@@ -293,7 +371,15 @@ fn extract_field_value<'a>(item: &'a Value, field: &str) -> Option<std::borrow::
             }),
         _ => {
             let ptr = format!("/{}", field.replace('.', "/"));
-            match item.pointer(&ptr) {
+            let val = item.pointer(&ptr).or_else(|| {
+                if field.starts_with("spec.") {
+                    None
+                } else {
+                    let spec_ptr = format!("/spec/{}", field.replace('.', "/"));
+                    item.pointer(&spec_ptr)
+                }
+            });
+            match val {
                 Some(Value::String(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
                 Some(Value::Bool(b)) => Some(std::borrow::Cow::Owned(b.to_string())),
                 Some(Value::Number(n)) => Some(std::borrow::Cow::Owned(n.to_string())),
@@ -432,6 +518,12 @@ async fn delete(
     };
     let deleted = status_outcome(http::StatusCode::OK, "Success", "deleted");
     if is_cluster_resource(&path.resource) {
+        if path.group.is_empty() && path.resource == "namespaces" {
+            if let Some(doc) = client.delete_namespace_options(name).await? {
+                return Ok(ok_json(doc));
+            }
+            return Ok(deleted);
+        }
         delete_cluster(client, &path.group, &path.resource, name).await?;
     } else if let Some(namespace) = &path.namespace {
         if path.group.is_empty() && path.resource == "pods" {
@@ -693,7 +785,8 @@ async fn read_single(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PatchType {
     Json,
-    Merge,
+    RfcMerge,
+    StrategicMerge,
     Apply,
 }
 
@@ -703,9 +796,11 @@ fn patch_type(content_type: Option<&str>) -> PatchType {
         PatchType::Json
     } else if content.contains("apply-patch") {
         PatchType::Apply
+    } else if content.contains("merge-patch") {
+        PatchType::RfcMerge
     } else {
-        // merge-patch, strategic-merge-patch and plain JSON all merge objects.
-        PatchType::Merge
+        // strategic-merge-patch and plain JSON all merge objects.
+        PatchType::StrategicMerge
     }
 }
 
@@ -738,7 +833,14 @@ async fn patch(
         PatchType::Json => {
             crate::admission::apply_json_patch(&mut target, body)?;
         },
-        PatchType::Merge => {
+        PatchType::RfcMerge => {
+            let merge: Value =
+                serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
+                    message: format!("patch body is not JSON: {err}"),
+                })?;
+            crate::client::json_rfc7396_merge_patch(&mut target, merge);
+        },
+        PatchType::StrategicMerge => {
             let merge: Value =
                 serde_json::from_slice(body).map_err(|err| ApiserverError::BadRequest {
                     message: format!("patch body is not JSON: {err}"),
@@ -931,6 +1033,10 @@ pub(crate) fn is_cluster_resource(resource: &str) -> bool {
             | "subjectaccessreviews"
             | "selfsubjectaccessreviews"
             | "selfsubjectrulesreviews"
+            | "deviceclasses"
+            | "devicetaintrules"
+            | "resourceslices"
+            | "storageversionmigrations"
     )
 }
 
@@ -1659,6 +1765,12 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "localsubjectaccessreviews" => "LocalSubjectAccessReview",
         "selfsubjectrulesreviews" => "SelfSubjectRulesReview",
         "podcertificaterequests" => "PodCertificateRequest",
+        "deviceclasses" => "DeviceClass",
+        "devicetaintrules" => "DeviceTaintRule",
+        "resourceslices" => "ResourceSlice",
+        "resourceclaims" => "ResourceClaim",
+        "resourceclaimtemplates" => "ResourceClaimTemplate",
+        "storageversionmigrations" => "StorageVersionMigration",
         _ => return None,
     })
 }
@@ -1721,6 +1833,12 @@ fn list_kind(resource: &str) -> &'static str {
         "flowschemas" => "FlowSchemaList",
         "prioritylevelconfigurations" => "PriorityLevelConfigurationList",
         "podcertificaterequests" => "PodCertificateRequestList",
+        "deviceclasses" => "DeviceClassList",
+        "devicetaintrules" => "DeviceTaintRuleList",
+        "resourceslices" => "ResourceSliceList",
+        "resourceclaims" => "ResourceClaimList",
+        "resourceclaimtemplates" => "ResourceClaimTemplateList",
+        "storageversionmigrations" => "StorageVersionMigrationList",
         _ => "List",
     }
 }
@@ -1811,7 +1929,7 @@ fn handle_self_subject_review(client: &KubernetesApiClient, mut doc: Value) -> V
             "username": user_info.username,
             "uid": user_info.uid.unwrap_or_default(),
             "groups": user_info.groups,
-            "extra": {}
+            "extra": user_info.extra
         }
     });
     doc["apiVersion"] = json!("authentication.k8s.io/v1");
@@ -1893,6 +2011,61 @@ async fn subresource_dispatch(
             let doc = decode_body(content_type, query, body, path)?;
             let token_req = client.create_token_request(namespace, name, doc).await?;
             Ok(created_json(token_req))
+        },
+        ("", "pods", "ephemeralcontainers") => match *method {
+            Method::GET => {
+                let object = ResourcePath {
+                    subresource: None,
+                    ..path.clone()
+                };
+                read(client, &object, query).await.map(ok_json)
+            },
+            Method::PUT | Method::PATCH => {
+                let Some(name) = &path.name else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "ephemeralcontainers requires a resource name".to_string(),
+                    });
+                };
+                let Some(namespace) = &path.namespace else {
+                    return Err(ApiserverError::BadRequest {
+                        message: "ephemeralcontainers requires a namespace".to_string(),
+                    });
+                };
+                let mut current = client.get_pod(namespace, name).await?;
+                if *method == Method::PUT {
+                    let doc = decode_body(content_type, query, body, path)?;
+                    if let Some(ec) = doc.pointer("/spec/ephemeralContainers")
+                        && let Some(spec) = current.get_mut("spec").and_then(Value::as_object_mut)
+                    {
+                        spec.insert("ephemeralContainers".to_string(), ec.clone());
+                    }
+                } else {
+                    apply_body_patch(&mut current, content_type, body)?;
+                }
+                if let Some(containers) = current
+                    .pointer_mut("/spec/ephemeralContainers")
+                    .and_then(Value::as_array_mut)
+                {
+                    for c in containers.iter_mut().filter_map(Value::as_object_mut) {
+                        KubernetesApiClient::default_container_spec(c);
+                    }
+                }
+                client
+                    .update_pod_subresource_options(
+                        namespace,
+                        name,
+                        current,
+                        is_dry_run(query),
+                        Some("ephemeralcontainers"),
+                    )
+                    .await
+                    .map(ok_json)
+            },
+            _ => Ok(status_outcome(
+                http::StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "method is not supported",
+            )),
         },
         (_, _, "status" | "finalize" | "resize" | "approval") => match *method {
             Method::GET => {
@@ -2230,12 +2403,16 @@ async fn record_pdb_disruption(
     }
 }
 
-fn split_proxy_name(raw: &str) -> (&str, Option<&str>) {
-    let parts: Vec<&str> = raw.splitn(3, ':').collect();
+fn split_proxy_name(raw: &str) -> (Option<&str>, &str, Option<&str>) {
+    let parts: Vec<&str> = raw.split(':').collect();
     match parts.as_slice() {
-        [_scheme, name, port] => (*name, Some(*port).filter(|p| !p.is_empty())),
-        [name, port] => (*name, Some(*port).filter(|p| !p.is_empty())),
-        _ => (raw, None),
+        [scheme, name, port] if *scheme == "http" || *scheme == "https" => {
+            (Some(*scheme), *name, Some(*port).filter(|p| !p.is_empty()))
+        },
+        [scheme, name] if *scheme == "http" || *scheme == "https" => (Some(*scheme), *name, None),
+        [name, port] => (None, *name, Some(*port).filter(|p| !p.is_empty())),
+        [name] => (None, *name, None),
+        _ => (None, raw, None),
     }
 }
 
@@ -2356,6 +2533,52 @@ async fn resolve_proxy_target(
     Ok((cluster_ip, svc_port_num))
 }
 
+async fn connect_proxy_sender(
+    stream: tokio::net::TcpStream,
+    ip: &str,
+    port: u16,
+    is_https: bool,
+) -> Result<
+    hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    ApiserverError,
+> {
+    if is_https {
+        let connector = crate::http::tls::tls_connector_for_ca(None);
+        let server_name = rustls::pki_types::ServerName::try_from(ip.to_string())
+            .or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()))
+            .map_err(|err| ApiserverError::Internal {
+                reason: format!("invalid server name for proxy TLS: {err}"),
+            })?;
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| ApiserverError::Internal {
+                reason: format!("proxy TLS handshake with {ip}:{port} failed: {err}"),
+            })?;
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|err| ApiserverError::Internal {
+                reason: format!("proxy HTTP handshake with {ip}:{port} failed: {err}"),
+            })?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sender)
+    } else {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|err| ApiserverError::Internal {
+                reason: format!("proxy HTTP handshake with {ip}:{port} failed: {err}"),
+            })?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sender)
+    }
+}
+
 async fn proxy_subresource(
     client: &KubernetesApiClient,
     method: &Method,
@@ -2370,9 +2593,14 @@ async fn proxy_subresource(
             message: format!("{} proxy requires a namespace and name", path.resource),
         });
     };
-    let (obj_name, port_spec) = split_proxy_name(raw_name);
-    let (ip, port) =
+    let (scheme, obj_name, port_spec) = split_proxy_name(raw_name);
+    let (ip, default_port) =
         resolve_proxy_target(client, &path.resource, namespace, obj_name, port_spec).await?;
+    let port = if port_spec.is_none() && scheme == Some("https") {
+        443
+    } else {
+        default_port
+    };
     let suffix = subresource.strip_prefix("proxy/").unwrap_or("");
     let target_uri = match (suffix, query) {
         ("", Some(q)) if !q.is_empty() => format!("/?{q}"),
@@ -2393,20 +2621,20 @@ async fn proxy_subresource(
         reason: format!("proxy connection to {ip}:{port} failed: {err}"),
     })?;
 
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|err| ApiserverError::Internal {
-            reason: format!("proxy HTTP handshake with {ip}:{port} failed: {err}"),
-        })?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let proto_str = if scheme == Some("https") {
+        "https"
+    } else {
+        "http"
+    };
+
+    let mut sender = connect_proxy_sender(stream, &ip, port, scheme == Some("https")).await?;
 
     let mut req_builder = http::Request::builder()
         .method(method)
         .uri(&target_uri)
-        .header(http::header::HOST, format!("{ip}:{port}"));
+        .header(http::header::HOST, format!("{ip}:{port}"))
+        .header("X-Forwarded-Uri", &target_uri)
+        .header("X-Forwarded-Proto", proto_str);
     if let Some(ct) = content_type {
         req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
     }
@@ -2459,7 +2687,15 @@ fn apply_body_patch(
 ) -> Result<(), ApiserverError> {
     match patch_type(content_type) {
         PatchType::Json => crate::admission::apply_json_patch(target, body),
-        PatchType::Merge | PatchType::Apply => {
+        PatchType::RfcMerge => {
+            let patch: Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => crate::http::field_validation::decode_yaml(body, false)?,
+            };
+            crate::client::json_rfc7396_merge_patch(target, patch);
+            Ok(())
+        },
+        PatchType::StrategicMerge | PatchType::Apply => {
             let patch: Value = match serde_json::from_slice(body) {
                 Ok(v) => v,
                 Err(_) => crate::http::field_validation::decode_yaml(body, false)?,

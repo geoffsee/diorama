@@ -1072,6 +1072,8 @@ fn message_for_gvk(api_version: &str, kind: &str) -> Option<String> {
         ("authorization.k8s.io", "v1") => "k8s.io.api.authorization.v1",
         ("flowcontrol.apiserver.k8s.io", "v1") => "k8s.io.api.flowcontrol.v1",
         ("apidiscovery.k8s.io", "v2" | "v2beta1") => "k8s.io.api.apidiscovery.v2",
+        ("resource.k8s.io", "v1") => "k8s.io.api.resource.v1",
+        ("storagemigration.k8s.io", "v1" | "v1alpha1") => "k8s.io.api.storagemigration.v1",
         _ => return None,
     };
     Some(format!("{package}.{kind}"))
@@ -1477,22 +1479,28 @@ fn is_inline_field(name: &str, type_name: &str) -> bool {
 }
 
 fn json_field_name<'a>(parent_message: &str, field_name: &'a str) -> &'a str {
-    if parent_message == "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps"
-    {
-        match field_name {
-            "schema" => "$schema",
-            "ref" => "$ref",
-            "xKubernetesPreserveUnknownFields" => "x-kubernetes-preserve-unknown-fields",
-            "xKubernetesEmbeddedResource" => "x-kubernetes-embedded-resource",
-            "xKubernetesIntOrString" => "x-kubernetes-int-or-string",
-            "xKubernetesListMapKeys" => "x-kubernetes-list-map-keys",
-            "xKubernetesListType" => "x-kubernetes-list-type",
-            "xKubernetesMapType" => "x-kubernetes-map-type",
-            "xKubernetesValidations" => "x-kubernetes-validations",
-            _ => field_name,
-        }
-    } else {
-        field_name
+    match field_name {
+        "Webhooks" => "webhooks",
+        "Expression" => "expression",
+        "Name" => "name",
+        "Raw" => "raw",
+        _ if parent_message
+            == "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps" =>
+        {
+            match field_name {
+                "schema" => "$schema",
+                "ref" => "$ref",
+                "xKubernetesPreserveUnknownFields" => "x-kubernetes-preserve-unknown-fields",
+                "xKubernetesEmbeddedResource" => "x-kubernetes-embedded-resource",
+                "xKubernetesIntOrString" => "x-kubernetes-int-or-string",
+                "xKubernetesListMapKeys" => "x-kubernetes-list-map-keys",
+                "xKubernetesListType" => "x-kubernetes-list-type",
+                "xKubernetesMapType" => "x-kubernetes-map-type",
+                "xKubernetesValidations" => "x-kubernetes-validations",
+                _ => field_name,
+            }
+        },
+        _ => field_name,
     }
 }
 

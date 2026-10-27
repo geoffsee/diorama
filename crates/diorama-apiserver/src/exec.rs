@@ -348,7 +348,39 @@ pub async fn serve_exec<S>(
         None,
     )
     .await;
-    let result = exec.exec_in_pod(&pod, &container, &options.command).await;
+
+    let mut command = options.command.clone();
+    if options.stdin {
+        let mut stdin_bytes = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                match msg {
+                    Message::Binary(data) if !data.is_empty() && data[0] == CHANNEL_STDIN => {
+                        stdin_bytes.extend_from_slice(&data[1..]);
+                    },
+                    Message::Close(_) => break,
+                    _ => {},
+                }
+            }
+        })
+        .await;
+
+        if !stdin_bytes.is_empty()
+            && let Ok(stdin_str) = std::str::from_utf8(&stdin_bytes)
+        {
+            let trimmed = stdin_str.trim();
+            if !trimmed.is_empty()
+                && (command == ["/bin/sh"]
+                    || command == ["sh"]
+                    || command == ["/bin/bash"]
+                    || command == ["bash"])
+            {
+                command = vec![command[0].clone(), "-c".to_string(), trimmed.to_string()];
+            }
+        }
+    }
+
+    let result = exec.exec_in_pod(&pod, &container, &command).await;
     match result {
         Ok(output) => {
             if options.stdout && !output.stdout.is_empty() {

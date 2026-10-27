@@ -182,6 +182,65 @@ fn merge_patch_array_by_key(target_arr: &mut Vec<Value>, patch_arr: Vec<Value>, 
     }
 }
 
+/// Applies an RFC 7396 JSON Merge Patch to a target JSON value.
+/// Per RFC 7396, arrays in the patch wholesale replace the target array.
+pub fn json_rfc7396_merge_patch(target: &mut Value, patch: Value) {
+    if let Value::Object(patch_obj) = patch {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        let target_obj = target.as_object_mut().unwrap();
+        for (key, value) in patch_obj {
+            if value.is_null() {
+                target_obj.remove(&key);
+            } else if value.is_object() {
+                if let Some(existing_sub) = target_obj.get_mut(&key) {
+                    json_rfc7396_merge_patch(existing_sub, value);
+                } else {
+                    target_obj.insert(key, value);
+                }
+            } else {
+                target_obj.insert(key, value);
+            }
+        }
+    } else {
+        *target = patch;
+    }
+}
+
+fn merge_array_field(
+    target_obj: &mut serde_json::Map<String, Value>,
+    key: String,
+    mut patch_arr: Vec<Value>,
+    merge_key: Option<&'static str>,
+) {
+    let Some(mk) = merge_key else {
+        target_obj.insert(key, Value::Array(patch_arr));
+        return;
+    };
+    let Some(Value::Array(target_arr)) = target_obj.get_mut(&key) else {
+        target_obj.insert(key, Value::Array(patch_arr));
+        return;
+    };
+    if key == "containers"
+        && target_arr.len() == 1
+        && patch_arr.len() == 1
+        && patch_arr[0].get(mk).is_none()
+        && let Some(existing_name) = target_arr[0].get(mk).and_then(Value::as_str)
+        && let Some(p_obj) = patch_arr[0].as_object_mut()
+    {
+        p_obj.insert(mk.to_string(), json!(existing_name));
+    }
+    if patch_arr
+        .iter()
+        .all(|item| item.get(mk).and_then(Value::as_str).is_some())
+    {
+        merge_patch_array_by_key(target_arr, patch_arr, mk);
+    } else {
+        target_obj.insert(key, Value::Array(patch_arr));
+    }
+}
+
 /// Applies an RFC 7386 JSON Merge Patch (with Kubernetes strategic merge array
 /// merging for keyed object lists like `containers`, `volumes`, `conditions`) to a target JSON value.
 pub fn json_merge_patch(target: &mut Value, patch: Value) {
@@ -211,16 +270,7 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
                     "conditions" => Some("type"),
                     _ => None,
                 };
-                if let Some(mk) = merge_key
-                    && let Some(Value::Array(target_arr)) = target_obj.get_mut(&key)
-                    && patch_arr
-                        .iter()
-                        .all(|item| item.get(mk).and_then(Value::as_str).is_some())
-                {
-                    merge_patch_array_by_key(target_arr, patch_arr, mk);
-                } else {
-                    target_obj.insert(key, Value::Array(patch_arr));
-                }
+                merge_array_field(target_obj, key, patch_arr, merge_key);
             } else {
                 target_obj.insert(key, value);
             }
@@ -290,14 +340,30 @@ impl KubernetesApiClient {
                     "system:masters".to_string(),
                     "system:authenticated".to_string(),
                 ],
+                extra: BTreeMap::new(),
             },
-            ClientIdentity::BearerToken(_) => UserInfo {
-                username: "system:serviceaccount:default:token".to_string(),
-                uid: None,
-                groups: vec![
-                    "system:serviceaccounts".to_string(),
-                    "system:authenticated".to_string(),
-                ],
+            ClientIdentity::BearerToken(token) => {
+                let mut extra = BTreeMap::new();
+                let (username, uid) = if let Some(ts) = &self.token_service
+                    && let Ok(claims) = ts.verify_token(token, None)
+                {
+                    extra.insert(
+                        "authentication.kubernetes.io/credential-id".to_string(),
+                        vec![format!("JTI={}", claims.jti)],
+                    );
+                    (claims.sub, Some(claims.jti))
+                } else {
+                    ("system:serviceaccount:default:token".to_string(), None)
+                };
+                UserInfo {
+                    username,
+                    uid,
+                    groups: vec![
+                        "system:serviceaccounts".to_string(),
+                        "system:authenticated".to_string(),
+                    ],
+                    extra,
+                }
             },
             ClientIdentity::ServiceAccount { namespace, name } => UserInfo {
                 username: format!("system:serviceaccount:{namespace}:{name}"),
@@ -307,6 +373,7 @@ impl KubernetesApiClient {
                     format!("system:serviceaccounts:{namespace}"),
                     "system:authenticated".to_string(),
                 ],
+                extra: BTreeMap::new(),
             },
             ClientIdentity::User { username, groups }
             | ClientIdentity::RestrictedUser { username, groups }
@@ -316,11 +383,13 @@ impl KubernetesApiClient {
                 username: username.clone(),
                 uid: None,
                 groups: groups.clone(),
+                extra: BTreeMap::new(),
             },
             ClientIdentity::Anonymous => UserInfo {
                 username: "system:anonymous".to_string(),
                 uid: None,
                 groups: vec!["system:unauthenticated".to_string()],
+                extra: BTreeMap::new(),
             },
         }
     }
@@ -561,6 +630,13 @@ impl KubernetesApiClient {
                 },
                 {
                     "name": "pods/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "verbs": ["get", "patch", "update"]
+                },
+                {
+                    "name": "pods/ephemeralcontainers",
                     "singularName": "",
                     "namespaced": true,
                     "kind": "Pod",
@@ -919,6 +995,21 @@ impl KubernetesApiClient {
                 ],
                 "preferredVersion": { "groupVersion": "storage.k8s.io/v1", "version": "v1" }
             }),
+            json!({
+                "name": "resource.k8s.io",
+                "versions": [
+                    { "groupVersion": "resource.k8s.io/v1", "version": "v1" }
+                ],
+                "preferredVersion": { "groupVersion": "resource.k8s.io/v1", "version": "v1" }
+            }),
+            json!({
+                "name": "storagemigration.k8s.io",
+                "versions": [
+                    { "groupVersion": "storagemigration.k8s.io/v1", "version": "v1" },
+                    { "groupVersion": "storagemigration.k8s.io/v1alpha1", "version": "v1alpha1" }
+                ],
+                "preferredVersion": { "groupVersion": "storagemigration.k8s.io/v1", "version": "v1" }
+            }),
         ];
 
         // Dynamically add CRD groups
@@ -1240,6 +1331,18 @@ impl KubernetesApiClient {
                     "clustertrustbundle",
                     "ClusterTrustBundle",
                 ));
+                resources.push(Self::namespaced_resource(
+                    "podcertificaterequests",
+                    "podcertificaterequest",
+                    "PodCertificateRequest",
+                ));
+                resources.push(json!({
+                    "name": "podcertificaterequests/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "PodCertificateRequest",
+                    "verbs": ["get", "patch", "update"]
+                }));
             },
             ("certificates.k8s.io", "v1alpha1" | "v1beta1") => {
                 resources.push(Self::cluster_resource(
@@ -1407,6 +1510,68 @@ impl KubernetesApiClient {
                     "volumeattributesclass",
                     "VolumeAttributesClass",
                 ));
+            },
+            ("resource.k8s.io", "v1") => {
+                resources.push(Self::cluster_resource(
+                    "deviceclasses",
+                    "deviceclass",
+                    "DeviceClass",
+                ));
+                resources.push(json!({
+                    "name": "deviceclasses/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "DeviceClass",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(Self::cluster_resource(
+                    "devicetaintrules",
+                    "devicetaintrule",
+                    "DeviceTaintRule",
+                ));
+                resources.push(json!({
+                    "name": "devicetaintrules/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "DeviceTaintRule",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(Self::cluster_resource(
+                    "resourceslices",
+                    "resourceslice",
+                    "ResourceSlice",
+                ));
+                resources.push(Self::namespaced_resource(
+                    "resourceclaims",
+                    "resourceclaim",
+                    "ResourceClaim",
+                ));
+                resources.push(json!({
+                    "name": "resourceclaims/status",
+                    "singularName": "",
+                    "namespaced": true,
+                    "kind": "ResourceClaim",
+                    "verbs": ["get", "patch", "update"]
+                }));
+                resources.push(Self::namespaced_resource(
+                    "resourceclaimtemplates",
+                    "resourceclaimtemplate",
+                    "ResourceClaimTemplate",
+                ));
+            },
+            ("storagemigration.k8s.io", "v1" | "v1alpha1") => {
+                resources.push(Self::cluster_resource(
+                    "storageversionmigrations",
+                    "storageversionmigration",
+                    "StorageVersionMigration",
+                ));
+                resources.push(json!({
+                    "name": "storageversionmigrations/status",
+                    "singularName": "",
+                    "namespaced": false,
+                    "kind": "StorageVersionMigration",
+                    "verbs": ["get", "patch", "update"]
+                }));
             },
             _ => {},
         }
@@ -1737,14 +1902,52 @@ impl KubernetesApiClient {
     }
 
     pub async fn delete_namespace(&self, name: &str) -> Result<(), ApiserverError> {
+        let _ = self.delete_namespace_options(name).await?;
+        Ok(())
+    }
+
+    pub async fn delete_namespace_options(
+        &self,
+        name: &str,
+    ) -> Result<Option<Value>, ApiserverError> {
         self.check_auth_detailed("delete", "", "namespaces", None, Some(name))?;
         let key = format!("{}/namespaces/{name}", self.storage.prefix());
-        if self.storage.get(&key).await?.is_none() {
-            return Err(ApiserverError::NotFound {
+        let kv = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
                 resource: "namespaces".to_string(),
                 name: name.to_string(),
-            });
+            })?;
+        let mut ns_doc: Value = serde_json::from_slice(&kv.value)?;
+
+        let pods_prefix = format!("{}/pods/{name}/", self.storage.prefix());
+        let pods = self.storage.list(&pods_prefix).await?;
+        if !pods.is_empty() {
+            if let Some(meta) = ns_doc.get_mut("metadata").and_then(Value::as_object_mut)
+                && !meta.contains_key("deletionTimestamp")
+            {
+                meta.insert(
+                    "deletionTimestamp".to_string(),
+                    json!(crate::time::now_rfc3339()),
+                );
+            }
+            ns_doc["status"] = json!({ "phase": "Terminating" });
+            let bytes = serde_json::to_vec(&ns_doc)?;
+            let updated_kv = self
+                .storage
+                .update(&key, bytes, Some(kv.mod_revision))
+                .await?;
+            if let Some(meta) = ns_doc.get_mut("metadata").and_then(Value::as_object_mut) {
+                meta.insert(
+                    "resourceVersion".to_string(),
+                    json!(updated_kv.mod_revision.to_string()),
+                );
+            }
+            return Ok(Some(ns_doc));
         }
+
         // Upstream deletes every namespaced object with the namespace instead
         // of orphaning them; do the same synchronously across all collections.
         for (group, plural) in Self::namespaced_collections() {
@@ -1758,7 +1961,7 @@ impl KubernetesApiClient {
             }
         }
         let _ = self.storage.delete(&key, None).await;
-        Ok(())
+        Ok(None)
     }
 
     /// Every `(group, plural)` holding namespaced objects, for cascade delete.
@@ -1851,6 +2054,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: "configmaps".to_string(),
             },
+            subresource: None,
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -1966,6 +2170,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: "configmaps".to_string(),
             },
+            subresource: None,
             name: Some(name),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -2115,6 +2320,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: "secrets".to_string(),
             },
+            subresource: None,
             name: Some(name),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -2456,7 +2662,7 @@ impl KubernetesApiClient {
         true
     }
 
-    fn default_container_spec(c_obj: &mut serde_json::Map<String, Value>) {
+    pub(crate) fn default_container_spec(c_obj: &mut serde_json::Map<String, Value>) {
         c_obj
             .entry("terminationMessagePath".to_string())
             .or_insert_with(|| json!("/dev/termination-log"));
@@ -2520,7 +2726,7 @@ impl KubernetesApiClient {
                 if !Self::is_valid_sysctl_name(name) {
                     return Err(ApiserverError::InvalidInput {
                         field: format!("spec.securityContext.sysctls[{idx}].name"),
-                        reason: format!("invalid sysctl name {name:?}"),
+                        reason: format!("Invalid value: \"{name}\""),
                     });
                 }
             }
@@ -2730,6 +2936,22 @@ impl KubernetesApiClient {
         }
     }
 
+    fn default_requests_from_limits(resources_map: &mut serde_json::Map<String, Value>) {
+        if let Some(limits_map) = resources_map
+            .get("limits")
+            .and_then(Value::as_object)
+            .cloned()
+            && let Some(req_map) = resources_map
+                .entry("requests".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        {
+            for (k, v) in limits_map {
+                req_map.entry(k).or_insert(v);
+            }
+        }
+    }
+
     fn apply_limit_range_to_pod(
         pod: &mut Value,
         def_lim: Option<&serde_json::Map<String, Value>>,
@@ -2758,6 +2980,7 @@ impl KubernetesApiClient {
                 if let Some(requests) = def_req.or(def_lim) {
                     Self::merge_resource_map(resources_map, "requests", requests);
                 }
+                Self::default_requests_from_limits(resources_map);
             }
         }
     }
@@ -2781,12 +3004,14 @@ impl KubernetesApiClient {
         self.admit_limit_ranges(namespace, &mut pod).await;
         Self::validate_pod_spec(&pod)?;
         self.admit_runtime_class(&mut pod).await?;
+        crate::quota::enforce_resource_quota(self, namespace, "", "pods", &pod).await?;
 
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("namespace".to_string(), json!(namespace));
             Self::stamp_creation_and_uid(meta, "pods", &name, cur_rev);
         }
+        Self::init_generation(&mut pod);
 
         let mut adm_req = AdmissionRequest {
             uid: format!("adm-{cur_rev}"),
@@ -2800,6 +3025,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: "pods".to_string(),
             },
+            subresource: None,
             name: Some(name.clone()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -2877,8 +3103,17 @@ impl KubernetesApiClient {
     }
 
     pub async fn list_pods(&self, namespace: &str) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("list", "", "pods", Some(namespace), None)?;
-        let prefix = format!("{}/pods/{namespace}/", self.storage.prefix());
+        let auth_ns = if namespace.is_empty() {
+            None
+        } else {
+            Some(namespace)
+        };
+        self.check_auth_detailed("list", "", "pods", auth_ns, None)?;
+        let prefix = if namespace.is_empty() {
+            format!("{}/pods/", self.storage.prefix())
+        } else {
+            format!("{}/pods/{namespace}/", self.storage.prefix())
+        };
         let kvs = self.storage.list(&prefix).await?;
         let mut items = Vec::new();
         for kv in kvs {
@@ -2958,6 +3193,31 @@ impl KubernetesApiClient {
                 name: format!("{namespace}/{name}"),
             })?;
         let mut pod: Value = serde_json::from_slice(&kv.value)?;
+
+        let cur_rev = self.storage.current_revision().await + 1;
+        let adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: String::new(),
+                version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            },
+            resource: GroupVersionResource {
+                group: String::new(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+            },
+            subresource: None,
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            operation: "DELETE".to_string(),
+            user_info: self.current_user_info(),
+            object: None,
+            old_object: Some(pod.clone()),
+            dry_run: None,
+        };
+        self.admission.run_validating_admission(&adm_req).await?;
+
         let scheduled = pod
             .pointer("/spec/nodeName")
             .and_then(Value::as_str)
@@ -2999,6 +3259,8 @@ impl KubernetesApiClient {
                 json!(crate::time::rfc3339_seconds(deadline)),
             );
             meta.insert("deletionGracePeriodSeconds".to_string(), json!(requested));
+            let cur_gen = meta.get("generation").and_then(Value::as_i64).unwrap_or(1);
+            meta.insert("generation".to_string(), json!(cur_gen + 1));
         }
         let bytes = serde_json::to_vec(&pod)?;
         let updated = self
@@ -3023,25 +3285,47 @@ impl KubernetesApiClient {
         self.update_pod_options(namespace, name, pod, false).await
     }
 
+    fn validate_pod_node_immutability(
+        old_pod: &Value,
+        new_pod: &Value,
+    ) -> Result<(), ApiserverError> {
+        let old_node = old_pod.pointer("/spec/nodeName").and_then(Value::as_str);
+        let new_node = new_pod.pointer("/spec/nodeName").and_then(Value::as_str);
+        if let Some(old) = old_node {
+            if let Some(new) = new_node {
+                if old != new {
+                    return Err(ApiserverError::InvalidInput {
+                        field: "spec.nodeName".to_string(),
+                        reason: "spec.nodeName is immutable once assigned".to_string(),
+                    });
+                }
+            } else {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.nodeName".to_string(),
+                    reason: "spec.nodeName cannot be unset once assigned".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update_pod_options(
         &self,
         namespace: &str,
         name: &str,
-        mut pod: Value,
+        pod: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("update", "", "pods", Some(namespace), Some(name))?;
-        let key = format!("{}/pods/{namespace}/{name}", self.storage.prefix());
-        let existing = self
-            .storage
-            .get(&key)
-            .await?
-            .ok_or_else(|| ApiserverError::NotFound {
-                resource: "pods".to_string(),
-                name: format!("{namespace}/{name}"),
-            })?;
-        let old_pod: Value = serde_json::from_slice(&existing.value)?;
+        self.update_pod_subresource_options(namespace, name, pod, dry_run, None)
+            .await
+    }
 
+    fn preserve_pod_metadata_on_update(
+        pod: &mut Value,
+        old_pod: &Value,
+        namespace: &str,
+        name: &str,
+    ) {
         if let Some(meta) = pod.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert("namespace".to_string(), json!(namespace));
             meta.insert("name".to_string(), json!(name));
@@ -3065,6 +3349,66 @@ impl KubernetesApiClient {
                     .or_insert_with(|| old_dgp.clone());
             }
         }
+    }
+
+    async fn write_pod_update_with_retry(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expected_version: Option<u64>,
+        old_gen: Option<i64>,
+        namespace: &str,
+        name: &str,
+    ) -> Result<diorama_datastore::KeyValue, ApiserverError> {
+        match self
+            .storage
+            .update(key, bytes.clone(), expected_version)
+            .await
+        {
+            Ok(kv) => Ok(kv),
+            Err(ApiserverError::Conflict { .. }) if expected_version.is_none() => {
+                if let Some(refreshed) = self.storage.get(key).await?
+                    && let Ok(refreshed_pod) = serde_json::from_slice::<Value>(&refreshed.value)
+                    && refreshed_pod
+                        .pointer("/metadata/generation")
+                        .and_then(Value::as_i64)
+                        == old_gen
+                {
+                    self.storage
+                        .update(key, bytes, Some(refreshed.mod_revision))
+                        .await
+                } else {
+                    Err(ApiserverError::Conflict {
+                        resource: "pods".to_string(),
+                        name: format!("{namespace}/{name}"),
+                    })
+                }
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn update_pod_subresource_options(
+        &self,
+        namespace: &str,
+        name: &str,
+        mut pod: Value,
+        dry_run: bool,
+        subresource: Option<&str>,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("update", "", "pods", Some(namespace), Some(name))?;
+        let key = format!("{}/pods/{namespace}/{name}", self.storage.prefix());
+        let existing = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: "pods".to_string(),
+                name: format!("{namespace}/{name}"),
+            })?;
+        let old_pod: Value = serde_json::from_slice(&existing.value)?;
+
+        Self::preserve_pod_metadata_on_update(&mut pod, &old_pod, namespace, name);
 
         let expected_version = pod
             .pointer("/metadata/resourceVersion")
@@ -3084,6 +3428,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: "pods".to_string(),
             },
+            subresource: subresource.map(ToString::to_string),
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),
@@ -3094,26 +3439,8 @@ impl KubernetesApiClient {
         };
         self.admission.run_mutating_admission(&mut adm_req).await?;
 
-        let old_node = old_pod.pointer("/spec/nodeName").and_then(Value::as_str);
-        let new_node = adm_req
-            .object
-            .as_ref()
-            .and_then(|obj| obj.pointer("/spec/nodeName"))
-            .and_then(Value::as_str);
-        if let Some(old) = old_node {
-            if let Some(new) = new_node {
-                if old != new {
-                    return Err(ApiserverError::InvalidInput {
-                        field: "spec.nodeName".to_string(),
-                        reason: "spec.nodeName is immutable once assigned".to_string(),
-                    });
-                }
-            } else {
-                return Err(ApiserverError::InvalidInput {
-                    field: "spec.nodeName".to_string(),
-                    reason: "spec.nodeName cannot be unset once assigned".to_string(),
-                });
-            }
+        if let Some(obj) = &adm_req.object {
+            Self::validate_pod_node_immutability(&old_pod, obj)?;
         }
 
         self.admission.run_validating_admission(&adm_req).await?;
@@ -3121,12 +3448,19 @@ impl KubernetesApiClient {
             pod = obj;
         }
 
+        Self::update_generation(&mut pod, &old_pod);
+
         if dry_run {
             return Ok(pod);
         }
 
+        let old_gen = old_pod
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64);
         let bytes = serde_json::to_vec(&pod)?;
-        let kv = self.storage.update(&key, bytes, expected_version).await?;
+        let kv = self
+            .write_pod_update_with_retry(&key, bytes, expected_version, old_gen, namespace, name)
+            .await?;
         let mut result = pod;
         if let Some(meta) = result.get_mut("metadata").and_then(Value::as_object_mut) {
             meta.insert(
@@ -3297,6 +3631,10 @@ impl KubernetesApiClient {
         if plural == "configmaps" {
             Self::validate_configmap_doc(&doc)?;
         }
+        if plural == "podcertificaterequests" {
+            crate::pki::validate_pod_certificate_request_json(&doc)?;
+        }
+        crate::quota::enforce_resource_quota(self, namespace, group, plural, &doc).await?;
 
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -3331,6 +3669,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.clone()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -3403,6 +3742,7 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Ok(doc)
     }
 
@@ -3440,6 +3780,7 @@ impl KubernetesApiClient {
                     json!(kv.mod_revision.to_string()),
                 );
             }
+            Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
             items.push(doc);
         }
         let cur_rev = self.storage.current_revision().await;
@@ -3544,6 +3885,42 @@ impl KubernetesApiClient {
         }
     }
 
+    fn validate_workload_immutability(
+        group: &str,
+        plural: &str,
+        kind: &str,
+        old_doc: &Value,
+        doc: &Value,
+    ) -> Result<(), ApiserverError> {
+        if group.is_empty()
+            && (plural == "configmaps" || plural == "secrets")
+            && old_doc.get("immutable").and_then(Value::as_bool) == Some(true)
+            && (doc.get("data") != old_doc.get("data")
+                || doc.get("binaryData") != old_doc.get("binaryData")
+                || doc.get("immutable").and_then(Value::as_bool) != Some(true))
+        {
+            return Err(ApiserverError::InvalidInput {
+                field: "data".to_string(),
+                reason: "field is immutable".to_string(),
+            });
+        }
+        if kind == "Job" {
+            let suspended = old_doc.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true);
+            let old_tmpl = old_doc.pointer("/spec/template");
+            let new_tmpl = doc.pointer("/spec/template");
+            if !suspended
+                && old_tmpl.map(Self::normalize_template_for_compare)
+                    != new_tmpl.map(Self::normalize_template_for_compare)
+            {
+                return Err(ApiserverError::InvalidInput {
+                    field: "spec.template".to_string(),
+                    reason: "spec.template is immutable for jobs".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn update_workload_options(
         &self,
@@ -3577,6 +3954,8 @@ impl KubernetesApiClient {
             })?;
         let old_doc: Value = serde_json::from_slice(&existing.value)?;
 
+        Self::validate_workload_immutability(group, plural, kind, &old_doc, &doc)?;
+
         Self::merge_updated_doc_metadata(&mut doc, &old_doc, namespace, name);
 
         let expected_version = doc
@@ -3597,6 +3976,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),
@@ -3607,27 +3987,10 @@ impl KubernetesApiClient {
         };
         self.admission.run_mutating_admission(&mut adm_req).await?;
 
-        if kind == "Job" {
-            let suspended = old_doc.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true);
-            let old_tmpl = old_doc.pointer("/spec/template");
-            let new_tmpl = adm_req
-                .object
-                .as_ref()
-                .and_then(|obj| obj.pointer("/spec/template"));
-            if !suspended
-                && old_tmpl.map(Self::normalize_template_for_compare)
-                    != new_tmpl.map(Self::normalize_template_for_compare)
-            {
-                return Err(ApiserverError::InvalidInput {
-                    field: "spec.template".to_string(),
-                    reason: "spec.template is immutable for jobs".to_string(),
-                });
-            }
-        }
-
         if let Some(obj) = adm_req.object.clone() {
             doc = obj;
         }
+        Self::validate_workload_immutability(group, plural, kind, &old_doc, &doc)?;
         if group.is_empty() && plural == "configmaps" {
             Self::validate_configmap_doc(&doc)?;
         } else if group.is_empty() && plural == "secrets" {
@@ -3671,6 +4034,43 @@ impl KubernetesApiClient {
                 self.storage.prefix()
             )
         };
+        let kv = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: plural.to_string(),
+                name: format!("{namespace}/{name}"),
+            })?;
+        let old_doc: Value = serde_json::from_slice(&kv.value)?;
+        let kind = old_doc
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or(plural);
+        let cur_rev = self.storage.current_revision().await + 1;
+        let adm_req = AdmissionRequest {
+            uid: format!("adm-{cur_rev}"),
+            kind: GroupVersionKind {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                kind: kind.to_string(),
+            },
+            resource: GroupVersionResource {
+                group: group.to_string(),
+                version: "v1".to_string(),
+                resource: plural.to_string(),
+            },
+            subresource: None,
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            operation: "DELETE".to_string(),
+            user_info: self.current_user_info(),
+            object: None,
+            old_object: Some(old_doc),
+            dry_run: None,
+        };
+        self.admission.run_validating_admission(&adm_req).await?;
+
         let res = self.storage.delete(&key, None).await?;
         if res.is_none() {
             return Err(ApiserverError::NotFound {
@@ -3850,6 +4250,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.to_string()),
             namespace: None,
             operation: "UPDATE".to_string(),
@@ -3952,6 +4353,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.clone()),
             namespace: None,
             operation: "CREATE".to_string(),
@@ -3981,6 +4383,67 @@ impl KubernetesApiClient {
         Ok(doc)
     }
 
+    async fn ensure_default_networking_objects(
+        &self,
+        group: &str,
+        plural: &str,
+    ) -> Result<(), ApiserverError> {
+        if group != "networking.k8s.io" {
+            return Ok(());
+        }
+        if plural == "servicecidrs" {
+            let key = cluster_key(
+                self.storage.prefix(),
+                "networking.k8s.io",
+                "servicecidrs",
+                "kubernetes",
+            );
+            if self.storage.get(&key).await?.is_none() {
+                let doc = json!({
+                    "apiVersion": "networking.k8s.io/v1",
+                    "kind": "ServiceCIDR",
+                    "metadata": {
+                        "name": "kubernetes",
+                        "creationTimestamp": crate::time::now_rfc3339(),
+                    },
+                    "spec": {
+                        "cidrs": ["10.43.0.0/16"]
+                    }
+                });
+                let bytes = serde_json::to_vec(&doc)?;
+                let _ = self.storage.create(&key, bytes).await;
+            }
+        } else if plural == "ipaddresses" {
+            let key = cluster_key(
+                self.storage.prefix(),
+                "networking.k8s.io",
+                "ipaddresses",
+                "10.43.0.1",
+            );
+            if self.storage.get(&key).await?.is_none() {
+                let doc = json!({
+                    "apiVersion": "networking.k8s.io/v1",
+                    "kind": "IPAddress",
+                    "metadata": {
+                        "name": "10.43.0.1",
+                        "creationTimestamp": crate::time::now_rfc3339(),
+                    },
+                    "spec": {
+                        "parentRef": {
+                            "group": "",
+                            "resource": "services",
+                            "namespace": "default",
+                            "name": "kubernetes"
+                        }
+                    }
+                });
+                let bytes = serde_json::to_vec(&doc)?;
+                let _ = self.storage.create(&key, bytes).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Generic get for cluster-scoped objects served over HTTP.
     pub async fn get_cluster_object(
         &self,
@@ -3989,6 +4452,8 @@ impl KubernetesApiClient {
         name: &str,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("get", group, plural, None, Some(name))?;
+        self.ensure_default_networking_objects(group, plural)
+            .await?;
         let key = cluster_key(self.storage.prefix(), group, plural, name);
         let kv = self
             .storage
@@ -4005,6 +4470,7 @@ impl KubernetesApiClient {
                 json!(kv.mod_revision.to_string()),
             );
         }
+        Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
         Ok(doc)
     }
 
@@ -4016,6 +4482,8 @@ impl KubernetesApiClient {
         plural: &str,
     ) -> Result<Value, ApiserverError> {
         self.check_auth_detailed("list", group, plural, None, None)?;
+        self.ensure_default_networking_objects(group, plural)
+            .await?;
         let prefix = cluster_prefix(self.storage.prefix(), group, plural);
         let kvs = self.storage.list(&prefix).await?;
         let mut items = Vec::new();
@@ -4027,6 +4495,7 @@ impl KubernetesApiClient {
                     json!(kv.mod_revision.to_string()),
                 );
             }
+            Self::apply_crd_defaults_to_instance(&self.crd_registry, group, plural, &mut doc);
             items.push(doc);
         }
         let cur_rev = self.storage.current_revision().await;
@@ -4485,9 +4954,12 @@ impl KubernetesApiClient {
     pub async fn create_pvc_options(
         &self,
         namespace: &str,
-        pvc: Value,
+        mut pvc: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
+        if pvc.pointer("/status/phase").is_none() {
+            pvc["status"] = json!({ "phase": "Pending" });
+        }
         self.create_workload_options(
             "",
             "PersistentVolumeClaim",
@@ -4697,6 +5169,9 @@ impl KubernetesApiClient {
             Self::stamp_creation_and_uid(meta, "persistentvolumes", &name, cur_rev);
         }
         Self::init_generation(&mut pv);
+        if pv.pointer("/status/phase").is_none() {
+            pv["status"] = json!({ "phase": "Available" });
+        }
 
         let key = format!("{}/persistentvolumes/{name}", self.storage.prefix());
         let bytes = serde_json::to_vec(&pv)?;
@@ -5202,36 +5677,40 @@ impl KubernetesApiClient {
         let old_cluster_ip = old_doc.pointer("/spec/clusterIP").and_then(Value::as_str);
         let new_cluster_ip = spec.get("clusterIP").and_then(Value::as_str);
 
-        match (old_cluster_ip, new_cluster_ip) {
-            (Some(old_ip), None | Some("")) => {
-                spec.insert("clusterIP".to_string(), json!(old_ip));
-            },
-            (Some(old_ip), Some(new_ip)) if old_ip != new_ip => {
-                return Err(ApiserverError::InvalidInput {
-                    field: "spec.clusterIP".to_string(),
-                    reason: "field is immutable".to_string(),
-                });
-            },
-            (None, None | Some("")) => {
-                if svc_type != "ExternalName" {
+        if svc_type == "ExternalName" {
+            spec.remove("clusterIP");
+            spec.remove("clusterIPs");
+        } else {
+            match (old_cluster_ip, new_cluster_ip) {
+                (Some(old_ip), None | Some("")) => {
+                    spec.insert("clusterIP".to_string(), json!(old_ip));
+                },
+                (Some(old_ip), Some(new_ip)) if old_ip != new_ip => {
+                    return Err(ApiserverError::InvalidInput {
+                        field: "spec.clusterIP".to_string(),
+                        reason: "field is immutable".to_string(),
+                    });
+                },
+                (None, None | Some("")) => {
                     let allocated = self.allocate_cluster_ip(namespace, name, &allocated_ips)?;
                     allocated_ips.insert(allocated);
                     spec.insert("clusterIP".to_string(), json!(allocated.to_string()));
-                }
-            },
-            (None, Some(new_ip)) if new_ip != "None" => {
-                let validated_ip = self.validate_specified_cluster_ip(new_ip, &allocated_ips)?;
-                allocated_ips.insert(validated_ip);
-            },
-            _ => {},
-        }
+                },
+                (None, Some(new_ip)) if new_ip != "None" => {
+                    let validated_ip =
+                        self.validate_specified_cluster_ip(new_ip, &allocated_ips)?;
+                    allocated_ips.insert(validated_ip);
+                },
+                _ => {},
+            }
 
-        if let Some(cip) = spec
-            .get("clusterIP")
-            .and_then(Value::as_str)
-            .filter(|cip| *cip != "None" && !cip.is_empty() && !spec.contains_key("clusterIPs"))
-        {
-            spec.insert("clusterIPs".to_string(), json!([cip]));
+            if let Some(cip) = spec
+                .get("clusterIP")
+                .and_then(Value::as_str)
+                .filter(|cip| *cip != "None" && !cip.is_empty() && !spec.contains_key("clusterIPs"))
+            {
+                spec.insert("clusterIPs".to_string(), json!([cip]));
+            }
         }
 
         // 4. Ports defaulting & NodePort handling
@@ -5291,6 +5770,56 @@ impl KubernetesApiClient {
         Ok(())
     }
 
+    async fn create_service_ip_address(
+        &self,
+        cluster_ip: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), ApiserverError> {
+        if cluster_ip == "None" || cluster_ip.is_empty() {
+            return Ok(());
+        }
+        let key = cluster_key(
+            self.storage.prefix(),
+            "networking.k8s.io",
+            "ipaddresses",
+            cluster_ip,
+        );
+        let ip_doc = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "IPAddress",
+            "metadata": {
+                "name": cluster_ip,
+                "creationTimestamp": crate::time::now_rfc3339(),
+            },
+            "spec": {
+                "parentRef": {
+                    "group": "",
+                    "resource": "services",
+                    "namespace": namespace,
+                    "name": name,
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&ip_doc)?;
+        let _ = self.storage.create(&key, bytes).await;
+        Ok(())
+    }
+
+    async fn delete_service_ip_address(&self, cluster_ip: &str) -> Result<(), ApiserverError> {
+        if cluster_ip == "None" || cluster_ip.is_empty() {
+            return Ok(());
+        }
+        let key = cluster_key(
+            self.storage.prefix(),
+            "networking.k8s.io",
+            "ipaddresses",
+            cluster_ip,
+        );
+        let _ = self.storage.delete(&key, None).await;
+        Ok(())
+    }
+
     pub async fn create_service_options(
         &self,
         namespace: &str,
@@ -5299,8 +5828,16 @@ impl KubernetesApiClient {
     ) -> Result<Value, ApiserverError> {
         self.prepare_service_for_create(namespace, &mut service)
             .await?;
-        self.create_workload_options("", "Service", "services", namespace, service, dry_run)
-            .await
+        let res = self
+            .create_workload_options("", "Service", "services", namespace, service, dry_run)
+            .await?;
+        if !dry_run
+            && let Some(cip) = res.pointer("/spec/clusterIP").and_then(Value::as_str)
+            && let Some(name) = res.pointer("/metadata/name").and_then(Value::as_str)
+        {
+            let _ = self.create_service_ip_address(cip, namespace, name).await;
+        }
+        Ok(res)
     }
     pub async fn get_service(&self, namespace: &str, name: &str) -> Result<Value, ApiserverError> {
         self.get_workload("", "services", namespace, name).await
@@ -5325,10 +5862,30 @@ impl KubernetesApiClient {
         mut service: Value,
         dry_run: bool,
     ) -> Result<Value, ApiserverError> {
+        let old_cip = self.get_service(namespace, name).await.ok().and_then(|s| {
+            s.pointer("/spec/clusterIP")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+
         self.prepare_service_for_update(namespace, name, &mut service)
             .await?;
-        self.update_workload_options("", "Service", "services", namespace, name, service, dry_run)
-            .await
+        let res = self
+            .update_workload_options("", "Service", "services", namespace, name, service, dry_run)
+            .await?;
+
+        if !dry_run {
+            let new_cip = res.pointer("/spec/clusterIP").and_then(Value::as_str);
+            if old_cip.as_deref() != new_cip {
+                if let Some(old) = old_cip.as_deref() {
+                    let _ = self.delete_service_ip_address(old).await;
+                }
+                if let Some(new) = new_cip {
+                    let _ = self.create_service_ip_address(new, namespace, name).await;
+                }
+            }
+        }
+        Ok(res)
     }
     pub async fn patch_service_status(
         &self,
@@ -5389,6 +5946,11 @@ impl KubernetesApiClient {
         Ok(service)
     }
     pub async fn delete_service(&self, namespace: &str, name: &str) -> Result<(), ApiserverError> {
+        if let Ok(svc) = self.get_service(namespace, name).await
+            && let Some(cip) = svc.pointer("/spec/clusterIP").and_then(Value::as_str)
+        {
+            let _ = self.delete_service_ip_address(cip).await;
+        }
         self.delete_workload("", "services", namespace, name).await
     }
 
@@ -6371,6 +6933,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "CREATE".to_string(),
@@ -6471,6 +7034,7 @@ impl KubernetesApiClient {
                 version: "v1".to_string(),
                 resource: plural.to_string(),
             },
+            subresource: None,
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             operation: "UPDATE".to_string(),

@@ -127,7 +127,8 @@ impl ApiserverService {
         Ok(ts)
     }
 
-    fn token_service_opt(&self) -> Option<Arc<TokenService>> {
+    #[must_use]
+    pub fn token_service_opt(&self) -> Option<Arc<TokenService>> {
         self.token_service().ok().map(Arc::new)
     }
 
@@ -221,12 +222,6 @@ impl ApiserverService {
         admin: &KubernetesApiClient,
         service: &Value,
     ) -> Result<(), ApiserverError> {
-        match admin.get_endpointslice("default", "kubernetes").await {
-            Ok(_) => return Ok(()),
-            Err(ApiserverError::NotFound { .. }) => {},
-            Err(err) => return Err(err),
-        }
-
         let port_name = service
             .pointer("/spec/ports/0/name")
             .and_then(Value::as_str)
@@ -236,6 +231,41 @@ impl ApiserverService {
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
             .unwrap_or("");
+
+        match admin.get_endpoints("default", "kubernetes").await {
+            Ok(_) => {},
+            Err(ApiserverError::NotFound { .. }) => {
+                let endpoint_ip = kubernetes_endpoint_ip(&self.config);
+                let _ = admin
+                    .create_endpoints(
+                        "default",
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Endpoints",
+                            "metadata": {
+                                "name": "kubernetes"
+                            },
+                            "subsets": [{
+                                "addresses": [{ "ip": endpoint_ip }],
+                                "ports": [{
+                                    "name": port_name,
+                                    "port": self.config.secure_port,
+                                    "protocol": "TCP"
+                                }]
+                            }]
+                        }),
+                    )
+                    .await;
+            },
+            Err(err) => return Err(err),
+        }
+
+        match admin.get_endpointslice("default", "kubernetes").await {
+            Ok(_) => return Ok(()),
+            Err(ApiserverError::NotFound { .. }) => {},
+            Err(err) => return Err(err),
+        }
+
         let endpoint_ip = kubernetes_endpoint_ip(&self.config);
         admin
             .create_endpointslice(
@@ -246,7 +276,8 @@ impl ApiserverService {
                     "metadata": {
                         "name": "kubernetes",
                         "labels": {
-                            "kubernetes.io/service-name": "kubernetes"
+                            "kubernetes.io/service-name": "kubernetes",
+                            "endpointslice.kubernetes.io/managed-by": "apiserver.k8s.io"
                         },
                         "ownerReferences": [{
                             "apiVersion": "v1",

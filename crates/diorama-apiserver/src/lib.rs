@@ -32,7 +32,7 @@ pub use aggregation::{
 };
 pub use client::{
     ClientIdentity, KubernetesApiClient, WatchEvent, WatchEventType, WatchReceiver,
-    json_merge_patch,
+    json_merge_patch, json_rfc7396_merge_patch,
 };
 pub use config::{
     ApiserverConfig, DEFAULT_ETCD_PREFIX, DEFAULT_SA_ISSUER, DEFAULT_SECURE_PORT,

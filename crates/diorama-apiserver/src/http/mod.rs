@@ -6,6 +6,6 @@ mod protojson;
 pub(crate) mod query;
 mod route;
 mod server;
-mod tls;
+pub(crate) mod tls;
 
 pub(crate) use server::{bind_listener, serve};
