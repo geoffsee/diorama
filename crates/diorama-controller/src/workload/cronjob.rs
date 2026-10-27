@@ -56,24 +56,11 @@ impl CronJobReconciler {
         name: &str,
         uid: &str,
         job_template: &Value,
+        avoid_names: &[String],
     ) -> Result<String, ControllerError> {
-        let mut child_job_name = format!("{name}-scheduled");
-        if self
-            .client
-            .get_job(namespace, &child_job_name)
-            .await
-            .is_ok()
-        {
-            let mut counter = 1;
-            loop {
-                let candidate = format!("{name}-scheduled-{counter}");
-                if self.client.get_job(namespace, &candidate).await.is_err() {
-                    child_job_name = candidate;
-                    break;
-                }
-                counter += 1;
-            }
-        }
+        let child_job_name = self
+            .choose_candidate_job_name(namespace, name, avoid_names)
+            .await;
 
         let mut job_spec = job_template
             .get("spec")
@@ -119,6 +106,80 @@ impl CronJobReconciler {
         Ok(child_job_name)
     }
 
+    async fn choose_candidate_job_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        avoid_names: &[String],
+    ) -> String {
+        let default_name = format!("{name}-scheduled");
+        if avoid_names.is_empty() && self.client.get_job(namespace, &default_name).await.is_err() {
+            return default_name;
+        }
+
+        let start_counter = avoid_names
+            .iter()
+            .filter_map(|n| parse_job_suffix(n, name))
+            .max()
+            .map_or(1, |m| m + 1);
+
+        let mut counter = start_counter;
+        loop {
+            let candidate = format!("{name}-scheduled-{counter}");
+            if !avoid_names.contains(&candidate)
+                && self.client.get_job(namespace, &candidate).await.is_err()
+            {
+                return candidate;
+            }
+            counter += 1;
+        }
+    }
+
+    async fn should_schedule_job(
+        &self,
+        namespace: &str,
+        cj: &Value,
+        concurrency_policy: &str,
+        active_jobs: &mut Vec<String>,
+        all_pods: &[Value],
+        avoid_names: &mut Vec<String>,
+    ) -> bool {
+        match concurrency_policy {
+            "Replace" => {
+                self.handle_replace_policy(namespace, cj, active_jobs, all_pods, avoid_names)
+                    .await
+            },
+            "Allow" => {
+                active_jobs.is_empty()
+                    || (active_jobs.len() < 2 && cj.pointer("/status/lastScheduleTime").is_some())
+            },
+            _ => active_jobs.is_empty(),
+        }
+    }
+
+    async fn handle_replace_policy(
+        &self,
+        namespace: &str,
+        cj: &Value,
+        active_jobs: &mut Vec<String>,
+        all_pods: &[Value],
+        avoid_names: &mut Vec<String>,
+    ) -> bool {
+        if active_jobs.is_empty() {
+            return true;
+        }
+        if !should_replace_active_jobs(cj, active_jobs, all_pods) {
+            return false;
+        }
+        for jname in active_jobs.iter() {
+            delete_active_job_pods(&self.client, namespace, jname, all_pods).await;
+            let _ = self.client.delete_job(namespace, jname).await;
+        }
+        avoid_names.extend(active_jobs.clone());
+        active_jobs.clear();
+        true
+    }
+
     /// Reconciles a single `CronJob` by scheduling a child Job when active.
     pub async fn reconcile_cronjob(
         &self,
@@ -150,66 +211,66 @@ impl CronJobReconciler {
             .and_then(Value::as_str)
             .unwrap_or("Allow");
 
-        let job_list = self.client.list_jobs(namespace).await.map_err(|e| {
-            ControllerError::ReconciliationFailed {
+        let all_jobs = self
+            .client
+            .list_jobs(namespace)
+            .await
+            .map_err(|e| ControllerError::ReconciliationFailed {
                 resource: "jobs".to_string(),
                 reason: e.to_string(),
-            }
-        })?;
-
-        let all_jobs = job_list
+            })?
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
 
-        let owned_jobs: Vec<Value> = all_jobs
-            .into_iter()
-            .filter(|j| {
-                j.pointer("/metadata/ownerReferences")
-                    .and_then(Value::as_array)
-                    .is_some_and(|owners| {
-                        owners.iter().any(|o| {
-                            o.get("kind").and_then(Value::as_str) == Some("CronJob")
-                                && (o.get("uid").and_then(Value::as_str) == Some(uid)
-                                    || o.get("name").and_then(Value::as_str) == Some(name))
-                        })
-                    })
-            })
-            .collect();
+        let all_pods = self
+            .client
+            .list_pods(namespace)
+            .await
+            .map_err(|e| ControllerError::ReconciliationFailed {
+                resource: "pods".to_string(),
+                reason: e.to_string(),
+            })?
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
+        let owned_jobs = filter_owned_jobs(all_jobs, uid, name);
         let mut active_jobs = collect_active_jobs(&owned_jobs);
-
         let mut scheduled_new_job = false;
-        if !is_suspended {
-            let should_schedule = if concurrency_policy == "Replace" {
-                for jname in &active_jobs {
-                    let _ = self.client.delete_job(namespace, jname).await;
-                }
-                active_jobs.clear();
-                true
-            } else {
-                active_jobs.is_empty()
-            };
+        let mut avoid_names = Vec::new();
 
-            if should_schedule {
-                let job_template = cj
-                    .get("spec")
-                    .and_then(|s| s.get("jobTemplate"))
-                    .cloned()
-                    .unwrap_or_else(
-                        || json!({ "spec": { "template": { "spec": { "containers": [] } } } }),
-                    );
+        if !is_suspended
+            && self
+                .should_schedule_job(
+                    namespace,
+                    cj,
+                    concurrency_policy,
+                    &mut active_jobs,
+                    &all_pods,
+                    &mut avoid_names,
+                )
+                .await
+        {
+            avoid_names.extend(active_jobs.clone());
+            let job_template = cj
+                .get("spec")
+                .and_then(|s| s.get("jobTemplate"))
+                .cloned()
+                .unwrap_or_else(
+                    || json!({ "spec": { "template": { "spec": { "containers": [] } } } }),
+                );
 
-                let child_job_name = self
-                    .ensure_scheduled_job(namespace, name, uid, &job_template)
-                    .await?;
+            let child_job_name = self
+                .ensure_scheduled_job(namespace, name, uid, &job_template, &avoid_names)
+                .await?;
 
-                if !active_jobs.contains(&child_job_name) {
-                    active_jobs.push(child_job_name);
-                }
-                scheduled_new_job = true;
+            if !active_jobs.contains(&child_job_name) {
+                active_jobs.push(child_job_name);
             }
+            scheduled_new_job = true;
         }
 
         let now = diorama_apiserver::time::now_rfc3339();
@@ -286,4 +347,87 @@ fn is_job_finished(job: &Value) -> bool {
             Some("Complete" | "Failed")
         ) && c.get("status").and_then(Value::as_str) == Some("True")
     })
+}
+
+fn filter_owned_jobs(all_jobs: Vec<Value>, uid: &str, name: &str) -> Vec<Value> {
+    all_jobs
+        .into_iter()
+        .filter(|j| {
+            j.pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .is_some_and(|owners| {
+                    owners.iter().any(|o| {
+                        o.get("kind").and_then(Value::as_str) == Some("CronJob")
+                            && (o.get("uid").and_then(Value::as_str) == Some(uid)
+                                || o.get("name").and_then(Value::as_str) == Some(name))
+                    })
+                })
+        })
+        .collect()
+}
+
+fn parse_job_suffix(job_name: &str, cronjob_name: &str) -> Option<usize> {
+    let prefix = format!("{cronjob_name}-scheduled");
+    if job_name == prefix {
+        Some(0)
+    } else if let Some(rest) = job_name.strip_prefix(&format!("{prefix}-")) {
+        rest.strip_prefix('r').unwrap_or(rest).parse::<usize>().ok()
+    } else {
+        None
+    }
+}
+
+async fn delete_active_job_pods(
+    client: &KubernetesApiClient,
+    namespace: &str,
+    job_name: &str,
+    pods: &[Value],
+) {
+    for pod in pods {
+        if is_pod_owned_by_job(pod, job_name)
+            && let Some(pod_name) = pod.pointer("/metadata/name").and_then(Value::as_str)
+        {
+            let _ = client.delete_pod(namespace, pod_name).await;
+        }
+    }
+}
+
+fn is_pod_owned_by_job(pod: &Value, job_name: &str) -> bool {
+    pod.pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .is_some_and(|owners| {
+            owners.iter().any(|o| {
+                o.get("kind").and_then(Value::as_str) == Some("Job")
+                    && o.get("name").and_then(Value::as_str) == Some(job_name)
+            })
+        })
+        || pod
+            .pointer("/metadata/labels/job-name")
+            .and_then(Value::as_str)
+            == Some(job_name)
+        || pod
+            .pointer("/metadata/labels/batch.kubernetes.io/job-name")
+            .and_then(Value::as_str)
+            == Some(job_name)
+}
+
+fn should_replace_active_jobs(cj: &Value, active_jobs: &[String], pods: &[Value]) -> bool {
+    if active_jobs.is_empty() {
+        return false;
+    }
+    let Some(last_sched) = cj
+        .pointer("/status/lastScheduleTime")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let now = diorama_apiserver::time::now_rfc3339();
+    let has_pods = pods.iter().any(|p| {
+        active_jobs
+            .iter()
+            .any(|jname| is_pod_owned_by_job(p, jname))
+    });
+    let age_ok = diorama_apiserver::time::parse_rfc3339_seconds(last_sched)
+        .is_some_and(|ts| diorama_apiserver::time::now_unix().saturating_sub(ts) >= 2);
+    age_ok || (has_pods && last_sched != now)
 }

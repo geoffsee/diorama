@@ -163,20 +163,6 @@ impl StatefulSetReconciler {
             .cloned()
             .unwrap_or_default();
 
-        if cfg.ordered_ready {
-            for idx in 0..cfg.desired_replicas {
-                let pname = format!("{}-{idx}", cfg.name);
-                if let Some(pod) = all_pods
-                    .iter()
-                    .find(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(&pname))
-                    && (has_nodes || pod.pointer("/status/conditions").is_some())
-                    && !super::replicaset::is_pod_ready(pod)
-                {
-                    return Ok(());
-                }
-            }
-        }
-
         let mut to_delete: Vec<(usize, String)> = Vec::new();
         for pod in all_pods {
             let is_owned = pod
@@ -195,21 +181,6 @@ impl StatefulSetReconciler {
                 continue;
             }
 
-            if cfg.ordered_ready {
-                if pod
-                    .pointer("/metadata/deletionTimestamp")
-                    .and_then(Value::as_str)
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                if (has_nodes || pod.pointer("/status/conditions").is_some())
-                    && !super::replicaset::is_pod_ready(&pod)
-                {
-                    return Ok(());
-                }
-            }
-
             if let Some(pname) = pod
                 .get("metadata")
                 .and_then(|m| m.get("name"))
@@ -218,6 +189,14 @@ impl StatefulSetReconciler {
                 && let Ok(idx) = suffix.parse::<usize>()
                 && idx >= cfg.desired_replicas
             {
+                if cfg.ordered_ready
+                    && pod
+                        .pointer("/metadata/deletionTimestamp")
+                        .and_then(Value::as_str)
+                        .is_some()
+                {
+                    return Ok(());
+                }
                 to_delete.push((idx, pname.to_string()));
             }
         }
@@ -394,7 +373,7 @@ impl StatefulSetReconciler {
             let pod_rev = pod
                 .pointer("/metadata/labels/controller-revision-hash")
                 .and_then(Value::as_str)
-                .unwrap_or(update_revision)
+                .unwrap_or("")
                 .to_string();
             if pod_rev == update_revision {
                 updated_count += 1;
@@ -402,15 +381,21 @@ impl StatefulSetReconciler {
             pod_revisions.push(pod_rev);
         }
 
-        let current_revision = if updated_count == existing_replicas && existing_replicas > 0 {
+        let prev_current_rev = ss
+            .pointer("/status/currentRevision")
+            .and_then(Value::as_str);
+
+        let current_revision = if desired_replicas > 0
+            && existing_replicas == desired_replicas
+            && updated_count == desired_replicas
+        {
             update_revision.to_string()
-        } else if let Some(first_rev) = pod_revisions.first() {
+        } else if let Some(prev) = prev_current_rev {
+            prev.to_string()
+        } else if let Some(first_rev) = pod_revisions.first().filter(|r| !r.is_empty()) {
             first_rev.clone()
         } else {
-            ss.pointer("/status/currentRevision")
-                .and_then(Value::as_str)
-                .unwrap_or(update_revision)
-                .to_string()
+            update_revision.to_string()
         };
         let current_replicas = pod_revisions
             .iter()
