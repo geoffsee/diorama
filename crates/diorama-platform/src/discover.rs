@@ -43,6 +43,15 @@ const FILES: [&str; 6] = [
     "/proc/self/mountinfo",
     "/proc/net/ip_tables_matches",
 ];
+pub(crate) fn glibc_linker(architecture: &str) -> Option<&'static str> {
+    match architecture {
+        "x86_64" | "amd64" => Some("/lib64/ld-linux-x86-64.so.2"),
+        "aarch64" | "arm64" => Some("/lib/ld-linux-aarch64.so.1"),
+        "arm" | "armv7" | "armv7l" => Some("/lib/ld-linux-armhf.so.3"),
+        "riscv64" => Some("/lib/ld-linux-riscv64-lp64d.so.1"),
+        _ => None,
+    }
+}
 pub(crate) fn error<T>(error: &io::Error) -> Observation<T> {
     match error.kind() {
         io::ErrorKind::NotFound => Observation::Absent,
@@ -203,6 +212,7 @@ pub fn discover(request: &DiscoveryRequest) -> Result<HostEvidence, PlatformErro
         return Err(PlatformError::PathTooLong);
     }
     let (kernel, privileges, hostname) = identity();
+    let executable = executable();
     let mut landmarks = BTreeMap::new();
     for path in LANDMARKS.into_iter().chain([
         "/sys/fs/cgroup/pids",
@@ -211,6 +221,9 @@ pub fn discover(request: &DiscoveryRequest) -> Result<HostEvidence, PlatformErro
         "/usr/bin/docker",
         "/usr/local/bin/docker",
     ]) {
+        landmarks.insert(path.into(), exists(Path::new(path)));
+    }
+    if let Some(path) = glibc_linker(&executable.architecture) {
         landmarks.insert(path.into(), exists(Path::new(path)));
     }
     for directory in BIN_DIRS {
@@ -254,7 +267,7 @@ pub fn discover(request: &DiscoveryRequest) -> Result<HostEvidence, PlatformErro
         }
     }
     Ok(HostEvidence {
-        executable: executable(),
+        executable,
         kernel,
         privileges,
         hostname,
