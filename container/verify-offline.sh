@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run against a disposable, network-isolated Linux node. No registry access occurs.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/offline-helpers.sh"
 engine=${ENGINE:-docker}
 image=${1:?core image}
 bundles=${2:?bundle directory}
@@ -44,17 +45,17 @@ if [ "$mode" = host ]; then
   startup='set -e; printf "nameserver 192.0.2.1\n" > /etc/resolv.conf; dioramactl install --offline-install="$1" --path=/var/lib/diorama; exec /var/lib/diorama/bin/diorama --path=/var/lib/diorama --container-mode --node-ip=127.0.0.1'
 fi
 "$engine" create --pull=never --name "$name" --hostname diorama-node \
-  --privileged --network=none --tmpfs /tmp --tmpfs /run --entrypoint /bin/sh \
+  --privileged --network=none --tmpfs /tmp:exec --tmpfs /run --entrypoint /bin/sh \
   -v "$volume:/var/lib/diorama" "$image" -c "$startup" node-bootstrap "/$(basename "$host")" >/dev/null
 if [ "$mode" = host ]; then "$engine" cp "$host" "$name:/$(basename "$host")"; fi
 "$engine" start "$name" >/dev/null
-"$engine" cp "$kubectl" "$name:/tmp/kubectl"
+copy_into_node "$kubectl" /tmp/kubectl 0755
 until_ok k get nodes
 k -n local-path-storage wait --for=condition=available deployment/local-path-provisioner --timeout=180s
 
 # Host extraction and direct socket loading use the Linux CLI carried by the core image.
 host="$bundles/diorama-$version-linux-$arch-host-offline.tar.gz"
-"$engine" cp "$host" "$name:/tmp/$(basename "$host")"
+copy_into_node "$host" "/tmp/$(basename "$host")"
 "$engine" exec "$name" dioramactl install --offline-install="/tmp/$(basename "$host")" --path=/tmp/host-node
 "$engine" exec "$name" test -x /tmp/host-node/bin/ctr
 "$engine" exec "$name" test ! -e /tmp/host-node/payloads
@@ -63,9 +64,9 @@ host="$bundles/diorama-$version-linux-$arch-host-offline.tar.gz"
 for addon in d2k portainer-agent; do
   archive="$bundles/diorama-$version-linux-$arch-addon-$addon-offline.tar.gz"
   mkdir "$work/$addon"
-  tar -xzf "$archive" -C "$work/$addon" install-job.json
+  extract_install_job "$archive" "$work/$addon"
   sed 's/replace-with-loaded-node/diorama-node/g' "$work/$addon/install-job.json" > "$work/$addon/job.json"
-  "$engine" cp "$work/$addon/job.json" "$name:/tmp/$addon-job.json"
+  copy_into_node "$work/$addon/job.json" "/tmp/$addon-job.json"
 done
 
 # The Job cannot pull its absent image, even with valid API bootstrap resources.
@@ -83,7 +84,7 @@ for addon in d2k portainer-agent; do
 done
 # Exercise the host runtime-socket adapter too, without a registry.
 d2k_pack="$bundles/diorama-$version-linux-$arch-addon-d2k-offline.tar.gz"
-"$engine" cp "$d2k_pack" "$name:/tmp/$(basename "$d2k_pack")"
+copy_into_node "$d2k_pack" "/tmp/$(basename "$d2k_pack")"
 "$engine" exec "$name" dioramactl addon load "/tmp/$(basename "$d2k_pack")" --path=/var/lib/diorama
 
 # Missing credentials must fail with useful diagnostics before creating workloads.
@@ -147,7 +148,7 @@ for addon in d2k portainer-agent; do
         --namespace k8s.io images export "/var/lib/diorama/images/addons/$addon-upgrade.tar" "$old-upgrade"
       "$engine" exec "$name" gzip -f "/var/lib/diorama/images/addons/$addon-upgrade.tar"
       sed "s|$old|$old-upgrade|g" "$work/$addon/job.json" > "$work/$addon/upgrade.json"
-      "$engine" cp "$work/$addon/upgrade.json" "$name:/tmp/$addon-job.json"
+      copy_into_node "$work/$addon/upgrade.json" "/tmp/$addon-job.json"
     fi
     k apply -f "/tmp/$addon-job.json"
     k -n "$ns" wait --for=condition=complete "job/diorama-install-$addon" --timeout=360s
@@ -200,7 +201,7 @@ k delete pod offline-writer --wait=true
 k apply -f - < "$work/reader.json"
 k wait --for=condition=ready pod/offline-reader --timeout=90s
 "$engine" restart "$name"
-"$engine" cp "$kubectl" "$name:/tmp/kubectl"
+copy_into_node "$kubectl" /tmp/kubectl 0755
 until_ok k get nodes
 until_ok k exec offline-reader -- cat /data/proof
 for addon in d2k portainer-agent; do
