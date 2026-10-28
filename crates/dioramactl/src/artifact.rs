@@ -135,3 +135,15 @@ pub fn installer_asset_name(os: &str, arch: Architecture) -> String {
     };
     format!("dioramactl-{os}-{arch_suffix}")
 }
+
+/// Current releases publish a separate offline archive per installation mode.
+pub fn core_archive_name(version: &str, target: NodeTarget, container: bool) -> String {
+    artifact_archive_name(version, target, true).replace(
+        "-offline.tar.gz",
+        if container {
+            "-container-offline.tar.gz"
+        } else {
+            "-host-offline.tar.gz"
+        },
+    )
+}

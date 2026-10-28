@@ -19,8 +19,9 @@ mod verify;
 pub use catalog::{AssetId, CatalogEntry, Encoding, Kind, catalog};
 pub use diorama_platform::{Architecture, Libc, NodeTarget};
 pub use inventory::{
-    DeclaredInventory, Delivery, FeatureSupport, InventoryError, InventoryRequest, Limits,
-    Manifest, OptionalFeature, Scope, Variant, feature_support,
+    BundleKind, BundleMetadata, Capability, DeclaredInventory, Delivery, FeatureSupport,
+    InventoryError, InventoryRequest, Limits, Manifest, OptionalFeature, Scope, Variant,
+    feature_support,
 };
 pub use verify::{EncodedBlobMatch, VerificationError, VerificationSession};
 

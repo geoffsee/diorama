@@ -469,6 +469,7 @@ fn test_execute_download_success() {
     let mut stderr = Vec::new();
 
     let download_opts = DownloadOptions {
+        run_mode: "service".into(),
         version: "v1.1.8".into(),
         path: PathBuf::from("/tmp/diorama-download-test"),
         arch: Some("arm64-musl".into()),
@@ -489,7 +490,7 @@ fn test_execute_download_success() {
     assert_eq!(
         inputs.download_dest_called.as_ref(),
         Some(&PathBuf::from(
-            "/tmp/diorama-download-test/diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"
+            "/tmp/diorama-download-test/diorama-v1.1.8-linux-arm64-musl-host-offline.tar.gz"
         ))
     );
     assert_eq!(
@@ -502,13 +503,17 @@ fn test_execute_download_success() {
     );
 
     let err_str = String::from_utf8_lossy(&stderr);
-    assert!(err_str.contains("Target resolved: diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"));
+    assert!(
+        err_str.contains("Target resolved: diorama-v1.1.8-linux-arm64-musl-host-offline.tar.gz")
+    );
     assert!(err_str.contains("Bundle ready in /tmp/diorama-download-test"));
     assert_eq!(
         inputs.download_temp_dir_called,
         Some(PathBuf::from("/tmp/scratch"))
     );
-    assert!(err_str.contains("--offline-install=./diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"));
+    assert!(
+        err_str.contains("--offline-install=./diorama-v1.1.8-linux-arm64-musl-host-offline.tar.gz")
+    );
 }
 
 #[test]
@@ -542,6 +547,7 @@ fn test_execute_download_failures() {
         ..Default::default()
     };
     let opts = DownloadOptions {
+        run_mode: "service".into(),
         version: "v1.1.8".into(),
         path: PathBuf::from("/tmp"),
         arch: Some("amd64".into()),
@@ -946,6 +952,7 @@ fn mismatched_bundle_installer_is_rejected_before_any_output() {
             ..TestInputs::default()
         };
         let opts = DownloadOptions {
+            run_mode: "service".into(),
             arch: Some(target.into()),
             offline: true,
             ..DownloadOptions::default()
@@ -1142,4 +1149,37 @@ fn upgrade_recovery_cli_does_not_prepare_or_download_an_artifact() {
     assert_eq!(result, 0);
     assert!(inputs.download_url_called.is_none());
     assert!(!root.path().join(".upgrade-completed").exists());
+}
+
+#[test]
+fn container_download_selects_the_core_container_pack_and_matching_install_command() {
+    let mut inputs = TestInputs {
+        arch: "aarch64".into(),
+        libc: Libc::Glibc,
+        ..TestInputs::default()
+    };
+    let options = DownloadOptions {
+        run_mode: "container".into(),
+        version: "v1.2.0".into(),
+        arch: Some("arm64".into()),
+        ..DownloadOptions::default()
+    };
+    let mut stderr = Vec::new();
+    assert_eq!(
+        execute_download(&options, &mut inputs, &mut Vec::new(), &mut stderr).unwrap(),
+        0
+    );
+    assert!(
+        inputs
+            .download_url_called
+            .unwrap()
+            .ends_with("/diorama-v1.2.0-linux-arm64-container-offline.tar.gz")
+    );
+    assert!(String::from_utf8(stderr).unwrap().contains("install --run-mode=container --offline-install=./diorama-v1.2.0-linux-arm64-container-offline.tar.gz"));
+    let parsed = parse_command(
+        &args(&["download", "--run-mode=container"]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert!(matches!(parsed, Command::Download(options) if options.run_mode == "container"));
 }

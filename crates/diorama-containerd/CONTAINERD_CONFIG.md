@@ -147,14 +147,15 @@ Managed containerd automatically provisions required system images into the `k8s
 | :--- | :--- | :--- | :--- |
 | `ImageCoredns` | `docker.io/coredns/coredns:1.14.4` | `coredns.tar.gz` | Always enabled (core DNS) |
 | `ImagePause` | `docker.io/portainer/pause:latest` | `pause.tar.gz` | Always enabled (sandbox pod infrastructure) |
-| `ImageLocalPath` | `docker.io/rancher/local-path-provisioner:v0.0.36` | `local-path-provisioner.tar.gz` | Enabled when `storage.local_path.enabled = true` |
+| `ImageLocalPath` | `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1` | `local-path-provisioner.tar.gz` | Enabled when `storage.local_path.enabled = true` |
 | `ImageLocalPathHelper` | `docker.io/library/busybox:latest` | `busybox.tar.gz` | Enabled when `storage.local_path.enabled = true` |
 | `ImagePortainerAgent` | `docker.io/portainer/agent:lts` (or custom reference) | `portainer-agent.tar.gz` (or empty if custom) | Enabled when `!portainer.edge_id.is_empty()` |
 | `ImageD2k` | `docker.io/portainer/d2k:1.2.3` | `d2k.tar.gz` | Enabled when `d2k.enabled = true` |
 
 ### Import & Pull Semantics
 - **Embedded Archives**: If the local archive file exists in `<base_path>/images/<filename>`, the image is loaded from local disk.
-- **Registry Pull Fallback**: If the local archive is missing or empty, the runtime issues a CRI `ImageServiceClient::PullImage` request.
+- **Registry Pull Fallback**: Online installations may issue a CRI `ImageServiceClient::PullImage` request when an archive is absent. The `images/offline` marker disables this fallback and produces an actionable error for enabled integrations without images.
+- **Retained Add-ons**: The loader saves verified images in `images/addons`. Startup imports them with bundled `ctr` into `k8s.io`, independently of legacy integration flags, because runtime cleanup rebuilds the disposable cache.
 - **Disabled Image Guarantee**: Disabled images are strictly omitted from `enabled_targets()` and never imported or pulled.
 - **Custom Edge Agent**: A custom Portainer agent image is pulled as a warm cache; pull errors do not abort node startup, allowing the kubelet to retry on pod creation.
 

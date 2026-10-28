@@ -24,6 +24,8 @@ deny = [
     { crate = "git2", use-instead = "gix" },
 ]
 skip = [
+    # kube-client 4.2 rustls support requires pem 3; rcgen and our PKI use pem 4.
+    { name = "pem", version = "=3.0.6" },
     { name = "base64" },
     { name = "syn" },
     { name = "untrusted" },

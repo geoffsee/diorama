@@ -53,7 +53,7 @@ flowchart TD
 ## Optional Provisioner Deployment and Image Selection
 
 Storage provisioner deployment adapts dynamically to configuration:
-- **Provisioner Image**: Defaults to `docker.io/rancher/local-path-provisioner:v0.0.36`. Can be overridden with private/offline registry targets.
+- **Provisioner Image**: Defaults to `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1`. Can be overridden with private/offline registry targets.
 - **Helper Image**: Defaults to `busybox` embedded in `helperPod.yaml`.
 - **Storage Paths**: Supports local filesystem directory mapping (`nodePathMap`) or shared cluster volume paths (`sharedFileSystemPath`).
 

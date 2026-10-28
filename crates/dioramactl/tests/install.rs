@@ -246,3 +246,75 @@ fn test_offline_install_rejects_unlisted_file_and_corrupt_archive() {
     assert!(err.contains("corrupt"), "{err}");
     assert!(!dest.exists());
 }
+
+#[test]
+fn incompatible_new_kind_leaves_even_target_parents_untouched() {
+    let temp = TempDir::new().unwrap();
+    let archive = build_bundle(temp.path(), &ARM64_ELF_HEADER, |_| {});
+    let renamed = temp
+        .path()
+        .join("diorama-v1.1.8-linux-arm64-container-offline.tar.gz");
+    fs::rename(archive, &renamed).unwrap();
+    let dest = temp.path().join("untouched/node");
+    let (code, _, downloaded) = run(renamed, &dest);
+    assert_ne!(code, 0);
+    assert!(!downloaded);
+    assert!(!temp.path().join("untouched").exists());
+}
+
+#[test]
+fn duplicate_archive_entries_are_rejected_without_mutation() {
+    let temp = TempDir::new().unwrap();
+    let archive = build_bundle(temp.path(), &ARM64_ELF_HEADER, |_| {});
+    let expanded = temp.path().join("expanded");
+    fs::create_dir(&expanded).unwrap();
+    assert!(
+        SysCommand::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&expanded)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        SysCommand::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&expanded)
+            .args([".", "."])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let dest = temp.path().join("dest");
+    let (code, error, _) = run(archive, &dest);
+    assert_ne!(code, 0);
+    assert!(error.contains("duplicate"), "{error}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn host_install_into_existing_data_root_preserves_state_and_cleans_staging() {
+    let temp = TempDir::new().unwrap();
+    let archive = build_bundle(temp.path(), &ARM64_ELF_HEADER, |_| {});
+    let dest = temp.path().join("mounted-data");
+    fs::create_dir_all(dest.join("pki")).unwrap();
+    fs::write(dest.join("pki/keep"), b"existing identity").unwrap();
+    let (code, error, _) = run(archive, &dest);
+    assert_eq!(code, 0, "{error}");
+    assert_eq!(
+        fs::read(dest.join("pki/keep")).unwrap(),
+        b"existing identity"
+    );
+    assert!(dest.join("diorama").is_file());
+    assert!(
+        fs::read_dir(&dest).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp"))
+    );
+}

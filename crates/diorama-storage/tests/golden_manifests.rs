@@ -260,8 +260,8 @@ fn test_golden_fixtures_parity_all_variants() {
         let container_golden = &dep_golden["spec"]["template"]["spec"]["containers"][0];
         assert_eq!(
             container.image.as_deref(),
-            Some(container_golden["image"].as_str().unwrap()),
-            "variant {variant}: Container image"
+            Some("ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1"),
+            "variant {variant}: repackaged provisioner image"
         );
         assert_eq!(
             container.image_pull_policy.as_deref(),
@@ -320,7 +320,7 @@ fn test_default_constants_and_contract() {
     assert_eq!(LOCAL_PATH_PROVISIONER_NAME, "rancher.io/local-path");
     assert_eq!(
         DEFAULT_PROVISIONER_IMAGE,
-        "docker.io/rancher/local-path-provisioner:v0.0.36"
+        "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1"
     );
     assert_eq!(DEFAULT_HELPER_IMAGE, "busybox");
     assert_eq!(DEFAULT_STORAGE_DIR_NAME, "local-path-storage");

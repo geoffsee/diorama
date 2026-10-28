@@ -37,7 +37,8 @@ pub const LOCAL_PATH_STORAGE_CLASS_NAME: &str = "local-path";
 pub const LOCAL_PATH_PROVISIONER_NAME: &str = "rancher.io/local-path";
 
 /// Default pinned image reference for `local-path-provisioner`.
-pub const DEFAULT_PROVISIONER_IMAGE: &str = "docker.io/rancher/local-path-provisioner:v0.0.36";
+pub const DEFAULT_PROVISIONER_IMAGE: &str =
+    "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1";
 
 /// Default helper pod container image.
 pub const DEFAULT_HELPER_IMAGE: &str = "busybox";

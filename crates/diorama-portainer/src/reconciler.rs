@@ -123,6 +123,19 @@ impl PortainerReconciler {
         &self,
         client: &KubernetesApiClient,
     ) -> Result<PortainerReconciliationReport> {
+        match client
+            .get_deployment(PORTAINER_NAMESPACE, PORTAINER_AGENT_DEPLOYMENT_NAME)
+            .await
+        {
+            Ok(deployment)
+                if deployment["metadata"]["labels"]["diorama.io/managed-by"] == "addon-job" =>
+            {
+                info!("Portainer is managed by an add-on Job; skipping legacy bootstrap");
+                return Ok(PortainerReconciliationReport::default());
+            },
+            Ok(_) | Err(ApiserverError::NotFound { .. }) => {},
+            Err(error) => return Err(PortainerError::Apiserver(error)),
+        }
         if !self.config.is_architecture_supported() {
             return Err(PortainerError::UnsupportedArchitecture(
                 self.config.architecture,

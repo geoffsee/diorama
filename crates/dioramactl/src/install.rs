@@ -42,7 +42,12 @@ pub struct BundleManifest {
 
 pub(crate) fn safe_relative(path: &str) -> Result<PathBuf, String> {
     let p = Path::new(path);
-    if path.is_empty() || p.is_absolute() {
+    if path.is_empty()
+        || p.is_absolute()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
         return Err(format!("unsafe bundle path '{path}'"));
     }
     for c in p.components() {
@@ -71,7 +76,9 @@ impl BundleManifest {
                     "libc" => &mut libc,
                     other => return Err(format!("unknown manifest key '{other}'")),
                 };
-                *slot = Some(v.to_string());
+                if slot.replace(v.to_string()).is_some() {
+                    return Err(format!("duplicate manifest key {k}"));
+                }
             } else {
                 let mut parts = line.splitn(3, ' ');
                 let (role, digest, path) = (parts.next(), parts.next(), parts.next());
@@ -209,12 +216,22 @@ pub(crate) fn audit_archive(archive: &Path) -> Result<(), String> {
         .arg(archive)
         .output()
         .map_err(|e| format!("tar command failed: {e}"))?;
+    if !names.status.success() {
+        return Err("corrupt archive member list".into());
+    }
+    let mut seen = BTreeSet::new();
     for name in String::from_utf8_lossy(&names.stdout).lines() {
-        let name = name.trim_start_matches("./").trim_end_matches('/');
+        let name = name
+            .strip_prefix("./")
+            .unwrap_or(name)
+            .trim_end_matches('/');
         if name.is_empty() || name == "." {
             continue;
         }
         safe_relative(name)?;
+        if !seen.insert(name) {
+            return Err(format!("duplicate archive member {name}"));
+        }
     }
     Ok(())
 }
@@ -360,9 +377,7 @@ pub fn install_container_with_engine(
 ) -> io::Result<crate::container::ContainerInstallResult> {
     use crate::container::ContainerInstallParams;
     use crate::container_image::install_selected_container;
-    use diorama_assets::{
-        DecodeLimits, Delivery, InventoryRequest, Limits, Manifest, Scope, Variant,
-    };
+    use diorama_assets::{BundleKind, DecodeLimits, Delivery, Limits, Variant};
     fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message)
     }
@@ -430,13 +445,15 @@ pub fn install_container_with_engine(
     let Some(path) = options.offline_install.as_ref() else {
         return install_selected_container(engine, options, params, None).map_err(invalid);
     };
-    // Explicit custom images retain their documented registry-pull behavior.
+    // Offline mode must never silently switch to a registry image.
     if options
         .container_image
         .as_ref()
         .is_some_and(|s| !s.is_empty())
     {
-        return install_selected_container(engine, options, params, None).map_err(invalid);
+        return Err(invalid(
+            "--image cannot be combined with --offline-install; select a container bundle",
+        ));
     }
     let parsed =
         ArtifactNaming::parse_node_archive(&path.file_name().unwrap_or_default().to_string_lossy())
@@ -458,28 +475,11 @@ pub fn install_container_with_engine(
     if !status.success() {
         return Err(invalid("offline container bundle extraction failed"));
     }
-    verify_staged_bundle(
-        staged.path(),
-        parsed.variant.architecture,
-        parsed.variant.libc,
-    )
-    .map_err(invalid)?;
-    let limits = Limits::default();
-    let inventory_path = staged.path().join("asset-inventory.json");
-    if fs::metadata(&inventory_path)?.len() > limits.manifest_bytes as u64 {
-        return Err(invalid("asset inventory exceeds the manifest limit"));
-    }
-    let inventory = Manifest::decode(&fs::read(inventory_path)?, limits)
+    let inventory = crate::offline::validate(staged.path(), &parsed, BundleKind::Container)
         .map_err(invalid)?
-        .validate_inventory(
-            InventoryRequest {
-                target: parsed.variant.node_target(),
-                variant: Variant::Offline,
-                scope: Scope::SupervisedBundle,
-            },
-            limits,
-        )
-        .map_err(invalid)?;
+        .ok_or_else(|| invalid("missing container inventory"))?;
+    crate::offline::check_optional_images(staged.path(), options).map_err(invalid)?;
+    let limits = Limits::default();
     let image_path = inventory
         .assets()
         .find_map(|(id, delivery)| match delivery {
@@ -597,11 +597,10 @@ pub fn execute_install(
     }
     let target_dir = &options.path;
     let parent = target_dir
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
+        .ancestors()
+        .find(|path| path.is_dir())
         .unwrap_or(Path::new("."));
-    let staging = match fs::create_dir_all(parent).and_then(|()| tempfile::TempDir::new_in(parent))
-    {
+    let staging = match tempfile::TempDir::new_in(parent) {
         Ok(s) => s,
         Err(err) => {
             writeln!(stderr, "  [fail] extraction: {err}")?;
@@ -642,6 +641,16 @@ pub fn execute_install(
             return Ok(1);
         },
     };
+    if let Err(err) =
+        crate::offline::validate(staging.path(), &parsed, diorama_assets::BundleKind::Host)
+            .and_then(|_| crate::offline::check_optional_images(staging.path(), options))
+    {
+        writeln!(
+            stderr,
+            "  [fail] bundle validation: {err}; no installation changes were made"
+        )?;
+        return Ok(1);
+    }
     if let Err(err) = publish(staging.path(), target_dir, &manifest) {
         writeln!(stderr, "  [fail] extraction: {err}")?;
         return Ok(1);

@@ -105,6 +105,9 @@ impl LocalPathService {
             Err(_) => None,
         };
         let volume_manager = self.volume_manager();
+        if let Err(error) = volume_manager.release_deleted_claims().await {
+            tracing::warn!(%error, "could not reconcile released local-path volumes");
+        }
 
         for namespace in &namespaces {
             self.bind_pod_volumes(namespace, &volume_manager).await;

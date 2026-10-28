@@ -1062,3 +1062,53 @@ async fn test_pvc_condition_and_pv_status_updates() {
     assert_eq!(updated_pv["status"]["reason"], "ClaimLost");
     assert_eq!(updated_pv["status"]["message"], "Claim deleted");
 }
+
+#[tokio::test]
+async fn deleted_claims_release_only_owned_volumes_without_active_consumers() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+    client.create_namespace("reclaim-test").await.unwrap();
+    for (name, provisioner) in [
+        ("owned", "rancher.io/local-path"),
+        ("unrelated", "example.com/other"),
+    ] {
+        client
+            .create_pv(json!({"apiVersion":"v1","kind":"PersistentVolume",
+            "metadata":{"name":name,"annotations":{"pv.kubernetes.io/provisioned-by":provisioner}},
+            "spec":{"capacity":{"storage":"1Mi"},"accessModes":["ReadWriteOnce"],
+            "local":{"path":"/unused/test"},"claimRef":{"namespace":"reclaim-test","name":"gone"},
+            "persistentVolumeReclaimPolicy":"Retain"},"status":{"phase":"Bound"}}))
+            .await
+            .unwrap();
+    }
+    client
+        .create_pod(
+            "reclaim-test",
+            json!({"apiVersion":"v1","kind":"Pod",
+        "metadata":{"name":"consumer"},"spec":{"containers":[{"name":"test","image":"busybox"}],
+        "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"gone"}}]}}),
+        )
+        .await
+        .unwrap();
+    let manager = LocalPathVolumeManager::new(LocalPathConfig::new(), client.clone());
+    manager.release_deleted_claims().await.unwrap();
+    assert_eq!(
+        client.get_pv("owned").await.unwrap()["status"]["phase"],
+        "Bound"
+    );
+    client.delete_pod("reclaim-test", "consumer").await.unwrap();
+    manager.release_deleted_claims().await.unwrap();
+    assert_eq!(
+        client.get_pv("owned").await.unwrap()["status"]["phase"],
+        "Released"
+    );
+    assert_eq!(
+        client.get_pv("owned").await.unwrap()["spec"]["volumeMode"],
+        "Filesystem"
+    );
+    assert_eq!(
+        client.get_pv("unrelated").await.unwrap()["status"]["phase"],
+        "Bound"
+    );
+}

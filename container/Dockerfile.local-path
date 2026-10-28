@@ -1,0 +1,14 @@
+# Build args are populated from per-platform digests in release-inputs.json.
+ARG UPSTREAM
+ARG RUNTIME=alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+FROM ${UPSTREAM} AS upstream
+FROM ${RUNTIME}
+COPY --from=upstream /usr/bin/local-path-provisioner /usr/bin/local-path-provisioner
+COPY --from=upstream /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY licenses/local-path-provisioner.LICENSE /usr/share/licenses/local-path-provisioner/LICENSE
+# Fail the build if the copied executable needs an absent runtime library.
+RUN local-path-provisioner --version
+LABEL org.opencontainers.image.title="Diorama local-path provisioner" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/rancher/local-path-provisioner"
+CMD ["local-path-provisioner"]

@@ -19,6 +19,7 @@ pub struct CompletionOptions {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DownloadOptions {
+    pub run_mode: String,
     pub version: String,
     pub path: PathBuf,
     pub arch: Option<String>,
@@ -32,6 +33,7 @@ pub struct DownloadOptions {
 impl fmt::Debug for DownloadOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DownloadOptions")
+            .field("run_mode", &self.run_mode)
             .field("version", &self.version)
             .field("path", &self.path)
             .field("arch", &self.arch)
@@ -57,6 +59,7 @@ impl Default for DownloadOptions {
             temp_dir: None,
             proxy: None,
             offline: false,
+            run_mode: "service".into(),
             libc: None,
         }
     }

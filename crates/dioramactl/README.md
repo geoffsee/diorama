@@ -1,26 +1,177 @@
+# Offline installation and management
+
+Use a matching release of `dioramactl` for the new version-two bundle format.
+The new CLI also accepts legacy combined `*-offline.tar.gz` archives. Older CLIs
+cannot select or validate the new formats. Releases publish Linux amd64 and arm64:
+
+| Archive suffix | Contents | Install mode |
+| --- | --- | --- |
+| `-host-offline.tar.gz` | Both CLIs, runtime executables, CNI, CoreDNS, pause, local-path provisioner and BusyBox | service (extraction) |
+| `-container-offline.tar.gz` | One core node image with those runtime assets inside it | container |
+| `-addon-portainer-agent-offline.tar.gz` | One Portainer installer/workload image and installation Job | `addon load` |
+| `-addon-d2k-offline.tar.gz` | One D2K installer/workload image and installation Job | `addon load` |
+
+Full names are `diorama-<version>-linux-<arch><suffix>`. Portainer and D2K are
+disabled by default and absent from core bundles. Enabling their legacy bootstrap
+options without an offline image fails with instructions to install an add-on.
+New release downloads always select an offline core bundle; `--offline` remains
+a compatibility flag. `download --run-mode=container` selects the container pack.
+
+```sh
+# Host extraction on a matching Linux machine:
+dioramactl install --offline-install=./diorama-v0.1.0-linux-arm64-host-offline.tar.gz --path=./node
+# Container installation (a Linux Docker Engine is required):
+dioramactl install --run-mode=container --offline-install=./diorama-v0.1.0-linux-arm64-container-offline.tar.gz
+```
+
+Host installation verifies and extracts files into `--path`; it does not yet
+register or start a system service. Container installation imports the verified
+image and creates the node using `--pull=never`. It queries the Engine's architecture,
+which may differ from the management host. `--image` cannot override an offline pack.
+A fresh container data volume receives its core images and runtime tools from the image.
+
+Validation checks bundle kind, version, architecture, declared capabilities,
+checksums, executable architecture, image tags, platform and layer digests before
+installation state changes. Duplicate assets, duplicate archive paths, links and
+path traversal are rejected. Schema-one combined archives retain their existing
+validation path. `bundle.manifest` and `asset-inventory.json` provide integrity;
+obtain the archive and published `SHA256SUMS` from a trusted release source.
+
+Core upgrades use the archive matching the existing installation mode:
+
+```sh
+dioramactl upgrade --version=v0.2.0 --offline-install=./diorama-v0.2.0-linux-arm64-host-offline.tar.gz
+```
+
+Host upgrades replace runtime assets as well as the node executable, with rollback
+copies. Container upgrades import the local image before replacement. Both retain
+the datastore and existing add-on resources. Upgrade add-ons separately with a new
+pack and a new installation Job. Existing legacy configuration-driven installations
+remain supported; remove their resources explicitly and disable legacy bootstrap
+before switching them to Job ownership. The installer refuses to adopt unowned
+resources, and core Portainer bootstrap skips Job-managed Deployments.
+
+## Installing add-ons
+
+Load the pack on the node that will run both the installer and workload. This
+validates the pack and imports its single image into containerd's `k8s.io` namespace.
+It retains verified images under `<node-data>/images/addons` for restart and core
+upgrade recovery, since the managed runtime rebuilds its disposable cache. It
+does not enable an integration or contact a registry. Retained old versions can
+be removed explicitly after their Jobs and workloads no longer reference them.
+
+```sh
+# A host installation, using its runtime socket and bundled ctr:
+sudo dioramactl addon load ./diorama-v0.1.0-linux-arm64-addon-d2k-offline.tar.gz --path=/var/lib/diorama
+# A named container; --engine=podman is also supported:
+dioramactl addon load ./diorama-v0.1.0-linux-arm64-addon-portainer-agent-offline.tar.gz --container=kubesolo
+```
+
+Use the published `*-job.json`, or extract `install-job.json` from the add-on
+archive. Replace `replace-with-loaded-node` with the actual Kubernetes node name
+from `kubectl get nodes`. The Job and Deployment use that node, the same explicit
+versioned image, and `imagePullPolicy: Never`. A missing image cannot cause a pull.
+
+Create credentials separately before applying the Job. For Portainer, obtain the
+Edge ID and key from your Portainer server and store them in private files:
+
+```sh
+kubectl create namespace portainer
+kubectl -n portainer create secret generic portainer-agent-edge-key \
+  --from-file=edge.id=./edge.id --from-file=edge.key=./edge.key
+kubectl apply -f portainer-job.json
+kubectl -n portainer wait --for=condition=complete job/diorama-install-portainer-agent --timeout=360s
+```
+
+Portainer readiness requires connectivity to that configured server; registry
+access is unnecessary. Its `portainer-agent-edge` ConfigMap controls `EDGE_ASYNC`
+and `EDGE_INSECURE_POLL`. The installer preserves this configuration on reruns.
+
+D2K defaults to namespace `d2k`. To choose another namespace, replace the namespace
+name and the Job's `DIORAMA_ADDON_NAMESPACE` value in its manifest, including the
+installer RoleBinding subject. Create its TLS Secret there using the node's existing
+CA and D2K server certificates (or equivalent certificates signed by that CA):
+
+```sh
+kubectl create namespace d2k
+kubectl -n d2k create secret generic d2k-tls \
+  --from-file=ca.crt=/var/lib/diorama/pki/ca.crt \
+  --from-file=tls.crt=/var/lib/diorama/pki/d2k-server.crt \
+  --from-file=tls.key=/var/lib/diorama/pki/d2k-server.key
+kubectl apply -f d2k-job.json
+kubectl -n d2k wait --for=condition=complete job/diorama-install-d2k --timeout=360s
+```
+
+D2K exposes TLS on port 2376 through a LoadBalancer Service. Keep the existing
+load-balancer and client-certificate conventions; container hosts that need a
+published D2K port must configure it explicitly. `dioramactl d2k fetch` exports
+existing client credentials but does not enable the add-on.
+
+The Jobs install RBAC, service accounts, Services, Deployments and configuration
+through the Kubernetes API, then wait up to 300 seconds for readiness. Inspect
+`kubectl -n <namespace> logs <installer-pod>` and pod events on failure. Missing
+Secrets fail before workload writes. Installation Jobs have privileged bootstrap
+RBAC; apply them as an administrator and remove the installer Job, service account,
+ClusterRole and ClusterRoleBinding after successful installation if no longer needed.
+
+To rerun or upgrade, load the selected pack, delete the previous Job, and apply its
+manifest again. Kubernetes Job pod templates are immutable. Resources labelled
+`diorama.io/managed-by=addon-job` and `diorama.io/addon=<name>` are updated in place;
+supplied Secrets and unrelated resources remain intact.
+
+To remove an add-on, delete its Job and bootstrap RBAC from the installation
+manifest, then remove only resources carrying both ownership labels:
+
+```sh
+kubectl -n d2k delete deployment,service,serviceaccount,role,rolebinding,configmap \
+  -l 'diorama.io/managed-by=addon-job,diorama.io/addon=d2k'
+kubectl delete clusterrole,clusterrolebinding \
+  -l 'diorama.io/managed-by=addon-job,diorama.io/addon=d2k'
+```
+
+Use namespace `portainer` and add-on label `portainer-agent` for Portainer. Delete
+installer Jobs and service accounts by their `diorama-install-<name>` names,
+and installer ClusterRoles/ClusterRoleBindings by
+`diorama-install-<name>-<namespace>`. Retain the namespace
+and Secrets unless you explicitly intend to discard them; avoid deleting the
+entire manifest's Namespace when unrelated workloads share it.
+
+## Release inputs and verification
+
+The [release workflow](../../.github/workflows/release.yml) publishes four packs per
+architecture, Job manifests, provenance, size reports and checksums. Pins live in
+[release-inputs.json](../diorama-dev/release-inputs.json). The storage recipe copies
+only the provisioner executable and CA certificates from the pinned upstream image
+into pinned Alpine, with its Apache license. It retains BusyBox and storage defaults.
+The release builder rejects a provisioner image at or above 25 MB and host bundles
+over 120 MB (ARM64) or 140 MB (amd64), measured in decimal bytes.
+
+For local reproduction, build both CLIs and a static `diorama-addon` executable,
+then use `diorama-release-bundle prepare`, `build-images`, and `package
+<host|container|portainer-agent|d2k>` as shown in the workflow. The node image embeds
+only core runtime files and workload archives. Host packs ship each executable
+once: the inventory's identity payload is the installed file, verified by size,
+SHA-256 and ELF checks, then compressed by the outer archive. There is no separate
+`payloads/*.zst` copy. Use the matching CLI release to install these packs; newer
+CLIs also accept older packs containing the compressed copies. Musl, ARMv7 and
+RISC-V release packs are not currently published.
+
 # Management checks and explicit prerequisites
 
-Offline archives use `diorama-<version>-linux-<arch>[-musl]-offline.tar.gz`.
-`bundle::build_offline_bundle` builds these archives from local files and writes
+Offline archives use the host/container/add-on names described above. Legacy
+combined archives use `diorama-<version>-linux-<arch>[-musl]-offline.tar.gz`.
+`bundle::build_offline_bundle` builds archives from local files and writes
 the checksummed `bundle.manifest` consumed by `install --offline-install`.
 Host installation verifies and extracts the bundle into `--path`; it does not
 yet register or start a system service. For example, on a matching Linux host:
 
 ```sh
-./dioramactl install --offline-install=./diorama-v0.1.0-linux-arm64-offline.tar.gz --path=./node
+./dioramactl install --offline-install=./diorama-v0.1.0-linux-arm64-host-offline.tar.gz --path=./node
 ```
 
 Download selection uses `geoffsee/diorama` releases and defaults to the management
 CLI's package version. The requested archive must be published there, or supplied
 through `--custom-url`. Local offline installation makes no download request.
-
-The [release workflow](../../.github/workflows/release.yml) publishes glibc offline
-bundles for Linux amd64 and arm64 alongside the standalone binaries. Each bundle
-contains `bin/diorama`, `bin/dioramactl`, the runtime executables, all seven image
-archives, `asset-inventory.json`, `release-inputs.json`, and `bundle.manifest`.
-Runtime files are ready to execute after host extraction; the inventory also
-includes the encoded payloads required by asset validation. Checksums for the
-complete archives are included in the release's `SHA256SUMS`.
 
 Inputs are pinned in [release-inputs.json](../diorama-dev/release-inputs.json):
 upstream binary downloads use SHA-256 checksums, and workload images use platform
@@ -36,8 +187,8 @@ For a local reproduction on a build host with Rust, curl and tar:
 ```sh
 CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo run --locked -p diorama-dev --bin diorama-release-bundle -- prepare arm64 /tmp/release-assets
 # Build/export the node image as shown in the release workflow, then:
-CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo run --locked -p diorama-dev --bin diorama-release-bundle -- package v0.1.0 arm64 \
-  target/aarch64-unknown-linux-gnu/dist /tmp/release-assets dist
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo run --locked -p diorama-dev --bin diorama-release-bundle -- package host v0.1.0 arm64 \
+  target/aarch64-unknown-linux-musl/dist /tmp/release-assets dist
 ```
 
 Container-mode installation dispatches through the Docker CLI and the existing owned
@@ -46,7 +197,7 @@ macOS or WSL2; its architecture is queried instead of inferred from the manageme
 This implements image import and container creation, not live node readiness qualification.
 
 An offline container bundle must include a hash-listed `asset-inventory.json` with
-the complete supervised offline asset inventory, and the declared `image-diorama`
+the inventory appropriate to its bundle kind, and the declared `image-diorama`
 gzip payload at its inventory path. Private archive staging, link/traversal rejection
 and bundle hash checks run before import. The decoder then verifies the exact image
 bytes, config platform and layer DiffIDs before passing those same bytes to Docker.
@@ -67,8 +218,8 @@ An explicit `--image` override retains registry-pull behavior and takes preceden
 over the offline bundle. Default online selection uses
 `ghcr.io/geoffsee/diorama:<version>`. Offline selection uses the verified archive's
 tag. Neither path requires a kubesolo executable or image.
-Tests use synthetic image archives and Engine fixtures; live Docker, retained-node
-startup and egress-denied workload qualification remain unexecuted.
+Tests use synthetic image archives and Engine fixtures. The release workflow also
+runs `container/verify-offline.sh` against a node with network access disabled.
 
 `dioramactl` is a separate management executable with checks and explicit lifecycle
 commands. The existing `diorama` startup parser, startup YAML and its
@@ -80,15 +231,15 @@ service; ordinary checks never prepare a host or stop conflicting processes.
 The name is an explicit diorama management CLI choice replacing `kubesoloctl` for
 this executable. Help/version text is branded accordingly. KubeSolo environment
 keys, on-disk paths, service/runtime/CNI identities and configuration schemas do not
-change. No compatibility alias or release packaging is implied; installers and
-existing scripts must choose the correct executable when packaging is introduced.
+change. No compatibility executable alias is supplied; existing scripts must select the
+matching dioramactl release.
 The crate remains private workspace code and adds no registry dependency.
 
 ## Interface and effects
 
 The command shell also supports completion and artifact download, with a
 `CommandHandler` seam for the remaining management commands. Download archive
-selection covers all 16 Linux architecture/libc/online/offline cells. Because the
+selection uses the installation mode and target architecture/libc. Because the
 current bundle stages the running `dioramactl`, download execution requires a Linux
 executable matching the selected architecture and libc ABI. macOS and cross-architecture
 invocations fail before downloading or copying files; run the command with a

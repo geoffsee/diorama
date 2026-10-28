@@ -243,6 +243,22 @@ impl ContainerdService {
                     code: "containerd_namespace_failed",
                 })?;
 
+            crate::image::import_archives(
+                options
+                    .paths
+                    .binary_path
+                    .parent()
+                    .unwrap_or(Path::new("/usr/local/bin")),
+                &options.paths.socket_path,
+                &options.image_config,
+            )
+            .await
+            .map_err(|error| {
+                eprintln!("{error}");
+                AdapterError {
+                    code: "containerd_image_import_failed",
+                }
+            })?;
             import_or_pull_images(channel, &options.image_config)
                 .await
                 .map_err(|_| AdapterError {
@@ -287,6 +303,22 @@ impl ContainerdService {
                 code: "containerd_namespace_failed",
             })?;
 
+        crate::image::import_archives(
+            self.options
+                .paths
+                .binary_path
+                .parent()
+                .unwrap_or(Path::new("/usr/local/bin")),
+            &self.options.paths.socket_path,
+            &self.options.image_config,
+        )
+        .await
+        .map_err(|error| {
+            eprintln!("{error}");
+            AdapterError {
+                code: "containerd_image_import_failed",
+            }
+        })?;
         let summary = import_or_pull_images(channel, &self.options.image_config)
             .await
             .map_err(|_| AdapterError {

@@ -31,10 +31,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             arch: x86_64
             bundle_arch: amd64
+            addon_target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             arch: aarch64
             bundle_arch: arm64
+            addon_target: aarch64-unknown-linux-musl
     env:
       RELEASE_VERSION: ${{ github.ref_name }}
       BUNDLE_ARCH: ${{ matrix.bundle_arch }}
@@ -50,15 +52,28 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Build ship binaries
         run: cargo build --locked --profile dist -p diorama -p dioramactl --target ${{ matrix.target }}
+      - name: Build static add-on installer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add ${{ matrix.addon_target }}
+          CC=musl-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            cargo build --locked --profile dist -p diorama-addon --target ${{ matrix.addon_target }}
       - name: Prepare pinned offline runtime and image assets
         run: |
           assets_dir="$RUNNER_TEMP/release-assets"
           printf 'ASSETS_DIR=%s\n' "$assets_dir" >> "$GITHUB_ENV"
           CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo build --locked -p diorama-dev --bin diorama-release-bundle
           target/debug/diorama-release-bundle prepare "$BUNDLE_ARCH" "$assets_dir"
+      - name: Build minimal storage and self-installing add-on images
+        run: |
+          target/debug/diorama-release-bundle build-images "$RELEASE_VERSION" "$BUNDLE_ARCH" \
+            "target/${{ matrix.addon_target }}/dist/diorama-addon" "$ASSETS_DIR" docker localhost:5000
       - name: Build and export the offline diorama image
         run: |
           install -m 0755 "$BINARY_DIR/diorama" "$ASSETS_DIR/bin/diorama"
+          install -m 0755 "$BINARY_DIR/dioramactl" "$ASSETS_DIR/bin/dioramactl"
           install -m 0755 container/entrypoint.sh "$ASSETS_DIR/entrypoint.sh"
           local_image="localhost:5000/diorama:$RELEASE_VERSION"
           docker build --platform "linux/$BUNDLE_ARCH" \
@@ -68,26 +83,45 @@ jobs:
             --tag "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" \
             --output "$RUNNER_TEMP/diorama-image.tar" "$local_image"
           gzip -n -c "$RUNNER_TEMP/diorama-image.tar" > "$ASSETS_DIR/images/diorama.tar.gz"
-      - name: Package and verify offline bundle
+      - name: Package and verify both core formats and add-on packs
         run: |
-          target/debug/diorama-release-bundle package "$RELEASE_VERSION" "$BUNDLE_ARCH" \
-            "$BINARY_DIR" "$ASSETS_DIR" dist
-          bundle="$PWD/dist/diorama-$RELEASE_VERSION-linux-$BUNDLE_ARCH-offline.tar.gz"
+          for kind in host container portainer-agent d2k; do
+            target/debug/diorama-release-bundle package "$kind" "$RELEASE_VERSION" "$BUNDLE_ARCH" \
+              "$BINARY_DIR" "$ASSETS_DIR" dist
+          done
+          bundle="$PWD/dist/diorama-$RELEASE_VERSION-linux-$BUNDLE_ARCH-host-offline.tar.gz"
           installed="$RUNNER_TEMP/offline-install"
           sudo unshare --net "$BINARY_DIR/dioramactl" install \
             --offline-install="$bundle" --path="$installed"
           cmp "$BINARY_DIR/diorama" "$installed/bin/diorama"
           "$installed/bin/dioramactl" version
-          docker load --input "$installed/images/diorama.tar.gz"
-          docker image inspect "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" > /dev/null
+          test ! -e "$installed/images/diorama.tar.gz"
+          test ! -e "$installed/images/portainer-agent.tar.gz"
+          test ! -e "$installed/images/d2k.tar.gz"
+          docker load --input "$ASSETS_DIR/images/diorama.tar.gz"
           docker run --rm --network=none --tmpfs /offline --entrypoint /bin/sh \
             "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" -c '
               diorama-entrypoint --path=/offline/node --version &&
               test -x /offline/node/bin/containerd &&
+              test -x /offline/node/bin/ctr &&
               test -x /offline/node/cni/bin/bridge &&
-              for image in coredns pause local-path-provisioner busybox portainer-agent d2k; do
+              command -v dioramactl &&
+              for image in coredns pause local-path-provisioner busybox; do
                 test -s "/offline/node/images/$image.tar.gz" || exit 1
               done'
+      - name: Qualify offline Jobs, upgrades and persistent volumes
+        run: |
+          kubectl="$RUNNER_TEMP/kubectl"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://dl.k8s.io/release/v1.35.0/bin/linux/$BUNDLE_ARCH/kubectl" --output "$kubectl"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://dl.k8s.io/release/v1.35.0/bin/linux/$BUNDLE_ARCH/kubectl.sha256" --output "$kubectl.sha256"
+          printf '%s  %s\n' "$(cat "$kubectl.sha256")" "$kubectl" | sha256sum --check --strict
+          chmod +x "$kubectl"
+          for mode in host container; do
+            bash container/verify-offline.sh "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" \
+              "$PWD/dist" "$RELEASE_VERSION" "$BUNDLE_ARCH" "$BINARY_DIR/dioramactl" "$kubectl" "$mode"
+          done
       - name: Package binaries
         run: |
           mkdir -p dist

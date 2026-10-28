@@ -5,6 +5,19 @@ diorama links are pinned to inspection revision
 `619847dd4324c3fee48fe50f0c9f32a32196de79`; the corresponding local paths are given
 in the index for review even if that revision has not yet reached the default branch.
 
+Current releases use schema-two inventories with explicit `host`, `container`, and
+`addon` kinds and capabilities. Their required assets are filtered from the role
+catalog; schema-one combined inventories retain the complete historical set. The
+host additionally checks both CLIs and `ctr` in its outer manifest. New host packs
+ship each executable once with identity encoding: the inventory verifies the
+installed file directly, while the outer archive supplies compression. Older
+schema-two zstd payloads and schema-one catalog encodings remain supported. See the
+[offline installation guide](../dioramactl/README.md) and
+[pinned release inputs](../diorama-dev/release-inputs.json) for the current amd64/arm64
+builds. The smaller local-path image preserves the pinned upstream executable and
+licensing in a pinned Alpine runtime. Historical source obligations below describe
+the broader compatibility matrix, not the current release matrix.
+
 ## Source anchor index
 
 | ID | Exact evidence |
@@ -50,7 +63,7 @@ locked payload. Versions and source revisions alone do not satisfy that requirem
 | fuse-overlayfs-snapshotter |standalone `containerd-fuse-overlayfs-grpc` v2.1.7|managed fallback capability; package separately from containerd|identity ELF (initial transport policy)|source entry-point hash/revision known; executable/build pins missing; R1:43,53–68|
 | image-coredns |docker.io/coredns/coredns:1.14.4|always bundled in online/offline embedded mode|gzip image archive|per-platform manifest/config/layer and archive hashes missing; G2,G3,G6|
 | image-pause |docker.io/portainer/pause:latest|always bundled in online/offline embedded mode|gzip image archive|mutable tag unresolved; unused3.10 variable is not a pin; G7|
-| image-local-path |docker.io/rancher/local-path-provisioner:v0.0.36|offline bundle; activation only with local storage|gzip image archive|per-platform pins missing; G3,G6|
+| image-local-path |ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1|offline bundle; activation only with local storage|gzip image archive|per-platform pins missing; G3,G6|
 | image-local-path-helper |docker.io/library/busybox:latest (normalized alias of baseline `busybox`)|offline closure when local storage enabled; genuine provisioning needs it|proposed gzip image archive|mutable tag unresolved; absent from baseline downloader, required correction by E01; G8,R1:47|
 | image-portainer-agent |docker.io/portainer/agent:lts|offline default-agent bundle except RISC-V; activation only enabled default agent|gzip image archive|mutable tag unresolved; custom references are separate acquisition obligations; G3,G6|
 | image-d2k |docker.io/portainer/d2k:1.2.3|offline bundle only amd64/arm64; activation conditional|gzip image archive|per-platform pins missing; G3,G6|

@@ -11,7 +11,8 @@ use tonic::transport::Channel;
 
 pub const DEFAULT_COREDNS_IMAGE: &str = "docker.io/coredns/coredns:1.14.4";
 pub const DEFAULT_PAUSE_IMAGE: &str = "docker.io/portainer/pause:latest";
-pub const DEFAULT_LOCAL_PATH_IMAGE: &str = "docker.io/rancher/local-path-provisioner:v0.0.36";
+pub const DEFAULT_LOCAL_PATH_IMAGE: &str =
+    "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1";
 pub const DEFAULT_BUSYBOX_IMAGE: &str = "docker.io/library/busybox:latest";
 pub const DEFAULT_PORTAINER_AGENT_IMAGE: &str = "docker.io/portainer/agent:lts";
 pub const DEFAULT_D2K_IMAGE: &str = "docker.io/portainer/d2k:1.2.3";
@@ -215,6 +216,12 @@ pub async fn import_or_pull_images(
             // Local embedded archive exists; mark as imported
             summary.imported.push(target.reference);
         } else {
+            if config.images_dir.join("offline").exists() {
+                return Err(ImageError::ImportFailed {
+                    image: target.reference,
+                    details: "image unavailable offline; disable the optional integration, load its add-on archive with dioramactl addon load, and apply its installation Job".into(),
+                });
+            }
             // Fall back to CRI pull_image
             let req = tonic::Request::new(PullImageRequest {
                 image: Some(ImageSpec {
@@ -245,4 +252,110 @@ pub async fn import_or_pull_images(
     }
 
     Ok(summary)
+}
+
+/// Load archives into Kubernetes' namespace before CRI readiness is reported.
+pub async fn import_archives(
+    binary_dir: &Path,
+    socket: &Path,
+    config: &ImageImportConfig,
+) -> Result<(), ImageError> {
+    let ctr = binary_dir.join("ctr");
+    let socket = socket.to_owned();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut archives: Vec<_> = config
+            .enabled_targets()
+            .into_iter()
+            .filter_map(|target| {
+                let archive = config.images_dir.join(&target.filename);
+                (!target.filename.is_empty() && archive.is_file())
+                    .then_some((target.reference, archive))
+            })
+            .collect();
+        let addons = config.images_dir.join("addons");
+        if addons.exists() {
+            for entry in std::fs::read_dir(addons).map_err(retained_image_error)? {
+                let entry = entry.map_err(retained_image_error)?;
+                if entry.file_type().map_err(retained_image_error)?.is_file()
+                    && entry.file_name().to_string_lossy().ends_with(".tar.gz")
+                {
+                    archives.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.path(),
+                    ));
+                }
+            }
+        }
+        archives.sort();
+        for (reference, archive) in archives {
+            let result = std::process::Command::new(&ctr)
+                .arg("--address")
+                .arg(&socket)
+                .args([
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "import",
+                    "--all-platforms",
+                ])
+                .arg(&archive)
+                .output()
+                .map_err(|e| ImageError::ImportFailed {
+                    image: reference.clone(),
+                    details: e.to_string(),
+                })?;
+            if !result.status.success() {
+                return Err(ImageError::ImportFailed {
+                    image: reference,
+                    details: String::from_utf8_lossy(&result.stderr).into_owned(),
+                });
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| ImageError::ImportFailed {
+        image: "offline archives".into(),
+        details: e.to_string(),
+    })?
+}
+
+#[allow(clippy::needless_pass_by_value)] // Adapter passed directly to Result::map_err.
+fn retained_image_error(error: std::io::Error) -> ImageError {
+    ImageError::ImportFailed {
+        image: "retained add-on".into(),
+        details: error.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retained_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn retained_addons_import_even_with_legacy_integrations_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(images.join("addons")).unwrap();
+        let archive = images.join("addons/addon-d2k-v1.tar.gz");
+        std::fs::write(&archive, b"verified by loader").unwrap();
+        std::fs::write(images.join("addons/.load.incomplete"), b"not published").unwrap();
+        let ctr = root.path().join("ctr");
+        std::fs::write(
+            &ctr,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$(dirname \"$0\")/calls\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ctr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = ImageImportConfig::new(images);
+        import_archives(root.path(), Path::new("/node/socket"), &config)
+            .await
+            .unwrap();
+        let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+        assert!(calls.contains("--namespace\nk8s.io\nimages\nimport\n"));
+        assert!(calls.contains(archive.to_str().unwrap()));
+        assert!(!calls.contains("incomplete"));
+    }
 }

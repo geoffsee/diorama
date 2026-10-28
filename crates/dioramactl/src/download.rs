@@ -1,5 +1,5 @@
 use crate::CheckInputs;
-use crate::artifact::{artifact_archive_name, artifact_download_url, resolve_target};
+use crate::artifact::{artifact_download_url, core_archive_name, resolve_target};
 use crate::contract::DownloadOptions;
 use diorama_platform::Libc;
 use std::io::{self, Write};
@@ -190,7 +190,7 @@ pub fn execute_download(
         return Ok(1);
     }
 
-    let archive_name = artifact_archive_name(&options.version, target, options.offline);
+    let archive_name = core_archive_name(&options.version, target, options.run_mode == "container");
     let download_url = artifact_download_url(
         &options.version,
         &archive_name,
@@ -224,8 +224,13 @@ pub fn execute_download(
 
     writeln!(
         stderr,
-        "  [ok] Bundle ready in {}\n\n  Next steps:\n  Transfer the files to the target machine, then:\n    sudo ./dioramactl install --offline-install={}\n",
+        "  [ok] Bundle ready in {}\n\n  Next steps:\n  Transfer the files to the target machine, then:\n    sudo ./dioramactl install{} --offline-install={}\n",
         dest_dir.display(),
+        if options.run_mode == "container" {
+            " --run-mode=container"
+        } else {
+            ""
+        },
         format_args!("./{archive_name}")
     )?;
 

@@ -51,7 +51,7 @@ fn ordinary_fixture_runtime_detection_and_config() {
 
     assert!(refs.contains(&"docker.io/coredns/coredns:1.14.4"));
     assert!(refs.contains(&"docker.io/portainer/pause:latest"));
-    assert!(refs.contains(&"docker.io/rancher/local-path-provisioner:v0.0.36"));
+    assert!(refs.contains(&"ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1"));
     assert!(refs.contains(&"docker.io/library/busybox:latest"));
 }
 

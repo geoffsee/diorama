@@ -1,0 +1,5 @@
+# The pinned workload is retained intact. Only a static installer is added.
+ARG UPSTREAM
+FROM ${UPSTREAM}
+COPY --chmod=755 diorama-addon /diorama-addon
+ENTRYPOINT ["/diorama-addon"]

@@ -12,7 +12,7 @@ COPY --chmod=755 bin/ /usr/local/bin/
 COPY --chmod=755 cni/bin/ /usr/libexec/cni/
 # These archives must survive a fresh data volume; the entrypoint copies them in.
 COPY images/coredns.tar.gz images/pause.tar.gz images/local-path-provisioner.tar.gz \
-     images/busybox.tar.gz images/portainer-agent.tar.gz images/d2k.tar.gz \
+     images/busybox.tar.gz \
      /usr/local/share/diorama/images/
 COPY --chmod=755 entrypoint.sh /usr/local/bin/diorama-entrypoint
 
