@@ -982,7 +982,7 @@ fn decode_type_meta(bytes: &[u8]) -> Option<(String, String)> {
             _ => {},
         }
     }
-    Some((api_version?, kind?))
+    Some((api_version.unwrap_or_default(), kind?))
 }
 
 fn decode_message(name: &str, bytes: &[u8], depth: usize) -> Result<Value, ApiserverError> {

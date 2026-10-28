@@ -277,7 +277,16 @@ pub fn json_merge_patch(target: &mut Value, patch: Value) {
             *target = Value::Object(serde_json::Map::new());
         }
         let target_obj = target.as_object_mut().unwrap();
+        if patch_obj.get("$patch").and_then(Value::as_str) == Some("replace") {
+            target_obj.clear();
+        } else if let Some(retain_arr) = patch_obj.get("$retainKeys").and_then(Value::as_array) {
+            let retain_set: BTreeSet<&str> = retain_arr.iter().filter_map(Value::as_str).collect();
+            target_obj.retain(|k, _| retain_set.contains(k.as_str()));
+        }
         for (key, value) in patch_obj {
+            if key == "$patch" || key == "$retainKeys" {
+                continue;
+            }
             if value.is_null() {
                 target_obj.remove(&key);
             } else if value.is_object() {
@@ -4150,7 +4159,7 @@ impl KubernetesApiClient {
                 }
             },
             Err(ApiserverError::Conflict { .. })
-                if target.expected_version.is_some() && target.subresource.is_none() =>
+                if target.expected_version.is_some() && target.subresource != Some("status") =>
             {
                 if let Some(refreshed) = self.storage.get(target.key).await?
                     && let Ok(refreshed_pod) = serde_json::from_slice::<Value>(&refreshed.value)
@@ -4249,6 +4258,11 @@ impl KubernetesApiClient {
             Self::check_quota_container_resources_immutable(&old_pod, &pod)?;
         }
 
+        if subresource == Some("resize")
+            && let Some(old_status) = old_pod.get("status")
+        {
+            pod["status"] = old_status.clone();
+        }
         Self::preserve_pod_metadata_on_update(&mut pod, &old_pod, namespace, name);
 
         let expected_version = pod
@@ -6388,6 +6402,23 @@ impl KubernetesApiClient {
             spec.insert("sessionAffinity".to_string(), json!("None"));
         }
 
+        if svc_type != "ExternalName" {
+            if spec
+                .get("ipFamilies")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                spec.insert("ipFamilies".to_string(), json!(["IPv4"]));
+            }
+            if spec
+                .get("ipFamilyPolicy")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                spec.insert("ipFamilyPolicy".to_string(), json!("SingleStack"));
+            }
+        }
+
         // 3. ClusterIP allocation
         let specified_cluster_ip = spec
             .get("clusterIP")
@@ -6574,6 +6605,23 @@ impl KubernetesApiClient {
         // 2. Default sessionAffinity
         if !spec.contains_key("sessionAffinity") {
             spec.insert("sessionAffinity".to_string(), json!("None"));
+        }
+
+        if svc_type != "ExternalName" {
+            if spec
+                .get("ipFamilies")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                spec.insert("ipFamilies".to_string(), json!(["IPv4"]));
+            }
+            if spec
+                .get("ipFamilyPolicy")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                spec.insert("ipFamilyPolicy".to_string(), json!("SingleStack"));
+            }
         }
 
         // 3. ClusterIP immutability / allocation
@@ -7554,23 +7602,40 @@ impl KubernetesApiClient {
     }
 
     pub(crate) fn sync_crd_schema_to_field_validation(crd: &Value) {
-        if let Some(spec) = crd.get("spec")
-            && let Some(group) = spec.get("group").and_then(Value::as_str)
-            && let Some(plural) = spec
-                .get("names")
-                .and_then(|n| n.get("plural"))
-                .and_then(Value::as_str)
-            && let Some(versions) = spec.get("versions").and_then(Value::as_array)
-        {
-            for v in versions {
-                if let Some(schema) = v.get("schema").and_then(|s| s.get("openAPIV3Schema")) {
-                    crate::http::field_validation::register_crd_schema(
-                        group,
-                        plural,
-                        schema.clone(),
-                    );
-                    break;
-                }
+        let Some(spec) = crd.get("spec") else {
+            return;
+        };
+        let Some(group) = spec.get("group").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(plural) = spec
+            .get("names")
+            .and_then(|n| n.get("plural"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let Some(versions) = spec.get("versions").and_then(Value::as_array) else {
+            return;
+        };
+        let mut default_registered = false;
+        for v in versions {
+            let Some(schema) = v.get("schema").and_then(|s| s.get("openAPIV3Schema")) else {
+                continue;
+            };
+            let ver_name = v.get("name").and_then(Value::as_str).unwrap_or("");
+            if !ver_name.is_empty() {
+                crate::http::field_validation::register_crd_version_schema(
+                    group,
+                    ver_name,
+                    plural,
+                    schema.clone(),
+                );
+            }
+            let is_storage = v.get("storage").and_then(Value::as_bool) == Some(true);
+            if !default_registered || is_storage {
+                crate::http::field_validation::register_crd_schema(group, plural, schema.clone());
+                default_registered = true;
             }
         }
     }

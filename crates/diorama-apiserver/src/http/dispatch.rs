@@ -719,9 +719,14 @@ fn delete_options_json(body: &[u8], group: &str, resource: &str) -> Option<Value
     if let Ok(val) = serde_json::from_slice::<Value>(body) {
         return Some(val);
     }
-    crate::http::protojson::decode_k8s_protobuf(body, group, resource)
+    crate::http::protojson::decode_k8s_protobuf(body, "", "deleteoptions")
         .ok()
         .flatten()
+        .or_else(|| {
+            crate::http::protojson::decode_k8s_protobuf(body, group, resource)
+                .ok()
+                .flatten()
+        })
 }
 
 fn delete_propagation_policy(body: &[u8], group: &str, resource: &str) -> Option<String> {
@@ -1189,10 +1194,11 @@ fn patch_type(content_type: Option<&str>) -> PatchType {
         PatchType::Json
     } else if content.contains("apply-patch") {
         PatchType::Apply
+    } else if content.contains("strategic-merge-patch") {
+        PatchType::StrategicMerge
     } else if content.contains("merge-patch") {
         PatchType::RfcMerge
     } else {
-        // strategic-merge-patch and plain JSON all merge objects.
         PatchType::StrategicMerge
     }
 }
@@ -1380,6 +1386,7 @@ async fn create(
         }
         return Ok(result);
     }
+    stamp_type_meta(&mut doc, path);
     let mut result = if is_cluster_resource(&path.resource) {
         create_cluster(client, &path.group, &path.resource, doc).await?
     } else if let Some(namespace) = &path.namespace {
@@ -2416,6 +2423,7 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "resourceclaims" => "ResourceClaim",
         "resourceclaimtemplates" => "ResourceClaimTemplate",
         "storageversionmigrations" => "StorageVersionMigration",
+        "deleteoptions" => "DeleteOptions",
         _ => return None,
     })
 }
@@ -3691,5 +3699,63 @@ mod tests {
         assert_eq!(v2_doc["spec"]["hostPort"], "example.com:8080");
         assert!(v2_doc["spec"].get("host").is_none());
         assert!(v2_doc["spec"].get("port").is_none());
+    }
+
+    #[test]
+    fn json_merge_patch_retain_keys_and_replace() {
+        let mut pod = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "c2",
+                        "resources": {
+                            "requests": { "cpu": "20m", "memory": "30Mi" },
+                            "limits": { "cpu": "40m", "memory": "50Mi" }
+                        }
+                    }
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "c2",
+                        "resources": {
+                            "requests": { "$retainKeys": ["memory"], "memory": "35Mi" }
+                        }
+                    }
+                ]
+            }
+        });
+        crate::client::json_merge_patch(&mut pod, patch);
+        assert!(
+            pod["spec"]["containers"][0]["resources"]["requests"]
+                .get("cpu")
+                .is_none()
+        );
+        assert_eq!(
+            pod["spec"]["containers"][0]["resources"]["requests"]["memory"],
+            "35Mi"
+        );
+    }
+
+    #[test]
+    fn delete_options_protobuf_without_apiversion_decodes_orphan() {
+        // Build k8s\0 + runtime.Unknown{TypeMeta{Kind: "DeleteOptions"}, Raw: DeleteOptions{orphanDependents: true}}
+        let type_meta = b"\x12\x0dDeleteOptions"; // field 2 = kind
+        let raw_opts = b"\x18\x01"; // field 3 = orphanDependents (bool = true)
+        let mut unknown = Vec::new();
+        unknown.push(0x0a);
+        unknown.push(u8::try_from(type_meta.len()).unwrap());
+        unknown.extend_from_slice(type_meta);
+        unknown.push(0x12);
+        unknown.push(u8::try_from(raw_opts.len()).unwrap());
+        unknown.extend_from_slice(raw_opts);
+        let mut body = b"k8s\x00".to_vec();
+        body.extend_from_slice(&unknown);
+
+        let policy = delete_propagation_policy(&body, "", "replicationcontrollers");
+        assert_eq!(policy.as_deref(), Some("Orphan"));
     }
 }

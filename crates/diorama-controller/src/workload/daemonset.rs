@@ -100,6 +100,7 @@ impl DaemonSetReconciler {
         let matching_node_names = find_matching_node_names(&schedulable_nodes, &p.template_spec);
         let use_generic_pod_name = is_generic_pod_naming(&raw_nodes, &p.template_spec);
 
+        let max_unavailable = parse_max_unavailable(ds, matching_node_names.len());
         let cfg = DaemonSetConfig {
             name: p.name,
             uid: p.uid,
@@ -108,6 +109,7 @@ impl DaemonSetReconciler {
             use_generic_pod_name,
             rev_hash: &rev_hash,
             update_strategy: &p.update_strategy,
+            max_unavailable,
         };
 
         if !p.deleting {
@@ -378,9 +380,31 @@ impl DaemonSetReconciler {
         self.cleanup_unschedulable_node_pods(namespace, cfg.name, matching_node_names, owned_pods)
             .await;
 
+        let any_pod_ready = owned_pods
+            .iter()
+            .any(|p| p.pointer("/metadata/deletionTimestamp").is_none() && super::is_pod_ready(p));
+        let mut unavailable_nodes = matching_node_names
+            .iter()
+            .filter(|node_name| {
+                !owned_pods.iter().any(|p| {
+                    p.pointer("/metadata/deletionTimestamp").is_none()
+                        && get_pod_node(p, cfg.name) == Some(node_name.as_str())
+                        && super::is_pod_ready(p)
+                })
+            })
+            .count();
+
         for node_name in matching_node_names {
             let (active_exists, failed_or_deleted) = self
-                .sync_node_pods(namespace, cfg, node_name, template_spec, owned_pods)
+                .sync_node_pods(
+                    namespace,
+                    cfg,
+                    node_name,
+                    template_spec,
+                    owned_pods,
+                    any_pod_ready,
+                    &mut unavailable_nodes,
+                )
                 .await;
 
             if !active_exists {
@@ -418,6 +442,7 @@ impl DaemonSetReconciler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn sync_node_pods(
         &self,
         namespace: &str,
@@ -425,6 +450,8 @@ impl DaemonSetReconciler {
         node_name: &str,
         template_spec: &Value,
         owned_pods: &[Value],
+        any_pod_ready: bool,
+        unavailable_nodes: &mut usize,
     ) -> (bool, Vec<String>) {
         let mut active_exists = false;
         let mut failed_or_deleted = Vec::new();
@@ -449,29 +476,35 @@ impl DaemonSetReconciler {
                 continue;
             }
 
-            if cfg.update_strategy == "RollingUpdate" {
-                let pod_rev = pod
-                    .pointer("/metadata/labels/controller-revision-hash")
-                    .and_then(Value::as_str);
-                let pod_img = pod
-                    .pointer("/spec/containers/0/image")
-                    .and_then(Value::as_str);
-                let tpl_img = template_spec
-                    .pointer("/containers/0/image")
-                    .and_then(Value::as_str);
-                let rev_matches = pod_rev == Some(cfg.rev_hash) && pod_img == tpl_img;
-                if rev_matches {
-                    active_exists = true;
-                } else {
-                    failed_or_deleted.push(pname.to_string());
-                    let _ = self
-                        .client
-                        .delete_pod_options(namespace, pname, Some(0))
-                        .await;
-                }
-            } else {
+            if cfg.update_strategy != "RollingUpdate" {
                 active_exists = true;
+                continue;
             }
+            let pod_rev = pod
+                .pointer("/metadata/labels/controller-revision-hash")
+                .and_then(Value::as_str);
+            let pod_img = pod
+                .pointer("/spec/containers/0/image")
+                .and_then(Value::as_str);
+            let tpl_img = template_spec
+                .pointer("/containers/0/image")
+                .and_then(Value::as_str);
+            let rev_matches = pod_rev == Some(cfg.rev_hash) && pod_img == tpl_img;
+            let pod_ready = super::is_pod_ready(pod);
+            if rev_matches
+                || (any_pod_ready && pod_ready && *unavailable_nodes >= cfg.max_unavailable)
+            {
+                active_exists = true;
+                continue;
+            }
+            if pod_ready {
+                *unavailable_nodes += 1;
+            }
+            failed_or_deleted.push(pname.to_string());
+            let _ = self
+                .client
+                .delete_pod_options(namespace, pname, Some(0))
+                .await;
         }
 
         (active_exists, failed_or_deleted)
@@ -585,6 +618,23 @@ struct DaemonSetConfig<'a> {
     use_generic_pod_name: bool,
     rev_hash: &'a str,
     update_strategy: &'a str,
+    max_unavailable: usize,
+}
+
+fn parse_max_unavailable(ds: &Value, total_nodes: usize) -> usize {
+    let Some(val) = ds.pointer("/spec/updateStrategy/rollingUpdate/maxUnavailable") else {
+        return 1;
+    };
+    if let Some(n) = val.as_u64() {
+        return usize::try_from(n).unwrap_or(1).max(1);
+    }
+    if let Some(s) = val.as_str()
+        && let Some(pct_str) = s.strip_suffix('%')
+        && let Ok(pct) = pct_str.trim().parse::<usize>()
+    {
+        return (total_nodes.saturating_mul(pct).saturating_add(99) / 100).max(1);
+    }
+    1
 }
 
 fn has_explicit_node_placement(template_spec: &Value) -> bool {
@@ -1052,4 +1102,25 @@ fn extract_cr_hash(cr: &Value, ds_name: &str) -> String {
             },
             str::to_string,
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_max_unavailable_respects_int_and_percent() {
+        let ds_default = json!({});
+        assert_eq!(parse_max_unavailable(&ds_default, 2), 1);
+
+        let ds_int = json!({
+            "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": 2 } } }
+        });
+        assert_eq!(parse_max_unavailable(&ds_int, 4), 2);
+
+        let ds_pct = json!({
+            "spec": { "updateStrategy": { "rollingUpdate": { "maxUnavailable": "50%" } } }
+        });
+        assert_eq!(parse_max_unavailable(&ds_pct, 4), 2);
+    }
 }
