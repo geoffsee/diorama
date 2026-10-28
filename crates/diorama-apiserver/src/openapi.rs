@@ -427,61 +427,8 @@ fn reverse_group(group: &str) -> String {
 }
 
 fn object_meta_schema() -> Value {
-    json!({
-        "description": "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
-        "type": "object",
-        "properties": {
-            "annotations": {
-                "type": "object",
-                "additionalProperties": { "type": "string" },
-                "description": "Annotations is an unstructured key value map stored with a resource."
-            },
-            "creationTimestamp": {
-                "type": "string",
-                "format": "date-time",
-                "description": "CreationTimestamp is a timestamp representing the server time when this object was created."
-            },
-            "deletionGracePeriodSeconds": {
-                "type": "integer",
-                "format": "int64",
-                "description": "Number of seconds allowed for this object to gracefully terminate."
-            },
-            "deletionTimestamp": {
-                "type": "string",
-                "format": "date-time",
-                "description": "DeletionTimestamp is RFC 3339 date and time at which this resource will be deleted."
-            },
-            "finalizers": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "generateName": {
-                "type": "string"
-            },
-            "generation": {
-                "type": "integer",
-                "format": "int64"
-            },
-            "labels": {
-                "type": "object",
-                "additionalProperties": { "type": "string" }
-            },
-            "name": {
-                "type": "string",
-                "description": "Name must be unique within a namespace."
-            },
-            "namespace": {
-                "type": "string",
-                "description": "Namespace defines the space within which each name must be unique."
-            },
-            "resourceVersion": {
-                "type": "string"
-            },
-            "uid": {
-                "type": "string"
-            }
-        }
-    })
+    const SCHEMA: &str = r#"{"description":"Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata","type":"object","properties":{"annotations":{"type":"object","additionalProperties":{"type":"string"},"description":"Annotations is an unstructured key value map stored with a resource."},"creationTimestamp":{"type":"string","format":"date-time","description":"CreationTimestamp is a timestamp representing the server time when this object was created."},"deletionGracePeriodSeconds":{"type":"integer","format":"int64","description":"Number of seconds allowed for this object to gracefully terminate."},"deletionTimestamp":{"type":"string","format":"date-time","description":"DeletionTimestamp is RFC 3339 date and time at which this resource will be deleted."},"finalizers":{"type":"array","items":{"type":"string"}},"generateName":{"type":"string"},"generation":{"type":"integer","format":"int64"},"labels":{"type":"object","additionalProperties":{"type":"string"}},"name":{"type":"string","description":"Name must be unique within a namespace."},"namespace":{"type":"string","description":"Namespace defines the space within which each name must be unique."},"resourceVersion":{"type":"string"},"uid":{"type":"string"}}}"#;
+    serde_json::from_str(SCHEMA).expect("valid static schema")
 }
 
 fn clean_crd_schema(schema: &mut Value) {

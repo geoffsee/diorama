@@ -67,9 +67,10 @@ codegen-units = 1
 panic = "abort"
 debug = "line-tables-only"
 
-# Artifact you actually ship: fat LTO, no symbols.
+# Artifact you actually ship: size-optimized fat LTO, no symbols.
 [profile.dist]
 inherits = "release"
+opt-level = "z"
 lto = "fat"
 debug = false
 strip = "symbols"
