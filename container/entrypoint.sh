@@ -31,6 +31,9 @@ link_bin() {
 link_bin containerd
 link_bin containerd-shim-runc-v2
 link_bin crun
+if command -v containerd-fuse-overlayfs-grpc >/dev/null 2>&1; then
+    link_bin containerd-fuse-overlayfs-grpc
+fi
 
 for plugin in bridge host-local portmap loopback; do
     src=/usr/libexec/cni/$plugin
@@ -40,6 +43,16 @@ for plugin in bridge host-local portmap loopback; do
     fi
     ln -sfn "$src" "$state/cni/bin/$plugin"
 done
+
+# Release images carry the workload archives outside the mounted state directory.
+# Refresh them from the installed release before containerd imports enabled images.
+if [ -d /usr/local/share/diorama/images ]; then
+    mkdir -p "$state/images"
+    for archive in /usr/local/share/diorama/images/*.tar.gz; do
+        [ -f "$archive" ] || continue
+        cp "$archive" "$state/images/"
+    done
+fi
 
 # cgroup v2: a cgroup with processes cannot delegate controllers to children
 # ("no internal processes"). Drain this container's root cgroup into /init so

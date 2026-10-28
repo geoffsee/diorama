@@ -14,7 +14,7 @@ fn independent_machine_vectors_and_missing_loader_are_observations_only() {
     ] {
         let b = executable(machine, class);
         let r = inventory(&b, architecture, Libc::Glibc)
-            .inspect_identity_elf(AssetId::KubeApiserver, &b, ElfLimits::default())
+            .inspect_identity_elf(AssetId::Containerd, &b, ElfLimits::default())
             .unwrap();
         assert_eq!(r.machine(), machine);
         assert_eq!(r.loader_relation(), LoaderRelation::Unresolved);
@@ -83,7 +83,7 @@ fn with_loader(loader: &[u8]) -> Vec<u8> {
 fn known_loader_mismatch_is_never_compatible() {
     let b = with_loader(b"/lib64/ld-linux-x86-64.so.2");
     let r = inventory(&b, Architecture::Amd64, Libc::Musl)
-        .inspect_identity_elf(AssetId::KubeApiserver, &b, ElfLimits::default())
+        .inspect_identity_elf(AssetId::Containerd, &b, ElfLimits::default())
         .unwrap();
     assert_eq!(r.loader_family(), LoaderFamily::Glibc);
     assert_eq!(r.loader_relation(), LoaderRelation::KnownMismatch);
@@ -103,7 +103,7 @@ fn arm_flags_are_not_cpu_or_complete_pcs_proof() {
         let mut b = executable(40, 1);
         put(&mut b, 36, flags, 4);
         let r = inventory(&b, Architecture::ArmV7, Libc::Musl)
-            .inspect_identity_elf(AssetId::KubeApiserver, &b, ElfLimits::default())
+            .inspect_identity_elf(AssetId::Containerd, &b, ElfLimits::default())
             .unwrap();
         assert_eq!(r.arm_float_abi(), expected);
         assert_eq!(r.loader_relation(), LoaderRelation::Unresolved);
@@ -117,7 +117,7 @@ fn exact_same_bytes_and_identity_are_required() {
     let mut altered = b.clone();
     altered[400] = 7;
     assert!(matches!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &altered, ElfLimits::default()),
+        inv.inspect_identity_elf(AssetId::Containerd, &altered, ElfLimits::default()),
         Err(ElfError::Encoded(_))
     ));
     assert!(matches!(
@@ -129,7 +129,7 @@ fn exact_same_bytes_and_identity_are_required() {
         ..ElfLimits::default()
     };
     assert!(matches!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &b, limits),
+        inv.inspect_identity_elf(AssetId::Containerd, &b, limits),
         Err(ElfError::Limit)
     ));
     let limits = ElfLimits {
@@ -137,7 +137,7 @@ fn exact_same_bytes_and_identity_are_required() {
         ..ElfLimits::default()
     };
     assert!(matches!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &b, limits),
+        inv.inspect_identity_elf(AssetId::Containerd, &b, limits),
         Err(ElfError::InvalidLimits)
     ));
 }
@@ -167,7 +167,7 @@ fn bounded_dynamic_table_resolves_names_through_load_segments() {
         ..ElfLimits::default()
     };
     assert_eq!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &b, separate_limits)
+        inv.inspect_identity_elf(AssetId::Containerd, &b, separate_limits)
             .unwrap()
             .needed(),
         &[b"libc.so.6".to_vec()]
@@ -175,7 +175,7 @@ fn bounded_dynamic_table_resolves_names_through_load_segments() {
     for (bytes, invalid) in [(8, false), (0, true)] {
         let error = inv
             .inspect_identity_elf(
-                AssetId::KubeApiserver,
+                AssetId::Containerd,
                 &b,
                 ElfLimits {
                     dependency_name_bytes: bytes,
@@ -194,7 +194,7 @@ fn bounded_dynamic_table_resolves_names_through_load_segments() {
         ..ElfLimits::default()
     };
     assert!(matches!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &b, limits),
+        inv.inspect_identity_elf(AssetId::Containerd, &b, limits),
         Err(ElfError::Limit)
     ));
     put(&mut b, 308, u64::MAX, 8);
@@ -210,7 +210,7 @@ fn section_counts_and_arm_attribute_bytes_are_bounded() {
     put(&mut b, 380, 20, 4);
     let inv = inventory(&b, Architecture::ArmV7, Libc::Musl);
     assert!(
-        inv.inspect_identity_elf(AssetId::KubeApiserver, &b, ElfLimits::default())
+        inv.inspect_identity_elf(AssetId::Containerd, &b, ElfLimits::default())
             .unwrap()
             .arm_attributes_present()
     );
@@ -225,14 +225,14 @@ fn section_counts_and_arm_attribute_bytes_are_bounded() {
         },
     ] {
         assert!(matches!(
-            inv.inspect_identity_elf(AssetId::KubeApiserver, &b, limits),
+            inv.inspect_identity_elf(AssetId::Containerd, &b, limits),
             Err(ElfError::Limit)
         ));
     }
     put(&mut b, 376, 500, 4);
     assert!(
         inventory(&b, Architecture::ArmV7, Libc::Musl)
-            .inspect_identity_elf(AssetId::KubeApiserver, &b, ElfLimits::default())
+            .inspect_identity_elf(AssetId::Containerd, &b, ElfLimits::default())
             .is_err()
     );
 }
@@ -242,7 +242,7 @@ fn interpreter_termination_duplicates_and_limit_are_checked() {
     let inv = inventory(&b, Architecture::Amd64, Libc::Glibc);
     assert!(
         inv.inspect_identity_elf(
-            AssetId::KubeApiserver,
+            AssetId::Containerd,
             &b,
             ElfLimits {
                 dependency_name_bytes: 1,
@@ -253,7 +253,7 @@ fn interpreter_termination_duplicates_and_limit_are_checked() {
     );
     assert!(
         inv.inspect_identity_elf(
-            AssetId::KubeApiserver,
+            AssetId::Containerd,
             &b,
             ElfLimits {
                 interpreter_bytes: 4,

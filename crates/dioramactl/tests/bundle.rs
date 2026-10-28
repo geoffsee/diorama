@@ -176,7 +176,7 @@ fn built_bundle_round_trips_through_offline_install() {
     let archive = build_offline_bundle(&spec(t.path(), 183)).unwrap();
     assert_eq!(
         archive.file_name().unwrap(),
-        "kubesolo-v1.1.8-linux-arm64-offline.tar.gz"
+        "diorama-v1.1.8-linux-arm64-offline.tar.gz"
     );
     let dest = t.path().join("dest");
     let (code, err) = install(archive, &dest);

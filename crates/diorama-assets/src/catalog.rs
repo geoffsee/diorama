@@ -1,13 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum AssetId {
-    KubeApiserver,
-    KubeControllerManager,
-    Kubelet,
-    KubeProxy,
-    Kine,
     Containerd,
     #[serde(rename = "containerd-shim-runc-v2")]
     ContainerdShim,
@@ -23,9 +18,9 @@ pub enum AssetId {
     ImageLocalPathHelper,
     ImagePortainerAgent,
     ImageD2k,
-    ImageKubesolo,
+    ImageDiorama,
 }
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoding {
     Identity,
@@ -45,28 +40,7 @@ pub struct CatalogEntry {
     pub reference: &'static str,
     pub encoding: Encoding,
 }
-const ENTRIES: [CatalogEntry; 20] = [
-    entry(
-        AssetId::KubeApiserver,
-        "kubernetes/v1.35.7/kube-apiserver",
-        Encoding::Identity,
-    ),
-    entry(
-        AssetId::KubeControllerManager,
-        "kubernetes/v1.35.7/kube-controller-manager",
-        Encoding::Identity,
-    ),
-    entry(
-        AssetId::Kubelet,
-        "kubernetes/v1.35.7/kubelet",
-        Encoding::Identity,
-    ),
-    entry(
-        AssetId::KubeProxy,
-        "kubernetes/v1.35.7/kube-proxy",
-        Encoding::Identity,
-    ),
-    entry(AssetId::Kine, "kine/v0.16.3", Encoding::Identity),
+const ENTRIES: [CatalogEntry; 15] = [
     entry(AssetId::Containerd, "containerd/v2.2.5", Encoding::Identity),
     entry(
         AssetId::ContainerdShim,
@@ -114,7 +88,7 @@ const ENTRIES: [CatalogEntry; 20] = [
         "docker.io/portainer/agent:lts",
     ),
     image(AssetId::ImageD2k, "docker.io/portainer/d2k:1.2.3"),
-    image(AssetId::ImageKubesolo, "ghcr.io/portainer/kubesolo:latest"),
+    image(AssetId::ImageDiorama, "ghcr.io/geoffsee/diorama:latest"),
 ];
 const fn entry(id: AssetId, reference: &'static str, encoding: Encoding) -> CatalogEntry {
     CatalogEntry {

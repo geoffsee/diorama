@@ -57,7 +57,7 @@ fn create_synthetic_payload(id: AssetId, encoding: Encoding) -> (Vec<u8>, Vec<u8
         | AssetId::ImageLocalPathHelper
         | AssetId::ImagePortainerAgent
         | AssetId::ImageD2k
-        | AssetId::ImageKubesolo => {
+        | AssetId::ImageDiorama => {
             let tar_data = entry("layer.tar", b"synthetic image layer");
             gzip(&tar_data)
         },
@@ -91,12 +91,7 @@ fn resolve_asset_delivery(variant: NodeVariant, id: AssetId) -> (bool, bool, Enc
     let is_bundled = !unavailable
         && (matches!(
             id,
-            AssetId::KubeApiserver
-                | AssetId::KubeControllerManager
-                | AssetId::Kubelet
-                | AssetId::KubeProxy
-                | AssetId::Kine
-                | AssetId::Containerd
+            AssetId::Containerd
                 | AssetId::FuseOverlayfsSnapshotter
                 | AssetId::ContainerdShim
                 | AssetId::Crun
@@ -121,7 +116,7 @@ fn resolve_asset_delivery(variant: NodeVariant, id: AssetId) -> (bool, bool, Enc
         | AssetId::ImageLocalPathHelper
         | AssetId::ImagePortainerAgent
         | AssetId::ImageD2k
-        | AssetId::ImageKubesolo => Encoding::Gzip,
+        | AssetId::ImageDiorama => Encoding::Gzip,
         _ => Encoding::Identity,
     };
 
@@ -130,11 +125,6 @@ fn resolve_asset_delivery(variant: NodeVariant, id: AssetId) -> (bool, bool, Enc
 
 fn parse_catalog_asset_id(id_str: &str) -> AssetId {
     match id_str {
-        "kube-apiserver" => AssetId::KubeApiserver,
-        "kube-controller-manager" => AssetId::KubeControllerManager,
-        "kubelet" => AssetId::Kubelet,
-        "kube-proxy" => AssetId::KubeProxy,
-        "kine" => AssetId::Kine,
         "containerd" => AssetId::Containerd,
         "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
         "containerd-shim-runc-v2" => AssetId::ContainerdShim,
@@ -149,7 +139,7 @@ fn parse_catalog_asset_id(id_str: &str) -> AssetId {
         "image-local-path-helper" => AssetId::ImageLocalPathHelper,
         "image-portainer-agent" => AssetId::ImagePortainerAgent,
         "image-d2k" => AssetId::ImageD2k,
-        "image-kubesolo" => AssetId::ImageKubesolo,
+        "image-diorama" => AssetId::ImageDiorama,
         other => panic!("unknown asset {other}"),
     }
 }

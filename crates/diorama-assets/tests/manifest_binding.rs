@@ -188,7 +188,7 @@ fn separately_declared_identity_rejects_role_archive_and_manifest_substitution()
     for (changed, expected) in [
         (
             DeclaredImageManifestPin {
-                asset: AssetId::Kine,
+                asset: AssetId::Containerd,
                 ..pin
             },
             Error::InvalidPin,

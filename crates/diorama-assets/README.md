@@ -25,13 +25,19 @@ supported optional image (including the local-path helper) while marking only
 target-restricted Portainer/D2K roles unavailable. CoreDNS and pause remain bundled
 in both variants.
 
+The current catalog contains eight runtime executables and seven images, including
+the diorama node image (`image-diorama`). Kubernetes components and Kine are not
+separate bundled assets. Offline manifests declare all 15 roles, with unsupported
+optional images marked unavailable. Online manifests bundle the eight executables,
+CoreDNS and pause; the other images require a registry.
+
 Release consumers must decode and validate the complete manifest for the requested
 target/variant before performing installation side effects. Wrong-target, missing-role,
 malformed and truncated manifest inputs are rejected by this same API. Validation does
 not authenticate otherwise well-formed manifest bytes, authorize installation, or
 replace verification of the exact bytes later materialized. Linux ARM64/glibc fixtures
-are structural manifests: Kubernetes arm64 pins match published releases, and the
-remaining bundled digests are placeholders rather than an accepted production cell.
+are structural manifests: their bundled digests are placeholders rather than an
+accepted production cell.
 
 `DeclaredInventory::verification_session()` creates an aggregate encoded-read
 budget. `verify_encoded_blob(id, reader)` checks exact encoded length and SHA-256,
@@ -54,7 +60,7 @@ encoded match does not prevent later mutation of a reopened path.
 ## Schema and scope
 
 See [the independent fixture](tests/fixtures/online-amd64.json) for the exact JSON
-shape. Its digests are real SHA-256(`abc`) test vectors. Do not ship it. Fields are:
+shape. Its digests are structural placeholders. Do not ship it. Fields are:
 
 - `schema_version`, `target:{os,architecture,libc}`, `variant`, `scope`, `assets`.
 - `os` is `linux`; architectures are `amd64`, `arm64`, `armv7`, `riscv64`; libc is

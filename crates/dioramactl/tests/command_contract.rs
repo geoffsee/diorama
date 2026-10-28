@@ -157,7 +157,7 @@ fn test_all_16_archive_matrix_cells() {
                 };
                 let archive_name = artifact_archive_name(version, target, offline);
                 let expected = format!(
-                    "kubesolo-{version}-linux-{arch_name}{libc_suffix}{offline_suffix}.tar.gz"
+                    "diorama-{version}-linux-{arch_name}{libc_suffix}{offline_suffix}.tar.gz"
                 );
                 assert_eq!(archive_name, expected);
                 generated_names.push(archive_name);
@@ -321,7 +321,7 @@ fn test_resolve_target_darwin_requires_arch() {
     assert_eq!(err, ArtifactSelectionError::DarwinRequiresArch);
     assert!(
         err.to_string()
-            .contains("on macOS, KubeSolo has no native binaries")
+            .contains("on macOS, diorama has no native binaries")
     );
 
     // Supplying explicit --arch on Darwin works
@@ -348,12 +348,12 @@ fn test_artifact_urls_and_installer_asset_names() {
         libc: Libc::Glibc,
     };
     let archive = artifact_archive_name("v1.1.8", target, false);
-    assert_eq!(archive, "kubesolo-v1.1.8-linux-amd64.tar.gz");
+    assert_eq!(archive, "diorama-v1.1.8-linux-amd64.tar.gz");
 
     let default_url = artifact_download_url("v1.1.8", &archive, None);
     assert_eq!(
         default_url,
-        "https://github.com/portainer/kubesolo/releases/download/v1.1.8/kubesolo-v1.1.8-linux-amd64.tar.gz"
+        "https://github.com/geoffsee/diorama/releases/download/v1.1.8/diorama-v1.1.8-linux-amd64.tar.gz"
     );
 
     let custom_url =
@@ -489,7 +489,7 @@ fn test_execute_download_success() {
     assert_eq!(
         inputs.download_dest_called.as_ref(),
         Some(&PathBuf::from(
-            "/tmp/diorama-download-test/kubesolo-v1.1.8-linux-arm64-musl-offline.tar.gz"
+            "/tmp/diorama-download-test/diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"
         ))
     );
     assert_eq!(
@@ -502,15 +502,13 @@ fn test_execute_download_success() {
     );
 
     let err_str = String::from_utf8_lossy(&stderr);
-    assert!(err_str.contains("Target resolved: kubesolo-v1.1.8-linux-arm64-musl-offline.tar.gz"));
+    assert!(err_str.contains("Target resolved: diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"));
     assert!(err_str.contains("Bundle ready in /tmp/diorama-download-test"));
     assert_eq!(
         inputs.download_temp_dir_called,
         Some(PathBuf::from("/tmp/scratch"))
     );
-    assert!(
-        err_str.contains("--offline-install=./kubesolo-v1.1.8-linux-arm64-musl-offline.tar.gz")
-    );
+    assert!(err_str.contains("--offline-install=./diorama-v1.1.8-linux-arm64-musl-offline.tar.gz"));
 }
 
 #[test]

@@ -200,12 +200,7 @@ impl AssetSelector {
     fn select_external_delivery(&self, id: AssetId, default_ref: &str) -> SelectedDelivery {
         match id {
             // Executables are supplied by host in external deps builds
-            AssetId::KubeApiserver
-            | AssetId::KubeControllerManager
-            | AssetId::Kubelet
-            | AssetId::KubeProxy
-            | AssetId::Kine
-            | AssetId::Containerd
+            AssetId::Containerd
             | AssetId::ContainerdShim
             | AssetId::Crun
             | AssetId::CniBridge
@@ -248,7 +243,7 @@ impl AssetSelector {
                     SelectedDelivery::Disabled
                 }
             },
-            AssetId::ImageKubesolo => {
+            AssetId::ImageDiorama => {
                 if self.variant == Variant::Offline {
                     SelectedDelivery::Bundled
                 } else {
@@ -279,13 +274,8 @@ impl AssetSelector {
 
     fn select_supervised_delivery(&self, id: AssetId, default_ref: &str) -> SelectedDelivery {
         match id {
-            // 13 executable roles and 2 core images are always bundled in supervised bundle
-            AssetId::KubeApiserver
-            | AssetId::KubeControllerManager
-            | AssetId::Kubelet
-            | AssetId::KubeProxy
-            | AssetId::Kine
-            | AssetId::Containerd
+            // 8 runtime executable roles and 2 core images are always bundled in supervised bundle
+            AssetId::Containerd
             | AssetId::ContainerdShim
             | AssetId::Crun
             | AssetId::CniBridge
@@ -338,8 +328,8 @@ impl AssetSelector {
                 }
             },
 
-            // D2K image
-            AssetId::ImageKubesolo => {
+            // Node container image & D2K image
+            AssetId::ImageDiorama => {
                 if self.variant == Variant::Offline {
                     SelectedDelivery::Bundled
                 } else {

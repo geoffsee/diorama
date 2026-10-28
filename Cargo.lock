@@ -618,11 +618,18 @@ dependencies = [
 name = "diorama-dev"
 version = "0.1.0"
 dependencies = [
+ "diorama-assets",
+ "diorama-platform",
+ "dioramactl",
+ "flate2",
  "regex",
  "rustix",
+ "serde",
  "serde_json",
+ "sha2",
  "syn 2.0.119",
  "tempfile",
+ "zstd",
 ]
 
 [[package]]

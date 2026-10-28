@@ -342,13 +342,24 @@ fn publish(_staged: &Path, _target: &Path, _manifest: &BundleManifest) -> io::Re
 }
 
 /// Import a platform-checked image from private staging without publishing service files.
-#[allow(clippy::too_many_lines)]
 fn execute_container_install(
     options: &InstallOptions,
 ) -> io::Result<crate::container::ContainerInstallResult> {
+    use crate::docker_engine::DockerEngine;
+    let architecture = DockerEngine::architecture()?;
+    install_container_with_engine(options, &mut DockerEngine, architecture)
+}
+
+/// Install through a connected Linux engine, using its observed architecture to
+/// validate an offline bundle before importing the image or creating resources.
+#[allow(clippy::too_many_lines)]
+pub fn install_container_with_engine(
+    options: &InstallOptions,
+    engine: &mut dyn crate::container::ContainerEngineClient,
+    engine_arch: Architecture,
+) -> io::Result<crate::container::ContainerInstallResult> {
     use crate::container::ContainerInstallParams;
     use crate::container_image::install_selected_container;
-    use crate::docker_engine::DockerEngine;
     use diorama_assets::{
         DecodeLimits, Delivery, InventoryRequest, Limits, Manifest, Scope, Variant,
     };
@@ -416,10 +427,8 @@ fn execute_container_install(
         apiserver_host_port: None,
         d2k_host_port: None,
     };
-    let mut engine = DockerEngine;
-    let engine_arch = DockerEngine::architecture()?;
     let Some(path) = options.offline_install.as_ref() else {
-        return install_selected_container(&mut engine, options, params, None).map_err(invalid);
+        return install_selected_container(engine, options, params, None).map_err(invalid);
     };
     // Explicit custom images retain their documented registry-pull behavior.
     if options
@@ -427,7 +436,7 @@ fn execute_container_install(
         .as_ref()
         .is_some_and(|s| !s.is_empty())
     {
-        return install_selected_container(&mut engine, options, params, None).map_err(invalid);
+        return install_selected_container(engine, options, params, None).map_err(invalid);
     }
     let parsed =
         ArtifactNaming::parse_node_archive(&path.file_name().unwrap_or_default().to_string_lossy())
@@ -474,7 +483,7 @@ fn execute_container_install(
     let image_path = inventory
         .assets()
         .find_map(|(id, delivery)| match delivery {
-            Delivery::Bundled { path, .. } if id == diorama_assets::AssetId::ImageKubesolo => {
+            Delivery::Bundled { path, .. } if id == diorama_assets::AssetId::ImageDiorama => {
                 Some(path.clone())
             },
             _ => None,
@@ -488,7 +497,7 @@ fn execute_container_install(
     let mut session = inventory
         .decoding_session(DecodeLimits::default())
         .map_err(invalid)?;
-    install_selected_container(&mut engine, options, params, Some((&mut session, &bytes)))
+    install_selected_container(engine, options, params, Some((&mut session, &bytes)))
         .map_err(invalid)
 }
 

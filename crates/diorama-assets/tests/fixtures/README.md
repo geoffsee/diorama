@@ -1,1 +1,8 @@
-Independent synthetic vectors, not a production asset lock. abc.bin is the standard SHA-256 abc vector (FIPS180-4); Python hashlib independently confirmed the displayed digest. The JSON role/encoding list was prepared directly from pinned baseline embed files and accepted E01 decisions, without calling the Rust catalog. Every bundled record deliberately uses the same non-ELF/non-gzip/non-zstd bytes: encoded-only matching must never be represented as content validation. Source anchors are in ../../CATALOG.md.
+Independent structural fixtures, not a production asset lock. The JSON manifests
+declare the eight runtime executables and seven images in the diorama inventory,
+including `image-diorama`. Their sizes and digests are placeholders; no corresponding
+production payloads are supplied.
+
+`abc.bin` is the standard SHA-256 `abc` vector (FIPS 180-4). Encoded verification
+tests replace the bundled records' size and digest with that vector. Those bytes
+are neither ELF nor gzip nor zstd: encoded matching must not imply content validation.

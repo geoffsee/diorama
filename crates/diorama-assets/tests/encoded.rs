@@ -43,9 +43,9 @@ fn known_independent_sha256_vector_matches_encoded_bytes_only() {
     let inventory = inventory(Limits::default());
     let mut session = inventory.verification_session();
     let result = session
-        .verify_encoded_blob(AssetId::KubeApiserver, ABC)
+        .verify_encoded_blob(AssetId::Containerd, ABC)
         .unwrap();
-    assert_eq!(result.id(), AssetId::KubeApiserver);
+    assert_eq!(result.id(), AssetId::Containerd);
     assert_eq!(result.encoded_bytes(), 3);
     assert_eq!(
         result.sha256(),
@@ -67,12 +67,12 @@ fn corruption_truncation_empty_and_extra_bytes_are_distinct() {
     let inventory = inventory(Limits::default());
     let mut session = inventory.verification_session();
     assert!(matches!(
-        session.verify_encoded_blob(AssetId::Kine, &b"abd"[..]),
-        Err(VerificationError::DigestMismatch(AssetId::Kine))
+        session.verify_encoded_blob(AssetId::Containerd, &b"abd"[..]),
+        Err(VerificationError::DigestMismatch(AssetId::Containerd))
     ));
     for (bytes, observed) in [(&b""[..], 0), (&b"ab"[..], 2), (&b"abcd"[..], 4)] {
         assert!(
-            matches!(session.verify_encoded_blob(AssetId::Kine,bytes),Err(VerificationError::SizeMismatch { expected:3,observed:n,.. }) if n==observed)
+            matches!(session.verify_encoded_blob(AssetId::Containerd,bytes),Err(VerificationError::SizeMismatch { expected:3,observed:n,.. }) if n==observed)
         );
     }
 }
@@ -82,7 +82,7 @@ fn long_input_consumes_no_more_than_declared_size_plus_one() {
     let mut session = inventory.verification_session();
     let mut input = Cursor::new(vec![b'a'; 1_000_000]);
     assert!(matches!(
-        session.verify_encoded_blob(AssetId::Kine, &mut input),
+        session.verify_encoded_blob(AssetId::Containerd, &mut input),
         Err(VerificationError::SizeMismatch { observed: 4, .. })
     ));
     assert_eq!(input.position(), 4);
@@ -106,7 +106,7 @@ fn short_reads_are_hashed_without_assuming_single_read() {
     assert!(
         inventory
             .verification_session()
-            .verify_encoded_blob(AssetId::Kine, OneByte(ABC))
+            .verify_encoded_blob(AssetId::Containerd, OneByte(ABC))
             .is_ok()
     );
 }
@@ -123,13 +123,13 @@ impl Read for Failed {
 #[test]
 fn io_source_is_preserved_and_attempts_consume_aggregate_budget() {
     let inventory = inventory(Limits {
-        encoded_total_bytes: 60,
+        encoded_total_bytes: 40,
         ..Limits::default()
     });
     let mut session = inventory.verification_session();
-    for remaining in (0..15).rev() {
+    for remaining in (0..10).rev() {
         let error = session
-            .verify_encoded_blob(AssetId::Kine, Failed)
+            .verify_encoded_blob(AssetId::Containerd, Failed)
             .unwrap_err();
         assert!(
             matches!(error,VerificationError::Io { ref source,.. } if source.kind()==io::ErrorKind::PermissionDenied)
@@ -140,7 +140,7 @@ fn io_source_is_preserved_and_attempts_consume_aggregate_budget() {
     }
     let mut input = Cursor::new(ABC);
     assert!(matches!(
-        session.verify_encoded_blob(AssetId::Kine, &mut input),
+        session.verify_encoded_blob(AssetId::Containerd, &mut input),
         Err(VerificationError::BudgetExceeded(_))
     ));
     assert_eq!(input.position(), 0);
@@ -148,7 +148,7 @@ fn io_source_is_preserved_and_attempts_consume_aggregate_budget() {
 #[test]
 fn aggregate_budget_can_verify_each_bundled_input_once() {
     let inventory = inventory(Limits {
-        encoded_total_bytes: 60,
+        encoded_total_bytes: 40,
         ..Limits::default()
     });
     let mut session = inventory.verification_session();
@@ -182,7 +182,7 @@ fn invalid_reader_counts_are_errors_not_panics() {
     assert!(matches!(
         inventory
             .verification_session()
-            .verify_encoded_blob(AssetId::Kine, InvalidCount),
+            .verify_encoded_blob(AssetId::Containerd, InvalidCount),
         Err(VerificationError::InvalidReadCount(_))
     ));
 }

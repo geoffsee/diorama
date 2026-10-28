@@ -331,9 +331,9 @@ impl ReleasePackager {
                                 | diorama_platform::Architecture::Arm64
                         )
                 },
-                AssetId::ImageLocalPath
-                | AssetId::ImageLocalPathHelper
-                | AssetId::ImageKubesolo => variant.variant == crate::Variant::Offline,
+                AssetId::ImageLocalPath | AssetId::ImageLocalPathHelper | AssetId::ImageDiorama => {
+                    variant.variant == crate::Variant::Offline
+                },
                 _ => true,
             })
             .map(|entry| entry.id)

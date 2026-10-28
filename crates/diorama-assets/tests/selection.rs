@@ -53,11 +53,6 @@ fn build_offline_archive() -> (diorama_assets::DeclaredInventory, Vec<u8>) {
         let delivery_kind = row["delivery"]["kind"].as_str().unwrap_or("");
         if delivery_kind == "bundled" {
             let id = match id_str {
-                "kube-apiserver" => AssetId::KubeApiserver,
-                "kube-controller-manager" => AssetId::KubeControllerManager,
-                "kubelet" => AssetId::Kubelet,
-                "kube-proxy" => AssetId::KubeProxy,
-                "kine" => AssetId::Kine,
                 "containerd" => AssetId::Containerd,
                 "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
                 "containerd-shim-runc-v2" => AssetId::ContainerdShim,
@@ -72,7 +67,7 @@ fn build_offline_archive() -> (diorama_assets::DeclaredInventory, Vec<u8>) {
                 "image-local-path-helper" => AssetId::ImageLocalPathHelper,
                 "image-portainer-agent" => AssetId::ImagePortainerAgent,
                 "image-d2k" => AssetId::ImageD2k,
-                "image-kubesolo" => AssetId::ImageKubesolo,
+                "image-diorama" => AssetId::ImageDiorama,
                 other => panic!("unknown asset {other}"),
             };
 
@@ -84,7 +79,7 @@ fn build_offline_archive() -> (diorama_assets::DeclaredInventory, Vec<u8>) {
                 | AssetId::ImageLocalPathHelper
                 | AssetId::ImagePortainerAgent
                 | AssetId::ImageD2k
-                | AssetId::ImageKubesolo => gzip(&entry("layer.tar", b"test layer")),
+                | AssetId::ImageDiorama => gzip(&entry("layer.tar", b"test layer")),
                 _ => format!("test-bin-{id:?}").into_bytes(),
             };
 
@@ -138,11 +133,6 @@ fn external_dependency_builds_compile_without_embedded_payloads() {
 
     // Executables are host-supplied
     for id in [
-        AssetId::KubeApiserver,
-        AssetId::KubeControllerManager,
-        AssetId::Kubelet,
-        AssetId::KubeProxy,
-        AssetId::Kine,
         AssetId::Containerd,
         AssetId::ContainerdShim,
         AssetId::Crun,
@@ -403,11 +393,11 @@ fn materializer_honors_asset_selection_filter() {
     );
 
     // Executables must still exist
-    let apiserver_dest = mat_no_storage
+    let containerd_dest = mat_no_storage
         .layout()
-        .resolve_destination(test_dir_no_storage.path(), AssetId::KubeApiserver)
+        .resolve_destination(test_dir_no_storage.path(), AssetId::Containerd)
         .unwrap();
-    assert!(apiserver_dest.exists(), "kube-apiserver must exist");
+    assert!(containerd_dest.exists(), "containerd must exist");
 
     // Now repeat with local storage enabled
     let (inventory2, _) = build_offline_archive();
@@ -565,16 +555,12 @@ fn directory_and_provider_selection_skip_excluded_payloads() {
         ] {
             assert!(result.get(id).is_none());
         }
-        assert!(result.get(AssetId::KubeApiserver).is_some());
+        assert!(result.get(AssetId::Containerd).is_some());
     }
     let single = materializer
         .materialize_single_asset(
-            AssetId::KubeApiserver,
-            Cursor::new(bundled_payload(
-                &inventory,
-                &archive,
-                AssetId::KubeApiserver,
-            )),
+            AssetId::Containerd,
+            Cursor::new(bundled_payload(&inventory, &archive, AssetId::Containerd)),
         )
         .unwrap();
     assert!(single.path.is_file());
@@ -618,7 +604,7 @@ fn mismatched_selector_is_rejected_by_every_materialization_entry_before_io() {
             Err(diorama_assets::MaterializationError::SelectorMismatch)
         ));
         assert!(matches!(
-            materializer.materialize_single_asset(AssetId::KubeApiserver, MustNotRead),
+            materializer.materialize_single_asset(AssetId::Containerd, MustNotRead),
             Err(diorama_assets::MaterializationError::SelectorMismatch)
         ));
         assert!(!destination.exists());

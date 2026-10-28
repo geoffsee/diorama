@@ -42,9 +42,9 @@ assets into configured writable host roots.
    specifications exactly.
 
 4. **Unix Permission Enforcement**:
-   - Executables (`Kind::Executable`: `kube-apiserver`, `kubelet`, `containerd`, etc.) are
+   - Executables (`Kind::Executable`: `containerd`, `crun`, CNI plugins, etc.) are
      materialized with Unix mode `0o755` (`rwxr-xr-x`).
-   - Image payloads and archives (`Kind::Image`: `containerd/images/*.tar.gz`) are
+   - Image payloads and archives (`Kind::Image`: `images/*.tar.gz`) are
      materialized with Unix mode `0o644` (`rw-r--r--`).
 
 5. **Idempotence**:

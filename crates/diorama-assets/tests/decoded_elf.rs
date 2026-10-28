@@ -269,7 +269,7 @@ fn invalid_limits_identity_and_gzip_image_are_rejected_without_budget_effects() 
         Err(CompressedElfError::NotExecutable)
     ));
     assert!(matches!(
-        session.inspect_compressed_elf(AssetId::KubeApiserver, b"abc", ElfLimits::default()),
+        session.inspect_compressed_elf(AssetId::Containerd, b"abc", ElfLimits::default()),
         Err(CompressedElfError::Decode(DecodeError::Policy(
             DecodePolicyError::NotCompressed
         )))

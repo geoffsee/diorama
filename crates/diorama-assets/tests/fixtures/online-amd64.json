@@ -9,56 +9,6 @@
   "scope": "supervised-bundle",
   "assets": [
     {
-      "id": "kube-apiserver",
-      "delivery": {
-        "kind": "bundled",
-        "path": "fixtures/kube-apiserver",
-        "encoding": "identity",
-        "encoded_bytes": 85778616,
-        "sha256": "0317e382c47b721af23dfcf853073fbe76ebe26a592dffc42359e20be21047a8"
-      }
-    },
-    {
-      "id": "kube-controller-manager",
-      "delivery": {
-        "kind": "bundled",
-        "path": "fixtures/kube-controller-manager",
-        "encoding": "identity",
-        "encoded_bytes": 71790776,
-        "sha256": "82c0dc57f9d066e4aef869c88386b2e1baacd30d12746dd09e08cf8e41492df8"
-      }
-    },
-    {
-      "id": "kubelet",
-      "delivery": {
-        "kind": "bundled",
-        "path": "fixtures/kubelet",
-        "encoding": "identity",
-        "encoded_bytes": 58089764,
-        "sha256": "e48cbb9c62351aa95f455bdae3c9a9e9d7d644027c231ade7a67b868b2be3258"
-      }
-    },
-    {
-      "id": "kube-proxy",
-      "delivery": {
-        "kind": "bundled",
-        "path": "fixtures/kube-proxy",
-        "encoding": "identity",
-        "encoded_bytes": 43204792,
-        "sha256": "1c22a8ff41efba86b32d50a24b1d07149e2f8a96a43b914bafd92b984f8f40f0"
-      }
-    },
-    {
-      "id": "kine",
-      "delivery": {
-        "kind": "bundled",
-        "path": "fixtures/kine",
-        "encoding": "identity",
-        "encoded_bytes": 47431544,
-        "sha256": "1331b855502c9ba8f27d51531baa204e513b5d5056036d4ca453f06ef32ce976"
-      }
-    },
-    {
       "id": "containerd",
       "delivery": {
         "kind": "bundled",
@@ -183,7 +133,7 @@
       }
     },
     {
-      "id": "image-kubesolo",
+      "id": "image-diorama",
       "delivery": {
         "kind": "registry-required"
       }

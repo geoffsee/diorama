@@ -1,7 +1,7 @@
 use crate::contract::InstallOptions;
 use diorama_assets::{ArchiveLimits, AssetId, DecodeSession, LayerDecodeLimits};
 
-pub const DEFAULT_CONTAINER_IMAGE: &str = "portainer/kubesolo";
+pub const DEFAULT_CONTAINER_IMAGE: &str = "ghcr.io/geoffsee/diorama";
 
 /// Capability bound to the exact image bytes verified by a decoding session.
 pub struct VerifiedContainerImage<'a> {
@@ -33,7 +33,7 @@ pub fn verify_container_image<'a>(
 ) -> Result<VerifiedContainerImage<'a>, String> {
     let observation = session
         .verify_crane_image_layer_digests(
-            AssetId::ImageKubesolo,
+            AssetId::ImageDiorama,
             bytes,
             ArchiveLimits::default(),
             LayerDecodeLimits::default(),

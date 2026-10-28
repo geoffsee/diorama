@@ -66,7 +66,7 @@ pub(crate) fn inventory(b: &[u8], architecture: Architecture, libc: Libc) -> Dec
     });
     v["target"]["libc"] = json!(if libc == Libc::Musl { "musl" } else { "glibc" });
     for a in v["assets"].as_array_mut().unwrap() {
-        if a["id"] == "kube-apiserver" || a["id"] == "kine" {
+        if a["id"] == "containerd" {
             a["delivery"]["encoded_bytes"] = json!(b.len());
             a["delivery"]["sha256"] =
                 json!(Sha256::digest(b).iter().fold(String::new(), |mut s, v| {
@@ -95,7 +95,7 @@ pub(crate) fn inventory(b: &[u8], architecture: Architecture, libc: Libc) -> Dec
 }
 pub(crate) fn inspect(b: &[u8]) -> Result<diorama_assets::ElfInspection, ElfError> {
     inventory(b, Architecture::Amd64, Libc::Glibc).inspect_identity_elf(
-        AssetId::KubeApiserver,
+        AssetId::Containerd,
         b,
         ElfLimits::default(),
     )

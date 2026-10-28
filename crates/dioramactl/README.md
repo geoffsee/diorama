@@ -1,12 +1,52 @@
 # Management checks and explicit prerequisites
 
+Offline archives use `diorama-<version>-linux-<arch>[-musl]-offline.tar.gz`.
+`bundle::build_offline_bundle` builds these archives from local files and writes
+the checksummed `bundle.manifest` consumed by `install --offline-install`.
+Host installation verifies and extracts the bundle into `--path`; it does not
+yet register or start a system service. For example, on a matching Linux host:
+
+```sh
+./dioramactl install --offline-install=./diorama-v0.1.0-linux-arm64-offline.tar.gz --path=./node
+```
+
+Download selection uses `geoffsee/diorama` releases and defaults to the management
+CLI's package version. The requested archive must be published there, or supplied
+through `--custom-url`. Local offline installation makes no download request.
+
+The [release workflow](../../.github/workflows/release.yml) publishes glibc offline
+bundles for Linux amd64 and arm64 alongside the standalone binaries. Each bundle
+contains `bin/diorama`, `bin/dioramactl`, the runtime executables, all seven image
+archives, `asset-inventory.json`, `release-inputs.json`, and `bundle.manifest`.
+Runtime files are ready to execute after host extraction; the inventory also
+includes the encoded payloads required by asset validation. Checksums for the
+complete archives are included in the release's `SHA256SUMS`.
+
+Inputs are pinned in [release-inputs.json](../diorama-dev/release-inputs.json):
+upstream binary downloads use SHA-256 checksums, and workload images use platform
+manifest digests. Update those pins when changing catalog versions. The release
+tool verifies executable architecture, image platform, tags and layer digests before
+producing an archive. CI then runs host extraction in a network namespace with no
+egress and loads the node image. The image carries workload archives outside the
+data volume and copies them into the configured state directory at startup.
+Musl, ARMv7 and RISC-V bundles are not produced by the current release matrix.
+
+For a local reproduction on a build host with Rust, curl and tar:
+
+```sh
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo run --locked -p diorama-dev --bin diorama-release-bundle -- prepare arm64 /tmp/release-assets
+# Build/export the node image as shown in the release workflow, then:
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo run --locked -p diorama-dev --bin diorama-release-bundle -- package v0.1.0 arm64 \
+  target/aarch64-unknown-linux-gnu/dist /tmp/release-assets dist
+```
+
 Container-mode installation dispatches through the Docker CLI and the existing owned
 network/volume/container request boundary. A Linux Engine is required on Linux,
 macOS or WSL2; its architecture is queried instead of inferred from the management host.
 This implements image import and container creation, not live node readiness qualification.
 
 An offline container bundle must include a hash-listed `asset-inventory.json` with
-the complete supervised offline asset inventory, and the declared `image-kubesolo`
+the complete supervised offline asset inventory, and the declared `image-diorama`
 gzip payload at its inventory path. Private archive staging, link/traversal rejection
 and bundle hash checks run before import. The decoder then verifies the exact image
 bytes, config platform and layer DiffIDs before passing those same bytes to Docker.
@@ -24,7 +64,9 @@ child, not arbitrary descendants or remote Engine operations: killing the client
 not prove an already-accepted daemon mutation was cancelled.
 
 An explicit `--image` override retains registry-pull behavior and takes precedence
-over the offline bundle. Default online selection uses the requested version.
+over the offline bundle. Default online selection uses
+`ghcr.io/geoffsee/diorama:<version>`. Offline selection uses the verified archive's
+tag. Neither path requires a kubesolo executable or image.
 Tests use synthetic image archives and Engine fixtures; live Docker, retained-node
 startup and egress-denied workload qualification remain unexecuted.
 
