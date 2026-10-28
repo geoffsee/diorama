@@ -101,7 +101,22 @@ pub(crate) fn register_crd_schema(group: &str, plural: &str, openapi_v3_schema: 
     CRD_SCHEMAS.write().unwrap().insert(key, openapi_v3_schema);
 }
 
-/// Unregisters a CRD `OpenAPI` v3 schema.
+/// Registers a version-specific CRD `OpenAPI` v3 schema for field validation.
+pub(crate) fn register_crd_version_schema(
+    group: &str,
+    version: &str,
+    plural: &str,
+    openapi_v3_schema: Value,
+) {
+    let key = if group.is_empty() {
+        format!("{version}/{plural}")
+    } else {
+        format!("{group}/{version}/{plural}")
+    };
+    CRD_SCHEMAS.write().unwrap().insert(key, openapi_v3_schema);
+}
+
+/// Unregisters a CRD `OpenAPI` v3 schema (and any version-specific entries).
 #[allow(dead_code)]
 pub(crate) fn unregister_crd_schema(group: &str, plural: &str) {
     let key = if group.is_empty() {
@@ -109,7 +124,15 @@ pub(crate) fn unregister_crd_schema(group: &str, plural: &str) {
     } else {
         format!("{group}/{plural}")
     };
-    CRD_SCHEMAS.write().unwrap().remove(&key);
+    let prefix = if group.is_empty() {
+        String::new()
+    } else {
+        format!("{group}/")
+    };
+    let suffix = format!("/{plural}");
+    let mut map = CRD_SCHEMAS.write().unwrap();
+    map.remove(&key);
+    map.retain(|k, _| !(k.starts_with(&prefix) && k.ends_with(&suffix)));
 }
 
 /// Clears all registered CRD schemas.
@@ -129,6 +152,23 @@ pub(crate) fn get_crd_schema(group: &str, plural: &str) -> Option<Value> {
     CRD_SCHEMAS.read().unwrap().get(&key).cloned()
 }
 
+/// Returns a copy of the registered CRD schema for `(group, version, plural)`,
+/// falling back to `(group, plural)`.
+#[must_use]
+pub(crate) fn get_crd_version_schema(group: &str, version: &str, plural: &str) -> Option<Value> {
+    if !version.is_empty() {
+        let version_key = if group.is_empty() {
+            format!("{version}/{plural}")
+        } else {
+            format!("{group}/{version}/{plural}")
+        };
+        if let Some(schema) = CRD_SCHEMAS.read().unwrap().get(&version_key).cloned() {
+            return Some(schema);
+        }
+    }
+    get_crd_schema(group, plural)
+}
+
 /// Checks strict decoding constraints on a JSON request payload.
 /// Detects duplicate keys at any depth and unknown fields.
 #[allow(dead_code)]
@@ -139,7 +179,7 @@ pub(crate) fn check_strict_json(body: &[u8], path: &ResourcePath) -> Result<(), 
         });
     };
     let kind = kind_from_path(path);
-    let crd_schema = get_crd_schema(&path.group, &path.resource);
+    let crd_schema = get_crd_version_schema(&path.group, &path.version, &path.resource);
     let mut checker = JsonStrictChecker::new(text, kind, crd_schema.as_ref());
     checker.check()
 }
@@ -220,7 +260,7 @@ fn decode_json_with_directive(
         });
     };
 
-    let crd_schema = get_crd_schema(&path.group, &path.resource);
+    let crd_schema = get_crd_version_schema(&path.group, &path.version, &path.resource);
     let kind = kind_from_path(path);
 
     let mut checker = JsonStrictChecker::new(text, kind, crd_schema.as_ref());
@@ -323,7 +363,7 @@ pub(crate) fn decode_yaml_with_directive(
     }
 
     if let Some(path) = path {
-        let crd_schema = get_crd_schema(&path.group, &path.resource);
+        let crd_schema = get_crd_version_schema(&path.group, &path.version, &path.resource);
         let kind = kind_from_path(path);
         let mut unknown_fields = Vec::new();
         collect_unknown_fields(

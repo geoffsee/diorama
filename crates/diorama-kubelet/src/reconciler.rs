@@ -582,11 +582,62 @@ fn is_active_deadline_exceeded(pod: &Value) -> bool {
     now.saturating_sub(start_secs) >= deadline_secs
 }
 
+fn carry_forward_prev_container_status(c_status: &mut Value, prev_cs: &Value) {
+    let prev_restarts = prev_cs
+        .get("restartCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cur_restarts = c_status
+        .get("restartCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if prev_restarts > cur_restarts {
+        c_status["restartCount"] = json!(prev_restarts);
+    }
+    if c_status.get("resources").is_none()
+        && let Some(prev_res) = prev_cs.get("resources")
+    {
+        c_status["resources"] = prev_res.clone();
+    }
+}
+
+fn should_restart_on_resize(container_spec: &Value, prev_res: &Value, new_res: &Value) -> bool {
+    let Some(policies) = container_spec.get("resizePolicy").and_then(Value::as_array) else {
+        return false;
+    };
+    for p in policies {
+        if p.get("restartPolicy").and_then(Value::as_str) != Some("RestartContainer") {
+            continue;
+        }
+        let Some(r_name) = p.get("resourceName").and_then(Value::as_str) else {
+            continue;
+        };
+        let req_path = format!("/requests/{r_name}");
+        let lim_path = format!("/limits/{r_name}");
+        if prev_res.pointer(&req_path) != new_res.pointer(&req_path)
+            || prev_res.pointer(&lim_path) != new_res.pointer(&lim_path)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn sync_container_status_resources(c_status: &mut Value, container_spec: &Value) {
     let res = container_spec
         .get("resources")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if let Some(prev_res) = c_status.get("resources")
+        && prev_res.as_object().is_some_and(|m| !m.is_empty())
+        && should_restart_on_resize(container_spec, prev_res, &res)
+    {
+        let cur = c_status
+            .get("restartCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        c_status["restartCount"] = json!(cur + 1);
+    }
     c_status["resources"] = res.clone();
     let alloc = res
         .get("requests")
@@ -2099,15 +2150,14 @@ fn build_container_resources(container: &Value) -> Option<cri::LinuxContainerRes
             has_resources = true;
         }
     }
+    if resources.cpu_quota == 0 {
+        resources.cpu_quota = -1;
+        resources.cpu_period = 100_000;
+    }
     let cpu_req = res
         .get("requests")
         .and_then(|r| r.get("cpu"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            res.get("limits")
-                .and_then(|l| l.get("cpu"))
-                .and_then(Value::as_str)
-        });
+        .and_then(Value::as_str);
     if let Some(cpu) = cpu_req
         && let Some(milli) = parse_cpu_quantity_milli(cpu)
     {
@@ -2116,6 +2166,8 @@ fn build_container_resources(container: &Value) -> Option<cri::LinuxContainerRes
             .max(2);
         resources.cpu_shares = shares;
         has_resources = true;
+    } else {
+        resources.cpu_shares = 2;
     }
 
     if has_resources { Some(resources) } else { None }
@@ -3761,7 +3813,16 @@ impl PodReconciler {
         node_name: &str,
     ) -> Result<Value, KubeletError> {
         let name = pod_name(pod);
-        let mut bound = pod.clone();
+        let mut bound = match self.client.get_pod(namespace, name).await {
+            Ok(latest) => latest,
+            Err(_) => pod.clone(),
+        };
+        if let Some(nom) = pod
+            .pointer("/status/nominatedNodeName")
+            .and_then(Value::as_str)
+        {
+            bound["status"]["nominatedNodeName"] = json!(nom);
+        }
         bound["spec"]["nodeName"] = json!(node_name);
         self.client
             .update_pod(namespace, name, bound)
@@ -4219,13 +4280,16 @@ impl PodReconciler {
                 })?;
         let name = pod_name(pod);
         let assignment = self.cpu_assignment(namespace, name, pod, container);
+        let linux = config
+            .linux
+            .get_or_insert_with(cri::LinuxContainerConfig::default);
+        let resources = linux
+            .resources
+            .get_or_insert_with(cri::LinuxContainerResources::default);
+        if resources.cpu_shares == 0 {
+            resources.cpu_shares = 2;
+        }
         if !assignment.cpuset.is_empty() {
-            let linux = config
-                .linux
-                .get_or_insert_with(cri::LinuxContainerConfig::default);
-            let resources = linux
-                .resources
-                .get_or_insert_with(cri::LinuxContainerResources::default);
             resources.cpuset_cpus = assignment.cpuset;
         }
         if let Some(target_name) = container.get("targetContainerName").and_then(Value::as_str) {
@@ -4707,11 +4771,17 @@ impl PodReconciler {
                 ephemeral_containers: &ephem_views,
             },
         );
+        let prev_c_statuses = orig_pod
+            .pointer("/status/containerStatuses")
+            .and_then(Value::as_array);
         if let Some(c_statuses) = status
             .get_mut("containerStatuses")
             .and_then(Value::as_array_mut)
         {
             for (i, c_status) in c_statuses.iter_mut().enumerate() {
+                if let Some(prev_cs) = prev_c_statuses.and_then(|arr| arr.get(i)) {
+                    carry_forward_prev_container_status(c_status, prev_cs);
+                }
                 if let Some(container_spec) = spec_containers.get(i) {
                     sync_container_status_resources(c_status, container_spec);
                 }
@@ -5206,6 +5276,18 @@ impl PodReconciler {
                 Ok(None)
             },
             cri::ContainerState::ContainerRunning => {
+                if let Some(linux_res) = build_container_resources(container) {
+                    let _ = self
+                        .runtime
+                        .update_container_resources(
+                            &latest.id,
+                            &cri::ContainerResources {
+                                linux: Some(linux_res),
+                                windows: None,
+                            },
+                        )
+                        .await;
+                }
                 let started_at_secs = secs_from_nanos(latest.started_at).unwrap_or(0);
                 let (live, is_ready) = self
                     .evaluate_container_probes(
@@ -9114,6 +9196,76 @@ mod tests {
         assert_eq!(
             med_state.pointer("/status/phase").and_then(Value::as_str),
             Some("Running")
+        );
+    }
+
+    #[test]
+    fn resize_policy_restart_container_increments_restarts() {
+        let mut cs = json!({
+            "name": "c3",
+            "restartCount": 0,
+            "resources": {
+                "requests": { "cpu": "20m", "memory": "35Mi" },
+                "limits": { "cpu": "30m", "memory": "50Mi" }
+            }
+        });
+        let spec = json!({
+            "name": "c3",
+            "resizePolicy": [
+                { "resourceName": "cpu", "restartPolicy": "RestartContainer" },
+                { "resourceName": "memory", "restartPolicy": "NotRequired" }
+            ],
+            "resources": {
+                "requests": { "cpu": "30m", "memory": "35Mi" },
+                "limits": { "cpu": "40m", "memory": "50Mi" }
+            }
+        });
+        sync_container_status_resources(&mut cs, &spec);
+        assert_eq!(cs["restartCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn bind_pod_preserves_concurrent_owner_references() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "node-1");
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "shared-pod",
+                "namespace": "default",
+                "ownerReferences": [
+                    { "apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "u1" }
+                ]
+            },
+            "spec": {
+                "containers": [{ "name": "c", "image": "pause" }]
+            }
+        });
+        let stale_snapshot = client.create_pod("default", pod).await.unwrap();
+
+        let mut patched = stale_snapshot.clone();
+        patched["metadata"]["ownerReferences"] = json!([
+            { "apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "u1" },
+            { "apiVersion": "v1", "kind": "ReplicationController", "name": "rc2", "uid": "u2" }
+        ]);
+        client
+            .update_pod("default", "shared-pod", patched)
+            .await
+            .unwrap();
+
+        let bound = reconciler
+            .bind_pod_to_specific_node("default", &stale_snapshot, "node-1")
+            .await
+            .unwrap();
+        assert_eq!(bound["spec"]["nodeName"], "node-1");
+        assert_eq!(
+            bound["metadata"]["ownerReferences"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

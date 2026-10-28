@@ -17,7 +17,7 @@ use crate::runtime::v1::{
     PodSandbox, PodSandboxConfig, PodSandboxFilter, PodSandboxStatus, PodSandboxStatusRequest,
     PullImageRequest, RemoveContainerRequest, RemoveImageRequest, RemovePodSandboxRequest,
     RunPodSandboxRequest, StartContainerRequest, StopContainerRequest, StopPodSandboxRequest,
-    VersionRequest, VersionResponse,
+    UpdateContainerResourcesRequest, VersionRequest, VersionResponse,
 };
 use std::collections::BTreeMap;
 use tonic::transport::Channel;
@@ -292,6 +292,22 @@ impl CriClient {
         };
         let resp = self.runtime.exec_sync(req).await?;
         Ok(resp.into_inner())
+    }
+
+    /// Updates resource limits of a running container synchronously.
+    pub async fn update_container_resources(
+        &mut self,
+        container_id: impl Into<String>,
+        linux: Option<crate::runtime::v1::LinuxContainerResources>,
+    ) -> Result<(), tonic::Status> {
+        let req = UpdateContainerResourcesRequest {
+            container_id: container_id.into(),
+            linux,
+            windows: None,
+            annotations: BTreeMap::new(),
+        };
+        self.runtime.update_container_resources(req).await?;
+        Ok(())
     }
 
     // --- Image Service Operations ---

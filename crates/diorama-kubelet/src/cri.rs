@@ -274,6 +274,18 @@ impl RuntimeProvider for CriRuntimeProvider {
         })
     }
 
+    async fn update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &cri::ContainerResources,
+    ) -> Result<(), KubeletError> {
+        let mut client = self.client().await?;
+        client
+            .update_container_resources(container_id, resources.linux.clone())
+            .await
+            .map_err(|s| map_status("update_container_resources", &s))
+    }
+
     async fn container_logs(
         &self,
         container_id: &str,
