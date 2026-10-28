@@ -5,17 +5,16 @@ use diorama_apiserver::error::ApiserverError;
 use diorama_apiserver::rbac::{
     ClusterRoleBinding as ApiserverClusterRoleBinding, Subject as ApiserverSubject,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, info};
 
 use crate::config::{
     CLUSTER_ADMIN_CLUSTER_ROLE_NAME, PORTAINER_AGENT_CLUSTER_ROLE_BINDING_NAME,
-    PORTAINER_AGENT_CONFIGMAP_NAME, PORTAINER_AGENT_DEPLOYMENT_NAME, PORTAINER_AGENT_SECRET_NAME,
-    PORTAINER_AGENT_SERVICE_ACCOUNT_NAME, PORTAINER_AGENT_SERVICE_NAME, PORTAINER_NAMESPACE,
-    PortainerAgentConfig,
+    PORTAINER_AGENT_CONFIGMAP_NAME, PORTAINER_AGENT_DEPLOYMENT_NAME, PORTAINER_AGENT_PORT_EDGE,
+    PORTAINER_AGENT_PORT_HTTP, PORTAINER_AGENT_SECRET_NAME, PORTAINER_AGENT_SERVICE_ACCOUNT_NAME,
+    PORTAINER_AGENT_SERVICE_NAME, PORTAINER_NAMESPACE, PortainerAgentConfig,
 };
 use crate::error::{PortainerError, Result};
-use crate::manifests::PortainerManifests;
 
 /// Summary report of Portainer Edge agent resources created or preserved during reconciliation.
 #[allow(clippy::struct_excessive_bools)]
@@ -141,35 +140,35 @@ impl PortainerReconciler {
             });
         }
 
-        let manifests = PortainerManifests::new(&self.config)?;
+        if self.config.image.is_empty() {
+            return Err(PortainerError::InvalidImage(
+                "image reference cannot be empty".to_string(),
+            ));
+        }
+
         let mut report = PortainerReconciliationReport::default();
 
         // 1. Reconcile Namespace
         self.reconcile_namespace(client, &mut report).await?;
 
         // 2. Reconcile ServiceAccount
-        self.reconcile_service_account(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_service_account(client, &mut report).await?;
 
         // 3. Reconcile ClusterRoleBinding
         self.reconcile_cluster_role_binding(client, &mut report)
             .await?;
 
         // 4. Reconcile ConfigMap
-        self.reconcile_config_map(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_config_map(client, &mut report).await?;
 
         // 5. Reconcile Secret
-        self.reconcile_secret(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_secret(client, &mut report).await?;
 
         // 6. Reconcile Service
-        self.reconcile_service(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_service(client, &mut report).await?;
 
         // 7. Reconcile Deployment
-        self.reconcile_deployment(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_deployment(client, &mut report).await?;
 
         info!(
             "Portainer reconciliation completed: {} created, {} preserved",
@@ -210,7 +209,6 @@ impl PortainerReconciler {
     async fn reconcile_service_account(
         &self,
         client: &KubernetesApiClient,
-        manifests: &PortainerManifests,
         report: &mut PortainerReconciliationReport,
     ) -> Result<()> {
         match client
@@ -224,7 +222,14 @@ impl PortainerReconciler {
                 );
             },
             Err(ApiserverError::NotFound { .. }) => {
-                let sa_val = serde_json::to_value(&manifests.service_account)?;
+                let sa_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {
+                        "name": PORTAINER_AGENT_SERVICE_ACCOUNT_NAME,
+                        "namespace": PORTAINER_NAMESPACE,
+                    }
+                });
                 match client
                     .create_service_account(PORTAINER_NAMESPACE, sa_val)
                     .await
@@ -296,7 +301,6 @@ impl PortainerReconciler {
     async fn reconcile_config_map(
         &self,
         client: &KubernetesApiClient,
-        manifests: &PortainerManifests,
         report: &mut PortainerReconciliationReport,
     ) -> Result<()> {
         match client
@@ -308,7 +312,37 @@ impl PortainerReconciler {
                 debug!("config map {PORTAINER_AGENT_CONFIGMAP_NAME} already exists; preserved");
             },
             Err(ApiserverError::NotFound { .. }) => {
-                let cm_val = serde_json::to_value(&manifests.config_map)?;
+                let mut data = serde_json::Map::new();
+                data.insert("EDGE_ID".to_string(), json!(self.config.edge_id));
+                data.insert(
+                    "EDGE_INSECURE_POLL".to_string(),
+                    json!(self.config.edge_insecure_poll),
+                );
+                data.insert(
+                    "EDGE_ASYNC".to_string(),
+                    json!(if self.config.edge_async {
+                        "true"
+                    } else {
+                        "false"
+                    }),
+                );
+                if let Some(secret) = &self.config.edge_secret
+                    && !secret.is_empty()
+                {
+                    data.insert("EDGE_SECRET".to_string(), json!(secret));
+                }
+                for (k, v) in &self.config.env_vars {
+                    data.insert(k.clone(), json!(v));
+                }
+                let cm_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": PORTAINER_AGENT_CONFIGMAP_NAME,
+                        "namespace": PORTAINER_NAMESPACE,
+                    },
+                    "data": data,
+                });
                 match client
                     .create_configmap_object(PORTAINER_NAMESPACE, cm_val)
                     .await
@@ -334,7 +368,6 @@ impl PortainerReconciler {
     async fn reconcile_secret(
         &self,
         client: &KubernetesApiClient,
-        manifests: &PortainerManifests,
         report: &mut PortainerReconciliationReport,
     ) -> Result<()> {
         match client
@@ -346,7 +379,18 @@ impl PortainerReconciler {
                 debug!("secret {PORTAINER_AGENT_SECRET_NAME} already exists; preserved");
             },
             Err(ApiserverError::NotFound { .. }) => {
-                let secret_val = serde_json::to_value(&manifests.secret)?;
+                let secret_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": PORTAINER_AGENT_SECRET_NAME,
+                        "namespace": PORTAINER_NAMESPACE,
+                    },
+                    "type": "Opaque",
+                    "stringData": {
+                        "edge.key": self.config.edge_key,
+                    }
+                });
                 match client
                     .create_secret_object(PORTAINER_NAMESPACE, secret_val)
                     .await
@@ -372,7 +416,6 @@ impl PortainerReconciler {
     async fn reconcile_service(
         &self,
         client: &KubernetesApiClient,
-        manifests: &PortainerManifests,
         report: &mut PortainerReconciliationReport,
     ) -> Result<()> {
         match client
@@ -384,7 +427,35 @@ impl PortainerReconciler {
                 debug!("service {PORTAINER_AGENT_SERVICE_NAME} already exists; preserved");
             },
             Err(ApiserverError::NotFound { .. }) => {
-                let svc_val = serde_json::to_value(&manifests.service)?;
+                let svc_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {
+                        "name": PORTAINER_AGENT_SERVICE_NAME,
+                        "namespace": PORTAINER_NAMESPACE,
+                    },
+                    "spec": {
+                        "clusterIP": "None",
+                        "publishNotReadyAddresses": true,
+                        "selector": {
+                            "app": PORTAINER_AGENT_DEPLOYMENT_NAME,
+                        },
+                        "ports": [
+                            {
+                                "name": "edge",
+                                "port": PORTAINER_AGENT_PORT_EDGE,
+                                "protocol": "TCP",
+                                "targetPort": 0,
+                            },
+                            {
+                                "name": "http",
+                                "port": PORTAINER_AGENT_PORT_HTTP,
+                                "protocol": "TCP",
+                                "targetPort": 0,
+                            }
+                        ]
+                    }
+                });
                 match client.create_service(PORTAINER_NAMESPACE, svc_val).await {
                     Ok(_) => {
                         report.service_created = true;
@@ -407,7 +478,6 @@ impl PortainerReconciler {
     async fn reconcile_deployment(
         &self,
         client: &KubernetesApiClient,
-        manifests: &PortainerManifests,
         report: &mut PortainerReconciliationReport,
     ) -> Result<()> {
         match client
@@ -419,7 +489,75 @@ impl PortainerReconciler {
                 debug!("deployment {PORTAINER_AGENT_DEPLOYMENT_NAME} already exists; preserved");
             },
             Err(ApiserverError::NotFound { .. }) => {
-                let dep_val = serde_json::to_value(&manifests.deployment)?;
+                let mut env = vec![
+                    json!({ "name": "LOG_LEVEL", "value": "INFO" }),
+                    json!({ "name": "EDGE", "value": "1" }),
+                    json!({ "name": "AGENT_CLUSTER_ADDR", "value": PORTAINER_AGENT_SERVICE_NAME }),
+                    json!({
+                        "name": "KUBERNETES_POD_IP",
+                        "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } }
+                    }),
+                    json!({
+                        "name": "EDGE_KEY",
+                        "valueFrom": {
+                            "secretKeyRef": {
+                                "name": PORTAINER_AGENT_SECRET_NAME,
+                                "key": "edge.key"
+                            }
+                        }
+                    }),
+                ];
+                if let Some(secret) = &self.config.edge_secret
+                    && !secret.is_empty()
+                {
+                    env.push(json!({
+                        "name": "AGENT_SECRET",
+                        "valueFrom": {
+                            "configMapKeyRef": {
+                                "name": PORTAINER_AGENT_CONFIGMAP_NAME,
+                                "key": "EDGE_SECRET",
+                                "optional": true
+                            }
+                        }
+                    }));
+                }
+                let dep_val = json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": PORTAINER_AGENT_DEPLOYMENT_NAME,
+                        "namespace": PORTAINER_NAMESPACE,
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {
+                            "matchLabels": { "app": PORTAINER_AGENT_DEPLOYMENT_NAME }
+                        },
+                        "strategy": {},
+                        "template": {
+                            "metadata": {
+                                "labels": { "app": PORTAINER_AGENT_DEPLOYMENT_NAME }
+                            },
+                            "spec": {
+                                "serviceAccountName": PORTAINER_AGENT_SERVICE_ACCOUNT_NAME,
+                                "containers": [{
+                                    "name": "portainer-agent",
+                                    "image": self.config.image,
+                                    "imagePullPolicy": "IfNotPresent",
+                                    "ports": [
+                                        { "containerPort": PORTAINER_AGENT_PORT_EDGE, "protocol": "TCP" },
+                                        { "containerPort": PORTAINER_AGENT_PORT_HTTP, "protocol": "TCP" }
+                                    ],
+                                    "envFrom": [{
+                                        "configMapRef": { "name": PORTAINER_AGENT_CONFIGMAP_NAME }
+                                    }],
+                                    "env": env,
+                                    "resources": {}
+                                }]
+                            }
+                        }
+                    }
+                });
                 match client.create_deployment(PORTAINER_NAMESPACE, dep_val).await {
                     Ok(_) => {
                         report.deployment_created = true;

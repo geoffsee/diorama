@@ -760,249 +760,275 @@ impl KubernetesApiClient {
 
     // --- Discovery API ---
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     pub fn discover_core(&self) -> Result<Value, ApiserverError> {
+        const FULL_VERBS: &[&str] = &[
+            "create",
+            "delete",
+            "deletecollection",
+            "get",
+            "list",
+            "patch",
+            "update",
+            "watch",
+        ];
+        const NS_VERBS: &[&str] = &[
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ];
+        const STATUS_VERBS: &[&str] = &["get", "patch", "update"];
+        const CORE_RESOURCES: &[(
+            &str,
+            &str,
+            bool,
+            &str,
+            &[&str],
+            &[&str],
+            Option<(&str, &str)>,
+        )] = &[
+            (
+                "namespaces",
+                "namespace",
+                false,
+                "Namespace",
+                &["ns"],
+                NS_VERBS,
+                None,
+            ),
+            (
+                "namespaces/status",
+                "",
+                false,
+                "Namespace",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "namespaces/finalize",
+                "",
+                false,
+                "Namespace",
+                &[],
+                &["update"],
+                None,
+            ),
+            (
+                "configmaps",
+                "configmap",
+                true,
+                "ConfigMap",
+                &["cm"],
+                FULL_VERBS,
+                None,
+            ),
+            ("secrets", "secret", true, "Secret", &[], FULL_VERBS, None),
+            ("pods", "pod", true, "Pod", &["po"], FULL_VERBS, None),
+            ("pods/log", "", true, "Pod", &[], &["get"], None),
+            ("pods/status", "", true, "Pod", &[], STATUS_VERBS, None),
+            (
+                "pods/ephemeralcontainers",
+                "",
+                true,
+                "Pod",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            ("pods/resize", "", true, "Pod", &[], STATUS_VERBS, None),
+            (
+                "pods/eviction",
+                "",
+                true,
+                "Eviction",
+                &[],
+                &["create"],
+                Some(("policy", "v1")),
+            ),
+            (
+                "pods/exec",
+                "",
+                true,
+                "PodExecOptions",
+                &[],
+                &["create", "get"],
+                None,
+            ),
+            (
+                "podtemplates",
+                "podtemplate",
+                true,
+                "PodTemplate",
+                &[],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "limitranges",
+                "limitrange",
+                true,
+                "LimitRange",
+                &["limits"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "resourcequotas",
+                "resourcequota",
+                true,
+                "ResourceQuota",
+                &["quota"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "resourcequotas/status",
+                "",
+                true,
+                "ResourceQuota",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "replicationcontrollers",
+                "replicationcontroller",
+                true,
+                "ReplicationController",
+                &["rc"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "replicationcontrollers/status",
+                "",
+                true,
+                "ReplicationController",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "replicationcontrollers/scale",
+                "",
+                true,
+                "Scale",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "services",
+                "service",
+                true,
+                "Service",
+                &["svc"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "services/status",
+                "",
+                true,
+                "Service",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "endpoints",
+                "endpoints",
+                true,
+                "Endpoints",
+                &["ep"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "serviceaccounts",
+                "serviceaccount",
+                true,
+                "ServiceAccount",
+                &["sa"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "serviceaccounts/token",
+                "",
+                true,
+                "TokenRequest",
+                &[],
+                &["create"],
+                Some(("authentication.k8s.io", "v1")),
+            ),
+            ("nodes", "node", false, "Node", &["no"], FULL_VERBS, None),
+            ("nodes/status", "", false, "Node", &[], STATUS_VERBS, None),
+            (
+                "persistentvolumeclaims",
+                "persistentvolumeclaim",
+                true,
+                "PersistentVolumeClaim",
+                &["pvc"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "persistentvolumeclaims/status",
+                "",
+                true,
+                "PersistentVolumeClaim",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            (
+                "persistentvolumes",
+                "persistentvolume",
+                false,
+                "PersistentVolume",
+                &["pv"],
+                FULL_VERBS,
+                None,
+            ),
+            (
+                "persistentvolumes/status",
+                "",
+                false,
+                "PersistentVolume",
+                &[],
+                STATUS_VERBS,
+                None,
+            ),
+            ("events", "event", true, "Event", &["ev"], FULL_VERBS, None),
+        ];
         self.check_auth_detailed("get", "", "discovery", None, None)?;
+        let resources: Vec<Value> = CORE_RESOURCES
+            .iter()
+            .map(
+                |&(name, singular, namespaced, kind, short_names, verbs, gv)| {
+                    let mut obj = json!({
+                        "name": name,
+                        "singularName": singular,
+                        "namespaced": namespaced,
+                        "kind": kind,
+                        "verbs": verbs,
+                    });
+                    if !short_names.is_empty() {
+                        obj["shortNames"] = json!(short_names);
+                    }
+                    if let Some((g, v)) = gv {
+                        obj["group"] = json!(g);
+                        obj["version"] = json!(v);
+                    }
+                    obj
+                },
+            )
+            .collect();
         Ok(json!({
             "kind": "APIResourceList",
             "apiVersion": "v1",
             "groupVersion": "v1",
-            "resources": [
-                {
-                    "name": "namespaces",
-                    "singularName": "namespace",
-                    "namespaced": false,
-                    "kind": "Namespace",
-                    "shortNames": ["ns"],
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "namespaces/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "Namespace",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "namespaces/finalize",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "Namespace",
-                    "verbs": ["update"]
-                },
-                {
-                    "name": "configmaps",
-                    "singularName": "configmap",
-                    "namespaced": true,
-                    "kind": "ConfigMap",
-                    "shortNames": ["cm"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "secrets",
-                    "singularName": "secret",
-                    "namespaced": true,
-                    "kind": "Secret",
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "pods",
-                    "singularName": "pod",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "shortNames": ["po"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "pods/log",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "verbs": ["get"]
-                },
-                {
-                    "name": "pods/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "pods/ephemeralcontainers",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "pods/resize",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Pod",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "pods/eviction",
-                    "singularName": "",
-                    "namespaced": true,
-                    "group": "policy",
-                    "version": "v1",
-                    "kind": "Eviction",
-                    "verbs": ["create"]
-                },
-                {
-                    "name": "pods/exec",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "PodExecOptions",
-                    "verbs": ["create", "get"]
-                },
-                {
-                    "name": "podtemplates",
-                    "singularName": "podtemplate",
-                    "namespaced": true,
-                    "kind": "PodTemplate",
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "limitranges",
-                    "singularName": "limitrange",
-                    "namespaced": true,
-                    "kind": "LimitRange",
-                    "shortNames": ["limits"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "resourcequotas",
-                    "singularName": "resourcequota",
-                    "namespaced": true,
-                    "kind": "ResourceQuota",
-                    "shortNames": ["quota"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "resourcequotas/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "ResourceQuota",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "replicationcontrollers",
-                    "singularName": "replicationcontroller",
-                    "namespaced": true,
-                    "kind": "ReplicationController",
-                    "shortNames": ["rc"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "replicationcontrollers/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "ReplicationController",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "replicationcontrollers/scale",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Scale",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "services",
-                    "singularName": "service",
-                    "namespaced": true,
-                    "kind": "Service",
-                    "shortNames": ["svc"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "services/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Service",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "endpoints",
-                    "singularName": "endpoints",
-                    "namespaced": true,
-                    "kind": "Endpoints",
-                    "shortNames": ["ep"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "serviceaccounts",
-                    "singularName": "serviceaccount",
-                    "namespaced": true,
-                    "kind": "ServiceAccount",
-                    "shortNames": ["sa"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "serviceaccounts/token",
-                    "singularName": "",
-                    "namespaced": true,
-                    "group": "authentication.k8s.io",
-                    "version": "v1",
-                    "kind": "TokenRequest",
-                    "verbs": ["create"]
-                },
-                {
-                    "name": "nodes",
-                    "singularName": "node",
-                    "namespaced": false,
-                    "kind": "Node",
-                    "shortNames": ["no"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "nodes/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "Node",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "persistentvolumeclaims",
-                    "singularName": "persistentvolumeclaim",
-                    "namespaced": true,
-                    "kind": "PersistentVolumeClaim",
-                    "shortNames": ["pvc"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "persistentvolumeclaims/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "PersistentVolumeClaim",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "persistentvolumes",
-                    "singularName": "persistentvolume",
-                    "namespaced": false,
-                    "kind": "PersistentVolume",
-                    "shortNames": ["pv"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                },
-                {
-                    "name": "persistentvolumes/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "PersistentVolume",
-                    "verbs": ["get", "patch", "update"]
-                },
-                {
-                    "name": "events",
-                    "singularName": "event",
-                    "namespaced": true,
-                    "kind": "Event",
-                    "shortNames": ["ev"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                }
-            ]
+            "resources": resources
         }))
     }
 
@@ -1047,162 +1073,46 @@ impl KubernetesApiClient {
         }));
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn discover_apis(&self) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("get", "", "discovery", None, None)?;
-        let mut groups = vec![
-            json!({
-                "name": "apps",
-                "versions": [
-                    { "groupVersion": "apps/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "apps/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "batch",
-                "versions": [
-                    { "groupVersion": "batch/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "batch/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "autoscaling",
-                "versions": [
-                    { "groupVersion": "autoscaling/v2", "version": "v2" },
-                    { "groupVersion": "autoscaling/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "autoscaling/v2", "version": "v2" }
-            }),
-            json!({
-                "name": "policy",
-                "versions": [
-                    { "groupVersion": "policy/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "policy/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "networking.k8s.io",
-                "versions": [
-                    { "groupVersion": "networking.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "networking.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "certificates.k8s.io",
-                "versions": [
-                    { "groupVersion": "certificates.k8s.io/v1", "version": "v1" },
-                    { "groupVersion": "certificates.k8s.io/v1beta1", "version": "v1beta1" },
-                    { "groupVersion": "certificates.k8s.io/v1alpha1", "version": "v1alpha1" }
-                ],
-                "preferredVersion": { "groupVersion": "certificates.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "authentication.k8s.io",
-                "versions": [
-                    { "groupVersion": "authentication.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "authentication.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "authorization.k8s.io",
-                "versions": [
-                    { "groupVersion": "authorization.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "authorization.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "flowcontrol.apiserver.k8s.io",
-                "versions": [
-                    { "groupVersion": "flowcontrol.apiserver.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "flowcontrol.apiserver.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "scheduling.k8s.io",
-                "versions": [
-                    { "groupVersion": "scheduling.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "scheduling.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "node.k8s.io",
-                "versions": [
-                    { "groupVersion": "node.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "node.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "coordination.k8s.io",
-                "versions": [
-                    { "groupVersion": "coordination.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "coordination.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "events.k8s.io",
-                "versions": [
-                    { "groupVersion": "events.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "events.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "apiextensions.k8s.io",
-                "versions": [
-                    { "groupVersion": "apiextensions.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "apiextensions.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "rbac.authorization.k8s.io",
-                "versions": [
-                    { "groupVersion": "rbac.authorization.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "rbac.authorization.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "admissionregistration.k8s.io",
-                "versions": [
-                    { "groupVersion": "admissionregistration.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "admissionregistration.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "apiregistration.k8s.io",
-                "versions": [
-                    { "groupVersion": "apiregistration.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "apiregistration.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "discovery.k8s.io",
-                "versions": [
-                    { "groupVersion": "discovery.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "discovery.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "storage.k8s.io",
-                "versions": [
-                    { "groupVersion": "storage.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "storage.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "resource.k8s.io",
-                "versions": [
-                    { "groupVersion": "resource.k8s.io/v1", "version": "v1" }
-                ],
-                "preferredVersion": { "groupVersion": "resource.k8s.io/v1", "version": "v1" }
-            }),
-            json!({
-                "name": "storagemigration.k8s.io",
-                "versions": [
-                    { "groupVersion": "storagemigration.k8s.io/v1", "version": "v1" },
-                    { "groupVersion": "storagemigration.k8s.io/v1alpha1", "version": "v1alpha1" }
-                ],
-                "preferredVersion": { "groupVersion": "storagemigration.k8s.io/v1", "version": "v1" }
-            }),
+        const BUILTIN_GROUPS: &[(&str, &[&str])] = &[
+            ("apps", &["v1"]),
+            ("batch", &["v1"]),
+            ("autoscaling", &["v2", "v1"]),
+            ("policy", &["v1"]),
+            ("networking.k8s.io", &["v1"]),
+            ("certificates.k8s.io", &["v1", "v1beta1", "v1alpha1"]),
+            ("authentication.k8s.io", &["v1"]),
+            ("authorization.k8s.io", &["v1"]),
+            ("flowcontrol.apiserver.k8s.io", &["v1"]),
+            ("scheduling.k8s.io", &["v1"]),
+            ("node.k8s.io", &["v1"]),
+            ("coordination.k8s.io", &["v1"]),
+            ("events.k8s.io", &["v1"]),
+            ("apiextensions.k8s.io", &["v1"]),
+            ("rbac.authorization.k8s.io", &["v1"]),
+            ("admissionregistration.k8s.io", &["v1"]),
+            ("apiregistration.k8s.io", &["v1"]),
+            ("discovery.k8s.io", &["v1"]),
+            ("storage.k8s.io", &["v1"]),
+            ("resource.k8s.io", &["v1"]),
+            ("storagemigration.k8s.io", &["v1", "v1alpha1"]),
         ];
+        self.check_auth_detailed("get", "", "discovery", None, None)?;
+        let mut groups: Vec<Value> = BUILTIN_GROUPS
+            .iter()
+            .map(|&(name, vers)| {
+                let versions: Vec<Value> = vers
+                    .iter()
+                    .map(|&v| json!({ "groupVersion": format!("{name}/{v}"), "version": v }))
+                    .collect();
+                let preferred = versions.first().cloned().unwrap_or(Value::Null);
+                json!({
+                    "name": name,
+                    "versions": versions,
+                    "preferredVersion": preferred
+                })
+            })
+            .collect();
 
         // Dynamically add CRD groups
         let crd_guard = self.crd_registry.read().unwrap();
@@ -1299,12 +1209,23 @@ impl KubernetesApiClient {
         })
     }
 
+    fn subresource(name: &str, namespaced: bool, kind: &str, verbs: &[&str]) -> Value {
+        json!({
+            "name": name,
+            "singularName": "",
+            "namespaced": namespaced,
+            "kind": kind,
+            "verbs": verbs
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn discover_group_resources(
         &self,
         group: &str,
         version: &str,
     ) -> Result<Value, ApiserverError> {
+        const STATUS_VERBS: &[&str] = &["get", "patch", "update"];
         self.check_auth_detailed("get", "", "discovery", None, None)?;
 
         let gv = format!("{group}/{version}");
@@ -1317,13 +1238,12 @@ impl KubernetesApiClient {
                     "customresourcedefinition",
                     "CustomResourceDefinition",
                 ));
-                resources.push(json!({
-                    "name": "customresourcedefinitions/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "CustomResourceDefinition",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "customresourcedefinitions/status",
+                    false,
+                    "CustomResourceDefinition",
+                    STATUS_VERBS,
+                ));
             },
             ("admissionregistration.k8s.io", "v1") => {
                 for (name, singular, kind) in [
@@ -1360,20 +1280,18 @@ impl KubernetesApiClient {
                 ] {
                     resources.push(Self::cluster_resource(name, singular, kind));
                 }
-                resources.push(json!({
-                    "name": "validatingadmissionpolicies/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "ValidatingAdmissionPolicy",
-                    "verbs": ["get", "patch", "update"]
-                }));
-                resources.push(json!({
-                    "name": "mutatingadmissionpolicies/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "MutatingAdmissionPolicy",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "validatingadmissionpolicies/status",
+                    false,
+                    "ValidatingAdmissionPolicy",
+                    STATUS_VERBS,
+                ));
+                resources.push(Self::subresource(
+                    "mutatingadmissionpolicies/status",
+                    false,
+                    "MutatingAdmissionPolicy",
+                    STATUS_VERBS,
+                ));
             },
             ("apiregistration.k8s.io", "v1") => {
                 resources.push(Self::cluster_resource(
@@ -1401,13 +1319,7 @@ impl KubernetesApiClient {
                     "replicasets/scale",
                     "statefulsets/scale",
                 ] {
-                    resources.push(json!({
-                        "name": scalable,
-                        "singularName": "",
-                        "namespaced": true,
-                        "kind": "Scale",
-                        "verbs": ["get", "patch", "update"]
-                    }));
+                    resources.push(Self::subresource(scalable, true, "Scale", STATUS_VERBS));
                 }
                 for (status, kind) in [
                     ("deployments/status", "Deployment"),
@@ -1415,13 +1327,7 @@ impl KubernetesApiClient {
                     ("statefulsets/status", "StatefulSet"),
                     ("daemonsets/status", "DaemonSet"),
                 ] {
-                    resources.push(json!({
-                        "name": status,
-                        "singularName": "",
-                        "namespaced": true,
-                        "kind": kind,
-                        "verbs": ["get", "patch", "update"]
-                    }));
+                    resources.push(Self::subresource(status, true, kind, STATUS_VERBS));
                 }
             },
             ("batch", "v1") => {
@@ -1431,13 +1337,7 @@ impl KubernetesApiClient {
                     resources.push(Self::namespaced_resource(name, singular, kind));
                 }
                 for (status, kind) in [("jobs/status", "Job"), ("cronjobs/status", "CronJob")] {
-                    resources.push(json!({
-                        "name": status,
-                        "singularName": "",
-                        "namespaced": true,
-                        "kind": kind,
-                        "verbs": ["get", "patch", "update"]
-                    }));
+                    resources.push(Self::subresource(status, true, kind, STATUS_VERBS));
                 }
             },
             ("autoscaling", "v1" | "v2") => {
@@ -1446,13 +1346,12 @@ impl KubernetesApiClient {
                     "horizontalpodautoscaler",
                     "HorizontalPodAutoscaler",
                 ));
-                resources.push(json!({
-                    "name": "horizontalpodautoscalers/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "HorizontalPodAutoscaler",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "horizontalpodautoscalers/status",
+                    true,
+                    "HorizontalPodAutoscaler",
+                    STATUS_VERBS,
+                ));
             },
             ("policy", "v1") => {
                 resources.push(Self::namespaced_resource(
@@ -1460,13 +1359,12 @@ impl KubernetesApiClient {
                     "poddisruptionbudget",
                     "PodDisruptionBudget",
                 ));
-                resources.push(json!({
-                    "name": "poddisruptionbudgets/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "PodDisruptionBudget",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "poddisruptionbudgets/status",
+                    true,
+                    "PodDisruptionBudget",
+                    STATUS_VERBS,
+                ));
             },
             ("networking.k8s.io", "v1") => {
                 resources.push(Self::namespaced_resource(
@@ -1475,13 +1373,12 @@ impl KubernetesApiClient {
                     "NetworkPolicy",
                 ));
                 resources.push(Self::namespaced_resource("ingresses", "ingress", "Ingress"));
-                resources.push(json!({
-                    "name": "ingresses/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "Ingress",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "ingresses/status",
+                    true,
+                    "Ingress",
+                    STATUS_VERBS,
+                ));
                 resources.push(Self::cluster_resource(
                     "ingressclasses",
                     "ingressclass",
@@ -1504,20 +1401,18 @@ impl KubernetesApiClient {
                     "certificatesigningrequest",
                     "CertificateSigningRequest",
                 ));
-                resources.push(json!({
-                    "name": "certificatesigningrequests/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "CertificateSigningRequest",
-                    "verbs": ["get", "patch", "update"]
-                }));
-                resources.push(json!({
-                    "name": "certificatesigningrequests/approval",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "CertificateSigningRequest",
-                    "verbs": ["patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "certificatesigningrequests/status",
+                    false,
+                    "CertificateSigningRequest",
+                    STATUS_VERBS,
+                ));
+                resources.push(Self::subresource(
+                    "certificatesigningrequests/approval",
+                    false,
+                    "CertificateSigningRequest",
+                    &["patch", "update"],
+                ));
                 resources.push(Self::cluster_resource(
                     "clustertrustbundles",
                     "clustertrustbundle",
@@ -1528,13 +1423,12 @@ impl KubernetesApiClient {
                     "podcertificaterequest",
                     "PodCertificateRequest",
                 ));
-                resources.push(json!({
-                    "name": "podcertificaterequests/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "PodCertificateRequest",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "podcertificaterequests/status",
+                    true,
+                    "PodCertificateRequest",
+                    STATUS_VERBS,
+                ));
             },
             ("certificates.k8s.io", "v1alpha1" | "v1beta1") => {
                 resources.push(Self::cluster_resource(
@@ -1547,59 +1441,40 @@ impl KubernetesApiClient {
                     "podcertificaterequest",
                     "PodCertificateRequest",
                 ));
-                resources.push(json!({
-                    "name": "podcertificaterequests/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "PodCertificateRequest",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "podcertificaterequests/status",
+                    true,
+                    "PodCertificateRequest",
+                    STATUS_VERBS,
+                ));
             },
             ("authentication.k8s.io", "v1") => {
-                resources.push(json!({
-                    "name": "tokenreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "TokenReview",
-                    "verbs": ["create"]
-                }));
-                resources.push(json!({
-                    "name": "selfsubjectreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SelfSubjectReview",
-                    "verbs": ["create"]
-                }));
+                resources.push(Self::subresource(
+                    "tokenreviews",
+                    false,
+                    "TokenReview",
+                    &["create"],
+                ));
+                resources.push(Self::subresource(
+                    "selfsubjectreviews",
+                    false,
+                    "SelfSubjectReview",
+                    &["create"],
+                ));
             },
             ("authorization.k8s.io", "v1") => {
-                resources.push(json!({
-                    "name": "subjectaccessreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SubjectAccessReview",
-                    "verbs": ["create"]
-                }));
-                resources.push(json!({
-                    "name": "selfsubjectaccessreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SelfSubjectAccessReview",
-                    "verbs": ["create"]
-                }));
-                resources.push(json!({
-                    "name": "localsubjectaccessreviews",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "LocalSubjectAccessReview",
-                    "verbs": ["create"]
-                }));
-                resources.push(json!({
-                    "name": "selfsubjectrulesreviews",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "SelfSubjectRulesReview",
-                    "verbs": ["create"]
-                }));
+                for (name, namespaced, kind) in [
+                    ("subjectaccessreviews", false, "SubjectAccessReview"),
+                    ("selfsubjectaccessreviews", false, "SelfSubjectAccessReview"),
+                    (
+                        "localsubjectaccessreviews",
+                        true,
+                        "LocalSubjectAccessReview",
+                    ),
+                    ("selfsubjectrulesreviews", false, "SelfSubjectRulesReview"),
+                ] {
+                    resources.push(Self::subresource(name, namespaced, kind, &["create"]));
+                }
             },
             ("flowcontrol.apiserver.k8s.io", "v1") => {
                 resources.push(Self::cluster_resource(
@@ -1607,25 +1482,23 @@ impl KubernetesApiClient {
                     "flowschema",
                     "FlowSchema",
                 ));
-                resources.push(json!({
-                    "name": "flowschemas/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "FlowSchema",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "flowschemas/status",
+                    false,
+                    "FlowSchema",
+                    STATUS_VERBS,
+                ));
                 resources.push(Self::cluster_resource(
                     "prioritylevelconfigurations",
                     "prioritylevelconfiguration",
                     "PriorityLevelConfiguration",
                 ));
-                resources.push(json!({
-                    "name": "prioritylevelconfigurations/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "PriorityLevelConfiguration",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "prioritylevelconfigurations/status",
+                    false,
+                    "PriorityLevelConfiguration",
+                    STATUS_VERBS,
+                ));
             },
             ("scheduling.k8s.io", "v1") => {
                 resources.push(Self::cluster_resource(
@@ -1673,14 +1546,10 @@ impl KubernetesApiClient {
                 ));
             },
             ("storage.k8s.io", "v1") => {
-                resources.push(json!({
-                    "name": "storageclasses",
-                    "singularName": "storageclass",
-                    "namespaced": false,
-                    "kind": "StorageClass",
-                    "shortNames": ["sc"],
-                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                }));
+                let mut sc =
+                    Self::cluster_resource("storageclasses", "storageclass", "StorageClass");
+                sc["shortNames"] = json!(["sc"]);
+                resources.push(sc);
                 resources.push(Self::cluster_resource("csinodes", "csinode", "CSINode"));
                 resources.push(Self::cluster_resource(
                     "csidrivers",
@@ -1709,25 +1578,23 @@ impl KubernetesApiClient {
                     "deviceclass",
                     "DeviceClass",
                 ));
-                resources.push(json!({
-                    "name": "deviceclasses/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "DeviceClass",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "deviceclasses/status",
+                    false,
+                    "DeviceClass",
+                    STATUS_VERBS,
+                ));
                 resources.push(Self::cluster_resource(
                     "devicetaintrules",
                     "devicetaintrule",
                     "DeviceTaintRule",
                 ));
-                resources.push(json!({
-                    "name": "devicetaintrules/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "DeviceTaintRule",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "devicetaintrules/status",
+                    false,
+                    "DeviceTaintRule",
+                    STATUS_VERBS,
+                ));
                 resources.push(Self::cluster_resource(
                     "resourceslices",
                     "resourceslice",
@@ -1738,13 +1605,12 @@ impl KubernetesApiClient {
                     "resourceclaim",
                     "ResourceClaim",
                 ));
-                resources.push(json!({
-                    "name": "resourceclaims/status",
-                    "singularName": "",
-                    "namespaced": true,
-                    "kind": "ResourceClaim",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "resourceclaims/status",
+                    true,
+                    "ResourceClaim",
+                    STATUS_VERBS,
+                ));
                 resources.push(Self::namespaced_resource(
                     "resourceclaimtemplates",
                     "resourceclaimtemplate",
@@ -1757,13 +1623,12 @@ impl KubernetesApiClient {
                     "storageversionmigration",
                     "StorageVersionMigration",
                 ));
-                resources.push(json!({
-                    "name": "storageversionmigrations/status",
-                    "singularName": "",
-                    "namespaced": false,
-                    "kind": "StorageVersionMigration",
-                    "verbs": ["get", "patch", "update"]
-                }));
+                resources.push(Self::subresource(
+                    "storageversionmigrations/status",
+                    false,
+                    "StorageVersionMigration",
+                    STATUS_VERBS,
+                ));
             },
             _ => {},
         }

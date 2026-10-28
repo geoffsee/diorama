@@ -13,7 +13,7 @@ use crate::config::{
     COREDNS_SERVICE_ACCOUNT_NAME, COREDNS_SERVICE_NAME, CoreDnsConfig,
 };
 use crate::error::{DnsError, Result};
-use crate::manifests::{CoreDnsManifests, generate_config_map_patch, should_recreate_service};
+use crate::manifests::{coredns_labels, coredns_selector, generate_config_map_patch};
 
 /// Summary of resources created, updated, or patched during reconciliation.
 #[allow(clippy::struct_excessive_bools)]
@@ -55,27 +55,22 @@ impl DnsReconciler {
     /// 5. `Service` (created, recreated if `ClusterIP` changed, or updated)
     /// 6. `Deployment` (created or updated)
     pub async fn reconcile(&self, client: &KubernetesApiClient) -> Result<ReconciliationReport> {
-        let manifests = CoreDnsManifests::new(&self.config);
         let mut report = ReconciliationReport::default();
 
         // 1. Reconcile ConfigMap
-        self.reconcile_config_map(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_config_map(client, &mut report).await?;
 
         // 2. Reconcile ServiceAccount
-        self.reconcile_service_account(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_service_account(client, &mut report).await?;
 
         // 3. Reconcile RBAC (ClusterRole and ClusterRoleBinding)
         self.reconcile_rbac(client, &mut report).await?;
 
         // 4. Reconcile Service
-        self.reconcile_service(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_service(client, &mut report).await?;
 
         // 5. Reconcile Deployment
-        self.reconcile_deployment(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_deployment(client, &mut report).await?;
 
         Ok(report)
     }
@@ -83,7 +78,6 @@ impl DnsReconciler {
     async fn reconcile_config_map(
         &self,
         client: &KubernetesApiClient,
-        manifests: &CoreDnsManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
         let corefile = self.config.generate_corefile();
@@ -100,7 +94,17 @@ impl DnsReconciler {
                 debug!("patched existing CoreDNS ConfigMap preserving unrelated keys");
             },
             Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
-                let cm_value = serde_json::to_value(&manifests.config_map)?;
+                let cm_value = json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": COREDNS_CONFIGMAP_NAME,
+                        "namespace": COREDNS_NAMESPACE,
+                    },
+                    "data": {
+                        "Corefile": corefile,
+                    }
+                });
                 client
                     .create_configmap_object(COREDNS_NAMESPACE, cm_value)
                     .await?;
@@ -115,7 +119,6 @@ impl DnsReconciler {
     async fn reconcile_service_account(
         &self,
         client: &KubernetesApiClient,
-        manifests: &CoreDnsManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
         match client
@@ -126,7 +129,14 @@ impl DnsReconciler {
                 debug!("CoreDNS ServiceAccount already exists");
             },
             Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
-                let sa_value = serde_json::to_value(&manifests.service_account)?;
+                let sa_value = json!({
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {
+                        "name": COREDNS_SERVICE_ACCOUNT_NAME,
+                        "namespace": COREDNS_NAMESPACE,
+                    }
+                });
                 client
                     .create_service_account(COREDNS_NAMESPACE, sa_value)
                     .await?;
@@ -218,18 +228,48 @@ impl DnsReconciler {
     async fn reconcile_service(
         &self,
         client: &KubernetesApiClient,
-        manifests: &CoreDnsManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let desired_val = serde_json::to_value(&manifests.service)?;
+        let desired_val = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": COREDNS_SERVICE_NAME,
+                "namespace": COREDNS_NAMESPACE,
+                "labels": coredns_labels(),
+            },
+            "spec": {
+                "clusterIP": self.config.dns_ip,
+                "selector": coredns_selector(),
+                "ports": [
+                    {
+                        "name": "dns",
+                        "port": 53,
+                        "protocol": "UDP",
+                        "targetPort": 0,
+                    },
+                    {
+                        "name": "dns-tcp",
+                        "port": 53,
+                        "protocol": "TCP",
+                        "targetPort": 0,
+                    }
+                ]
+            }
+        });
         match client
             .get_service(COREDNS_NAMESPACE, COREDNS_SERVICE_NAME)
             .await
         {
             Ok(existing_val) => {
-                let existing_svc: k8s_openapi::api::core::v1::Service =
-                    serde_json::from_value(existing_val.clone())?;
-                if should_recreate_service(&existing_svc, &manifests.service) {
+                let desired_cluster_ip = Some(self.config.dns_ip.as_str());
+                let recreate = existing_val
+                    .get("spec")
+                    .and_then(Value::as_object)
+                    .is_none_or(|existing_spec| {
+                        existing_spec.get("clusterIP").and_then(Value::as_str) != desired_cluster_ip
+                    });
+                if recreate {
                     warn!("CoreDNS service ClusterIP changed; deleting and recreating Service");
                     client
                         .delete_service(COREDNS_NAMESPACE, COREDNS_SERVICE_NAME)
@@ -260,13 +300,94 @@ impl DnsReconciler {
         Ok(())
     }
 
+    fn desired_deployment_value(&self) -> serde_json::Value {
+        let mut resources = json!({
+            "requests": {
+                "cpu": "50m",
+                "memory": "20Mi",
+            }
+        });
+        if !self.config.container_mode {
+            resources["limits"] = json!({ "memory": "64Mi" });
+        }
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": COREDNS_DEPLOYMENT_NAME,
+                "namespace": COREDNS_NAMESPACE,
+                "labels": coredns_labels(),
+            },
+            "spec": {
+                "replicas": 1,
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {
+                        "maxUnavailable": 1,
+                    }
+                },
+                "selector": {
+                    "matchLabels": coredns_selector(),
+                },
+                "template": {
+                    "metadata": {
+                        "labels": coredns_selector(),
+                    },
+                    "spec": {
+                        "dnsPolicy": "Default",
+                        "priorityClassName": "system-cluster-critical",
+                        "serviceAccountName": COREDNS_SERVICE_ACCOUNT_NAME,
+                        "containers": [{
+                            "name": "coredns",
+                            "image": self.config.image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "resources": resources,
+                            "args": ["-conf", "/etc/coredns/Corefile"],
+                            "volumeMounts": [{
+                                "name": "config-volume",
+                                "mountPath": "/etc/coredns",
+                            }],
+                            "ports": [
+                                { "containerPort": 53, "name": "dns", "protocol": "UDP" },
+                                { "containerPort": 53, "name": "dns-tcp", "protocol": "TCP" },
+                                { "containerPort": 8080, "name": "metrics", "protocol": "TCP" },
+                            ],
+                            "livenessProbe": {
+                                "httpGet": { "path": "/health", "port": 8080, "scheme": "HTTP" },
+                                "initialDelaySeconds": 60,
+                                "periodSeconds": 10,
+                                "successThreshold": 1,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                            "readinessProbe": {
+                                "httpGet": { "path": "/ready", "port": 8181, "scheme": "HTTP" },
+                                "initialDelaySeconds": 10,
+                                "periodSeconds": 10,
+                                "successThreshold": 1,
+                                "timeoutSeconds": 5,
+                                "failureThreshold": 3,
+                            },
+                        }],
+                        "volumes": [{
+                            "name": "config-volume",
+                            "configMap": {
+                                "name": COREDNS_CONFIGMAP_NAME,
+                                "items": [{ "key": "Corefile", "path": "Corefile" }],
+                            }
+                        }],
+                    }
+                }
+            }
+        })
+    }
+
     async fn reconcile_deployment(
         &self,
         client: &KubernetesApiClient,
-        manifests: &CoreDnsManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let mut desired_val = serde_json::to_value(&manifests.deployment)?;
+        let mut desired_val = self.desired_deployment_value();
         match client
             .get_deployment(COREDNS_NAMESPACE, COREDNS_DEPLOYMENT_NAME)
             .await

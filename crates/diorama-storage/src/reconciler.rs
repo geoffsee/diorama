@@ -6,16 +6,19 @@ use diorama_apiserver::rbac::{
     PolicyRule as ApiserverPolicyRule, Role as ApiserverRole, RoleBinding as ApiserverRoleBinding,
     Subject as ApiserverSubject,
 };
+use serde_json::json;
 use tracing::{debug, info};
 
 use crate::config::{
+    DEFAULT_CONFIG_FILE_PATH, DEFAULT_CONFIG_MOUNT_PATH, DEFAULT_CPU_REQUEST, DEFAULT_MEMORY_LIMIT,
+    DEFAULT_MEMORY_REQUEST, DEFAULT_SETUP_SCRIPT, DEFAULT_TEARDOWN_SCRIPT,
     LOCAL_PATH_CLUSTER_ROLE_BINDING_NAME, LOCAL_PATH_CLUSTER_ROLE_NAME, LOCAL_PATH_CONFIGMAP_NAME,
-    LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LOCAL_PATH_ROLE_BINDING_NAME,
-    LOCAL_PATH_ROLE_NAME, LOCAL_PATH_SERVICE_ACCOUNT_NAME, LOCAL_PATH_STORAGE_CLASS_NAME,
-    LocalPathConfig,
+    LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LOCAL_PATH_PROVISIONER_NAME,
+    LOCAL_PATH_ROLE_BINDING_NAME, LOCAL_PATH_ROLE_NAME, LOCAL_PATH_SERVICE_ACCOUNT_NAME,
+    LOCAL_PATH_STORAGE_CLASS_NAME, LocalPathConfig,
 };
 use crate::error::{Result, StorageError};
-use crate::manifests::{LocalPathManifests, generate_config_map_patch};
+use crate::manifests::{generate_config_json, generate_helper_pod_yaml, provisioner_labels};
 
 /// Summary of resources created, updated, or patched during reconciliation.
 #[allow(clippy::struct_excessive_bools)]
@@ -115,34 +118,42 @@ impl LocalPathReconciler {
             return Ok(report);
         }
 
-        let manifests = LocalPathManifests::new(&self.config)?;
+        if self.config.reclaim_policy != "Retain" && self.config.reclaim_policy != "Delete" {
+            return Err(StorageError::InvalidConfiguration(format!(
+                "unsupported reclaim policy '{}': must be Retain or Delete",
+                self.config.reclaim_policy
+            )));
+        }
+
+        if self.config.volume_binding_mode != "WaitForFirstConsumer"
+            && self.config.volume_binding_mode != "Immediate"
+        {
+            return Err(StorageError::InvalidConfiguration(format!(
+                "unsupported volume binding mode '{}': must be WaitForFirstConsumer or Immediate",
+                self.config.volume_binding_mode
+            )));
+        }
 
         // 1. Reconcile Namespace
         self.reconcile_namespace(client, &mut report).await?;
 
         // 2. Reconcile ServiceAccount
-        self.reconcile_service_account(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_service_account(client, &mut report).await?;
 
         // 3. Reconcile ClusterRole and ClusterRoleBinding
-        self.reconcile_cluster_rbac(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_cluster_rbac(client, &mut report).await?;
 
         // 4. Reconcile namespaced Role and RoleBinding
-        self.reconcile_role_rbac(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_role_rbac(client, &mut report).await?;
 
         // 5. Reconcile ConfigMap
-        self.reconcile_config_map(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_config_map(client, &mut report).await?;
 
         // 6. Reconcile StorageClass
-        self.reconcile_storage_class(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_storage_class(client, &mut report).await?;
 
         // 7. Reconcile Deployment
-        self.reconcile_deployment(client, &manifests, &mut report)
-            .await?;
+        self.reconcile_deployment(client, &mut report).await?;
 
         // 8. Reconcile CSIDriver if enabled
         self.reconcile_csi_driver(client, &mut report).await?;
@@ -179,7 +190,6 @@ impl LocalPathReconciler {
     async fn reconcile_service_account(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
         match client
@@ -190,7 +200,14 @@ impl LocalPathReconciler {
                 debug!("ServiceAccount {LOCAL_PATH_SERVICE_ACCOUNT_NAME} exists");
             },
             Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
-                let sa_val = serde_json::to_value(&manifests.service_account)?;
+                let sa_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {
+                        "name": LOCAL_PATH_SERVICE_ACCOUNT_NAME,
+                        "namespace": LOCAL_PATH_NAMESPACE,
+                    }
+                });
                 client
                     .create_service_account(LOCAL_PATH_NAMESPACE, sa_val)
                     .await
@@ -206,15 +223,34 @@ impl LocalPathReconciler {
     async fn reconcile_cluster_rbac(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let rules = manifests
-            .cluster_role
-            .rules
-            .as_ref()
-            .map(|r| r.iter().map(to_apiserver_policy_rule).collect())
-            .unwrap_or_default();
+        let rules = vec![
+            policy_rule(
+                &[""],
+                &[
+                    "nodes",
+                    "persistentvolumeclaims",
+                    "configmaps",
+                    "pods",
+                    "pods/log",
+                ],
+                &["get", "list", "watch"],
+            ),
+            policy_rule(
+                &[""],
+                &["persistentvolumes"],
+                &[
+                    "get", "list", "watch", "create", "patch", "update", "delete",
+                ],
+            ),
+            policy_rule(&[""], &["events"], &["create", "patch"]),
+            policy_rule(
+                &["storage.k8s.io"],
+                &["storageclasses"],
+                &["get", "list", "watch"],
+            ),
+        ];
 
         let cluster_role = ApiserverClusterRole {
             name: LOCAL_PATH_CLUSTER_ROLE_NAME.to_string(),
@@ -279,15 +315,15 @@ impl LocalPathReconciler {
     async fn reconcile_role_rbac(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let rules = manifests
-            .role
-            .rules
-            .as_ref()
-            .map(|r| r.iter().map(to_apiserver_policy_rule).collect())
-            .unwrap_or_default();
+        let rules = vec![policy_rule(
+            &[""],
+            &["pods"],
+            &[
+                "get", "list", "watch", "create", "patch", "update", "delete",
+            ],
+        )];
 
         let role = ApiserverRole {
             namespace: LOCAL_PATH_NAMESPACE.to_string(),
@@ -357,15 +393,22 @@ impl LocalPathReconciler {
     async fn reconcile_config_map(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
+        let config_json = generate_config_json(&self.config)?;
+        let helper_pod = generate_helper_pod_yaml(&self.config.helper_image);
+        let data = json!({
+            "config.json": config_json,
+            "setup": DEFAULT_SETUP_SCRIPT,
+            "teardown": DEFAULT_TEARDOWN_SCRIPT,
+            "helperPod.yaml": helper_pod,
+        });
         match client
             .get_configmap(LOCAL_PATH_NAMESPACE, LOCAL_PATH_CONFIGMAP_NAME)
             .await
         {
             Ok(_) => {
-                let patch = generate_config_map_patch(&manifests.config_map);
+                let patch = json!({ "data": data });
                 client
                     .patch_configmap(LOCAL_PATH_NAMESPACE, LOCAL_PATH_CONFIGMAP_NAME, patch)
                     .await
@@ -374,7 +417,15 @@ impl LocalPathReconciler {
                 debug!("patched existing ConfigMap {LOCAL_PATH_CONFIGMAP_NAME}");
             },
             Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {
-                let cm_val = serde_json::to_value(&manifests.config_map)?;
+                let cm_val = json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": LOCAL_PATH_CONFIGMAP_NAME,
+                        "namespace": LOCAL_PATH_NAMESPACE,
+                    },
+                    "data": data,
+                });
                 client
                     .create_configmap_object(LOCAL_PATH_NAMESPACE, cm_val)
                     .await
@@ -390,10 +441,23 @@ impl LocalPathReconciler {
     async fn reconcile_storage_class(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let sc_val = serde_json::to_value(&manifests.storage_class)?;
+        let mut metadata = json!({ "name": LOCAL_PATH_STORAGE_CLASS_NAME });
+        if self.config.default_class {
+            metadata["annotations"] = json!({
+                "storageclass.kubernetes.io/is-default-class": "true"
+            });
+        }
+        let sc_val = json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": metadata,
+            "provisioner": LOCAL_PATH_PROVISIONER_NAME,
+            "volumeBindingMode": self.config.volume_binding_mode,
+            "reclaimPolicy": self.config.reclaim_policy,
+            "allowVolumeExpansion": self.config.allow_volume_expansion,
+        });
         match client
             .get_storage_class(LOCAL_PATH_STORAGE_CLASS_NAME)
             .await
@@ -422,10 +486,73 @@ impl LocalPathReconciler {
     async fn reconcile_deployment(
         &self,
         client: &KubernetesApiClient,
-        manifests: &LocalPathManifests,
         report: &mut ReconciliationReport,
     ) -> Result<()> {
-        let dep_val = serde_json::to_value(&manifests.deployment)?;
+        let labels = provisioner_labels();
+        let dep_val = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": LOCAL_PATH_DEPLOYMENT_NAME,
+                "namespace": LOCAL_PATH_NAMESPACE,
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": labels,
+                },
+                "template": {
+                    "metadata": {
+                        "labels": labels,
+                    },
+                    "spec": {
+                        "serviceAccountName": LOCAL_PATH_SERVICE_ACCOUNT_NAME,
+                        "containers": [{
+                            "name": LOCAL_PATH_DEPLOYMENT_NAME,
+                            "image": self.config.provisioner_image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": [
+                                "local-path-provisioner",
+                                "start",
+                                "--config",
+                                DEFAULT_CONFIG_FILE_PATH,
+                            ],
+                            "env": [
+                                {
+                                    "name": "POD_NAMESPACE",
+                                    "valueFrom": {
+                                        "fieldRef": {
+                                            "fieldPath": "metadata.namespace"
+                                        }
+                                    }
+                                },
+                                {
+                                    "name": "CONFIG_MOUNT_PATH",
+                                    "value": DEFAULT_CONFIG_MOUNT_PATH,
+                                }
+                            ],
+                            "resources": {
+                                "limits": { "memory": DEFAULT_MEMORY_LIMIT },
+                                "requests": {
+                                    "cpu": DEFAULT_CPU_REQUEST,
+                                    "memory": DEFAULT_MEMORY_REQUEST,
+                                }
+                            },
+                            "volumeMounts": [{
+                                "name": "config-volume",
+                                "mountPath": DEFAULT_CONFIG_MOUNT_PATH,
+                            }],
+                        }],
+                        "volumes": [{
+                            "name": "config-volume",
+                            "configMap": {
+                                "name": LOCAL_PATH_CONFIGMAP_NAME,
+                            }
+                        }],
+                    }
+                }
+            }
+        });
         match client
             .get_deployment(LOCAL_PATH_NAMESPACE, LOCAL_PATH_DEPLOYMENT_NAME)
             .await
@@ -557,12 +684,12 @@ impl LocalPathReconciler {
     }
 }
 
-fn to_apiserver_policy_rule(rule: &k8s_openapi::api::rbac::v1::PolicyRule) -> ApiserverPolicyRule {
+fn policy_rule(api_groups: &[&str], resources: &[&str], verbs: &[&str]) -> ApiserverPolicyRule {
     ApiserverPolicyRule {
-        verbs: rule.verbs.clone(),
-        api_groups: rule.api_groups.clone().unwrap_or_default(),
-        resources: rule.resources.clone().unwrap_or_default(),
-        resource_names: rule.resource_names.clone().unwrap_or_default(),
-        non_resource_urls: rule.non_resource_urls.clone().unwrap_or_default(),
+        verbs: verbs.iter().map(|&s| s.to_string()).collect(),
+        api_groups: api_groups.iter().map(|&s| s.to_string()).collect(),
+        resources: resources.iter().map(|&s| s.to_string()).collect(),
+        resource_names: Vec::new(),
+        non_resource_urls: Vec::new(),
     }
 }

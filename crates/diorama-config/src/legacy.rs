@@ -20,7 +20,8 @@ use crate::{
 
 /// Regular expression pattern matching service arguments:
 /// `--[a-z0-9][a-z0-9-]*(?:=(?:"[^"]*"|'[^']*'|[^\s"']+))?`
-const SERVICE_FLAG_REGEX: &str = r#"--[a-z0-9][a-z0-9-]*(?:=(?:"[^"]*"|'[^']*'|[^\s"']+))?"#;
+const SERVICE_FLAG_REGEX: &str =
+    r#"--[a-z0-9][a-z0-9-]*(?:=(?:"[^"]*"|'[^']*'|[^\t\n\x0B\x0C\r "']+))?"#;
 
 /// Strips surrounding double or single shell quotes from a flag value if present.
 pub fn unquote_shell_value(val: &str) -> String {
@@ -57,7 +58,7 @@ pub fn has_config_flag(content: &str) -> bool {
 /// Resolve a single literal absolute config argument from active service command fields.
 /// Runtime expansions and ambiguous arguments cannot establish an offline verification path.
 pub fn service_config_path(content: &str) -> Result<std::path::PathBuf, String> {
-    let re = Regex::new(r#"(?:^|\s|=)(?:"--config=([^"]*)"|'--config=([^']*)'|--config(?:=|\s+)("[^"]*"|'[^']*'|[^\s"']+)|--config(?:\s|$))"#)
+    let re = Regex::new(r#"(?:^|[\t\n\x0B\x0C\r ]|=)(?:"--config=([^"]*)"|'--config=([^']*)'|--config(?:=|[\t\n\x0B\x0C\r ]+)("[^"]*"|'[^']*'|[^\t\n\x0B\x0C\r "']+)|--config(?:[\t\n\x0B\x0C\r ]|$))"#)
         .expect("valid regex");
     let mut paths = Vec::new();
     for (_, line) in argument_lines(content) {
@@ -146,9 +147,10 @@ struct LegacyArgument {
 }
 
 fn legacy_arguments(line: &str) -> Vec<LegacyArgument> {
-    let re = Regex::new(r#"--[a-z0-9][a-z0-9-]*(?:=(?:"[^"]*"|'[^']*'|[^\s"']*))?"#)
+    let re = Regex::new(r#"--[a-z0-9][a-z0-9-]*(?:=(?:"[^"]*"|'[^']*'|[^\t\n\x0B\x0C\r "']*))?"#)
         .expect("valid regex");
-    let value_re = Regex::new(r#"^\s+("[^"]*"|'[^']*'|[^\s"'\\]+)"#).expect("valid regex");
+    let value_re = Regex::new(r#"^[\t\n\x0B\x0C\r ]+("[^"]*"|'[^']*'|[^\t\n\x0B\x0C\r "'\\]+)"#)
+        .expect("valid regex");
     let mut arguments = Vec::new();
     let mut consumed = 0;
     for mat in re.find_iter(line) {
