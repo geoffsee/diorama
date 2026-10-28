@@ -278,21 +278,36 @@ fn duplicate_archive_entries_are_rejected_without_mutation() {
             .unwrap()
             .success()
     );
+    // A separate inode keeps GNU tar from encoding the duplicate as a hard link.
+    let duplicate = temp.path().join("duplicate");
+    fs::create_dir(&duplicate).unwrap();
+    fs::copy(
+        expanded.join("bundle.manifest"),
+        duplicate.join("bundle.manifest"),
+    )
+    .unwrap();
     assert!(
         SysCommand::new("tar")
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
             .arg(&expanded)
-            .args([".", "."])
+            .arg(".")
+            .arg("-C")
+            .arg(&duplicate)
+            .arg("./bundle.manifest")
             .status()
             .unwrap()
             .success()
     );
     let dest = temp.path().join("dest");
-    let (code, error, _) = run(archive, &dest);
+    let (code, error, downloaded) = run(archive, &dest);
     assert_ne!(code, 0);
-    assert!(error.contains("duplicate"), "{error}");
+    assert!(
+        error.contains("duplicate archive member bundle.manifest"),
+        "{error}"
+    );
+    assert!(!downloaded);
     assert!(!dest.exists());
 }
 
