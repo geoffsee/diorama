@@ -136,7 +136,10 @@ jobs:
             install -m 0755 "$src/diorama" dist/diorama-linux-amd64
             install -m 0755 "$src/dioramactl" dist/dioramactl-linux-amd64
           fi
-          (cd dist && sha256sum ./*) > "dist/SHA256SUMS-${{ matrix.arch }}"
+          checksums="$RUNNER_TEMP/SHA256SUMS-${{ matrix.arch }}"
+          (cd dist && sha256sum ./*) > "$checksums"
+          (cd dist && sha256sum --check --strict "$checksums")
+          mv "$checksums" dist/
       - name: Upload binaries and verified offline bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
