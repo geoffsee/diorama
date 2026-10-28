@@ -15,7 +15,8 @@ jobs:
   # the release is given both names.
   dist:
     name: Dist ${{ matrix.arch }}
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Manual runs qualify the complete release without publishing or moving a tag.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     services:
@@ -38,7 +39,7 @@ jobs:
             bundle_arch: arm64
             addon_target: aarch64-unknown-linux-musl
     env:
-      RELEASE_VERSION: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && format('v0.0.0-check.{0}', github.run_id) || github.ref_name }}
       BUNDLE_ARCH: ${{ matrix.bundle_arch }}
       BINARY_DIR: target/${{ matrix.target }}/dist
     steps:

@@ -204,6 +204,80 @@ fn musl_cli_uses_observed_glibc_host_for_bundle_selection() {
 }
 
 #[test]
+fn glibc_bundle_installs_with_an_optional_musl_toolchain_present() {
+    for environment in ["gnu", "musl"] {
+        let temp = TempDir::new().unwrap();
+        let archive = build_bundle(temp.path(), &ARM64_ELF_HEADER, |_| {});
+        let mut evidence = arm64_glibc_evidence();
+        evidence.executable.environment = environment.into();
+        evidence.musl_linkers = Observation::Present(vec!["/lib/ld-musl-aarch64.so.1".into()]);
+        evidence.landmarks.insert(
+            "/lib/ld-linux-aarch64.so.1".into(),
+            Observation::Present(true),
+        );
+        let mut inputs = MockInputs {
+            evidence,
+            download_called: false,
+        };
+        let dest = temp.path().join("dest");
+        let mut stderr = Vec::new();
+        let code = DefaultCommandHandler
+            .execute_install(
+                InstallOptions {
+                    offline_install: Some(archive),
+                    path: dest.clone(),
+                    ..InstallOptions::default()
+                },
+                &mut inputs,
+                &mut Vec::new(),
+                &mut stderr,
+            )
+            .unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8(stderr).unwrap());
+        assert_eq!(fs::read(dest.join("diorama")).unwrap(), ARM64_ELF_HEADER);
+        assert!(!inputs.download_called);
+    }
+}
+
+#[test]
+fn glibc_bundle_is_rejected_on_a_musl_only_host_without_mutation() {
+    let temp = TempDir::new().unwrap();
+    let archive = build_bundle(temp.path(), &ARM64_ELF_HEADER, |_| {});
+    let mut evidence = arm64_glibc_evidence();
+    evidence.executable.environment = "musl".into();
+    evidence.musl_linkers = Observation::Present(vec!["/lib/ld-musl-aarch64.so.1".into()]);
+    evidence
+        .landmarks
+        .insert("/lib/ld-linux-aarch64.so.1".into(), Observation::Absent);
+    let mut inputs = MockInputs {
+        evidence,
+        download_called: false,
+    };
+    let dest = temp.path().join("dest");
+    let mut stderr = Vec::new();
+    let code = DefaultCommandHandler
+        .execute_install(
+            InstallOptions {
+                offline_install: Some(archive),
+                path: dest.clone(),
+                ..InstallOptions::default()
+            },
+            &mut inputs,
+            &mut Vec::new(),
+            &mut stderr,
+        )
+        .unwrap();
+    assert_eq!(code, 1);
+    assert!(
+        String::from_utf8(stderr)
+            .unwrap()
+            .contains("mismatched architecture or libc")
+    );
+    assert!(!dest.exists());
+    assert!(!inputs.download_called);
+}
+
+#[test]
 fn test_offline_install_rejects_digest_mismatch_without_mutation() {
     let temp = TempDir::new().unwrap();
     let dest = temp.path().join("dest");

@@ -13,9 +13,11 @@ returns `UnsupportedHost`; classifiers and target selection work on other hosts.
 (permission denied, IO error, malformed text, oversized input or unsupported probe).
 An unreadable higher-priority init landmark cannot become a confident lower-priority
 init result. No missing libc observation becomes proof of glibc: `host_libc_hint`
-is explicitly the baseline linker-presence heuristic, independent of Rust's target
-environment. Init landmarks describe baseline classification, not a successful
-connection to a running service manager.
+is a linker-presence heuristic, independent of Rust's target environment. An observed
+glibc loader for the executable's architecture takes precedence over optional musl
+loaders (for example, Ubuntu with `musl-tools` installed). Otherwise, the existing
+musl directory observations determine the hint. Init landmarks describe baseline
+classification, not a successful connection to a running service manager.
 
 Evidence retains kernel uname identity, real/effective UID, raw hostname, executable
 OS/architecture/environment, fixed init/container/tool landmarks, musl linker names,

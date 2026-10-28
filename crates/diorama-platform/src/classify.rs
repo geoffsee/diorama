@@ -355,7 +355,14 @@ pub fn classify(e: &HostEvidence) -> HostCapabilities {
             exists(e, "/run/.containerenv"),
             Observation::Present(e.container_environment_set),
         ]),
+        // Ubuntu can carry musl-tools alongside glibc. Prefer an observed native
+        // glibc loader; the CLI's own target environment is not host evidence.
         host_libc_hint: match &e.musl_linkers {
+            _ if crate::discover::glibc_linker(&e.executable.architecture)
+                .is_some_and(|path| exists(e, path) == Observation::Present(true)) =>
+            {
+                Observation::Present(Libc::Glibc)
+            },
             Observation::Present(values) => Observation::Present(if values.is_empty() {
                 Libc::Glibc
             } else {

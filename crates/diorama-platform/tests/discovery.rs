@@ -184,6 +184,63 @@ fn accepted_d01_targets_include_all_arch_libc_pairs_without_using_kernel_or_exec
     }
 }
 #[test]
+fn native_glibc_loader_takes_precedence_over_optional_musl_toolchains() {
+    for (arch, glibc, musl) in [
+        (
+            "x86_64",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/ld-musl-x86_64.so.1",
+        ),
+        (
+            "aarch64",
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib/ld-musl-aarch64.so.1",
+        ),
+        ("arm", "/lib/ld-linux-armhf.so.3", "/lib/ld-musl-armhf.so.1"),
+        (
+            "riscv64",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/lib/ld-musl-riscv64.so.1",
+        ),
+    ] {
+        for environment in ["gnu", "musl"] {
+            let mut fixture = evidence();
+            fixture.executable.architecture = arch.into();
+            fixture.executable.environment = environment.into();
+            fixture.musl_linkers = Observation::Present(vec![musl.into()]);
+            fixture
+                .landmarks
+                .insert(glibc.into(), Observation::Present(true));
+            assert_eq!(
+                classify(&fixture).host_libc_hint,
+                Observation::Present(Libc::Glibc),
+                "{arch}/{environment}"
+            );
+
+            fixture.landmarks.insert(glibc.into(), Observation::Absent);
+            assert_eq!(
+                classify(&fixture).host_libc_hint,
+                Observation::Present(Libc::Musl)
+            );
+        }
+    }
+}
+
+#[test]
+fn foreign_glibc_loader_does_not_override_native_musl() {
+    let mut fixture = evidence();
+    fixture.musl_linkers = Observation::Present(vec!["/lib/ld-musl-aarch64.so.1".into()]);
+    fixture.landmarks.insert(
+        "/lib64/ld-linux-x86-64.so.2".into(),
+        Observation::Present(true),
+    );
+    assert_eq!(
+        classify(&fixture).host_libc_hint,
+        Observation::Present(Libc::Musl)
+    );
+}
+
+#[test]
 fn missing_or_unreadable_evidence_never_becomes_a_positive_default() {
     let mut fixture = evidence();
     fixture.landmarks.insert(
