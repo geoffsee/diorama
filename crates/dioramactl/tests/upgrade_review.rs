@@ -103,6 +103,7 @@ fn host_binary_replacement_is_executable_without_exposing_config_permissions() {
         systemd: true,
         service_file: None,
         legacy_config: None,
+        data_path: None,
     };
     backend.replace("v1.3.0").unwrap();
     assert_eq!(
@@ -208,6 +209,7 @@ fn host_rollback_restores_all_state_and_removes_migration_created_config() {
         runner: &mut runner,
         systemd: true,
         service_file: Some(service.clone()),
+        data_path: None,
         legacy_config: Some(config.clone()),
     };
     let result = run_upgrade(
@@ -315,6 +317,7 @@ fn incomplete_snapshot_restarts_old_service_without_receipt_or_replacement() {
             systemd: true,
             service_file: None,
             legacy_config: None,
+            data_path: None,
         };
         assert!(run_upgrade(&mut backend, dir.path(), None, "v1.3.0", 1, &mut Vec::new()).is_err());
         assert_eq!(fs::read(binary).unwrap(), b"old-binary");
@@ -345,6 +348,7 @@ fn host_snapshot_allows_initially_absent_unit_but_rejects_present_nonregular_uni
         systemd: true,
         service_file: Some(dir.path().join("absent-unit")),
         legacy_config: None,
+        data_path: None,
     };
     let backup = backup_state(dir.path(), None, "v1.2.0", 1).unwrap();
     backend.snapshot(&backup).unwrap();
@@ -379,6 +383,7 @@ fn failed_committing_host_restore_retries_as_rollback_not_commit() {
         systemd: true,
         service_file: None,
         legacy_config: None,
+        data_path: None,
     };
     let backup = backup_state(dir.path(), None, "v1.2.0", 1).unwrap();
     backend.snapshot(&backup).unwrap();
@@ -616,6 +621,7 @@ fn non_systemd_restore_accepts_only_explicit_inactive_status() {
             systemd: false,
             service_file: None,
             legacy_config: None,
+            data_path: None,
         };
         let outcome = backend.restore(dir.path());
         if status == Some(3) && !probe_error {
@@ -777,6 +783,7 @@ fn interrupted_upgrade_recovery_restores_pre_upgrade_state_from_pending_receipt(
         runner: &mut runner,
         systemd: true,
         service_file: Some(service.clone()),
+        data_path: None,
         legacy_config: Some(config.clone()),
     };
 
@@ -849,6 +856,7 @@ fn interrupted_upgrade_recovery_refuses_corrupted_or_missing_backup_without_muta
         systemd: true,
         service_file: Some(service.clone()),
         legacy_config: None,
+        data_path: None,
     };
 
     let err =
@@ -921,6 +929,7 @@ fn recovery_prevalidation_rejects_changed_bytes_missing_artifacts_and_unsafe_ent
             systemd: true,
             service_file: Some(service.clone()),
             legacy_config: None,
+            data_path: None,
         };
         let backup = backup_state(dir.path(), None, "v1.2.0", 1).unwrap();
         backend.snapshot(&backup).unwrap();
@@ -1285,6 +1294,7 @@ fn recovery_rejects_foreign_backup_before_backend_calls() {
         systemd: true,
         service_file: None,
         legacy_config: None,
+        data_path: None,
     };
     let error = dioramactl::upgrade::recover_interrupted_upgrade(
         &mut backend,

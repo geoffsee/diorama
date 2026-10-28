@@ -450,6 +450,7 @@ impl LocalPathVolumeManager {
                     "storage": capacity,
                 },
                 "accessModes": access_modes,
+                "volumeMode": "Filesystem",
                 "persistentVolumeReclaimPolicy": reclaim_policy,
                 "storageClassName": effective_sc_name,
                 "local": {
@@ -581,6 +582,47 @@ impl LocalPathVolumeManager {
         Ok(bound_pvs)
     }
 
+    /// Release orphaned local-path PVs so the external provisioner can honor Delete.
+    /// Retain volumes stay Released with their data intact. API errors never imply absence.
+    pub async fn release_deleted_claims(&self) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let volumes = self.client.list_pvs().await?;
+        for pv in volumes["items"].as_array().into_iter().flatten() {
+            if pv["metadata"]["annotations"][STORAGE_PROVISIONED_BY_ANNOTATION]
+                != LOCAL_PATH_PROVISIONER_NAME
+                || pv["status"]["phase"] != "Bound"
+            {
+                continue;
+            }
+            let (Some(namespace), Some(claim), Some(name)) = (
+                pv["spec"]["claimRef"]["namespace"].as_str(),
+                pv["spec"]["claimRef"]["name"].as_str(),
+                pv["metadata"]["name"].as_str(),
+            ) else {
+                continue;
+            };
+            match self.client.get_pvc(namespace, claim).await {
+                Ok(_) => continue,
+                Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {},
+                Err(error) => return Err(error.into()),
+            }
+            if self.is_pvc_in_use(namespace, claim).await? {
+                continue;
+            }
+            let mut released = pv.clone();
+            // Older native PVs omitted Kubernetes' Filesystem default. The upstream
+            // provisioner expects it when constructing its cleanup helper pod.
+            if released["spec"]["volumeMode"].is_null() {
+                released["spec"]["volumeMode"] = json!("Filesystem");
+            }
+            released["status"]["phase"] = json!("Released");
+            self.client.update_pv(name, released).await?;
+        }
+        Ok(())
+    }
+
     /// Reclaim a PVC and its associated PV according to the configured reclaim policy.
     ///
     /// - `Retain`: Deletes the PVC; marks PV as `Released`; host data is retained untouched.
@@ -685,9 +727,7 @@ impl LocalPathVolumeManager {
 
     /// Check whether a PVC is actively referenced by any non-completed Pod in the namespace.
     pub async fn is_pvc_in_use(&self, pvc_namespace: &str, pvc_name: &str) -> Result<bool> {
-        let Ok(pod_list) = self.client.list_pods(pvc_namespace).await else {
-            return Ok(false);
-        };
+        let pod_list = self.client.list_pods(pvc_namespace).await?;
         let Some(pods) = pod_list.get("items").and_then(Value::as_array) else {
             return Ok(false);
         };

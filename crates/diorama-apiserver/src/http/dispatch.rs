@@ -1715,81 +1715,12 @@ async fn list_all_namespaces(
     group: &str,
     resource: &str,
 ) -> Result<Value, ApiserverError> {
-    if group.is_empty() && resource == "pods" {
-        return client.list_all_pods().await;
-    }
-    let namespaces = client.list_namespaces().await?;
-    let mut items = Vec::new();
-    let mut max_rv: u64 = 0;
-    if let Some(entries) = namespaces.get("items").and_then(Value::as_array) {
-        for entry in entries {
-            let Some(name) = entry.pointer("/metadata/name").and_then(Value::as_str) else {
-                continue;
-            };
-            let page = list_namespaced(client, group, resource, name).await?;
-            if let Some(page_items) = page.get("items").and_then(Value::as_array) {
-                items.extend(page_items.iter().cloned());
-            }
-            if let Some(resource_version) = page
-                .pointer("/metadata/resourceVersion")
-                .and_then(Value::as_str)
-                && let Ok(rv_num) = resource_version.parse::<u64>()
-            {
-                max_rv = max_rv.max(rv_num);
-            }
-        }
-    }
-    if !is_builtin_namespaced(resource)
-        && let Ok(cluster_page) = list_cluster(client, group, resource).await
-    {
-        if let Some(cluster_items) = cluster_page.get("items").and_then(Value::as_array) {
-            items.extend(cluster_items.iter().cloned());
-        }
-        if let Some(rv) = cluster_page
-            .pointer("/metadata/resourceVersion")
-            .and_then(Value::as_str)
-            && let Ok(rv_num) = rv.parse::<u64>()
-        {
-            max_rv = max_rv.max(rv_num);
-        }
-    }
-    let version = if max_rv > 0 {
-        max_rv.to_string()
-    } else {
-        "1".to_string()
-    };
-    let api_version = items
-        .first()
-        .and_then(|item| item.get("apiVersion"))
-        .and_then(Value::as_str)
-        .map_or_else(
-            || {
-                if group.is_empty() {
-                    "v1".to_string()
-                } else {
-                    format!("{group}/v1")
-                }
-            },
-            str::to_owned,
-        );
-    let kind = {
-        let base = list_kind(resource);
-        if base == "List" {
-            items
-                .first()
-                .and_then(|item| item.get("kind"))
-                .and_then(Value::as_str)
-                .map_or_else(|| "List".to_string(), |k| format!("{k}List"))
-        } else {
-            base.to_string()
-        }
-    };
-    Ok(json!({
-        "apiVersion": api_version,
-        "kind": kind,
-        "metadata": { "resourceVersion": version },
-        "items": items
-    }))
+    // A cluster-wide list is authorized for the requested resource. Enumerating
+    // Namespace objects here incorrectly required an unrelated RBAC permission.
+    let storage_group = if resource == "events" { "" } else { group };
+    client
+        .list_namespaced_objects(storage_group, list_kind(resource), resource, "")
+        .await
 }
 
 async fn list_namespaced(
@@ -3614,6 +3545,74 @@ fn scale_from(current: &Value, path: &ResourcePath) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn cluster_wide_list_does_not_require_namespace_discovery_permission() {
+        use crate::{
+            ApiserverConfig, ApiserverService, ClusterRole, ClusterRoleBinding, KubernetesStorage,
+            PolicyRule, Subject,
+        };
+        use diorama_datastore::{DatastoreConfig, DatastoreEngine};
+        use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
+        use std::collections::BTreeMap;
+        let root = tempfile::tempdir().unwrap();
+        let pki = root.path().join("pki");
+        let ip = "127.0.0.1".parse().unwrap();
+        ClusterPki::new(ClusterPkiConfig::new(pki.clone(), "node".into(), ip))
+            .reconcile()
+            .unwrap();
+        let (engine, _) =
+            DatastoreEngine::open(DatastoreConfig::new(root.path().join("db"))).unwrap();
+        let service = ApiserverService::new(
+            ApiserverConfig::default_for_pki(&pki, ip),
+            KubernetesStorage::new(engine.client(), "/registry"),
+        );
+        service.check_prerequisites().await.unwrap();
+        let admin = service.admin_client();
+        for namespace in ["alpha", "beta"] {
+            admin.create_namespace(namespace).await.unwrap();
+            admin
+                .create_configmap(namespace, "proof", BTreeMap::new())
+                .await
+                .unwrap();
+        }
+        admin
+            .create_cluster_role(ClusterRole {
+                name: "reader".into(),
+                rules: vec![PolicyRule {
+                    verbs: vec!["list".into()],
+                    api_groups: vec![String::new()],
+                    resources: vec!["configmaps".into()],
+                    resource_names: vec![],
+                    non_resource_urls: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        admin
+            .create_cluster_role_binding(ClusterRoleBinding {
+                name: "reader".into(),
+                role_ref: "reader".into(),
+                subjects: vec![Subject::ServiceAccount {
+                    namespace: "alpha".into(),
+                    name: "reader".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        let reader = service.service_account_client("alpha", "reader");
+        assert!(reader.list_namespaces().await.is_err());
+        let list = list_all_namespaces(&reader, "", "configmaps")
+            .await
+            .unwrap();
+        let items = list["items"].as_array().unwrap();
+        for namespace in ["alpha", "beta"] {
+            assert!(items.iter().any(
+                |v| v["metadata"]["name"] == "proof" && v["metadata"]["namespace"] == namespace
+            ));
+        }
+        assert!(list_all_namespaces(&reader, "", "secrets").await.is_err());
+    }
 
     #[test]
     fn page_list_chunking_and_continuation() {

@@ -174,3 +174,25 @@ fn embedded_archive_detection_distinguishes_local_file_from_missing() {
     assert!(pause_path.is_file());
     assert!(!local_path_path.exists());
 }
+
+#[tokio::test]
+async fn enabled_integrations_missing_offline_images_fail_before_a_registry_request() {
+    use diorama_containerd::image::{ImageError, import_or_pull_images};
+    for addon in ["portainer", "custom-portainer", "d2k"] {
+        let root = TempDir::new().unwrap();
+        for file in ["offline", "coredns.tar.gz", "pause.tar.gz"] {
+            fs::write(root.path().join(file), b"already imported").unwrap();
+        }
+        let mut config = ImageImportConfig::new(root.path());
+        config.local_storage_enabled = false;
+        config.d2k_enabled = addon == "d2k";
+        config.portainer_edge_enabled = addon != "d2k";
+        if addon == "custom-portainer" {
+            config.portainer_edge_image = Some("example.invalid/agent:v1".into());
+        }
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
+        let error = import_or_pull_images(channel, &config).await.unwrap_err();
+        assert!(matches!(error, ImageError::ImportFailed { .. }), "{error}");
+        assert!(error.to_string().contains("dioramactl addon load"));
+    }
+}

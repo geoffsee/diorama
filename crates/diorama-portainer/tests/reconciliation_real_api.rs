@@ -500,3 +500,39 @@ async fn test_supervisor_portainer_adapter_disabled_mode() {
     let report = sup_task.await.unwrap();
     assert_eq!(report.cause, StopCause::Requested);
 }
+
+#[tokio::test]
+async fn job_owned_deployment_suppresses_missing_legacy_bootstrap_resources() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+    client.create_namespace(PORTAINER_NAMESPACE).await.unwrap();
+    client.create_deployment(PORTAINER_NAMESPACE, json!({
+        "apiVersion":"apps/v1","kind":"Deployment",
+        "metadata":{"name":PORTAINER_AGENT_DEPLOYMENT_NAME,"labels":{"diorama.io/managed-by":"addon-job","diorama.io/addon":"portainer-agent"}},
+        "spec":{"replicas":1,"selector":{"matchLabels":{"app":"portainer-agent"}},
+        "template":{"metadata":{"labels":{"app":"portainer-agent"}},"spec":{"containers":[{"name":"agent","image":"ghcr.io/geoffsee/diorama-addon-portainer-agent:v1"}]}}}
+    })).await.unwrap();
+    let before = client
+        .get_deployment(PORTAINER_NAMESPACE, PORTAINER_AGENT_DEPLOYMENT_NAME)
+        .await
+        .unwrap();
+    let report = PortainerReconciler::new(&sample_config())
+        .reconcile(&client)
+        .await
+        .unwrap();
+    assert_eq!(report.total_created(), 0);
+    assert!(
+        client
+            .get_secret(PORTAINER_NAMESPACE, PORTAINER_AGENT_SECRET_NAME)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        before,
+        client
+            .get_deployment(PORTAINER_NAMESPACE, PORTAINER_AGENT_DEPLOYMENT_NAME)
+            .await
+            .unwrap()
+    );
+}

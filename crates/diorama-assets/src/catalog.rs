@@ -77,7 +77,7 @@ const ENTRIES: [CatalogEntry; 15] = [
     image(AssetId::ImagePause, "docker.io/portainer/pause:latest"),
     image(
         AssetId::ImageLocalPath,
-        "docker.io/rancher/local-path-provisioner:v0.0.36",
+        "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1",
     ),
     image(
         AssetId::ImageLocalPathHelper,

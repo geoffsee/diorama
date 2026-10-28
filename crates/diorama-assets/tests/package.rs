@@ -371,7 +371,7 @@ fn build_synthetic_oci_images() -> Vec<OciImageIndexArtifact> {
         ("image-pause", "docker.io/portainer/pause:latest"),
         (
             "image-local-path",
-            "docker.io/rancher/local-path-provisioner:v0.0.36",
+            "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1",
         ),
         (
             "image-local-path-helper",

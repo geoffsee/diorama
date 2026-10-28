@@ -83,3 +83,10 @@ To protect the host operating system and unrelated workloads sharing the node:
   `config.storage_path` allocates volumes under `<basePath>/local-path-storage/<namespace>_<pvc-name>_<pv-name>`.
 - **Shared Filesystem Mode** (`sharedFileSystemPath`, upstream #79 / KS-79):
   When `config.shared_path` is configured (e.g. NFS, shared cluster mount), volumes are allocated under `<sharedPath>/<namespace>_<pvc-name>_<pv-name>`, enabling multi-node shared storage.
+
+API deletion of a PVC is reconciled by marking its owned local-path PV `Released`
+only after no active pod references the claim. API lookup failures do not count as
+absence. The external provisioner then handles `Delete` through its BusyBox cleanup
+helper; `Retain` preserves the data. New native PVs explicitly set
+`volumeMode: Filesystem`, and release reconciliation supplies this default for
+older native PVs before handing them to the upstream provisioner.

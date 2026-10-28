@@ -864,6 +864,7 @@ pub struct HostBackend<'a, R: Runner> {
     pub systemd: bool,
     pub service_file: Option<PathBuf>,
     pub legacy_config: Option<PathBuf>,
+    pub data_path: Option<PathBuf>,
 }
 
 impl<R: Runner> HostBackend<'_, R> {
@@ -919,6 +920,26 @@ impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
 
     fn snapshot(&mut self, dir: &Path) -> io::Result<()> {
         fs::copy(&self.binary, dir.join("kubesolo.bin"))?;
+        if let Some(data) = &self.data_path {
+            let assets = dir.join("host-assets");
+            fs::create_dir(&assets)?;
+            for name in [
+                "bin",
+                "cni",
+                "images",
+                "bundle.manifest",
+                "asset-inventory.json",
+                "release-inputs.json",
+                "build-provenance.json",
+            ] {
+                reject_symlink_state(data, name)?;
+                if data.join(name).is_dir() {
+                    copy_tree(&data.join(name), &assets.join(name))?;
+                } else if data.join(name).is_file() {
+                    fs::copy(data.join(name), assets.join(name))?;
+                }
+            }
+        }
         if let Some(unit) = self.service_file.as_ref().filter(|p| p.is_file()) {
             fs::copy(unit, dir.join("service.unit"))?;
         }
@@ -941,6 +962,26 @@ impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
     }
 
     fn replace(&mut self, _target: &str) -> io::Result<()> {
+        if let Some(data) = &self.data_path
+            && let Some(root) = self.staged.parent().and_then(Path::parent)
+            && root.join(crate::install::BUNDLE_MANIFEST).is_file()
+        {
+            let manifest = crate::install::BundleManifest::parse(&fs::read_to_string(
+                root.join(crate::install::BUNDLE_MANIFEST),
+            )?)
+            .map_err(io::Error::other)?;
+            for entry in manifest.entries {
+                let destination = data.join(&entry.path);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                atomic_copy_with_mode(&root.join(entry.path), &destination, entry.executable)?;
+            }
+            atomic_copy(
+                &root.join(crate::install::BUNDLE_MANIFEST),
+                &data.join(crate::install::BUNDLE_MANIFEST),
+            )?;
+        }
         atomic_copy_with_mode(&self.staged, &self.binary, true)
     }
 
@@ -951,6 +992,27 @@ impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
     fn restore(&mut self, dir: &Path) -> io::Result<()> {
         self.stop()?;
         atomic_copy_with_mode(&dir.join("kubesolo.bin"), &self.binary, true)?;
+        if let Some(data) = &self.data_path
+            && dir.join("host-assets").is_dir()
+        {
+            for name in [
+                "bin",
+                "cni",
+                "images",
+                "bundle.manifest",
+                "asset-inventory.json",
+                "release-inputs.json",
+                "build-provenance.json",
+            ] {
+                remove_owned_entry(&data.join(name))?;
+                let saved = dir.join("host-assets").join(name);
+                if saved.is_dir() {
+                    copy_tree(&saved, &data.join(name))?;
+                } else if saved.is_file() {
+                    atomic_copy(&saved, &data.join(name))?;
+                }
+            }
+        }
         if let (Some(unit), true) = (&self.service_file, dir.join("service.unit").is_file()) {
             atomic_copy(&dir.join("service.unit"), unit)?;
             let mut marker = unit.as_os_str().to_owned();
@@ -1118,6 +1180,7 @@ pub struct ContainerBackend<'a, R: Runner> {
     spec_path: Option<PathBuf>,
     target: Option<String>,
     recovering_target: bool,
+    offline_image: Option<PathBuf>,
 }
 
 impl<'a, R: Runner> ContainerBackend<'a, R> {
@@ -1130,6 +1193,7 @@ impl<'a, R: Runner> ContainerBackend<'a, R> {
             spec_path: None,
             target: None,
             recovering_target: false,
+            offline_image: None,
         }
     }
 
@@ -1225,7 +1289,12 @@ impl<R: Runner> TransitionBackend for ContainerBackend<'_, R> {
 
     fn prepare(&mut self, target: &str) -> io::Result<()> {
         let image = self.spec.with_version(target).image;
-        self.eng(&["pull", &image]).map(|_| ())
+        if let Some(path) = self.offline_image.clone() {
+            self.eng(&["load", "--input", &path.to_string_lossy()])?;
+            self.eng(&["image", "inspect", &image]).map(|_| ())
+        } else {
+            self.eng(&["pull", &image]).map(|_| ())
+        }
     }
 
     fn snapshot(&mut self, dir: &Path) -> io::Result<()> {
@@ -1335,6 +1404,7 @@ impl<R: Runner> TransitionBackend for ContainerBackend<'_, R> {
 }
 
 /// Command entry point: chooses container mode when a recorded spec exists under the data path.
+#[allow(clippy::too_many_lines)] // Staging and transition state remain in one command scope.
 pub fn execute_upgrade(
     options: &crate::UpgradeOptions,
     inputs: &mut dyn crate::CheckInputs,
@@ -1357,8 +1427,49 @@ pub fn execute_upgrade(
             .and_then(|t| ContainerSpec::parse(&t));
         match spec {
             Ok(spec) => {
+                let stage = tempfile::tempdir()?;
+                let offline_image = if let Some(archive) = &options.offline_install {
+                    let parsed = diorama_assets::ArtifactNaming::parse_node_archive(
+                        &archive.file_name().unwrap_or_default().to_string_lossy(),
+                    )
+                    .map_err(io::Error::other)?;
+                    let arch = crate::docker_engine::DockerEngine::architecture()?;
+                    if parsed.variant.architecture != arch || parsed.version != options.version {
+                        return Err(io::Error::other(
+                            "upgrade bundle version or architecture differs from selected container",
+                        ));
+                    }
+                    crate::offline::stage(archive, stage.path()).map_err(io::Error::other)?;
+                    let inventory = crate::offline::validate(
+                        stage.path(),
+                        &parsed,
+                        diorama_assets::BundleKind::Container,
+                    )
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| io::Error::other("missing inventory"))?;
+                    let (_, path, _, _) = inventory
+                        .bundled_assets()
+                        .find(|(id, _, _, _)| *id == diorama_assets::AssetId::ImageDiorama)
+                        .ok_or_else(|| io::Error::other("missing node image"))?;
+                    let payload = fs::read(stage.path().join(path))?;
+                    let mut session = inventory
+                        .decoding_session(diorama_assets::DecodeLimits::default())
+                        .map_err(io::Error::other)?;
+                    let verified =
+                        crate::container_image::verify_container_image(&mut session, &payload)
+                            .map_err(io::Error::other)?;
+                    if verified.reference() != spec.with_version(&options.version).image {
+                        return Err(io::Error::other(
+                            "offline upgrade image tag differs from the recorded container repository and requested version",
+                        ));
+                    }
+                    Some(stage.path().join(path))
+                } else {
+                    None
+                };
                 let mut backend = ContainerBackend::new("docker", spec, &mut runner)
                     .with_spec_path(spec_path.clone());
+                backend.offline_image = offline_image;
                 run_upgrade(
                     &mut backend,
                     &options.path,
@@ -1397,6 +1508,7 @@ pub fn execute_upgrade(
             systemd: init == diorama_platform::InitSystem::Systemd,
             service_file: crate::migrate::service_file_path(init).map(PathBuf::from),
             legacy_config: None,
+            data_path: Some(options.path.clone()),
         };
         run_upgrade(
             &mut backend,
@@ -1448,6 +1560,7 @@ fn execute_recovery(
             systemd: init == diorama_platform::InitSystem::Systemd,
             service_file: crate::migrate::service_file_path(init).map(PathBuf::from),
             legacy_config: None,
+            data_path: Some(options.path.clone()),
         };
         recover_interrupted_upgrade(
             &mut backend,
@@ -1476,7 +1589,7 @@ fn stage_host_artifact(
         let evidence = inputs.discover().map_err(io::Error::other)?;
         let target =
             crate::resolve_target(None, None, Some(&evidence)).map_err(io::Error::other)?;
-        let name = crate::artifact_archive_name(&options.version, target, false);
+        let name = crate::artifact::core_archive_name(&options.version, target, false);
         let url =
             crate::artifact_download_url(&options.version, &name, options.custom_url.as_deref());
         let dest = stage.join(&name);
@@ -1492,17 +1605,21 @@ fn stage_host_artifact(
     if !is_archive {
         return Ok(source);
     }
+    let parsed = diorama_assets::ArtifactNaming::parse_node_archive(
+        &source.file_name().unwrap_or_default().to_string_lossy(),
+    )
+    .map_err(io::Error::other)?;
+    let evidence = inputs.discover().map_err(io::Error::other)?;
+    let target = crate::resolve_target(None, None, Some(&evidence)).map_err(io::Error::other)?;
+    if parsed.variant.node_target() != target || parsed.version != options.version {
+        return Err(io::Error::other(
+            "upgrade bundle version or architecture differs from requested target",
+        ));
+    }
     let out = stage.join("extract");
-    fs::create_dir_all(&out)?;
-    ProcessRunner.run(
-        "tar",
-        &[
-            "-xzf".into(),
-            source.to_string_lossy().into_owned(),
-            "-C".into(),
-            out.to_string_lossy().into_owned(),
-        ],
-    )?;
+    crate::offline::stage(&source, &out).map_err(io::Error::other)?;
+    crate::offline::validate(&out, &parsed, diorama_assets::BundleKind::Host)
+        .map_err(io::Error::other)?;
     if let Some(bin) = ["diorama", "bin/diorama", "kubesolo"]
         .iter()
         .map(|relative| out.join(relative))
@@ -1532,7 +1649,22 @@ mod tests {
                 &mut self,
             ) -> Result<diorama_platform::HostEvidence, diorama_platform::PlatformError>
             {
-                panic!("local upgrade staging must not discover a download target");
+                use diorama_platform::{ExecutableAbi, HostEvidence, Observation};
+                Ok(HostEvidence {
+                    executable: ExecutableAbi {
+                        os: "linux".into(),
+                        architecture: "amd64".into(),
+                        environment: "gnu".into(),
+                    },
+                    kernel: Observation::Absent,
+                    privileges: Observation::Absent,
+                    hostname: Observation::Absent,
+                    container_environment_set: false,
+                    landmarks: std::collections::BTreeMap::new(),
+                    musl_linkers: Observation::Present(vec![]),
+                    files: std::collections::BTreeMap::new(),
+                    requested_paths: vec![],
+                })
             }
             fn supplemental(
                 &mut self,
@@ -1652,6 +1784,7 @@ mod tests {
             systemd: true,
             service_file: None,
             legacy_config: None,
+            data_path: None,
         }
     }
 
@@ -1726,6 +1859,7 @@ mod tests {
             systemd: true,
             service_file: None,
             legacy_config: None,
+            data_path: None,
         };
         let out = run_upgrade(&mut b, d.path(), None, "v1.2.0", 1, &mut Vec::new()).unwrap();
         assert!(matches!(out, UpgradeOutcome::RolledBack { .. }), "{out:?}");
@@ -1770,6 +1904,82 @@ mod tests {
     }
 
     const SPEC: &str = "name=diorama\nimage=ghcr.io/example/kubesolo:v1.1.8\narg=--debug\nport=6443:6443\nport=9090:9090\nmount=/var/lib/diorama/pki:/var/lib/diorama/pki\nmount=/etc/diorama/registries.yaml:/etc/diorama/registries.yaml:ro\nmtu=1400\n";
+
+    #[test]
+    fn offline_container_upgrade_imports_and_inspects_without_pull() {
+        let mut runner = Fake::default();
+        let mut backend =
+            ContainerBackend::new("docker", ContainerSpec::parse(SPEC).unwrap(), &mut runner);
+        backend.offline_image = Some(PathBuf::from("/private/verified.tar.gz"));
+        backend.prepare("v1.2.0").unwrap();
+        assert_eq!(
+            runner.log,
+            vec![
+                "docker load --input /private/verified.tar.gz",
+                "docker image inspect ghcr.io/example/kubesolo:v1.2.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn host_asset_upgrade_retains_addons_and_rolls_back_runtime_files() {
+        use crate::install::{BundleEntry, BundleManifest};
+        let data = data_dir();
+        fs::create_dir_all(data.path().join("bin")).unwrap();
+        fs::write(data.path().join("bin/containerd"), "old runtime").unwrap();
+        fs::create_dir_all(data.path().join("images/addons")).unwrap();
+        fs::write(
+            data.path().join("images/addons/d2k.tar.gz"),
+            "retained image",
+        )
+        .unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        fs::create_dir(stage.path().join("bin")).unwrap();
+        for name in ["diorama", "containerd"] {
+            fs::write(stage.path().join("bin").join(name), "new executable").unwrap();
+        }
+        let manifest = BundleManifest {
+            version: "v1.2.0".into(),
+            os: "linux".into(),
+            arch: "arm64".into(),
+            libc: "glibc".into(),
+            entries: ["bin/diorama", "bin/containerd"]
+                .into_iter()
+                .map(|name| BundleEntry {
+                    path: name.into(),
+                    executable: true,
+                    sha256: crate::install::sha256_hex(&stage.path().join(name)).unwrap(),
+                })
+                .collect(),
+        };
+        fs::write(stage.path().join("bundle.manifest"), manifest.render()).unwrap();
+        let binaries = tempfile::tempdir().unwrap();
+        let mut runner = Fake::default();
+        let mut backend = host(binaries.path(), &mut runner);
+        backend.staged = stage.path().join("bin/diorama");
+        backend.data_path = Some(data.path().into());
+        let backup = tempfile::tempdir().unwrap();
+        backend.snapshot(backup.path()).unwrap();
+        backend.replace("v1.2.0").unwrap();
+        assert_eq!(
+            fs::read_to_string(data.path().join("bin/containerd")).unwrap(),
+            "new executable"
+        );
+        assert_eq!(
+            fs::read_to_string(data.path().join("images/addons/d2k.tar.gz")).unwrap(),
+            "retained image"
+        );
+        backend.restore(backup.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(data.path().join("bin/containerd")).unwrap(),
+            "old runtime"
+        );
+        assert!(!data.path().join("bundle.manifest").exists());
+        assert_eq!(
+            fs::read_to_string(data.path().join("images/addons/d2k.tar.gz")).unwrap(),
+            "retained image"
+        );
+    }
 
     #[test]
     fn container_spec_roundtrip_and_preservation() {

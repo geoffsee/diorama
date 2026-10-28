@@ -55,7 +55,26 @@ pub fn build_offline_bundle(spec: &BundleSpec) -> Result<PathBuf, String> {
                 && c.variant == Variant::Offline
         })
         .ok_or("no offline bundle exists for this target")?;
-    let filename = cell.archive_filename(BUNDLE_PREFIX, &spec.version);
+    let mut filename = cell.archive_filename(BUNDLE_PREFIX, &spec.version);
+    if let Some(input) = spec
+        .inputs
+        .iter()
+        .find(|i| i.relative == "asset-inventory.json")
+    {
+        let bytes = fs::read(&input.source).map_err(|e| e.to_string())?;
+        let manifest = diorama_assets::Manifest::decode(&bytes, diorama_assets::Limits::default())
+            .map_err(|e| e.to_string())?;
+        if let Some(bundle) = manifest.bundle() {
+            bundle.validate().map_err(|e| e.to_string())?;
+            if bundle.version != spec.version {
+                return Err("inventory version differs from bundle".into());
+            }
+            filename = filename.replace(
+                "-offline.tar.gz",
+                &format!("-{}-offline.tar.gz", bundle.suffix()),
+            );
+        }
+    }
 
     fs::create_dir_all(&spec.output_dir).map_err(|e| e.to_string())?;
     let staging = tempfile::TempDir::new_in(&spec.output_dir).map_err(|e| e.to_string())?;

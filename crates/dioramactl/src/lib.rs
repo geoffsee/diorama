@@ -1,4 +1,5 @@
 //! Read-only management command boundary, independent from node startup parsing.
+pub mod addon;
 pub mod artifact;
 pub mod bundle;
 pub mod check_workflow;
@@ -19,6 +20,7 @@ pub mod endpoints;
 pub mod install;
 pub mod kubeconfig;
 pub mod migrate;
+pub mod offline;
 mod parse;
 pub mod preparation;
 pub mod service;
@@ -98,8 +100,9 @@ pub trait CheckInputs {
 
 pub fn help(topic: HelpTopic) -> &'static str {
     match topic {
+        HelpTopic::Addon => crate::addon::HELP,
         HelpTopic::Root => {
-            "diorama Kube management commands\n\nUsage:\n  dioramactl [command]\n\nCommands:\n  check       Check host prerequisites\n  completion  Generate shell completion scripts\n  config      Manage diorama configuration\n  d2k         Manage Docker-to-Kubernetes (d2k) API translator\n  download    Download the binary bundle for offline installation\n  install     Install diorama and configure the system service\n  kubeconfig  Manage kubeconfig context and cluster access\n  reset       Reset cluster data and restart services\n  uninstall   Uninstall diorama and remove associated system resources\n  upgrade     Upgrade diorama to a different version\n  version     Print version information\n\nUse dioramactl [command] --help for more information about a command.\n"
+            "diorama Kube management commands\n\nUsage:\n  dioramactl [command]\n\nCommands:\n  addon       Load an offline add-on pack\n  check       Check host prerequisites\n  completion  Generate shell completion scripts\n  config      Manage diorama configuration\n  d2k         Manage Docker-to-Kubernetes (d2k) API translator\n  download    Download the binary bundle for offline installation\n  install     Install diorama and configure the system service\n  kubeconfig  Manage kubeconfig context and cluster access\n  reset       Reset cluster data and restart services\n  uninstall   Uninstall diorama and remove associated system resources\n  upgrade     Upgrade diorama to a different version\n  version     Print version information\n\nUse dioramactl [command] --help for more information about a command.\n"
         },
         HelpTopic::Check => {
             "Check Linux host prerequisites; preparation requires explicit opt-in.\n\nUsage:\n  dioramactl check [flags]\n\nFlags:\n  -h, --help             Help for check\n      --install-prereqs  Install missing Alpine networking packages and enable its cgroups service\n      --pprof-server     Include pprof port 6060 in port checks\n"
@@ -112,7 +115,7 @@ pub fn help(topic: HelpTopic) -> &'static str {
         },
         HelpTopic::Download => {
             concat!(
-                "Download the binary bundle for offline installation.\n\nUsage:\n  dioramactl download [flags]\n\nFlags:\n      --arch string        Target architecture for the bundle (default: current host)\n                           Valid values: amd64, arm64, arm, riscv64, amd64-musl, arm64-musl, arm-musl, riscv64-musl\n      --bin-url string     Custom URL for binary download\n      --custom-url string  Custom URL for binary download\n      --glibc              Use glibc-based binary (default)\n  -h, --help               Help for download\n      --musl               Use musl-based binary\n      --offline            Download offline bundle with all images embedded\n      --path string        Directory to download files into (default: \".\")\n      --proxy string       HTTP/HTTPS proxy URL\n      --temp-dir string    Temporary directory for download/extraction\n      --version string     Version to download (default: \"v",
+                "Download the binary bundle for offline installation.\n\nUsage:\n  dioramactl download [flags]\n\nFlags:\n      --arch string        Target architecture for the bundle (default: current host)\n                           Valid values: amd64, arm64, arm, riscv64, amd64-musl, arm64-musl, arm-musl, riscv64-musl\n      --bin-url string     Custom URL for binary download\n      --custom-url string  Custom URL for binary download\n      --glibc              Use glibc-based binary (default)\n  -h, --help               Help for download\n      --musl               Use musl-based binary\n      --offline            Compatibility flag; core downloads are always offline\n      --path string        Directory to download files into (default: \".\")\n      --run-mode string    Select host (service) or container bundle (default: service)\n      --proxy string       HTTP/HTTPS proxy URL\n      --temp-dir string    Temporary directory for download/extraction\n      --version string     Version to download (default: \"v",
                 env!("CARGO_PKG_VERSION"),
                 "\")\n"
             )
@@ -217,6 +220,7 @@ pub fn execute_with_handler(
             stderr.write_all(help(HelpTopic::Root).as_bytes())?;
             Ok(0)
         },
+        Ok(Command::Addon(options)) => crate::addon::execute(&options, stdout, stderr),
         Ok(Command::Version) => {
             writeln!(stdout, "dioramactl {version}")?;
             Ok(0)

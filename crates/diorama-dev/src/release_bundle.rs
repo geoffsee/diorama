@@ -2,9 +2,9 @@
 
 use crate::{Result, read_bounded, run_checked};
 use diorama_assets::{
-    Architecture, ArchiveLimits, AssetId, AssetLayout, DecodeLimits, ElfLimits, Encoding,
-    InventoryRequest, Kind, LayerDecodeLimits, Libc, Limits, Manifest, NodeTarget, Scope, Variant,
-    catalog,
+    Architecture, ArchiveLimits, AssetId, AssetLayout, BundleKind, BundleMetadata, Capability,
+    DecodeLimits, ElfLimits, Encoding, InventoryRequest, Kind, LayerDecodeLimits, Libc, Limits,
+    Manifest, NodeTarget, Scope, Variant, catalog,
 };
 use dioramactl::bundle::{BundleInput, BundleSpec, build_offline_bundle};
 use flate2::{Compression, write::GzEncoder};
@@ -45,6 +45,9 @@ struct Sources {
     downloads: BTreeMap<String, Vec<Source>>,
     tools: BTreeMap<String, Source>,
     images: Vec<ImageSource>,
+    local_path_runtime: String,
+    local_path_reference: String,
+    local_path_license_sha256: String,
 }
 
 fn architecture(name: &str) -> Result<Architecture> {
@@ -140,6 +143,17 @@ fn gzip(source: &Path, destination: &Path) -> Result<()> {
 pub fn prepare(arch: &str, destination: &Path) -> Result<()> {
     architecture(arch)?;
     let sources: Sources = serde_json::from_str(INPUTS)?;
+    if !sources.local_path_runtime.contains("@sha256:")
+        || sources.local_path_reference
+            != catalog()
+                .iter()
+                .find(|e| e.id == AssetId::ImageLocalPath)
+                .ok_or("missing local-path catalog entry")?
+                .reference
+        || sources.local_path_license_sha256.len() != 64
+    {
+        return Err("invalid local-path provenance".into());
+    }
     if sources.schema_version != 1 {
         return Err("unsupported release input schema".into());
     }
@@ -179,7 +193,12 @@ pub fn prepare(arch: &str, destination: &Path) -> Result<()> {
         }
     }
     fs::create_dir_all(destination.join("images"))?;
-    for source in &sources.images {
+    for source in sources.images.iter().filter(|s| {
+        matches!(
+            s.id,
+            AssetId::ImageCoredns | AssetId::ImagePause | AssetId::ImageLocalPathHelper
+        )
+    }) {
         let digest = source
             .digests
             .get(arch)
@@ -220,6 +239,8 @@ fn canonical_tag(tag: &str) -> String {
 /// before publishing it. `assets` contains decoded runtime executables and gzip images.
 #[allow(clippy::too_many_lines)]
 pub fn package(
+    kind: BundleKind,
+    addon: Option<Capability>,
     version: &str,
     arch: &str,
     binaries: &Path,
@@ -230,52 +251,58 @@ pub fn package(
         architecture: architecture(arch)?,
         libc: Libc::Glibc,
     };
+    let bundle = BundleMetadata {
+        kind,
+        version: version.into(),
+        capabilities: if kind == BundleKind::Addon {
+            vec![addon.ok_or("addon capability is required")?]
+        } else {
+            vec![Capability::Core, Capability::LocalStorage]
+        },
+    };
+    bundle.validate()?;
     let staging = tempfile::tempdir()?;
     let mut inputs = Vec::new();
-    for name in ["diorama", "dioramactl"] {
+    for name in ["diorama", "dioramactl"]
+        .into_iter()
+        .filter(|_| kind == BundleKind::Host)
+    {
         inputs.push(BundleInput {
             source: binaries.join(name),
             relative: format!("bin/{name}"),
             executable: true,
         });
     }
+    if kind == BundleKind::Host {
+        inputs.push(BundleInput {
+            source: assets.join("bin/ctr"),
+            relative: "bin/ctr".into(),
+            executable: true,
+        });
+    }
     let mut records = Vec::new();
-    for entry in catalog() {
-        let id = serde_json::to_value(entry.id)?
-            .as_str()
-            .ok_or("asset ID is not text")?
-            .to_owned();
+    for entry in catalog().iter().filter(|e| bundle.includes(e.id)) {
         let relative = AssetLayout::default_relative_path(entry.id);
         let source = assets.join(relative);
-        // Hash the raw runtime file as well as its encoded inventory payload. Host
-        // installation can then use the executable without a separate decode step.
+        // The installed executable is also its inventory payload; the outer archive
+        // compresses it once, with no second encoded copy to ship or retain.
         inputs.push(BundleInput {
             source: source.clone(),
             relative: relative.into(),
             executable: entry.kind == Kind::Executable,
         });
-        let (encoded, encoded_relative) = if entry.encoding == Encoding::Zstd {
-            let encoded = staging.path().join(format!("{id}.zst"));
-            let mut compressor = zstd::stream::write::Encoder::new(File::create(&encoded)?, 3)?;
-            io::copy(&mut File::open(&source)?, &mut compressor)?;
-            compressor.finish()?.sync_all()?;
-            let relative = format!("payloads/{id}.zst");
-            inputs.push(BundleInput {
-                source: encoded.clone(),
-                relative: relative.clone(),
-                executable: false,
-            });
-            (encoded, relative)
+        let encoding = if entry.kind == Kind::Executable {
+            Encoding::Identity
         } else {
-            (source, relative.to_owned())
+            entry.encoding
         };
         records.push(json!({"id":entry.id,"delivery":{
-            "kind":"bundled","path":encoded_relative,"encoding":entry.encoding,
-            "encoded_bytes":fs::metadata(&encoded)?.len(),"sha256":sha256(&encoded)?
+            "kind":"bundled","path":relative,"encoding":encoding,
+            "encoded_bytes":fs::metadata(&source)?.len(),"sha256":sha256(&source)?
         }}));
     }
     let bytes = serde_json::to_vec_pretty(&json!({
-        "schema_version":1,"target":{"os":"linux","architecture":arch,"libc":"glibc"},
+        "schema_version":2,"bundle":bundle,"target":{"os":"linux","architecture":arch,"libc":"glibc"},
         "variant":"offline","scope":"supervised-bundle","assets":records
     }))?;
     let inventory = Manifest::decode(&bytes, Limits::default())?.validate_inventory(
@@ -308,16 +335,9 @@ pub fn package(
                     ArchiveLimits::default(),
                     LayerDecodeLimits::default(),
                 )?;
-                let expected = if id == AssetId::ImageDiorama {
-                    format!("ghcr.io/geoffsee/diorama:{version}")
-                } else {
-                    catalog()
-                        .iter()
-                        .find(|entry| entry.id == id)
-                        .ok_or("missing catalog image")?
-                        .reference
-                        .to_owned()
-                };
+                let expected = bundle
+                    .image_reference(id)
+                    .ok_or("missing image reference")?;
                 let tags = image.archive().repo_tags();
                 if tags.len() != 1 || canonical_tag(&tags[0]) != expected {
                     return Err(format!(
@@ -327,6 +347,55 @@ pub fn package(
                 }
             },
         }
+    }
+    if kind == BundleKind::Addon {
+        let addon_name = if addon == Some(Capability::PortainerAgent) {
+            "portainer-agent"
+        } else {
+            "d2k"
+        };
+        let id = if addon_name == "d2k" {
+            AssetId::ImageD2k
+        } else {
+            AssetId::ImagePortainerAgent
+        };
+        let settings = diorama_addon::Settings {
+            addon: addon_name.into(),
+            image: bundle
+                .image_reference(id)
+                .ok_or("missing installer image")?,
+            namespace: if addon_name == "d2k" {
+                "d2k"
+            } else {
+                "portainer"
+            }
+            .into(),
+            node: "replace-with-loaded-node".into(),
+        };
+        let job = serde_json::to_vec_pretty(&diorama_addon::installation_job(&settings)?)?;
+        let source = staging.path().join("install-job.json");
+        fs::write(&source, &job)?;
+        inputs.push(BundleInput {
+            source,
+            relative: "install-job.json".into(),
+            executable: false,
+        });
+        fs::create_dir_all(output)?;
+        fs::write(
+            output.join(format!(
+                "diorama-{version}-linux-{arch}-{addon_name}-job.json"
+            )),
+            &job,
+        )?;
+    }
+    if kind == BundleKind::Host {
+        let marker = staging.path().join("offline");
+        fs::write(&marker, b"schema-version=2\n")?;
+        inputs.push(BundleInput {
+            source: marker,
+            relative: "images/offline".into(),
+            executable: false,
+        });
     }
     for (relative, contents) in [
         ("asset-inventory.json", bytes.as_slice()),
@@ -340,16 +409,181 @@ pub fn package(
             executable: false,
         });
     }
-    build_offline_bundle(&BundleSpec {
+    let provenance = assets.join("build-provenance.json");
+    if provenance.is_file() {
+        inputs.push(BundleInput {
+            source: provenance.clone(),
+            relative: "build-provenance.json".into(),
+            executable: false,
+        });
+        fs::create_dir_all(output)?;
+        fs::copy(
+            &provenance,
+            output.join(format!("diorama-{version}-linux-{arch}-provenance.json")),
+        )?;
+    }
+    let archive = build_offline_bundle(&BundleSpec {
         version: version.into(),
         architecture: target.architecture,
         libc: target.libc,
-        inputs,
+        inputs: inputs.clone(),
         output_dir: output.into(),
     })
-    .map_err(Into::into)
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let bytes = fs::metadata(&archive)?.len();
+    let ceiling = if arch == "arm64" {
+        120_000_000
+    } else {
+        140_000_000
+    };
+    if kind == BundleKind::Host {
+        enforce_host_ceiling(&archive, ceiling)?;
+    }
+    let breakdown = inputs
+        .iter()
+        .map(|i| Ok(json!({"path":i.relative,"bytes":fs::metadata(&i.source)?.len()})))
+        .collect::<Result<Vec<_>>>()?;
+    fs::write(
+        output.join(format!(
+            "{}-sizes.json",
+            archive
+                .file_name()
+                .ok_or("missing archive filename")?
+                .to_string_lossy()
+        )),
+        serde_json::to_vec_pretty(
+            &json!({"archive_bytes":bytes,"host_ceiling_bytes":ceiling,"assets":breakdown}),
+        )?,
+    )?;
+    Ok(archive)
 }
 
 #[cfg(test)]
 #[path = "release_bundle_tests.rs"]
 mod tests;
+
+fn enforce_host_ceiling(archive: &Path, ceiling: u64) -> Result<()> {
+    let bytes = fs::metadata(archive)?.len();
+    if bytes > ceiling {
+        fs::remove_file(archive)?;
+        return Err(format!("host bundle {bytes} bytes exceeds ceiling {ceiling}").into());
+    }
+    Ok(())
+}
+
+/// Build derived images from pinned bases, then export canonical crane archives.
+/// A local build registry avoids a dependency on publishing credentials.
+#[allow(clippy::too_many_lines)] // Each derived image uses the same pinned build/export sequence.
+pub fn build_images(
+    version: &str,
+    arch: &str,
+    installer: &Path,
+    assets: &Path,
+    engine: &str,
+    registry: &str,
+) -> Result<()> {
+    architecture(arch)?;
+    let sources: Sources = serde_json::from_str(INPUTS)?;
+    let context = tempfile::tempdir()?;
+    fs::create_dir(context.path().join("licenses"))?;
+    fs::write(
+        context
+            .path()
+            .join("licenses/local-path-provisioner.LICENSE"),
+        include_bytes!("../../../container/licenses/local-path-provisioner.LICENSE"),
+    )?;
+    if sha256(
+        &context
+            .path()
+            .join("licenses/local-path-provisioner.LICENSE"),
+    )? != sources.local_path_license_sha256
+    {
+        return Err("local-path license checksum mismatch".into());
+    }
+    copy_executable(installer, &context.path().join("diorama-addon"))?;
+    let crane = assets.join("tools/crane");
+    let mut provenance = Vec::new();
+    for (id, name, recipe) in [
+        (
+            AssetId::ImageLocalPath,
+            "local-path",
+            include_str!("../../../container/Dockerfile.local-path"),
+        ),
+        (
+            AssetId::ImagePortainerAgent,
+            "portainer-agent",
+            include_str!("../../../container/Dockerfile.addon"),
+        ),
+        (
+            AssetId::ImageD2k,
+            "d2k",
+            include_str!("../../../container/Dockerfile.addon"),
+        ),
+    ] {
+        let source = sources
+            .images
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or("missing upstream image")?;
+        let repository = source
+            .reference
+            .rsplit_once(':')
+            .ok_or("missing upstream tag")?
+            .0;
+        let upstream = format!(
+            "{repository}@{}",
+            source.digests.get(arch).ok_or("missing platform pin")?
+        );
+        let reference = if id == AssetId::ImageLocalPath {
+            sources.local_path_reference.clone()
+        } else {
+            format!("ghcr.io/geoffsee/diorama-addon-{name}:{version}")
+        };
+        let local = format!("{registry}/diorama-{name}:{version}");
+        fs::write(context.path().join("Dockerfile"), recipe)?;
+        run_checked(
+            Command::new(engine)
+                .args([
+                    "build",
+                    "--platform",
+                    &format!("linux/{arch}"),
+                    "--build-arg",
+                    &format!("UPSTREAM={upstream}"),
+                    "--build-arg",
+                    &format!("RUNTIME={}", sources.local_path_runtime),
+                    "--tag",
+                    &local,
+                ])
+                .arg(context.path()),
+        )?;
+        run_checked(Command::new(engine).args(["push", &local]))?;
+        let archive = context.path().join("image.tar");
+        run_checked(
+            Command::new(&crane)
+                .args([
+                    "mutate",
+                    "--insecure",
+                    "--platform",
+                    &format!("linux/{arch}"),
+                    "--tag",
+                    &reference,
+                    "--output",
+                ])
+                .arg(&archive)
+                .arg(&local),
+        )?;
+        let destination = assets.join(AssetLayout::default_relative_path(id));
+        gzip(&archive, &destination)?;
+        if id == AssetId::ImageLocalPath && fs::metadata(&destination)?.len() >= 25_000_000 {
+            return Err("local-path provisioner exceeds the 25 MB compressed ceiling".into());
+        }
+        provenance.push(json!({"image":reference,"upstream":upstream,"runtime":if id == AssetId::ImageLocalPath {Some(&sources.local_path_runtime)} else {None},"recipe_sha256":sha256(&context.path().join("Dockerfile"))?,"archive_sha256":sha256(&destination)?,"archive_bytes":fs::metadata(destination)?.len(),"installer_sha256":sha256(installer)?}));
+    }
+    fs::write(
+        assets.join("build-provenance.json"),
+        serde_json::to_vec_pretty(
+            &json!({"schema_version":1,"version":version,"architecture":arch,"images":provenance}),
+        )?,
+    )?;
+    Ok(())
+}

@@ -22,6 +22,7 @@ pub enum HelpTopic {
     Config,
     Kubeconfig,
     D2k,
+    Addon,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -40,6 +41,7 @@ pub enum Command {
     Config(ConfigOptions),
     Kubeconfig(KubeconfigOptions),
     D2k(D2kOptions),
+    Addon(crate::addon::AddonOptions),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +106,12 @@ pub fn parse_command(
     {
         return Err(ParseError::TooManyArguments);
     }
+    if args.first().map(String::as_str) == Some("addon") {
+        if args.len() == 1 || args.iter().any(|a| a == "--help" || a == "-h") {
+            return Ok(Command::Help(HelpTopic::Addon));
+        }
+        return crate::addon::parse(&args[1..]).map(Command::Addon);
+    }
     let mut topic = HelpTopic::Root;
     let mut command_index = None;
     let mut help_command = false;
@@ -146,6 +154,7 @@ pub fn parse_command(
     };
 
     let mut download_opts = DownloadOptions {
+        run_mode: "service".into(),
         version: environment
             .get("KUBESOLO_VERSION")
             .cloned()
@@ -376,6 +385,12 @@ pub fn parse_command(
                 "install-prereqs" if topic == HelpTopic::Install => {
                     install_opts.install_prereqs = value.map_or(Ok(true), boolean)?;
                 },
+                "run-mode" if topic == HelpTopic::Download => {
+                    download_opts.run_mode = get_string_val(value, &mut i, args)?;
+                    if !matches!(download_opts.run_mode.as_str(), "service" | "container") {
+                        return Err(ParseError::UnknownFlag);
+                    }
+                },
                 "d2k" if topic == HelpTopic::Install => {
                     install_opts.d2k = value.map_or(Ok(true), boolean)?;
                 },
@@ -522,11 +537,13 @@ pub fn parse_command(
             Some("config") => Command::Help(HelpTopic::Config),
             Some("kubeconfig") => Command::Help(HelpTopic::Kubeconfig),
             Some("d2k") => Command::Help(HelpTopic::D2k),
+            Some("addon") => Command::Help(HelpTopic::Addon),
             _ => Command::UnknownHelp,
         });
     }
 
     Ok(match topic {
+        HelpTopic::Addon => Command::Help(HelpTopic::Addon),
         HelpTopic::Check => Command::Check(check_opts),
         HelpTopic::Version => Command::Version,
         HelpTopic::Root => Command::Help(HelpTopic::Root),

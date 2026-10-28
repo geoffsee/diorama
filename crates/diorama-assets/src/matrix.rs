@@ -264,6 +264,7 @@ impl std::error::Error for MatrixError {}
 /// Parsed node archive metadata from a filename.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedNodeArchive {
+    pub bundle_suffix: Option<String>,
     pub prefix: String,
     pub version: String,
     pub variant: NodeVariant,
@@ -411,6 +412,16 @@ impl ArtifactNaming {
 
         let prefix_and_version = &stem[..linux_pos];
         let target_part = &stem[linux_pos + 7..];
+        let mut bundle_suffix = None;
+        let mut legacy_target = target_part.to_owned();
+        for suffix in ["host", "container", "addon-portainer-agent", "addon-d2k"] {
+            if let Some(target) = target_part.strip_suffix(&format!("-{suffix}-offline")) {
+                bundle_suffix = Some(suffix.to_owned());
+                legacy_target = format!("{target}-offline");
+                break;
+            }
+        }
+        let target_part = legacy_target.as_str();
 
         // Split prefix and version: prefix is diorama
         let (prefix, version) = if let Some(stripped) = prefix_and_version.strip_prefix("diorama-")
@@ -463,6 +474,7 @@ impl ArtifactNaming {
             .ok_or_else(|| ArtifactNamingError::InvalidFormat(base.to_string()))?;
 
         Ok(ParsedNodeArchive {
+            bundle_suffix,
             prefix,
             version,
             variant: node_variant,
@@ -522,6 +534,11 @@ impl ArtifactNaming {
         let canonical = parsed
             .variant
             .archive_filename(&parsed.prefix, &parsed.version);
+        let canonical = if let Some(suffix) = &parsed.bundle_suffix {
+            canonical.replace("-offline.tar.gz", &format!("-{suffix}-offline.tar.gz"))
+        } else {
+            canonical
+        };
         if base != canonical {
             return Err(ArtifactNamingError::NonCanonical {
                 filename: base.to_string(),
