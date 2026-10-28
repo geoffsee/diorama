@@ -141,7 +141,7 @@ fn same_encoded_slice_must_match_before_any_callback() {
     );
     assert!(s.remaining_encoded_budget() < Limits::default().encoded_total_bytes);
     assert!(matches!(
-        s.inspect_compressed_blob(AssetId::KubeApiserver, b"abc", |_| Ok::<_, Infallible>(())),
+        s.inspect_compressed_blob(AssetId::Containerd, b"abc", |_| Ok::<_, Infallible>(())),
         Err(DecodeError::Policy(DecodePolicyError::NotCompressed))
     ));
 }

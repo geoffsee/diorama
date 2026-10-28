@@ -1503,13 +1503,16 @@ fn stage_host_artifact(
             out.to_string_lossy().into_owned(),
         ],
     )?;
-    let bin = out.join("kubesolo");
-    if bin.is_file() {
+    if let Some(bin) = ["diorama", "bin/diorama", "kubesolo"]
+        .iter()
+        .map(|relative| out.join(relative))
+        .find(|path| path.is_file())
+    {
         Ok(bin)
     } else {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "archive does not contain 'kubesolo'",
+            "archive does not contain 'diorama' or 'bin/diorama'",
         ))
     }
 }
@@ -1517,6 +1520,70 @@ fn stage_host_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_diorama_bundles_stage_for_upgrade_without_downloads() {
+        use crate::bundle::{BundleInput, BundleSpec, build_offline_bundle};
+        use diorama_platform::{Architecture, Libc};
+
+        struct OfflineInputs;
+        impl crate::CheckInputs for OfflineInputs {
+            fn discover(
+                &mut self,
+            ) -> Result<diorama_platform::HostEvidence, diorama_platform::PlatformError>
+            {
+                panic!("local upgrade staging must not discover a download target");
+            }
+            fn supplemental(
+                &mut self,
+            ) -> Result<
+                diorama_platform::preflight_probe::SupplementalFacts,
+                diorama_platform::PlatformError,
+            > {
+                panic!("local upgrade staging must not probe the host");
+            }
+            fn ports(
+                &mut self,
+                _: bool,
+            ) -> Result<
+                [diorama_platform::Observation<diorama_platform::preflight::PortAvailability>; 4],
+                diorama_platform::PlatformError,
+            > {
+                panic!("local upgrade staging must not probe ports");
+            }
+        }
+
+        for relative in ["diorama", "bin/diorama"] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("node");
+            let mut elf = [0u8; 64];
+            elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            elf[18] = 62;
+            fs::write(&source, elf).unwrap();
+            let archive = build_offline_bundle(&BundleSpec {
+                version: "v0.1.0".into(),
+                architecture: Architecture::Amd64,
+                libc: Libc::Glibc,
+                inputs: vec![BundleInput {
+                    source,
+                    relative: relative.into(),
+                    executable: true,
+                }],
+                output_dir: root.path().join("out"),
+            })
+            .unwrap();
+            let staged = stage_host_artifact(
+                &crate::UpgradeOptions {
+                    offline_install: Some(archive),
+                    ..crate::UpgradeOptions::default()
+                },
+                &mut OfflineInputs,
+                &root.path().join("stage"),
+            )
+            .unwrap();
+            assert_eq!(fs::read(staged).unwrap(), elf);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct Fake {

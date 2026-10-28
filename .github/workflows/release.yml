@@ -18,6 +18,11 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    services:
+      registry:
+        image: registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - '127.0.0.1:5000:5000'
     strategy:
       fail-fast: false
       matrix:
@@ -25,15 +30,16 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             arch: x86_64
+            bundle_arch: amd64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             arch: aarch64
+            bundle_arch: arm64
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+      BUNDLE_ARCH: ${{ matrix.bundle_arch }}
+      BINARY_DIR: target/${{ matrix.target }}/dist
     steps:
-      - name: Set up Docker to use mirror.gcr.io mirror
-        run: |
-          sudo mkdir -p /etc/docker
-          echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -44,23 +50,65 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Build ship binaries
         run: cargo build --locked --profile dist -p diorama -p dioramactl --target ${{ matrix.target }}
+      - name: Prepare pinned offline runtime and image assets
+        run: |
+          assets_dir="$RUNNER_TEMP/release-assets"
+          printf 'ASSETS_DIR=%s\n' "$assets_dir" >> "$GITHUB_ENV"
+          CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo build --locked -p diorama-dev --bin diorama-release-bundle
+          target/debug/diorama-release-bundle prepare "$BUNDLE_ARCH" "$assets_dir"
+      - name: Build and export the offline diorama image
+        run: |
+          install -m 0755 "$BINARY_DIR/diorama" "$ASSETS_DIR/bin/diorama"
+          install -m 0755 container/entrypoint.sh "$ASSETS_DIR/entrypoint.sh"
+          local_image="localhost:5000/diorama:$RELEASE_VERSION"
+          docker build --platform "linux/$BUNDLE_ARCH" \
+            --file container/Dockerfile.release --tag "$local_image" "$ASSETS_DIR"
+          docker push "$local_image"
+          "$ASSETS_DIR/tools/crane" mutate --insecure --platform "linux/$BUNDLE_ARCH" \
+            --tag "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" \
+            --output "$RUNNER_TEMP/diorama-image.tar" "$local_image"
+          gzip -n -c "$RUNNER_TEMP/diorama-image.tar" > "$ASSETS_DIR/images/diorama.tar.gz"
+      - name: Package and verify offline bundle
+        run: |
+          target/debug/diorama-release-bundle package "$RELEASE_VERSION" "$BUNDLE_ARCH" \
+            "$BINARY_DIR" "$ASSETS_DIR" dist
+          bundle="$PWD/dist/diorama-$RELEASE_VERSION-linux-$BUNDLE_ARCH-offline.tar.gz"
+          installed="$RUNNER_TEMP/offline-install"
+          sudo unshare --net "$BINARY_DIR/dioramactl" install \
+            --offline-install="$bundle" --path="$installed"
+          cmp "$BINARY_DIR/diorama" "$installed/bin/diorama"
+          "$installed/bin/dioramactl" version
+          docker load --input "$installed/images/diorama.tar.gz"
+          docker image inspect "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" > /dev/null
+          docker run --rm --network=none --tmpfs /offline --entrypoint /bin/sh \
+            "ghcr.io/geoffsee/diorama:$RELEASE_VERSION" -c '
+              diorama-entrypoint --path=/offline/node --version &&
+              test -x /offline/node/bin/containerd &&
+              test -x /offline/node/cni/bin/bridge &&
+              for image in coredns pause local-path-provisioner busybox portainer-agent d2k; do
+                test -s "/offline/node/images/$image.tar.gz" || exit 1
+              done'
       - name: Package binaries
         run: |
           mkdir -p dist
-          src="target/${{ matrix.target }}/dist"
+          src="$BINARY_DIR"
           install -m 0755 "$src/diorama" "dist/diorama-linux-${{ matrix.arch }}"
           install -m 0755 "$src/dioramactl" "dist/dioramactl-linux-${{ matrix.arch }}"
           if [ "${{ matrix.arch }}" = "aarch64" ]; then
             install -m 0755 "$src/diorama" dist/diorama-linux-arm64
             install -m 0755 "$src/dioramactl" dist/dioramactl-linux-arm64
+          else
+            install -m 0755 "$src/diorama" dist/diorama-linux-amd64
+            install -m 0755 "$src/dioramactl" dist/dioramactl-linux-amd64
           fi
           (cd dist && sha256sum ./*) > "dist/SHA256SUMS-${{ matrix.arch }}"
-      - name: Upload binaries
+      - name: Upload binaries and verified offline bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+          compression-level: 0
 
   release:
     name: Attach GitHub release
@@ -71,7 +119,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Download dist binaries
+      - name: Download binaries and offline bundles
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: dist-*

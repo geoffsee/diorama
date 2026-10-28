@@ -1,9 +1,9 @@
 use diorama_platform::{Architecture, HostEvidence, Libc, NodeTarget, classify};
 use std::fmt;
 
-pub const DEFAULT_VERSION: &str = "v1.1.8";
-pub const DEFAULT_RELEASE_BASE_URL: &str =
-    "https://github.com/portainer/kubesolo/releases/download";
+pub const ARCHIVE_PREFIX: &str = "diorama";
+pub const DEFAULT_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+pub const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/geoffsee/diorama/releases/download";
 pub const DEFAULT_DATA_PATH: &str = "/var/lib/diorama";
 pub const DEFAULT_INSTALL_PATH: &str = "/usr/local/bin/diorama";
 
@@ -24,7 +24,7 @@ impl fmt::Display for ArtifactSelectionError {
             ),
             Self::DarwinRequiresArch => write!(
                 f,
-                "on macOS, KubeSolo has no native binaries — specify the target Linux arch with --arch (e.g. --arch=amd64 or --arch=arm64)"
+                "on macOS, diorama has no native binaries — specify the target Linux arch with --arch (e.g. --arch=amd64 or --arch=arm64)"
             ),
             Self::UnsupportedHost(os) => write!(
                 f,
@@ -107,7 +107,7 @@ pub fn artifact_archive_name(version: &str, target: NodeTarget, offline: bool) -
         Libc::Musl => "-musl",
     };
     let offline_suffix = if offline { "-offline" } else { "" };
-    format!("kubesolo-{version}-linux-{arch_suffix}{libc_suffix}{offline_suffix}.tar.gz")
+    format!("{ARCHIVE_PREFIX}-{version}-linux-{arch_suffix}{libc_suffix}{offline_suffix}.tar.gz")
 }
 
 /// Constructs the download URL, honoring custom URLs when configured.

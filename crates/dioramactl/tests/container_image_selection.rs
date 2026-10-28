@@ -9,7 +9,7 @@ fn test_select_container_image_default() {
     };
 
     let image = select_container_image(&options, None).unwrap();
-    assert_eq!(image, "portainer/kubesolo:v1.2.3");
+    assert_eq!(image, "ghcr.io/geoffsee/diorama:v1.2.3");
 }
 
 #[test]

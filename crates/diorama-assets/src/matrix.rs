@@ -412,12 +412,10 @@ impl ArtifactNaming {
         let prefix_and_version = &stem[..linux_pos];
         let target_part = &stem[linux_pos + 7..];
 
-        // Split prefix and version: prefix is typically diorama or kubesolo
+        // Split prefix and version: prefix is diorama
         let (prefix, version) = if let Some(stripped) = prefix_and_version.strip_prefix("diorama-")
         {
             ("diorama".to_string(), stripped.to_string())
-        } else if let Some(stripped) = prefix_and_version.strip_prefix("kubesolo-") {
-            ("kubesolo".to_string(), stripped.to_string())
         } else if let Some(last_dash) = prefix_and_version.rfind('-') {
             (
                 prefix_and_version[..last_dash].to_string(),

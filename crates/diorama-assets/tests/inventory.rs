@@ -98,17 +98,12 @@ fn assert_image_contract(
             AssetId::ImageD2k,
             matches!(architecture, Architecture::Amd64 | Architecture::Arm64),
         );
-        assert_delivery(inventory, AssetId::ImageKubesolo, true);
+        assert_delivery(inventory, AssetId::ImageDiorama, true);
     }
 }
 #[test]
 fn all_sixteen_target_variant_cells_have_exact_declared_roles() {
     let expected = [
-        "kube-apiserver",
-        "kube-controller-manager",
-        "kubelet",
-        "kube-proxy",
-        "kine",
         "containerd",
         "fuse-overlayfs-snapshotter",
         "containerd-shim-runc-v2",
@@ -123,7 +118,7 @@ fn all_sixteen_target_variant_cells_have_exact_declared_roles() {
         "image-local-path-helper",
         "image-portainer-agent",
         "image-d2k",
-        "image-kubesolo",
+        "image-diorama",
     ];
     let mut cells = 0;
     for (architecture, name, unavailable) in [
@@ -157,13 +152,13 @@ fn all_sixteen_target_variant_cells_have_exact_declared_roles() {
                     Limits::default(),
                 )
                 .expect("complete cell");
-                assert_eq!(inventory.assets().len(), 20);
+                assert_eq!(inventory.assets().len(), 15);
                 assert_eq!(
                     inventory.bundled_assets().len(),
                     if variant == Variant::Online {
-                        15
+                        10
                     } else {
-                        20 - unavailable
+                        15 - unavailable
                     }
                 );
                 assert_eq!(
@@ -238,8 +233,8 @@ fn structural_linux_arm64_glibc_manifests_validate_both_variants() {
             Limits::default(),
         )
         .expect("valid online arm64 glibc inventory");
-    assert_eq!(online.assets().len(), 20);
-    assert_eq!(online.bundled_assets().len(), 15);
+    assert_eq!(online.assets().len(), 15);
+    assert_eq!(online.bundled_assets().len(), 10);
     assert_image_contract(&online, Architecture::Arm64, Variant::Online);
     assert_optional_support(&online, Architecture::Arm64);
 
@@ -251,8 +246,8 @@ fn structural_linux_arm64_glibc_manifests_validate_both_variants() {
             Limits::default(),
         )
         .expect("valid offline arm64 glibc inventory");
-    assert_eq!(offline.assets().len(), 20);
-    assert_eq!(offline.bundled_assets().len(), 20);
+    assert_eq!(offline.assets().len(), 15);
+    assert_eq!(offline.bundled_assets().len(), 15);
     assert_image_contract(&offline, Architecture::Arm64, Variant::Offline);
     assert_optional_support(&offline, Architecture::Arm64);
     assert_structural_placeholders(online_bytes, &online);
@@ -269,39 +264,14 @@ fn structural_linux_amd64_glibc_manifest_validates_online_variant() {
             Limits::default(),
         )
         .expect("valid online amd64 glibc inventory");
-    assert_eq!(online.assets().len(), 20);
-    assert_eq!(online.bundled_assets().len(), 15);
+    assert_eq!(online.assets().len(), 15);
+    assert_eq!(online.bundled_assets().len(), 10);
     assert_image_contract(&online, Architecture::Amd64, Variant::Online);
     assert_optional_support(&online, Architecture::Amd64);
     assert_structural_placeholders(online_bytes, &online);
 }
 
 const EXPECTED_ONLINE_AMD64: &[(AssetId, u64, &str)] = &[
-    (
-        AssetId::KubeApiserver,
-        85_778_616,
-        "0317e382c47b721af23dfcf853073fbe76ebe26a592dffc42359e20be21047a8",
-    ),
-    (
-        AssetId::KubeControllerManager,
-        71_790_776,
-        "82c0dc57f9d066e4aef869c88386b2e1baacd30d12746dd09e08cf8e41492df8",
-    ),
-    (
-        AssetId::Kubelet,
-        58_089_764,
-        "e48cbb9c62351aa95f455bdae3c9a9e9d7d644027c231ade7a67b868b2be3258",
-    ),
-    (
-        AssetId::KubeProxy,
-        43_204_792,
-        "1c22a8ff41efba86b32d50a24b1d07149e2f8a96a43b914bafd92b984f8f40f0",
-    ),
-    (
-        AssetId::Kine,
-        47_431_544,
-        "1331b855502c9ba8f27d51531baa204e513b5d5056036d4ca453f06ef32ce976",
-    ),
     (
         AssetId::Containerd,
         48_117_256,
@@ -356,31 +326,6 @@ const EXPECTED_ONLINE_AMD64: &[(AssetId, u64, &str)] = &[
 
 const EXPECTED_ONLINE_ARM64: &[(AssetId, u64, &str)] = &[
     (
-        AssetId::KubeApiserver,
-        79_888_568,
-        "4e5fe160e7b90e84faab827e71a101f0472a920385abfb7f6bba36ee783529e1",
-    ),
-    (
-        AssetId::KubeControllerManager,
-        67_043_512,
-        "9125fca53876e58137305cf177bc2c67eab38adc7f2f70cfe1444d124c39d012",
-    ),
-    (
-        AssetId::Kubelet,
-        54_264_100,
-        "0dc3f53fc51f6a6c26c437ec9eded016106ef931db2dd9b3905c656796bed438",
-    ),
-    (
-        AssetId::KubeProxy,
-        40_632_504,
-        "216b76b4ab7f642a1e305f6402a0a466af7cea1287bf89fefb9269396ba04dc2",
-    ),
-    (
-        AssetId::Kine,
-        44_465_296,
-        "ced586344c072454336002cb07d1146400f70f989ecc1576fcf98fbf3e6e5cd8",
-    ),
-    (
         AssetId::Containerd,
         45_332_336,
         "b0e4f5a10a8d18e77b276c8cb89638c9d2438579b35286d29ca9fe2521bd2c12",
@@ -433,31 +378,6 @@ const EXPECTED_ONLINE_ARM64: &[(AssetId, u64, &str)] = &[
 ];
 
 const EXPECTED_OFFLINE_ARM64: &[(AssetId, u64, &str)] = &[
-    (
-        AssetId::KubeApiserver,
-        79_888_568,
-        "4e5fe160e7b90e84faab827e71a101f0472a920385abfb7f6bba36ee783529e1",
-    ),
-    (
-        AssetId::KubeControllerManager,
-        67_043_512,
-        "9125fca53876e58137305cf177bc2c67eab38adc7f2f70cfe1444d124c39d012",
-    ),
-    (
-        AssetId::Kubelet,
-        54_264_100,
-        "0dc3f53fc51f6a6c26c437ec9eded016106ef931db2dd9b3905c656796bed438",
-    ),
-    (
-        AssetId::KubeProxy,
-        40_632_504,
-        "216b76b4ab7f642a1e305f6402a0a466af7cea1287bf89fefb9269396ba04dc2",
-    ),
-    (
-        AssetId::Kine,
-        44_465_296,
-        "ced586344c072454336002cb07d1146400f70f989ecc1576fcf98fbf3e6e5cd8",
-    ),
     (
         AssetId::Containerd,
         45_332_336,
@@ -529,7 +449,7 @@ const EXPECTED_OFFLINE_ARM64: &[(AssetId, u64, &str)] = &[
         "59aebbc8922ad7ce4b5deb43a1256482d63f9250cf20c85cf9a521453f28a59f",
     ),
     (
-        AssetId::ImageKubesolo,
+        AssetId::ImageDiorama,
         85_689_657,
         "868c6b3b9b563800bbe02b14219f549314138415955d8537d6dc2701c518a678",
     ),
@@ -627,8 +547,8 @@ fn unknown_duplicate_fields_ids_and_versions_fail() {
             1,
         ),
         SOURCE.replacen(
-            "\"encoded_bytes\": 3",
-            "\"encoded_bytes\": 3, \"encoded_bytes\": 3",
+            "\"encoded_bytes\":",
+            "\"encoded_bytes\": 3, \"encoded_bytes\":",
             1,
         ),
         SOURCE.replacen(
@@ -652,7 +572,7 @@ fn unknown_duplicate_fields_ids_and_versions_fail() {
             1,
         ),
         SOURCE.replacen("\"schema_version\": 1", "\"schema_version\": true", 1),
-        SOURCE.replacen("\"kube-apiserver\"", "\"unknown-component\"", 1),
+        SOURCE.replacen("\"containerd\"", "\"unknown-component\"", 1),
     ] {
         assert!(
             Manifest::decode(raw.as_bytes(), Limits::default()).is_err(),
@@ -670,12 +590,12 @@ fn unknown_duplicate_fields_ids_and_versions_fail() {
     v["assets"].as_array_mut().unwrap().push(first);
     assert_eq!(
         decode(&v, standard(), Limits::default()).unwrap_err(),
-        InventoryError::DuplicateAsset(AssetId::KubeApiserver)
+        InventoryError::DuplicateAsset(AssetId::Containerd)
     );
 }
 #[test]
 fn missing_mandatory_roles_wrong_target_and_delivery_fail() {
-    for index in [0, 13, 14, 16] {
+    for index in [0, 8, 9, 11] {
         let mut v = fixture();
         v["assets"].as_array_mut().unwrap().remove(index);
         assert!(matches!(
@@ -694,7 +614,7 @@ fn missing_mandatory_roles_wrong_target_and_delivery_fail() {
         InventoryError::TargetMismatch
     );
     let mut v = fixture();
-    v["assets"][13]["delivery"] = json!({"kind":"registry-required"});
+    v["assets"][8]["delivery"] = json!({"kind":"registry-required"});
     assert!(matches!(
         decode(&v, standard(), Limits::default()),
         Err(InventoryError::WrongDelivery(_))
@@ -722,9 +642,9 @@ fn unsafe_conflicting_paths_and_invalid_digests_are_rejected() {
         );
     }
     for path in [
-        "fixtures/kube-apiserver",
+        "fixtures/containerd",
         "fixtures",
-        "fixtures/kube-apiserver/nested",
+        "fixtures/containerd/nested",
     ] {
         let mut v = fixture();
         v["assets"][1]["delivery"]["path"] = json!(path);

@@ -202,7 +202,7 @@ impl Default for AssetLayout {
 }
 
 impl AssetLayout {
-    /// Canonical KubeSolo-compatible placement within the writable root.
+    /// Canonical diorama placement within the writable root.
     pub fn canonical() -> Self {
         Self {
             overrides: BTreeMap::new(),
@@ -212,26 +212,21 @@ impl AssetLayout {
     /// Default relative path for an asset within the root.
     pub fn default_relative_path(id: AssetId) -> &'static str {
         match id {
-            AssetId::KubeApiserver => "bin/kube-apiserver",
-            AssetId::KubeControllerManager => "bin/kube-controller-manager",
-            AssetId::Kubelet => "bin/kubelet",
-            AssetId::KubeProxy => "bin/kube-proxy",
-            AssetId::Kine => "bin/kine",
-            AssetId::Containerd => "containerd/containerd",
-            AssetId::ContainerdShim => "containerd/containerd-shim-runc-v2",
-            AssetId::Crun => "containerd/crun",
-            AssetId::CniBridge => "containerd/cni/plugins/bridge",
-            AssetId::CniHostLocal => "containerd/cni/plugins/host-local",
-            AssetId::CniPortmap => "containerd/cni/plugins/portmap",
-            AssetId::CniLoopback => "containerd/cni/plugins/loopback",
+            AssetId::Containerd => "bin/containerd",
+            AssetId::ContainerdShim => "bin/containerd-shim-runc-v2",
+            AssetId::Crun => "bin/crun",
+            AssetId::CniBridge => "cni/bin/bridge",
+            AssetId::CniHostLocal => "cni/bin/host-local",
+            AssetId::CniPortmap => "cni/bin/portmap",
+            AssetId::CniLoopback => "cni/bin/loopback",
             AssetId::FuseOverlayfsSnapshotter => "bin/containerd-fuse-overlayfs-grpc",
-            AssetId::ImageCoredns => "containerd/images/coredns.tar.gz",
-            AssetId::ImagePause => "containerd/images/pause.tar.gz",
-            AssetId::ImageLocalPath => "containerd/images/local-path-provisioner.tar.gz",
-            AssetId::ImageLocalPathHelper => "containerd/images/local-path-helper.tar.gz",
-            AssetId::ImagePortainerAgent => "containerd/images/portainer-agent.tar.gz",
-            AssetId::ImageD2k => "containerd/images/d2k.tar.gz",
-            AssetId::ImageKubesolo => "containerd/images/kubesolo.tar.gz",
+            AssetId::ImageCoredns => "images/coredns.tar.gz",
+            AssetId::ImagePause => "images/pause.tar.gz",
+            AssetId::ImageLocalPath => "images/local-path-provisioner.tar.gz",
+            AssetId::ImageLocalPathHelper => "images/busybox.tar.gz",
+            AssetId::ImagePortainerAgent => "images/portainer-agent.tar.gz",
+            AssetId::ImageD2k => "images/d2k.tar.gz",
+            AssetId::ImageDiorama => "images/diorama.tar.gz",
         }
     }
 
@@ -1063,11 +1058,6 @@ fn create_staged_file(_staging: &File, _path: &Path) -> Result<File, Materializa
 
 fn id_tag(id: AssetId) -> &'static str {
     match id {
-        AssetId::KubeApiserver => "kube-apiserver",
-        AssetId::KubeControllerManager => "kube-controller-manager",
-        AssetId::Kubelet => "kubelet",
-        AssetId::KubeProxy => "kube-proxy",
-        AssetId::Kine => "kine",
         AssetId::Containerd => "containerd",
         AssetId::ContainerdShim => "containerd-shim-runc-v2",
         AssetId::Crun => "crun",
@@ -1082,7 +1072,7 @@ fn id_tag(id: AssetId) -> &'static str {
         AssetId::ImageLocalPathHelper => "image-local-path-helper",
         AssetId::ImagePortainerAgent => "image-portainer-agent",
         AssetId::ImageD2k => "image-d2k",
-        AssetId::ImageKubesolo => "image-kubesolo",
+        AssetId::ImageDiorama => "image-diorama",
     }
 }
 
@@ -1419,24 +1409,24 @@ mod transaction_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(root.join("bin/kube-apiserver")).unwrap();
+        fs::create_dir_all(root.join("bin/containerd")).unwrap();
         let mut guard = StagingGuard::create(&root).unwrap();
-        let backup = guard.path.join("backup-kube-apiserver");
+        let backup = guard.path.join("backup-containerd");
         create_staged_file(&guard.file, &backup)
             .unwrap()
             .write_all(b"original")
             .unwrap();
         let target = CommitTarget {
             parent: File::open(root.join("bin")).unwrap(),
-            name: "kube-apiserver".into(),
-            source: "staged-kube-apiserver".into(),
-            backup: "backup-kube-apiserver".into(),
+            name: "containerd".into(),
+            source: "staged-containerd".into(),
+            backup: "backup-containerd".into(),
             had_existing: true,
             backed_up: true,
             installed: false,
             asset: MaterializedAsset {
-                id: AssetId::KubeApiserver,
-                path: root.join("bin/kube-apiserver"),
+                id: AssetId::Containerd,
+                path: root.join("bin/containerd"),
                 kind: Kind::Executable,
                 mode: EXECUTABLE_PERMISSIONS,
                 bytes_written: 8,
@@ -1465,28 +1455,24 @@ mod transaction_tests {
                     .as_nanos()
             ));
             fs::create_dir_all(root.join("bin")).unwrap();
-            let first = root.join("bin/kube-apiserver");
-            let second = root.join("bin/kube-controller-manager");
+            let first = root.join("bin/containerd");
+            let second = root.join("bin/crun");
             if replace_first {
                 fs::write(&first, b"original-first").unwrap();
             }
             fs::write(&second, b"original-second").unwrap();
             let guard = StagingGuard::create(&root).unwrap();
-            let staged_first = guard.path.join("staged-kube-apiserver");
+            let staged_first = guard.path.join("staged-containerd");
             create_staged_file(&guard.file, &staged_first)
                 .unwrap()
                 .write_all(b"new-first")
                 .unwrap();
             // The second verified staging file disappears before its rename. The real
             // filesystem error occurs after the first destination has been committed.
-            let staged_second = guard.path.join("staged-kube-controller-manager");
+            let staged_second = guard.path.join("staged-crun");
             let assets = [
-                (staged_first, first.clone(), AssetId::KubeApiserver),
-                (
-                    staged_second,
-                    second.clone(),
-                    AssetId::KubeControllerManager,
-                ),
+                (staged_first, first.clone(), AssetId::Containerd),
+                (staged_second, second.clone(), AssetId::Crun),
             ]
             .into_iter()
             .map(|(staged, path, id)| {

@@ -69,7 +69,7 @@ fn test_offline_install_mismatch() {
     // amd64 bundle on arm64 host should fail
     let offline_path = temp
         .path()
-        .join("kubesolo-v1.1.8-linux-amd64-offline.tar.gz");
+        .join("diorama-v1.1.8-linux-amd64-offline.tar.gz");
     fs::write(&offline_path, b"dummy").unwrap();
 
     let mut handler = DefaultCommandHandler;
@@ -126,7 +126,7 @@ fn build_bundle(root: &Path, elf: &[u8], tamper: impl FnOnce(&Path)) -> std::pat
     )
     .unwrap();
     tamper(&src);
-    let archive = root.join("kubesolo-v1.1.8-linux-arm64-offline.tar.gz");
+    let archive = root.join("diorama-v1.1.8-linux-arm64-offline.tar.gz");
     let status = SysCommand::new("tar")
         .arg("-czf")
         .arg(&archive)

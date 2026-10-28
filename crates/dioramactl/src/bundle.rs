@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Archive filename prefix shared with the install path's parser.
-pub const BUNDLE_PREFIX: &str = "kubesolo";
+pub const BUNDLE_PREFIX: &str = crate::artifact::ARCHIVE_PREFIX;
 
 /// One input file placed in the bundle at `relative`.
 #[derive(Clone, Debug)]

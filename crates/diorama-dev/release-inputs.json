@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "downloads": {
+    "amd64": [
+      {
+        "url": "https://github.com/containerd/containerd/releases/download/v2.2.5/containerd-static-2.2.5-linux-amd64.tar.gz",
+        "sha256": "5bd824219cd44eadd050832549c969cd8413ee1f69affa68401753cbe0925c40",
+        "files": {
+          "bin/containerd": "bin/containerd",
+          "bin/containerd-shim-runc-v2": "bin/containerd-shim-runc-v2"
+        }
+      },
+      {
+        "url": "https://github.com/containernetworking/plugins/releases/download/v1.9.0/cni-plugins-linux-amd64-v1.9.0.tgz",
+        "sha256": "58c03705426e929658f45a851df15a86d06ef680cacbf3f2dc127731ca265c28",
+        "files": {
+          "bridge": "cni/bin/bridge",
+          "host-local": "cni/bin/host-local",
+          "portmap": "cni/bin/portmap",
+          "loopback": "cni/bin/loopback"
+        }
+      },
+      {
+        "url": "https://github.com/containers/crun/releases/download/1.26/crun-1.26-linux-amd64",
+        "sha256": "8b37b0f8bfa170a9c338fa869902a33991101264ce0764e776a997a8d787dc83",
+        "files": {
+          "": "bin/crun"
+        }
+      },
+      {
+        "url": "https://github.com/containerd/fuse-overlayfs-snapshotter/releases/download/v2.1.7/containerd-fuse-overlayfs-2.1.7-linux-amd64.tar.gz",
+        "sha256": "d54148043c22381af89cec2a167431e40668716404a1eb682ca69dfb890376f3",
+        "files": {
+          "containerd-fuse-overlayfs-grpc": "bin/containerd-fuse-overlayfs-grpc"
+        }
+      }
+    ],
+    "arm64": [
+      {
+        "url": "https://github.com/containerd/containerd/releases/download/v2.2.5/containerd-static-2.2.5-linux-arm64.tar.gz",
+        "sha256": "e3b94184e26660b7cd6d50893c091f688525a1ed93628f8caaf43934c0de0cfb",
+        "files": {
+          "bin/containerd": "bin/containerd",
+          "bin/containerd-shim-runc-v2": "bin/containerd-shim-runc-v2"
+        }
+      },
+      {
+        "url": "https://github.com/containernetworking/plugins/releases/download/v1.9.0/cni-plugins-linux-arm64-v1.9.0.tgz",
+        "sha256": "2596ef56329dd1269026f46b8df262f09ba43c92dbfb940e1e69fbccccd30a29",
+        "files": {
+          "bridge": "cni/bin/bridge",
+          "host-local": "cni/bin/host-local",
+          "portmap": "cni/bin/portmap",
+          "loopback": "cni/bin/loopback"
+        }
+      },
+      {
+        "url": "https://github.com/containers/crun/releases/download/1.26/crun-1.26-linux-arm64",
+        "sha256": "4fa62f6fadd21a1ea4c1f7a040d4d2df4f7120fed788bf77e9ecfcaa922c417d",
+        "files": {
+          "": "bin/crun"
+        }
+      },
+      {
+        "url": "https://github.com/containerd/fuse-overlayfs-snapshotter/releases/download/v2.1.7/containerd-fuse-overlayfs-2.1.7-linux-arm64.tar.gz",
+        "sha256": "94ed6c2c3bece42e0c789ea056565b64fe487de4644121ee0dfb8acd8ef9369c",
+        "files": {
+          "containerd-fuse-overlayfs-grpc": "bin/containerd-fuse-overlayfs-grpc"
+        }
+      }
+    ]
+  },
+  "tools": {
+    "linux-x86_64": {
+      "url": "https://github.com/google/go-containerregistry/releases/download/v0.21.5/go-containerregistry_Linux_x86_64.tar.gz",
+      "sha256": "9f823ae5ee25803161110f957b5fd4538f714d40cdf25dacb4914fefafd246bf"
+    },
+    "linux-aarch64": {
+      "url": "https://github.com/google/go-containerregistry/releases/download/v0.21.5/go-containerregistry_Linux_arm64.tar.gz",
+      "sha256": "3a47c6da5a0ba1ca7a93def41036d8f262a2160799e5d4ca25dba3cfa47dab41"
+    },
+    "macos-x86_64": {
+      "url": "https://github.com/google/go-containerregistry/releases/download/v0.21.5/go-containerregistry_Darwin_x86_64.tar.gz",
+      "sha256": "d5ad8d97d7c5407f761b4fd37801044473f58b79a033f6a64e84ce6d010c1b2c"
+    },
+    "macos-aarch64": {
+      "url": "https://github.com/google/go-containerregistry/releases/download/v0.21.5/go-containerregistry_Darwin_arm64.tar.gz",
+      "sha256": "a41938cdbd8becc59e90f4bb491a557d52dce5681f9812c961854cab706f5f59"
+    }
+  },
+  "images": [
+    {
+      "id": "image-coredns",
+      "reference": "docker.io/coredns/coredns:1.14.4",
+      "digests": {
+        "amd64": "sha256:b9300dc9fa4b5f2abe85579f7d9c7478ca1173183c1623c8d57f6f17e1340941",
+        "arm64": "sha256:18f34dc0909c41ffc499684a992898376c58d0ec8460d59ce676a35a0df5ccd0"
+      }
+    },
+    {
+      "id": "image-pause",
+      "reference": "docker.io/portainer/pause:latest",
+      "digests": {
+        "amd64": "sha256:325e89090a413f0d595f08794f4349057678cc417ef1535945b341e9b916732c",
+        "arm64": "sha256:dc0f59811df66abb40b105211eb6aadc536c202f80e13526d46364922f62b474"
+      }
+    },
+    {
+      "id": "image-local-path",
+      "reference": "docker.io/rancher/local-path-provisioner:v0.0.36",
+      "digests": {
+        "amd64": "sha256:67f83d34746a637da2141ae38ab547a1d7edc440e794c42239c0fb908296bdfc",
+        "arm64": "sha256:7839ab35f7b8f50c2a871dab2e651c3042a7dd343a9d38b29ba8c550de330ba5"
+      }
+    },
+    {
+      "id": "image-local-path-helper",
+      "reference": "docker.io/library/busybox:latest",
+      "digests": {
+        "amd64": "sha256:f97baa533a26513c453a362be331a43eb60214302f449c16571b23cea141dce4",
+        "arm64": "sha256:365a051f12e05767b598e643676f14a450fb678a75ccf2beb0052c95d5c73b83"
+      }
+    },
+    {
+      "id": "image-portainer-agent",
+      "reference": "docker.io/portainer/agent:lts",
+      "digests": {
+        "amd64": "sha256:8a6f5bc0bc57aed4911971e61d8d5863c5157f62a482efbf0409954fa0c597ad",
+        "arm64": "sha256:06cae51b13391a71a612f7c2a5ca478d207fbd8d7bec80bb85252370899f9927"
+      }
+    },
+    {
+      "id": "image-d2k",
+      "reference": "docker.io/portainer/d2k:1.2.3",
+      "digests": {
+        "amd64": "sha256:dcaa6337c4cff5a6cf8ea120600c0937f201475d165a76e7e4137a7655e000f1",
+        "arm64": "sha256:fadc206dbd318af3efcdedaad2b2ad8b18ea4c436be11c70493a93212d6ac5ee"
+      }
+    }
+  ]
+}

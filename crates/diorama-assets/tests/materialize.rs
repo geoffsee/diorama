@@ -73,7 +73,7 @@ fn create_synthetic_payload(
         | AssetId::ImageLocalPathHelper
         | AssetId::ImagePortainerAgent
         | AssetId::ImageD2k
-        | AssetId::ImageKubesolo => {
+        | AssetId::ImageDiorama => {
             // Valid minimal tar.gz image payload
             let tar_data = entry("layer.tar", b"synthetic image layer");
             gzip(&tar_data)
@@ -106,11 +106,6 @@ fn build_synthetic_manifest_and_archive(
         let delivery_kind = row["delivery"]["kind"].as_str().unwrap_or("");
         if delivery_kind == "bundled" {
             let id = match id_str {
-                "kube-apiserver" => AssetId::KubeApiserver,
-                "kube-controller-manager" => AssetId::KubeControllerManager,
-                "kubelet" => AssetId::Kubelet,
-                "kube-proxy" => AssetId::KubeProxy,
-                "kine" => AssetId::Kine,
                 "containerd" => AssetId::Containerd,
                 "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
                 "containerd-shim-runc-v2" => AssetId::ContainerdShim,
@@ -125,7 +120,7 @@ fn build_synthetic_manifest_and_archive(
                 "image-local-path-helper" => AssetId::ImageLocalPathHelper,
                 "image-portainer-agent" => AssetId::ImagePortainerAgent,
                 "image-d2k" => AssetId::ImageD2k,
-                "image-kubesolo" => AssetId::ImageKubesolo,
+                "image-diorama" => AssetId::ImageDiorama,
                 other => panic!("unknown asset {other}"),
             };
 
@@ -230,10 +225,10 @@ fn digest_verification_enforces_arm64_manifest_hashes() {
     let test_dir = TestDir::new("diorama-test-digest-enforce");
     let materializer = Materializer::new(online, test_dir.path());
 
-    // Provide bad data for kube-apiserver
-    let bad_data = vec![0x99u8; 79_888_568];
+    // Provide bad data for containerd
+    let bad_data = vec![0x99u8; 45_332_336];
     let err = materializer
-        .materialize_single_asset(AssetId::KubeApiserver, Cursor::new(&bad_data))
+        .materialize_single_asset(AssetId::Containerd, Cursor::new(&bad_data))
         .unwrap_err();
 
     match err {
@@ -242,14 +237,14 @@ fn digest_verification_enforces_arm64_manifest_hashes() {
             expected,
             observed,
         } => {
-            assert_eq!(asset, AssetId::KubeApiserver);
+            assert_eq!(asset, AssetId::Containerd);
             let expected_hex = expected.iter().fold(String::new(), |mut s, b| {
                 use std::fmt::Write;
                 write!(&mut s, "{b:02x}").unwrap();
                 s
             });
             assert_eq!(
-                expected_hex, "4e5fe160e7b90e84faab827e71a101f0472a920385abfb7f6bba36ee783529e1",
+                expected_hex, "b0e4f5a10a8d18e77b276c8cb89638c9d2438579b35286d29ca9fe2521bd2c12",
                 "enforces exact ARM64 manifest hash"
             );
             assert_ne!(expected, observed);
@@ -260,7 +255,7 @@ fn digest_verification_enforces_arm64_manifest_hashes() {
     // Destination file must NOT exist after digest mismatch
     let final_dest = materializer
         .layout()
-        .resolve_destination(test_dir.path(), AssetId::KubeApiserver)
+        .resolve_destination(test_dir.path(), AssetId::Containerd)
         .unwrap();
     assert!(
         !final_dest.exists(),
@@ -422,7 +417,7 @@ fn custom_root_fixture_stays_strictly_within_configured_root() {
 
     let layout = materializer_layout_with_traversal();
     let err = layout
-        .resolve_destination(test_dir.path(), AssetId::KubeApiserver)
+        .resolve_destination(test_dir.path(), AssetId::Containerd)
         .unwrap_err();
 
     assert!(
@@ -432,9 +427,9 @@ fn custom_root_fixture_stays_strictly_within_configured_root() {
 
     // Absolute path escaping
     let layout_abs =
-        diorama_assets::AssetLayout::canonical().with_path(AssetId::Kubelet, "/etc/shadow");
+        diorama_assets::AssetLayout::canonical().with_path(AssetId::Containerd, "/etc/shadow");
     let err_abs = layout_abs
-        .resolve_destination(test_dir.path(), AssetId::Kubelet)
+        .resolve_destination(test_dir.path(), AssetId::Containerd)
         .unwrap_err();
     assert!(
         matches!(err_abs, MaterializationError::PathEscapesRoot(_)),
@@ -443,8 +438,7 @@ fn custom_root_fixture_stays_strictly_within_configured_root() {
 }
 
 fn materializer_layout_with_traversal() -> diorama_assets::AssetLayout {
-    diorama_assets::AssetLayout::canonical()
-        .with_path(AssetId::KubeApiserver, "../../../etc/passwd")
+    diorama_assets::AssetLayout::canonical().with_path(AssetId::Containerd, "../../../etc/passwd")
 }
 
 #[test]
@@ -455,13 +449,13 @@ fn existing_directory_and_file_symlinks_cannot_redirect_materialization() {
             build_synthetic_manifest_and_archive(ONLINE_ARM64_JSON, Variant::Online);
         let root = TestDir::new("diorama-no-follow-root");
         let outside = TestDir::new("diorama-no-follow-outside");
-        let protected = outside.path().join("kube-apiserver");
+        let protected = outside.path().join("containerd");
         fs::write(&protected, b"unmanaged bytes").unwrap();
         if directory {
             std::os::unix::fs::symlink(outside.path(), root.path().join("bin")).unwrap();
         } else {
             fs::create_dir(root.path().join("bin")).unwrap();
-            std::os::unix::fs::symlink(&protected, root.path().join("bin/kube-apiserver")).unwrap();
+            std::os::unix::fs::symlink(&protected, root.path().join("bin/containerd")).unwrap();
         }
         let materializer = Materializer::new(inventory, root.path());
         assert!(
@@ -480,8 +474,8 @@ fn obstruction_preserves_prior_installation_and_leaves_no_new_executable() {
         let (inventory, archive) =
             build_synthetic_manifest_and_archive(ONLINE_ARM64_JSON, Variant::Online);
         let root = TestDir::new("diorama-preflight-failure");
-        fs::create_dir_all(root.path().join("bin/kube-controller-manager")).unwrap();
-        let executable = root.path().join("bin/kube-apiserver");
+        fs::create_dir_all(root.path().join("bin/crun")).unwrap();
+        let executable = root.path().join("bin/containerd");
         if prior_installation {
             fs::write(&executable, b"previous installation").unwrap();
         }
@@ -526,7 +520,7 @@ fn corrupt_and_truncated_outer_gzip_trailers_fail_before_commit() {
                 .materialize_from_archive(Cursor::new(archive))
                 .is_err()
         );
-        assert!(!root.path().join("bin/kube-apiserver").exists());
+        assert!(!root.path().join("bin/containerd").exists());
     }
 }
 
@@ -545,7 +539,7 @@ fn valid_outer_gzip_supports_short_reader_reads() {
     Materializer::new(inventory, root.path())
         .materialize_from_archive(ShortReads(Cursor::new(gzip(&archive))))
         .unwrap();
-    assert!(root.path().join("bin/kube-apiserver").is_file());
+    assert!(root.path().join("bin/containerd").is_file());
 }
 
 #[test]
@@ -584,11 +578,7 @@ fn ancestor_replaced_during_payload_read_cannot_redirect_commit() {
     let root = TestDir::new("diorama-ancestor-race");
     let outside = TestDir::new("diorama-ancestor-race-outside");
     fs::create_dir(root.path().join("bin")).unwrap();
-    fs::write(
-        root.path().join("bin/kube-apiserver"),
-        b"previous installation",
-    )
-    .unwrap();
+    fs::write(root.path().join("bin/containerd"), b"previous installation").unwrap();
     let materializer = Materializer::new(inventory, root.path());
     let mut replaced = false;
     let result = materializer.materialize_from_payloads(|id, _| {
@@ -602,7 +592,7 @@ fn ancestor_replaced_during_payload_read_cannot_redirect_commit() {
     assert!(result.is_err());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     assert_eq!(
-        fs::read(root.path().join("original-bin/kube-apiserver")).unwrap(),
+        fs::read(root.path().join("original-bin/containerd")).unwrap(),
         b"previous installation"
     );
 }

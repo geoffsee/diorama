@@ -7,10 +7,10 @@ use std::{collections::HashMap, io};
 mod vectors;
 
 fn image_inventory() -> (diorama_assets::DeclaredInventory, Vec<u8>) {
-    image_inventory_with_tags(&["example.invalid/image:fixture"])
+    image_inventory_with_tags(&["ghcr.io/geoffsee/diorama:fixture"])
 }
 
-fn image_inventory_with_tags(tags: &[&str]) -> (diorama_assets::DeclaredInventory, Vec<u8>) {
+fn image_manifest_with_tags(tags: &[&str]) -> (Value, Vec<u8>) {
     let raw_layer = vectors::entry("payload", b"image fixture");
     let layer = vectors::gzip(&raw_layer);
     let mut config: Value = serde_json::from_slice(&vectors::config("amd64", None, 1)).unwrap();
@@ -31,11 +31,16 @@ fn image_inventory_with_tags(tags: &[&str]) -> (diorama_assets::DeclaredInventor
     .unwrap();
     manifest["target"]["architecture"] = json!("amd64");
     for row in manifest["assets"].as_array_mut().unwrap() {
-        if row["id"] == "image-kubesolo" {
+        if row["id"] == "image-diorama" {
             row["delivery"]["encoded_bytes"] = json!(bytes.len());
             row["delivery"]["sha256"] = json!(vectors::hex(&bytes));
         }
     }
+    (manifest, bytes)
+}
+
+fn image_inventory_with_tags(tags: &[&str]) -> (diorama_assets::DeclaredInventory, Vec<u8>) {
+    let (manifest, bytes) = image_manifest_with_tags(tags);
     let inventory = Manifest::decode(&serde_json::to_vec(&manifest).unwrap(), Limits::default())
         .unwrap()
         .validate_inventory(
@@ -108,7 +113,7 @@ impl ContainerEngineClient for Engine {
         }))
     }
     fn create_container(&mut self, _: &str, config: &ContainerConfig) -> io::Result<String> {
-        assert_eq!(config.image, "example.invalid/image:fixture");
+        assert_eq!(config.image, "ghcr.io/geoffsee/diorama:fixture");
         self.calls.push("create");
         self.created = true;
         Ok("id".into())
@@ -150,6 +155,71 @@ fn offline_install_imports_verified_bytes_before_creating_owned_resources_withou
     )
     .unwrap();
     assert_eq!(engine.loaded, bytes);
+    assert_eq!(
+        engine.calls,
+        ["load", "network", "volume", "create", "start"]
+    );
+}
+
+#[test]
+fn diorama_bundle_installs_offline_without_kubesolo_payloads_or_registry_access() {
+    use dioramactl::bundle::{BundleInput, BundleSpec, build_offline_bundle};
+    use dioramactl::install::install_container_with_engine;
+    use std::fs;
+
+    let root = tempfile::tempdir().unwrap();
+    let (mut manifest, image) = image_manifest_with_tags(&["ghcr.io/geoffsee/diorama:fixture"]);
+    let mut inputs = Vec::new();
+    for row in manifest["assets"].as_array_mut().unwrap() {
+        let id = row["id"].as_str().unwrap().to_owned();
+        assert!(!id.contains("kubesolo"));
+        let bytes = if id == "image-diorama" {
+            image.as_slice()
+        } else {
+            b"unused runtime payload fixture"
+        };
+        let source = root.path().join(&id);
+        fs::write(&source, bytes).unwrap();
+        row["delivery"]["encoded_bytes"] = json!(bytes.len());
+        row["delivery"]["sha256"] = json!(vectors::hex(bytes));
+        inputs.push(BundleInput {
+            source,
+            relative: row["delivery"]["path"].as_str().unwrap().into(),
+            executable: false,
+        });
+    }
+    let source = root.path().join("asset-inventory.json");
+    fs::write(&source, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    inputs.push(BundleInput {
+        source,
+        relative: "asset-inventory.json".into(),
+        executable: false,
+    });
+    let archive = build_offline_bundle(&BundleSpec {
+        version: "v0.1.0".into(),
+        architecture: Architecture::Amd64,
+        libc: Libc::Glibc,
+        inputs,
+        output_dir: root.path().join("out"),
+    })
+    .unwrap();
+    assert_eq!(
+        archive.file_name().unwrap(),
+        "diorama-v0.1.0-linux-amd64-offline.tar.gz"
+    );
+    let options = InstallOptions {
+        offline_install: Some(archive),
+        run_mode: "container".into(),
+        ..InstallOptions::default()
+    };
+    let mut engine = Engine::default();
+    let error =
+        install_container_with_engine(&options, &mut engine, Architecture::Arm64).unwrap_err();
+    assert!(error.to_string().contains("architecture"));
+    assert_eq!(engine.calls, <[&str; 0]>::default());
+
+    install_container_with_engine(&options, &mut engine, Architecture::Amd64).unwrap();
+    assert_eq!(engine.loaded, image);
     assert_eq!(
         engine.calls,
         ["load", "network", "volume", "create", "start"]
