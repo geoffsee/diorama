@@ -985,10 +985,18 @@ fn register_container_runtime(
 ) -> Result<RuntimeBuilder, RuntimeError> {
     let mut paths = ContainerdPaths::from_base(state_dir);
     let bundled_loopback = paths.cni_bin_dir.join("loopback");
-    paths.cni_bin_dir = PathBuf::from("/opt/diorama/cni/bin");
-    paths.cni_conf_dir = PathBuf::from("/etc/diorama/cni/net.d");
-    std::fs::create_dir_all(&paths.cni_bin_dir)?;
-    std::fs::create_dir_all(&paths.cni_conf_dir)?;
+    let sys_bin = PathBuf::from("/opt/diorama/cni/bin");
+    let sys_conf = PathBuf::from("/etc/diorama/cni/net.d");
+    if std::fs::create_dir_all(&sys_bin)
+        .and_then(|()| std::fs::create_dir_all(&sys_conf))
+        .is_ok()
+    {
+        paths.cni_bin_dir = sys_bin;
+        paths.cni_conf_dir = sys_conf;
+    } else {
+        std::fs::create_dir_all(&paths.cni_bin_dir)?;
+        std::fs::create_dir_all(&paths.cni_conf_dir)?;
+    }
     if bundled_loopback.is_file() && !paths.cni_bin_dir.join("loopback").exists() {
         std::fs::copy(bundled_loopback, paths.cni_bin_dir.join("loopback"))?;
     }
