@@ -15,6 +15,7 @@ pub fn render_effective_yaml(config: &Config) -> Result<String, ConfigError> {
     let mut value = serde_json::to_value(config).map_err(|e| failure(e.to_string()))?;
     for path in [
         "kubernetes.nodeName",
+        "runtime.backend",
         "runtime.containerMode",
         "kubernetes.apiServer.extraSANs",
         "kubernetes.kubelet.systemReserved",

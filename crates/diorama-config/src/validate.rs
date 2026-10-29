@@ -524,6 +524,23 @@ impl Config {
             ));
         }
         self.portainer.image = normalize_image(&self.portainer.image)?;
+        if !matches!(
+            self.runtime.backend.as_str(),
+            "" | "auto" | "containerd" | "oci-cri"
+        ) {
+            return Err(invalid(
+                "runtime.backend",
+                "expected auto, containerd, or oci-cri",
+            ));
+        }
+        if matches!(self.runtime.backend.as_str(), "containerd" | "oci-cri")
+            && !self.runtime.endpoint.trim().is_empty()
+        {
+            return Err(invalid(
+                "runtime.backend",
+                "managed backend cannot be combined with runtime.endpoint",
+            ));
+        }
         resolve_runtime_endpoint(&self.runtime.endpoint)?;
         validate_cpu(&mut self.kubernetes.kubelet, host.cpu_count)?;
         if self.api.enabled && self.api.socket_path.len() > 107 {

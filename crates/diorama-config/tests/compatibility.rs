@@ -51,8 +51,8 @@ fn independent_full_document_and_negative_fixtures_match() {
 }
 
 #[test]
-fn thirty_fields_preserve_explicit_presence_and_defaults() {
-    assert_eq!(FIELDS.len(), 30);
+fn fields_preserve_explicit_presence_and_defaults() {
+    assert_eq!(FIELDS.len(), 31);
     let empty = decode("").unwrap();
     assert_eq!(empty.config, Config::default());
     assert!(

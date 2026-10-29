@@ -50,6 +50,9 @@ pub struct LoadBalancer {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Runtime {
+    /// Empty or auto preserves automatic runtime detection.
+    #[serde(default)]
+    pub backend: String,
     pub endpoint: String,
     pub container_mode: Option<bool>,
 }

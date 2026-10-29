@@ -14,7 +14,7 @@ It generates and manages:
 - **RoleBinding**: `local-path-provisioner-bind` binding the provisioner ServiceAccount to the namespaced Role
 - **ClusterRoleBinding**: `local-path-provisioner-bind` binding the provisioner ServiceAccount to the ClusterRole
 - **ConfigMap**: `local-path-config` containing `config.json` (`nodePathMap` or `sharedFileSystemPath`), helper pod scripts (`setup` and `teardown`), and `helperPod.yaml` template
-- **Deployment**: `local-path-provisioner` running `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1` with 128Mi memory limit and 50m / 32Mi requests to avoid historical OOM errors
+- **Deployment**: `local-path-provisioner` running `docker.io/rancher/local-path-provisioner:v0.0.36` with 128Mi memory limit and 50m / 32Mi requests to avoid historical OOM errors
 - **StorageClass**: `local-path` with provisioner `rancher.io/local-path`, `volumeBindingMode: WaitForFirstConsumer`, `reclaimPolicy: Retain`, and default StorageClass annotation (`storageclass.kubernetes.io/is-default-class: "true"`)
 
 ## Configuration and Defaults
@@ -26,7 +26,10 @@ Storage configuration honors upstream KubeSolo contract decisions (including D04
   - When `sharedPath` is configured, `config.json` specifies `sharedFileSystemPath` and omits `nodePathMap`, enabling shared storage across nodes or containers.
 - **Resource Limits & Parity**:
   - Memory limit is set to `128Mi` with requests of `32Mi` memory and `50m` CPU. This eliminates historical edge memory override OOM bugs.
-  - Image reference defaults to pinned `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1`.
+  - Online image reference defaults to `docker.io/rancher/local-path-provisioner:v0.0.36`.
+    Managed containerd selects the smaller `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1`
+    when its nonempty bundled archive is present. That reference is an offline artifact identity,
+    not a public registry fallback. External runtimes and managed oci-cri use the public image.
 
 ## Architecture & Documentation
 

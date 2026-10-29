@@ -52,6 +52,7 @@ jobs:
       - uses: $/.github/actions/setup-rust
         with:
           cache-key: clippy
+      - uses: $/.github/actions/setup-oci-cri
       - name: Enforce repository language policy
         run: cargo run --locked -p diorama-dev --bin diorama-language-policy
       - run: cargo lint
@@ -76,6 +77,7 @@ jobs:
       - uses: $/.github/actions/setup-rust
         with:
           cache-key: test-debug
+      - uses: $/.github/actions/setup-oci-cri
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest

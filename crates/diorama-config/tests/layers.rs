@@ -27,6 +27,7 @@ fn resolve(
 }
 fn samples(path: &str, kind: FieldType) -> (&'static str, &'static str, Value, Value) {
     match path {
+        "runtime.backend" => ("auto", "oci-cri", json!("auto"), json!("oci-cri")),
         "kubernetes.kubelet.cpuManager.policy" => {
             ("none", "static", json!("none"), json!("static"))
         },
@@ -67,7 +68,7 @@ fn samples(path: &str, kind: FieldType) -> (&'static str, &'static str, Value, V
 }
 #[test]
 fn every_binding_obeys_file_environment_explicit_flag_precedence() {
-    assert_eq!(INPUT_BINDINGS.len(), 30);
+    assert_eq!(INPUT_BINDINGS.len(), 31);
     for binding in INPUT_BINDINGS {
         let field = FIELDS.iter().find(|v| v.path == binding.path).unwrap();
         let (lo, hi, low, high) = samples(binding.path, field.kind);
@@ -161,7 +162,10 @@ fn go_layer_and_print_observations_match_independent_expected_outputs() {
             let config = result.unwrap();
             assert_eq!(
                 serde_json::to_value(&config).unwrap(),
-                case["expected_typed"],
+                serde_json::to_value(
+                    serde_json::from_value::<Config>(case["expected_typed"].clone()).unwrap()
+                )
+                .unwrap(),
                 "{} typed",
                 case["id"]
             );
@@ -192,8 +196,12 @@ fn every_binding_matches_the_independent_go_schema_capture() {
     let source: Value =
         serde_json::from_str(include_str!("fixtures/bindings-reference.json")).unwrap();
     let settings = source["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), INPUT_BINDINGS.len());
-    for binding in INPUT_BINDINGS {
+    assert_eq!(settings.len() + 1, INPUT_BINDINGS.len());
+    // The managed backend selector extends the captured Go schema.
+    for binding in INPUT_BINDINGS
+        .iter()
+        .filter(|binding| binding.path != "runtime.backend")
+    {
         let expected = settings
             .iter()
             .find(|field| field["path"] == binding.path)
@@ -368,4 +376,42 @@ fn raw_input_debug_omits_secret_values() {
     assert!(!format!("{flags:?}").contains(secret));
     assert!(!format!("{parsed:?}").contains(secret));
     assert!(format!("{flags:?}").contains("portainer-edge-key"));
+}
+
+#[test]
+fn managed_runtime_selector_rejects_unknown_backends_and_external_endpoints() {
+    for input in [
+        "runtime: {backend: typo}",
+        "runtime: {backend: oci-cri, endpoint: /run/cri.sock}",
+        "runtime: {backend: containerd, endpoint: /run/cri.sock}",
+    ] {
+        assert_eq!(
+            resolve(input, &BTreeMap::new(), &ExplicitFlags::default())
+                .unwrap_err()
+                .path,
+            "runtime.backend"
+        );
+    }
+    let config = resolve(
+        "runtime: {backend: oci-cri}",
+        &BTreeMap::new(),
+        &ExplicitFlags::default(),
+    )
+    .unwrap();
+    assert!(
+        render_effective_yaml(&config)
+            .unwrap()
+            .contains("backend: oci-cri")
+    );
+    assert!(
+        diorama_config::diff_configs(&Config::default(), &config)
+            .contains(&"runtime.backend".to_string())
+    );
+    assert_ne!(
+        diorama_config::compute_etag(&Config::default()),
+        diorama_config::compute_etag(&config)
+    );
+    let cleared =
+        diorama_config::apply_merge_patch(&config, &json!({"runtime":{"backend":null}})).unwrap();
+    assert_eq!(cleared.runtime.backend, "");
 }

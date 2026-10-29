@@ -1409,20 +1409,20 @@ async fn test_issue_345_select_runtime_provider_hook() {
     if cfg!(target_os = "linux") && host_socket.exists() {
         let provider =
             select_runtime_provider(config.config()).expect("provider selected from host socket");
-        assert_eq!(provider.provider_name(), "containerd");
+        assert_eq!(provider.provider_name(), "cri");
         assert_eq!(
             builder
                 .select_runtime_provider()
                 .expect("builder provider")
                 .provider_name(),
-            "containerd"
+            "cri"
         );
         assert_eq!(
             runtime
                 .select_runtime_provider()
                 .expect("runtime provider")
                 .provider_name(),
-            "containerd"
+            "cri"
         );
     } else {
         assert!(select_runtime_provider(config.config()).is_none());
@@ -1438,14 +1438,14 @@ async fn test_issue_345_select_runtime_provider_hook() {
     if cfg!(target_os = "linux") {
         let managed_provider = select_runtime_provider(config.config())
             .expect("provider selected from managed socket");
-        assert_eq!(managed_provider.provider_name(), "containerd");
+        assert_eq!(managed_provider.provider_name(), "cri");
     }
 
     // Explicit custom endpoint
     let mut custom_cfg = config.config().clone();
     custom_cfg.runtime.endpoint = "unix:///var/run/custom-containerd.sock".to_string();
     let custom_provider = select_runtime_provider(&custom_cfg).expect("custom provider");
-    assert_eq!(custom_provider.provider_name(), "containerd");
+    assert_eq!(custom_provider.provider_name(), "cri");
     assert_eq!(custom_provider.runtime_version(), "unknown");
     assert!(custom_provider.requires_socket());
 }

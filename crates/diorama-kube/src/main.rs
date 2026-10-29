@@ -124,6 +124,14 @@ fn run() -> io::Result<u8> {
     }
 }
 fn main() -> ExitCode {
+    #[cfg(feature = "oci-cri")]
+    if let Err(error) = diorama_oci::startup() {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "diorama: OCI runtime initialization: {error}"
+        );
+        return ExitCode::FAILURE;
+    }
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(error) => {

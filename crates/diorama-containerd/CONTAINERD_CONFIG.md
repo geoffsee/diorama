@@ -147,7 +147,7 @@ Managed containerd automatically provisions required system images into the `k8s
 | :--- | :--- | :--- | :--- |
 | `ImageCoredns` | `docker.io/coredns/coredns:1.14.4` | `coredns.tar.gz` | Always enabled (core DNS) |
 | `ImagePause` | `docker.io/portainer/pause:latest` | `pause.tar.gz` | Always enabled (sandbox pod infrastructure) |
-| `ImageLocalPath` | `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1` | `local-path-provisioner.tar.gz` | Enabled when `storage.local_path.enabled = true` |
+| `ImageLocalPath` | `docker.io/rancher/local-path-provisioner:v0.0.36` online; `ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1` from the bundled archive | `local-path-provisioner.tar.gz` | Enabled when `storage.local_path.enabled = true` |
 | `ImageLocalPathHelper` | `docker.io/library/busybox:latest` | `busybox.tar.gz` | Enabled when `storage.local_path.enabled = true` |
 | `ImagePortainerAgent` | `docker.io/portainer/agent:lts` (or custom reference) | `portainer-agent.tar.gz` (or empty if custom) | Enabled when `!portainer.edge_id.is_empty()` |
 | `ImageD2k` | `docker.io/portainer/d2k:1.2.3` | `d2k.tar.gz` | Enabled when `d2k.enabled = true` |

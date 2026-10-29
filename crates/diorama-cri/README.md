@@ -10,7 +10,7 @@ Client bindings, endpoint validation, provider detection, cgroup negotiation, an
   - Supports separate runtime and image service endpoints, automatically defaulting image service to runtime socket if not explicitly specified.
   - Rejects unsupported URI schemes (`tcp://`, `http://`, etc.), relative paths, and empty paths with actionable errors.
 - **Provider Detection & Classification**:
-  - Classifies external CRI providers into `CriProvider::Containerd` and `CriProvider::Crio`.
+  - Classifies external CRI providers into `CriProvider::Containerd`, `CriProvider::Crio`, and `CriProvider::OciCri`.
   - Rejects unsupported or legacy runtimes (such as `dockershim`, `docker`, `frakti`) with clear error messaging.
 - **Bounded Readiness Probing**:
   - Validates connectivity and responsiveness against both `RuntimeService` (`Version` RPC) and `ImageService` (`ListImages` RPC).
@@ -21,7 +21,7 @@ Client bindings, endpoint validation, provider detection, cgroup negotiation, an
   - Never fabricates protobuf enum zero `systemd`.
   - Propagates resolved driver and endpoint arguments to downstream consumers (Kubelet and CNI).
 - **Workload Lifecycle Management**:
-  - Typed `CriClient` abstraction for pod sandbox creation, container lifecycle, and image listing/pulling against external containerd and CRI-O runtimes using host-supplied images and network plugins.
+  - Typed `CriClient` abstraction for pod sandbox creation, container lifecycle, and image listing/pulling against external containerd, CRI-O, and oci-cri runtimes using host-supplied images and network plugins.
 - **Strict Non-Ownership Boundaries & Lifecycle Invariants**:
   - Supervised by `diorama-supervisor` via `ExternalRuntimeService` (`COMPONENT_EXTERNAL_CRI`).
   - Acts strictly as an external client: does not launch child processes, extract local payloads, mutate host sockets, or purge host runtime state.

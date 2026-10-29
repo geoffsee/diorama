@@ -8,6 +8,33 @@ use std::fs;
 use tempfile::TempDir;
 
 #[test]
+fn local_path_uses_public_image_unless_a_nonempty_archive_is_available() {
+    let temp = TempDir::new().unwrap();
+    let config = ImageImportConfig::new(temp.path());
+    let selected = || {
+        config
+            .enabled_targets()
+            .into_iter()
+            .find(|target| target.id == AssetId::ImageLocalPath)
+            .unwrap()
+            .reference
+    };
+    let public = "docker.io/rancher/local-path-provisioner:v0.0.36";
+    assert_eq!(selected(), public);
+    let archive = temp.path().join("local-path-provisioner.tar.gz");
+    fs::write(&archive, b"").unwrap();
+    assert_eq!(selected(), public);
+    fs::write(&archive, b"bundled archive").unwrap();
+    assert_eq!(
+        selected(),
+        "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1"
+    );
+    fs::remove_file(&archive).unwrap();
+    fs::create_dir(&archive).unwrap();
+    assert_eq!(selected(), public);
+}
+
+#[test]
 fn default_config_enables_core_and_storage_images() {
     let temp = TempDir::new().unwrap();
     let config = Config::default();

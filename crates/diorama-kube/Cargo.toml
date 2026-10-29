@@ -9,7 +9,11 @@ autotests = false
 [lints]
 workspace = true
 
+[features]
+oci-cri = ["dep:diorama-oci"]
+
 [dependencies]
+diorama-oci = { version = "=0.1.0", path = "../diorama-oci", optional = true }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-network = { version = "=0.1.0", path = "../diorama-network" }
 serde_json = "=1.0.151"

@@ -312,7 +312,7 @@ async fn test_config_api_reads_and_schema() {
     assert_eq!(status, 200);
     assert_eq!(schema_body["apiVersion"], diorama_config::API_VERSION);
     let settings = schema_body["settings"].as_array().expect("settings array");
-    assert_eq!(settings.len(), 30);
+    assert_eq!(settings.len(), 31);
     assert!(
         settings
             .iter()

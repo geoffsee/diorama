@@ -194,6 +194,13 @@ pub const FIELDS: &[FieldSpec] = &[
         immutable: false,
     },
     FieldSpec {
+        path: "runtime.backend",
+        kind: FieldType::String,
+        owner: "E09",
+        secret: false,
+        immutable: false,
+    },
+    FieldSpec {
         path: "runtime.containerMode",
         kind: FieldType::OptionalBool,
         owner: "E09",

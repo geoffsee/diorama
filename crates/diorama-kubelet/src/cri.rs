@@ -1,5 +1,5 @@
 //! CRI runtime provider: implements [`RuntimeProvider`] over [`diorama_cri::CriClient`]
-//! for containerd on Linux.
+//! for supported CRI runtimes on Linux.
 //!
 //! Every required [`RuntimeProvider`] method forwards 1:1 to the official Kubernetes v1.35.7
 //! CRI v1 protocol without semantic translation beyond error mapping. Container logs are
@@ -31,6 +31,7 @@ pub struct CriRuntimeProvider {
     socket_path: PathBuf,
     client: Arc<Mutex<Option<CriClient>>>,
     version: Arc<RwLock<String>>,
+    provider: Arc<RwLock<Option<diorama_cri::CriProvider>>>,
 }
 
 impl CriRuntimeProvider {
@@ -41,6 +42,7 @@ impl CriRuntimeProvider {
             socket_path: socket_path.into(),
             client: Arc::new(Mutex::new(None)),
             version: Arc::new(RwLock::new("unknown".to_string())),
+            provider: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -51,6 +53,7 @@ impl CriRuntimeProvider {
             socket_path: socket_path.into(),
             client: Arc::new(Mutex::new(Some(client))),
             version: Arc::new(RwLock::new("unknown".to_string())),
+            provider: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -82,14 +85,21 @@ impl CriRuntimeProvider {
             }
         })?;
 
-        if let Ok(resp) = client.version("v1").await
-            && let Ok(mut w) = self.version.write()
-        {
-            *w = resp.runtime_version;
+        if let Ok(resp) = client.version("v1").await {
+            self.record_version(resp);
         }
 
         *guard = Some(client.clone());
         Ok(client)
+    }
+
+    fn record_version(&self, response: cri::VersionResponse) {
+        if let Ok(mut provider) = self.provider.write() {
+            *provider = Some(diorama_cri::detect_provider(&response.runtime_name));
+        }
+        if let Ok(mut version) = self.version.write() {
+            *version = response.runtime_version;
+        }
     }
 }
 
@@ -103,7 +113,18 @@ fn map_status(op: &'static str, status: &diorama_cri::tonic::Status) -> KubeletE
 #[async_trait]
 impl RuntimeProvider for CriRuntimeProvider {
     fn provider_name(&self) -> &'static str {
-        "containerd"
+        match self
+            .provider
+            .read()
+            .ok()
+            .as_deref()
+            .and_then(Option::as_ref)
+        {
+            Some(diorama_cri::CriProvider::Containerd) => "containerd",
+            Some(diorama_cri::CriProvider::Crio) => "cri-o",
+            Some(diorama_cri::CriProvider::OciCri) => "oci-cri",
+            _ => "cri",
+        }
     }
 
     fn runtime_version(&self) -> String {
@@ -129,9 +150,7 @@ impl RuntimeProvider for CriRuntimeProvider {
                 endpoint: self.socket_path.display().to_string(),
                 reason: s.to_string(),
             })?;
-        if let Ok(mut w) = self.version.write() {
-            *w = resp.runtime_version;
-        }
+        self.record_version(resp);
         Ok(())
     }
 
@@ -628,7 +647,7 @@ mod tests {
     #[test]
     fn provider_properties() {
         let provider = CriRuntimeProvider::new("/run/containerd/containerd.sock");
-        assert_eq!(provider.provider_name(), "containerd");
+        assert_eq!(provider.provider_name(), "cri");
         assert_eq!(provider.runtime_version(), "unknown");
         assert!(provider.requires_socket());
         assert!(provider.is_external());
@@ -636,5 +655,20 @@ mod tests {
             provider.socket_path(),
             Path::new("/run/containerd/containerd.sock")
         );
+    }
+
+    #[test]
+    fn provider_identity_follows_version_response_and_is_shared_with_clones() {
+        let provider = CriRuntimeProvider::new("/run/oci-cri/oci-cri.sock");
+        let cloned = provider.clone();
+        for name in ["oci-cri", "cri-o", "containerd"] {
+            provider.record_version(cri::VersionResponse {
+                runtime_name: name.into(),
+                runtime_version: "1.2.3".into(),
+                ..Default::default()
+            });
+            assert_eq!(cloned.provider_name(), name);
+            assert_eq!(cloned.runtime_version(), "1.2.3");
+        }
     }
 }
