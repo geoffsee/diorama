@@ -234,20 +234,34 @@ fn verified_absence_is_idempotent_for_uninstall_and_refused_for_reset() {
     );
     assert!(dir.path().join("kine/db/record").is_file());
     for _ in 0..2 {
-        run_container_cleanup(
-            &mut engine,
-            "docker",
-            &spec(),
-            CleanupKind::Uninstall {
-                purge: true,
-                keep_config: false,
-            },
-            dir.path(),
-            true,
-            &mut io::Cursor::new(Vec::<u8>::new()),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let calls_before = engine.calls.len();
+            let result = run_container_cleanup(
+                &mut engine,
+                "docker",
+                &spec(),
+                CleanupKind::Uninstall {
+                    purge: true,
+                    keep_config: false,
+                },
+                dir.path(),
+                true,
+                &mut io::Cursor::new(Vec::<u8>::new()),
+                &mut Vec::new(),
+            );
+            if result.as_ref().is_err_and(|error| error.to_string()
+                == "another upgrade or cleanup owns this installation: lock acquisition failed because the operation would block")
+                && std::time::Instant::now() < deadline {
+                // A concurrent test child can retain the lock's open file description
+                // between fork and exec. Refused lock acquisition must have no effects.
+                assert_eq!(engine.calls.len(), calls_before);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            result.unwrap();
+            break;
+        }
     }
     assert!(!dir.path().join("kine/db").exists());
     assert!(!dir.path().join("local-path-storage").exists());

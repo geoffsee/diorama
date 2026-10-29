@@ -13,6 +13,7 @@ workspace = true
 oci-cri = ["dep:diorama-oci"]
 
 [dependencies]
+serde-saphyr = "=0.0.29"
 diorama-oci = { version = "=0.1.0", path = "../diorama-oci", optional = true }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-network = { version = "=0.1.0", path = "../diorama-network" }

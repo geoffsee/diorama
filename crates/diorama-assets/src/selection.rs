@@ -200,7 +200,8 @@ impl AssetSelector {
     fn select_external_delivery(&self, id: AssetId, default_ref: &str) -> SelectedDelivery {
         match id {
             // Executables are supplied by host in external deps builds
-            AssetId::Containerd
+            AssetId::KubeScheduler
+            | AssetId::Containerd
             | AssetId::ContainerdShim
             | AssetId::Crun
             | AssetId::CniBridge
@@ -275,7 +276,8 @@ impl AssetSelector {
     fn select_supervised_delivery(&self, id: AssetId, default_ref: &str) -> SelectedDelivery {
         match id {
             // 8 runtime executable roles and 2 core images are always bundled in supervised bundle
-            AssetId::Containerd
+            AssetId::KubeScheduler
+            | AssetId::Containerd
             | AssetId::ContainerdShim
             | AssetId::Crun
             | AssetId::CniBridge

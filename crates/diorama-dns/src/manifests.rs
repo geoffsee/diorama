@@ -227,6 +227,10 @@ pub fn generate_deployment(config: &CoreDnsConfig, namespace: &str) -> Deploymen
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
+                    node_selector: Some(BTreeMap::from([(
+                        "diorama.io/runtime".into(),
+                        "ordinary".into(),
+                    )])),
                     dns_policy: Some("Default".to_string()),
                     priority_class_name: Some("system-cluster-critical".to_string()),
                     service_account_name: Some(COREDNS_SERVICE_ACCOUNT_NAME.to_string()),

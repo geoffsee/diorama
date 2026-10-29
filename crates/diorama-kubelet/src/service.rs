@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use diorama_apiserver::{
-    ApiserverError, ApiserverService, KubernetesApiClient, PodExec, PodExecResult, PodLogOptions,
-    PodLogReader,
+    ApiserverError, ApiserverService, PodExec, PodExecResult, PodLogOptions, PodLogReader,
 };
 use serde_json::Value;
 
@@ -23,7 +22,7 @@ use crate::workload::{
 #[derive(Clone, Debug)]
 pub struct KubeletService {
     options: KubeletConfigOptions,
-    apiserver: Arc<ApiserverService>,
+    client: crate::api::NodeApi,
     runtime: Arc<dyn RuntimeProvider>,
     running: Arc<AtomicBool>,
     registration: NodeRegistration,
@@ -37,7 +36,23 @@ impl KubeletService {
         apiserver: Arc<ApiserverService>,
         runtime: Arc<dyn RuntimeProvider>,
     ) -> Self {
-        let client = Arc::new(apiserver.node_client(&options.node_name));
+        let client = crate::api::NodeApi::from(Arc::new(apiserver.node_client(&options.node_name)));
+        let mut service = Self::with_api(options, client, runtime);
+        service.reconciler = service.reconciler.with_apiserver(apiserver);
+        service
+    }
+
+    pub fn https(options: KubeletConfigOptions, runtime: Arc<dyn RuntimeProvider>) -> Self {
+        let client =
+            crate::api::NodeApi::https(options.kubeconfig.clone(), options.node_name.clone());
+        Self::with_api(options, client, runtime)
+    }
+
+    fn with_api(
+        options: KubeletConfigOptions,
+        client: crate::api::NodeApi,
+        runtime: Arc<dyn RuntimeProvider>,
+    ) -> Self {
         let registration = NodeRegistration::new(
             client.clone(),
             options.clone(),
@@ -47,22 +62,19 @@ impl KubeletService {
                 runtime.runtime_version()
             ),
         );
-        let cpu_manager = Arc::new(CpuManager::from_options(&options));
         let reconciler = PodReconciler::new(
-            client,
+            client.clone(),
             runtime.clone(),
             &options.node_name,
             &options.node_ip,
         )
         .with_cluster_dns(options.cluster_dns.clone())
         .with_cluster_domain(options.cluster_domain.clone())
-        .with_cpu_manager(cpu_manager)
-        .with_root_dir(options.root_dir.clone())
-        .with_apiserver(apiserver.clone());
-
+        .with_cpu_manager(Arc::new(CpuManager::from_options(&options)))
+        .with_root_dir(options.root_dir.clone());
         Self {
             options,
-            apiserver,
+            client,
             runtime,
             running: Arc::new(AtomicBool::new(false)),
             registration,
@@ -98,8 +110,8 @@ impl KubeletService {
     }
 
     #[must_use]
-    pub fn client(&self) -> KubernetesApiClient {
-        self.apiserver.node_client(&self.options.node_name)
+    pub fn client(&self) -> crate::api::NodeApi {
+        self.client.clone()
     }
 
     #[must_use]
@@ -152,6 +164,9 @@ impl KubeletService {
     /// - `KubeletError::RuntimeUnavailable` for CRI endpoint connectivity failures
     /// - `KubeletError::ApiserverUnavailable` for API server outages
     pub async fn check_prerequisites(&self) -> Result<(), KubeletError> {
+        if matches!(self.client, crate::api::NodeApi::Https { .. }) {
+            crate::bootstrap::ensure(&self.options).await?;
+        }
         // 1. Verify credential file paths
         if !self.options.kubeconfig.exists() {
             return Err(KubeletError::MissingCredential {
@@ -181,16 +196,7 @@ impl KubeletService {
             });
         }
 
-        // Validate kubeconfig content and user identity
-        let kubeconfig_content =
-            std::fs::read_to_string(&self.options.kubeconfig).map_err(|e| {
-                KubeletError::InvalidConfiguration {
-                    field: "kubeconfig".to_string(),
-                    reason: format!("failed to read kubeconfig: {e}"),
-                }
-            })?;
-
-        self.validate_kubeconfig_client_cert(&kubeconfig_content)?;
+        self.validate_kubeconfig_client_cert()?;
 
         // 2. Validate CRI runtime endpoint
         let endpoint_str = &self.options.runtime_endpoint;
@@ -243,6 +249,8 @@ impl KubeletService {
             self.reconciler.cpu_manager().reset();
         }
         self.reconciler.mark_checkpoint_invalidated(invalidated);
+        self.registration
+            .set_ready(self.runtime.network_ready().await.unwrap_or(false));
         self.registration.register_or_update().await?;
         self.registration.update_lease().await?;
         self.running.store(true, Ordering::SeqCst);
@@ -267,13 +275,18 @@ impl KubeletService {
         }
     }
 
-    /// One pass of the kubelet loop: bind, sync and clean up every pod in the cluster.
+    /// Reconciles this node's assigned Pods and removes its orphaned sandboxes.
     pub async fn reconcile_once(&self) -> Result<ReconcileReport, KubeletError> {
         self.reconciler.reconcile_all().await
     }
 
     /// Renews the node lease and re-asserts node status.
     pub async fn heartbeat(&self) -> Result<(), KubeletError> {
+        if matches!(self.client, crate::api::NodeApi::Https { .. }) {
+            crate::bootstrap::ensure(&self.options).await?;
+        }
+        self.registration
+            .set_ready(self.runtime.network_ready().await.unwrap_or(false));
         self.registration.register_or_update().await?;
         self.registration.update_lease().await?;
         Ok(())
@@ -337,47 +350,38 @@ impl KubeletService {
         ))
     }
 
-    fn validate_kubeconfig_client_cert(
-        &self,
-        kubeconfig_content: &str,
-    ) -> Result<(), KubeletError> {
+    fn validate_kubeconfig_client_cert(&self) -> Result<(), KubeletError> {
+        let invalid = || KubeletError::AuthenticationFailed {
+            reason: "kubeconfig missing valid client certificate credentials".into(),
+        };
         let expected_node_user = format!("system:node:{}", self.options.node_name);
-        let cert_pem = if let Some(idx) = kubeconfig_content.find("client-certificate-data:") {
-            let after = &kubeconfig_content[idx + "client-certificate-data:".len()..];
-            let b64_token = after.split_whitespace().next().unwrap_or("");
-            let decoded = diorama_pki::base64_decode(b64_token).map_err(|_| {
-                KubeletError::AuthenticationFailed {
-                    reason: "failed to decode client-certificate-data in kubeconfig".to_string(),
-                }
-            })?;
-            String::from_utf8(decoded).map_err(|_| KubeletError::AuthenticationFailed {
-                reason: "client-certificate-data is not valid UTF-8 PEM".to_string(),
-            })?
-        } else if let Some(idx) = kubeconfig_content.find("client-certificate:") {
-            let after = &kubeconfig_content[idx + "client-certificate:".len()..];
-            let path_str = after.lines().next().unwrap_or("").trim();
-            let cert_path = Path::new(path_str);
-            let resolved_path = if cert_path.is_absolute() {
-                cert_path.to_path_buf()
-            } else {
-                self.options
-                    .kubeconfig
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(cert_path)
-            };
-            std::fs::read_to_string(&resolved_path).map_err(|e| {
-                KubeletError::AuthenticationFailed {
-                    reason: format!(
-                        "failed to read client-certificate file {}: {e}",
-                        resolved_path.display()
-                    ),
-                }
-            })?
+        let document = diorama_apiserver::transport::HttpsClient::new(&self.options.kubeconfig)
+            .document()
+            .map_err(|_| invalid())?;
+        let context = document["contexts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|context| context["name"] == document["current-context"])
+            .ok_or_else(invalid)?;
+        let user = &document["users"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|user| user["name"] == context["context"]["user"])
+            .ok_or_else(invalid)?["user"];
+        let cert_pem = if let Some(data) = user["client-certificate-data"].as_str() {
+            let decoded = diorama_pki::base64_decode(data).map_err(|_| invalid())?;
+            String::from_utf8(decoded).map_err(|_| invalid())?
         } else {
-            return Err(KubeletError::AuthenticationFailed {
-                reason: "kubeconfig missing client certificate credentials".to_string(),
-            });
+            let path = user["client-certificate"].as_str().ok_or_else(invalid)?;
+            let path = self
+                .options
+                .kubeconfig
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(path);
+            std::fs::read_to_string(path).map_err(|_| invalid())?
         };
 
         let ca_pem = std::fs::read_to_string(&self.options.ca_file).map_err(|e| {
@@ -434,8 +438,7 @@ impl PodLogReader for KubeletLogSource {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
-        let companion_node = crate::config::companion_node_name(&self.node_name);
-        if assigned != Some(self.node_name.as_str()) && assigned != Some(companion_node.as_str()) {
+        if assigned != Some(self.node_name.as_str()) {
             return Err(ApiserverError::BadRequest {
                 message: format!("pod {name} is not assigned to node {}", self.node_name),
             });
@@ -523,8 +526,7 @@ impl PodExec for KubeletExecSource {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
-        let companion_node = crate::config::companion_node_name(&self.node_name);
-        if assigned != Some(self.node_name.as_str()) && assigned != Some(companion_node.as_str()) {
+        if assigned != Some(self.node_name.as_str()) {
             return Err(ApiserverError::BadRequest {
                 message: format!("pod {name} is not assigned to node {}", self.node_name),
             });

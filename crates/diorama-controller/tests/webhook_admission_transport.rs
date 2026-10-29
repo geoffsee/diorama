@@ -86,7 +86,7 @@ async fn test_webhook_configuration_generation_and_pki_trust() {
 async fn test_handler_protocol_correctness_and_parity_cases() {
     let handler = NodeSetterHandler::new("test-node", "192.0.2.9", true);
 
-    // Case 1: Unassigned Pod receives nodeName patch
+    // Case 1: Unassigned Pod receives no placement patch
     let unassigned_pod_req = json!({
         "uid": "req-pod-1",
         "kind": { "group": "", "version": "v1", "kind": "Pod" },
@@ -101,12 +101,7 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
         .await
         .unwrap();
     assert!(!scheduled1);
-    let patch_json1: serde_json::Value =
-        serde_json::from_slice(&diorama_pki::base64_decode(&patch1.unwrap()).unwrap()).unwrap();
-    assert_eq!(
-        patch_json1,
-        json!([{"op": "add", "path": "/spec/nodeName", "value": "test-node"}])
-    );
+    assert!(patch1.is_none(), "placement belongs to the scheduler");
 
     // Case 2: Already assigned Pod receives no patch
     let assigned_pod_req = json!({
@@ -120,7 +115,7 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
     let (patch2, _) = handler.evaluate_mutation(&assigned_pod_req).await.unwrap();
     assert!(patch2.is_none());
 
-    // Case 3: Pod direct UPDATE still receives nodeName patch if unassigned
+    // Case 3: Pod direct UPDATE still receives no placement patch if unassigned
     let update_pod_req = json!({
         "uid": "req-pod-3",
         "kind": { "group": "", "version": "v1", "kind": "Pod" },
@@ -128,9 +123,9 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
         "object": { "spec": {} }
     });
     let (patch3, _) = handler.evaluate_mutation(&update_pod_req).await.unwrap();
-    assert!(patch3.is_some());
+    assert!(patch3.is_none());
 
-    // Case 4: PVC empty receives selected-node annotation patch
+    // Case 4: PVC empty receives no selected-node annotation
     let pvc_empty_req = json!({
         "uid": "req-pvc-1",
         "kind": { "group": "", "version": "v1", "kind": "PersistentVolumeClaim" },
@@ -138,12 +133,7 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
         "object": { "metadata": {} }
     });
     let (patch4, _) = handler.evaluate_mutation(&pvc_empty_req).await.unwrap();
-    let patch_json4: serde_json::Value =
-        serde_json::from_slice(&diorama_pki::base64_decode(&patch4.unwrap()).unwrap()).unwrap();
-    assert_eq!(
-        patch_json4,
-        json!([{"op": "add", "path": "/metadata/annotations", "value": {"volume.kubernetes.io/selected-node": "test-node"}}])
-    );
+    assert!(patch4.is_none(), "placement belongs to the scheduler");
 
     // Case 5: PVC already assigned receives no patch
     let pvc_assigned_req = json!({
@@ -161,7 +151,7 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
     let (patch5, _) = handler.evaluate_mutation(&pvc_assigned_req).await.unwrap();
     assert!(patch5.is_none());
 
-    // Case 6: Job empty receives nodeSelector hostname patch
+    // Case 6: Job empty receives no hostname selector
     let job_empty_req = json!({
         "uid": "req-job-1",
         "kind": { "group": "batch", "version": "v1", "kind": "Job" },
@@ -171,12 +161,7 @@ async fn test_handler_protocol_correctness_and_parity_cases() {
         }
     });
     let (patch6, _) = handler.evaluate_mutation(&job_empty_req).await.unwrap();
-    let patch_json6: serde_json::Value =
-        serde_json::from_slice(&diorama_pki::base64_decode(&patch6.unwrap()).unwrap()).unwrap();
-    assert_eq!(
-        patch_json6,
-        json!([{"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {"kubernetes.io/hostname": "test-node"}}])
-    );
+    assert!(patch6.is_none(), "placement belongs to the scheduler");
 
     // Case 7: Job existing selector receives no patch if hostname is present
     let job_assigned_req = json!({
@@ -324,8 +309,8 @@ async fn test_http_transport_status_codes_and_errors() {
     assert_eq!(resp_val["kind"], "AdmissionReview");
     assert_eq!(resp_val["response"]["uid"], "rev-uid-123");
     assert_eq!(resp_val["response"]["allowed"], true);
-    assert_eq!(resp_val["response"]["patchType"], "JSONPatch");
-    assert!(resp_val["response"]["patch"].is_string());
+    assert!(resp_val["response"]["patchType"].is_null());
+    assert!(resp_val["response"]["patch"].is_null());
 }
 
 #[tokio::test]
@@ -374,7 +359,7 @@ async fn test_webhook_service_lifecycle_and_live_api_admission() {
         }
     });
     let created_pod = admin.create_pod("default", pod_spec).await.unwrap();
-    assert_eq!(created_pod["spec"]["nodeName"], "test-node");
+    assert!(created_pod["spec"]["nodeName"].is_null());
 
     // 2. Submit unassigned PVC and verify it is mutated with volume.kubernetes.io/selected-node annotation
     let pvc_spec = json!({
@@ -396,7 +381,7 @@ async fn test_webhook_service_lifecycle_and_live_api_admission() {
     let created_pvc = admin.create_pvc("default", pvc_spec).await.unwrap();
     assert_eq!(
         created_pvc["metadata"]["annotations"]["volume.kubernetes.io/selected-node"],
-        "test-node"
+        serde_json::Value::Null
     );
 
     // 3. Submit unassigned Job and verify it is mutated with kubernetes.io/hostname selector
@@ -424,7 +409,7 @@ async fn test_webhook_service_lifecycle_and_live_api_admission() {
     let created_job = admin.create_job("default", job_spec).await.unwrap();
     assert_eq!(
         created_job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
-        "test-node"
+        serde_json::Value::Null
     );
 
     // 4. Test shutdown
@@ -466,7 +451,7 @@ async fn test_concurrency_and_shutdown_safety() {
 
             let parsed: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(parsed["response"]["allowed"], true);
-            assert!(parsed["response"]["patch"].is_string());
+            assert!(parsed["response"]["patch"].is_null());
         }));
     }
 

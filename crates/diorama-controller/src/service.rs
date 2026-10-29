@@ -15,6 +15,7 @@ pub struct ControllerManagerService {
     config: ControllerManagerConfig,
     apiserver: Arc<ApiserverService>,
     running: Arc<AtomicBool>,
+    leader_identity: String,
 }
 
 impl ControllerManagerService {
@@ -23,6 +24,14 @@ impl ControllerManagerService {
             config,
             apiserver,
             running: Arc::new(AtomicBool::new(false)),
+            leader_identity: format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         }
     }
 
@@ -170,6 +179,26 @@ impl ControllerManagerService {
     /// Reconciles workloads and endpoints across all namespaces in the cluster.
     pub async fn reconcile_all(&self) -> Result<Vec<ReconciliationSummary>, ControllerError> {
         let client = self.client();
+        if self.config.leader_elect
+            && !crate::leader::acquire(&client, &self.leader_identity)
+                .await
+                .map_err(|e| ControllerError::ApiserverUnavailable {
+                    reason: e.to_string(),
+                })?
+        {
+            return Ok(Vec::new());
+        }
+        crate::bootstrap::reconcile(&client, &self.config.root_ca_file)
+            .await
+            .map_err(|e| ControllerError::ApiserverUnavailable {
+                reason: e.to_string(),
+            })?;
+        crate::volume::reconcile(&client).await.map_err(|error| {
+            ControllerError::ReconciliationFailed {
+                resource: "persistentvolumes".into(),
+                reason: error.to_string(),
+            }
+        })?;
         let namespaces = list_active_namespaces(&client).await;
         // The root-ca publisher keeps kube-root-ca.crt in every namespace.
         // A missing or edited ConfigMap is repaired on this pass.

@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: diorama-kube-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-proxy
+subjects:
+- kind: ServiceAccount
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: iptables
+    clusterCIDR: DIORAMA_POD_POOL
+    conntrack:
+      maxPerCore: 0
+      tcpEstablishedTimeout: 0s
+      tcpCloseWaitTimeout: 0s
+    clientConnection:
+      kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
+  kubeconfig.conf: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - name: diorama
+      cluster:
+        server: https://DIORAMA_API_HOST:6443
+        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+    - name: kube-proxy
+      user:
+        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+    - name: kube-proxy
+      context:
+        cluster: diorama
+        user: kube-proxy
+    current-context: kube-proxy
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy
+    spec:
+      serviceAccountName: kube-proxy
+      hostNetwork: true
+      dnsPolicy: Default
+      nodeSelector:
+        diorama.io/runtime: ordinary
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+      - key: node.kubernetes.io/network-unavailable
+        operator: Exists
+      containers:
+      - name: kube-proxy
+        image: registry.k8s.io/kube-proxy:v1.35.7
+        command: [kube-proxy]
+        args: [--config=/var/lib/kube-proxy/config.conf, --hostname-override=$(NODE_NAME)]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: config
+          mountPath: /var/lib/kube-proxy
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: kube-proxy
+      - name: modules
+        hostPath:
+          path: /lib/modules

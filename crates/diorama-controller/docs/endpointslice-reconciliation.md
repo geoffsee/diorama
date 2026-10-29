@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `diorama-controller` crate implements `EndpointSlice` (`discovery.k8s.io/v1`) and legacy `Endpoints` (`core/v1`) controllers adhering to Kubernetes v1.35.7 reconciliation semantics on single-node clusters.
+The `diorama-controller` crate implements `EndpointSlice` (`discovery.k8s.io/v1`) and legacy `Endpoints` (`core/v1`) controllers adhering to Kubernetes v1.35.7 reconciliation semantics across registered nodes.
 
 ## Upstream Batching and Latency Elimination (KS-29 / PR #111)
 

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use diorama_supervisor::{
@@ -11,18 +9,6 @@ use crate::service::LocalPathService;
 
 pub const COMPONENT_LOCAL_PATH: &str = "local-path-provisioner";
 
-fn spawn_volume_binder(service: LocalPathService, stop: Arc<AtomicBool>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
-        loop {
-            interval.tick().await;
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            service.bind_pending_volumes().await;
-        }
-    });
-}
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Supervisor adapter for the local-path storage provisioner.
@@ -88,11 +74,6 @@ impl Adapter for LocalPathAdapter {
                 });
             }
 
-            // Volume binding is independent of the provisioner pod becoming Ready.
-            // A readiness timeout still degrades the addon, and binding continues.
-            let stop = Arc::new(AtomicBool::new(false));
-            spawn_volume_binder(self.service.clone(), Arc::clone(&stop));
-
             // 3. Wait for readiness
             let timeout = self.service.config().readiness_timeout;
             if let Err(err) = self.service.wait_for_readiness(timeout).await {
@@ -103,18 +84,16 @@ impl Adapter for LocalPathAdapter {
 
             // 4. Signal readiness to supervisor coordinator
             if !context.ready() {
-                stop.store(true, Ordering::Relaxed);
                 return Err(AdapterError {
                     code: "storage-readiness-rejected",
                 });
             }
 
-            // 5. Await supervisor stop while the binder keeps running.
+            // 5. Await supervisor stop while the provisioner workload owns volume operations.
             loop {
                 match context.changed().await {
                     StopPhase::Running => {},
                     StopPhase::Graceful | StopPhase::Force => {
-                        stop.store(true, Ordering::Relaxed);
                         self.service.stop();
                         break;
                     },

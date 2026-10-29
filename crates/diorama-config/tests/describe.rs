@@ -28,7 +28,14 @@ fn complete_descriptors_match_the_independent_actual_go_schema() {
         json!(
             describe_settings()
                 .into_iter()
-                .filter(|field| field.path != "runtime.backend")
+                .filter(|field| !matches!(
+                    field.path,
+                    "runtime.backend"
+                        | "kubernetes.role"
+                        | "kubernetes.tokenFile"
+                        | "kubernetes.disableLocalKubelet"
+                        | "network.podAddressPool"
+                ))
                 .collect::<Vec<_>>()
         ),
         reference["settings"]
@@ -38,7 +45,7 @@ fn complete_descriptors_match_the_independent_actual_go_schema() {
 #[test]
 fn inventory_is_complete_unique_sorted_and_has_model_leaves_and_bindings() {
     let descriptors = describe_settings();
-    assert_eq!(descriptors.len(), 31);
+    assert_eq!(descriptors.len(), 35);
     assert!(
         descriptors
             .windows(2)
@@ -92,7 +99,7 @@ fn secret_null_and_underived_defaults_retain_their_declared_types() {
             .iter()
             .filter(|field| field.mutability == "immutable")
             .count(),
-        1
+        5
     );
 }
 

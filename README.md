@@ -1,170 +1,147 @@
 # diorama
 
-diorama aims to be a single-node Kubernetes distribution
-inspired by KubeSolo. It provides distribution configuration,
-component supervision, host preparation, networking, addon management and operator
-commands while preserving established configuration and data ownership contracts.
+diorama is a developing Kubernetes distribution with one control-plane process group
+and independently joining workers. It retains its Rust datastore, API server,
+controller manager, and native ordinary-node kubelet, and runs upstream
+kube-scheduler **v1.35.7** as a supervised executable.
 
-The selected architecture uses Rust to manage upstream Kubernetes components,
-Kine and containerd through process and protocol boundaries. Kubernetes components
-remain upstream executables; generated Rust API clients supply their interfaces.
+The control plane may also run an ordinary kubelet. Each process has its own state
+and node identity. There is no node roster, synthetic companion node, or configured
+membership limit. The datastore retains its exclusive installation lock; sharing
+its directory between control planes is unsupported. Control-plane HA and WASM
+are outside the baseline.
 
-[//]: # (See the [architecture decision]&#40;experiments/component-boundary/ADR.md&#41; for the)
+## Build and start
 
-[//]: # (responsibility split and its qualification limits.)
-
-**Status: Under Development** 
-
-The `diorama` executable currently parses and
-validates configuration and supports help, version and effective configuration
-printing. Normal invocation exits with `runtime startup is not implemented`.
-The separate `dioramactl` executable provides management checks, version and help,
-including explicit prerequisite preparation where supported. Component libraries
-and fixtures are implemented in bounded slices; this repository does not yet
-provide an end-to-end node startup or general installer.
-
-## Getting started
-
-For development, use Git and a Rust installation that honors
-[rust-toolchain.toml](rust-toolchain.toml): nightly 2026-10-12 with Clippy, rustfmt, and the Cranelift codegen backend.
-The workspace uses edition 2024 and a committed dependency lockfile.
+Use the pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml):
 
 ```sh
-git clone https://github.com/geoffsee/diorama.git
-cd diorama
 cargo build --locked -p diorama -p dioramactl
-cargo run --locked -p diorama -- --help
-cargo run --locked -p diorama -- --version
-cargo run --locked -p dioramactl -- --help
-```
-
-To inspect effective node configuration without starting services:
-
-```sh
 cargo run --locked -p diorama -- --print-config
 ```
 
-Configuration precedence is defaults, file, environment, then explicit flags.
-Legacy `KUBESOLO_*` environment variables and the `kubesolo.io/v1alpha1`
-configuration schema remain compatibility inputs. The default configuration file
-is `/etc/diorama/config.yaml`; a missing file is allowed. Printed effective
-configuration can contain credentials, so review it before sharing output.
-See the [startup adapter](crates/diorama/README.md) and
-[configuration layer](crates/diorama-config/README.md) for supported behavior.
+Node execution requires Linux. Install the pinned release assets into the chosen
+state directory, including `bin/kube-scheduler`. A source-only Cargo build does
+not download or install runtime assets. Ordinary nodes require managed containerd,
+managed oci-cri with its build feature, or a supported host-managed containerd/CRI-O
+endpoint. Host-managed runtimes must already consume `/opt/diorama/cni/bin` and
+`/etc/diorama/cni/net.d`; diorama preserves their daemon configuration, sockets,
+standard host CNI directories, and unrelated workloads.
 
-Linux host and runtime qualification uses disposable containers or VMs. Docker
-and additional pinned tools are required for some integration fixtures; consult
-the relevant fixture README before running them. macOS development checks do not
-establish Linux node compatibility.
+Example control-plane configuration:
 
-## Contributing
+```yaml
+apiVersion: kubesolo.io/v1alpha1
+kind: Config
+path: /var/lib/diorama
+kubernetes:
+  role: control-plane
+  nodeName: control-plane-1
+  disableLocalKubelet: true
+network:
+  nodeIP: 192.0.2.10 # Replace with an address reachable from every worker.
+  podAddressPool: 10.42.0.0/16
+```
 
-Contributions to implementation, compatibility fixtures, documentation and
-qualification evidence are welcome. Start with a
-[project issue](https://github.com/geoffsee/diorama/issues) describing the
-intended behavior and acceptance criteria, then submit a focused pull request.
-Include the behavior changed, relevant issue links, validation and remaining gaps.
+Run `diorama --config=/etc/diorama/config.yaml`. Set `disableLocalKubelet: false`
+and configure an ordinary runtime to execute workloads on the control-plane host.
+An omitted node name uses existing hostname discovery; an empty discovered identity
+is an error. Configuration precedence remains defaults, file, environment, explicit
+flags. Legacy `KUBESOLO_*` inputs and the `kubesolo.io/v1alpha1` schema are retained.
+See [configuration](crates/diorama-config/README.md).
 
-Read the [development tooling policy](docs/architecture/development-tooling.md) for
-repository tooling, and [CI and repository rules](.github/README.md) for required
-checks. Repository-owned executable tooling and tests use Rust. Reusable
-maintenance logic belongs in `tools/dev`, outside the node runtime dependency
-graph. Preserve existing compatibility fixtures and independent evidence.
+## Join workers
 
-Run focused package tests while developing. Workspace checks include:
+On the control plane, using its administrative kubeconfig:
+
+```sh
+umask 077
+dioramactl token create --role=worker --expiry=24h \
+  --kubeconfig /var/lib/diorama/pki/admin.kubeconfig > worker.token
+```
+
+Securely transfer the token file to each joining worker. An ordinary worker uses
+its own state directory and locally installed runtime:
+
+```yaml
+apiVersion: kubesolo.io/v1alpha1
+kind: Config
+path: /var/lib/diorama
+kubernetes:
+  role: worker
+  nodeName: ordinary-1
+  tokenFile: /etc/diorama/worker.token
+network:
+  nodeIP: 192.0.2.11
+runtime:
+  endpoint: unix:///run/containerd/containerd.sock
+```
+
+Start it with `diorama --config=/etc/diorama/config.yaml`. It generates its own key,
+requests a kubelet client certificate over HTTPS, and registers only its own Node
+and Lease. It never initializes a datastore or control-plane services. Kubelets
+renew certificates through the API; signing keys stay on the control plane.
+
+Foreign workers are entirely operator-owned. Export the standard bootstrap
+kubeconfig and supply it to an independently launched kubelet:
+
+```sh
+dioramactl token export --token-file worker.token > bootstrap.kubeconfig
+kubelet --bootstrap-kubeconfig=bootstrap.kubeconfig --kubeconfig=kubelet.kubeconfig \
+  --config=kubelet.yaml --hostname-override=foreign-1 \
+  --node-labels=diorama.io/runtime=foreign \
+  --register-with-taints=diorama.io/foreign-runtime=true:NoSchedule
+```
+
+The operator supplies `kubelet.yaml`, the CRI, and all runtime-specific settings.
+Exporting credentials starts no process. Foreign sockets and process identities
+are never supplied to diorama. `v8-matrix-wasi` is explicitly rejected as an
+ordinary external runtime. Compatible foreign workloads need the foreign taint
+toleration and must satisfy their runtime's restrictions, including DNS settings.
+
+List or revoke bootstrap credentials with `dioramactl token list` and
+`dioramactl token invalidate TOKEN_ID`, passing `--kubeconfig` when needed. Expired
+tokens are rejected immediately and cleaned up by the controller. Revocation
+prevents new bootstrap authentication; it does not revoke already issued node
+certificates. Treat exported token files as secrets.
+
+## Scheduling and networking
+
+Upstream kube-scheduler binds Pods through the atomic API binding endpoint. Both
+the scheduler and controller manager use leader Leases. Kubelets execute only
+Pods whose `spec.nodeName` exactly matches their identity. HTTPS node authorization
+limits writes to their Node, Lease, and assigned Pods, and workload reads to
+referenced resources. Bootstrap identities cannot register Nodes, bind Pods, or
+approve/sign certificates.
+
+The single network profile is **Cilium 1.20.4**, eBPF with VXLAN and cluster-pool
+IPAM, with one operator replica and scheduled kube-proxy
+(`kubeProxyReplacement=false`). Cilium bootstrap Pods use host networking and the
+direct API endpoint. Ordinary kubelets register and reconcile host-network Pods
+before CNI is ready. Their Ready condition follows CRI runtime/network readiness;
+address-pool exhaustion is a networking readiness failure. Foreign nodes receive
+neither ordinary CNI installation nor ordinary PodCIDRs.
+The control plane's existing `network.mtu` setting overrides Cilium's detected
+underlying MTU when nonzero; zero retains automatic detection.
+
+CoreDNS **1.14.4** retains its Deployment, Service, configuration, and
+`10.43.0.10:53` address. CoreDNS, Cilium, kube-proxy, local-path storage, and ordinary
+addons require `diorama.io/runtime=ordinary` and do not tolerate the foreign taint.
+Local-path storage uses `WaitForFirstConsumer`: the scheduler selects an ordinary
+node and the provisioner workload launches node-local helpers there. The control
+plane does not create volume directories on behalf of remote workers.
+
+## Verification
 
 ```sh
 cargo fmt-check
 cargo lint
-cargo test-ci
-cargo test --locked --workspace --doc --all-features
+cargo test --locked --workspace --all-features
 cargo run --locked -p diorama-dev --bin diorama-language-policy
 ```
 
-Bare Cargo build and test commands select `diorama`, the default workspace
-member. Use `-p <package>` or `--workspace` deliberately. CI also tests release
-builds and checks dependencies and security; live qualification has separate
-fixture and environment requirements.
-
-## Scope
-
-### In scope
-
-The implementation and qualification plan covers:
-
-- Single-node Kubernetes, with NodeSetter admission in place of a scheduler.
-- Configuration, PKI, lifecycle supervision and explicit host prerequisites.
-- Managed containerd and attachment to host-managed containerd or CRI-O.
-- Pod and Service networking, CoreDNS, local-path storage and optional addons.
-- Management commands and preservation of existing configuration, credentials
-  and persistent data through documented lifecycle operations.
-- Pinned upstream inputs, generated clients, independent compatibility fixtures
-  and reproducible runtime evidence.
-
-The node release contract targets Linux amd64, arm64, ARMv7 hard-float and riscv64
-with glibc and musl variants. Management CLI release targets are Linux and macOS
-amd64 and arm64. These are qualification obligations, not a statement that all
-artifacts are available or all platform cells have passed.
-
-[//]: # (### Out of scope)
-
-[//]: # ()
-[//]: # (- Multi-node clustering, high availability and a Kubernetes scheduler.)
-
-[//]: # (- GPU or WASM support in the baseline distribution.)
-
-[//]: # (- Native Windows node or management binaries.)
-
-[//]: # (- Reimplementing Kubernetes in Rust or claiming generated bindings provide its)
-
-[//]: # (  runtime behavior.)
-
-[//]: # (The [compatibility contract]&#40;docs/architecture/compatibility-contract.md&#41; defines)
-
-[//]: # (the pinned KubeSolo baseline, retained behavior and deliberate deviations. The)
-
-[//]: # ([acceptance matrix]&#40;docs/architecture/acceptance-matrix.md&#41; records the gates for)
-
-[//]: # (implementation and qualification. Preserve these boundaries when proposing scope)
-
-[//]: # (changes.)
-
-## Communications
-
-Use [GitHub issues](https://github.com/geoffsee/diorama/issues) for bugs,
-questions and proposed work, and
-[pull requests](https://github.com/geoffsee/diorama/pulls) for implementation
-and review. This repository does not currently document a mailing list, chat
-channel or public meeting schedule.
-
-## Resources
-
-> TODO
-
-[//]: # (- [Roadmap and work items]&#40;https://github.com/geoffsee/diorama/issues&#41;)
-
-[//]: # (- [Compatibility and acceptance matrix]&#40;docs/architecture/acceptance-matrix.md&#41;)
-
-[//]: # (- [Selected component boundary]&#40;experiments/component-boundary/ADR.md&#41;)
-
-[//]: # (- [Upstream provenance and generation contract]&#40;docs/architecture/upstream-inputs.md&#41;)
-
-[//]: # (- [Upstream preparation and client generation]&#40;tools/upstream/README.md&#41;)
-
-[//]: # (- [Live integration evidence]&#40;tools/integration/README.md&#41;)
-
-[//]: # (- [Management CLI]&#40;crates/dioramactl/README.md&#41;)
-
-[//]: # (- [CI, dependency and security checks]&#40;.github/README.md&#41;)
-
-## License
-
-`diorama` is licensed under the [ISC License](LICENSE). Third-party code retains
-its own license terms; see, for example, the vendored
-[saphyr-parser license](third_party/saphyr-parser/LICENSE).
-
-## Conduct
-
-Software is better built together. Ask questions. Be curious. Give specific, useful feedback;
-receive it with openness. Respect others. Listen. Take ownership. Make room for repair.
-Harassment and personal attacks have no place here.
+The [multi-node fixture](tests/multinode/README.md) uses real independent ordinary
+workers and externally supplied foreign kubelet/CRI artifacts. It records failures
+and unexecuted checks explicitly. Local unit tests and macOS builds do not establish
+Linux network, storage, or foreign-runtime qualification. See the fixture's
+[qualification record](tests/multinode/QUALIFICATION.md) for actual results.

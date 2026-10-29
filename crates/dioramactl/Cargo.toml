@@ -10,6 +10,8 @@ autotests = false
 workspace = true
 
 [dependencies]
+diorama-apiserver = { version = "=0.1.0", path = "../diorama-apiserver" }
+diorama-pki = { version = "=0.1.0", path = "../diorama-pki" }
 shlex = "=2.0.1"
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-platform = { version = "=0.1.0", path = "../diorama-platform" }

@@ -14,6 +14,26 @@ pub struct InputBinding {
 /// Baseline registry order, also the error precedence within an input layer.
 pub const INPUT_BINDINGS: &[InputBinding] = &[
     InputBinding {
+        path: "kubernetes.role",
+        environment: "KUBESOLO_ROLE",
+        flag: Some("role"),
+    },
+    InputBinding {
+        path: "kubernetes.tokenFile",
+        environment: "KUBESOLO_TOKEN_FILE",
+        flag: Some("token-file"),
+    },
+    InputBinding {
+        path: "kubernetes.disableLocalKubelet",
+        environment: "KUBESOLO_DISABLE_LOCAL_KUBELET",
+        flag: Some("disable-local-kubelet"),
+    },
+    InputBinding {
+        path: "network.podAddressPool",
+        environment: "KUBESOLO_POD_ADDRESS_POOL",
+        flag: Some("pod-address-pool"),
+    },
+    InputBinding {
         path: "path",
         environment: "KUBESOLO_PATH",
         flag: Some("path"),

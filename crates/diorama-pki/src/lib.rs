@@ -535,3 +535,5 @@ mod tests {
         assert_ne!(ec_data.stub_pkcs10_b64, "");
     }
 }
+
+pub mod bootstrap;

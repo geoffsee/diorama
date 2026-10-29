@@ -52,7 +52,7 @@ fn independent_full_document_and_negative_fixtures_match() {
 
 #[test]
 fn fields_preserve_explicit_presence_and_defaults() {
-    assert_eq!(FIELDS.len(), 31);
+    assert_eq!(FIELDS.len(), 35);
     let empty = decode("").unwrap();
     assert_eq!(empty.config, Config::default());
     assert!(

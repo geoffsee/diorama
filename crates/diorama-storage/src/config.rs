@@ -140,8 +140,8 @@ pub struct LocalPathConfig {
     #[serde(default = "default_true")]
     pub allow_volume_expansion: bool,
 
-    /// Whether CSI resources (`CSIDriver`, etc.) are reconciled.
-    #[serde(default = "default_true")]
+    /// Legacy opt-in for CSI fixture resources. Local-path is not a CSI driver.
+    #[serde(default)]
     pub csi_enabled: bool,
 
     /// Timeout for deployment readiness polling.
@@ -161,7 +161,7 @@ impl Default for LocalPathConfig {
             volume_binding_mode: DEFAULT_VOLUME_BINDING_MODE.to_string(),
             default_class: true,
             allow_volume_expansion: DEFAULT_ALLOW_VOLUME_EXPANSION,
-            csi_enabled: true,
+            csi_enabled: false,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
     }
@@ -278,7 +278,7 @@ impl LocalPathConfig {
             volume_binding_mode: DEFAULT_VOLUME_BINDING_MODE.to_string(),
             default_class: true,
             allow_volume_expansion: DEFAULT_ALLOW_VOLUME_EXPANSION,
-            csi_enabled: true,
+            csi_enabled: false,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
         }
     }

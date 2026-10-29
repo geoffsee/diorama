@@ -71,21 +71,8 @@ impl Adapter for KubeletAdapter {
                 });
             }
 
-            // 2. Check readiness
-            match self.service.check_readiness().await {
-                Ok(report) if report.is_healthy && report.node_ready => {},
-                Ok(_) => {
-                    return Err(AdapterError {
-                        code: "kubelet-readiness-failed",
-                    });
-                },
-                Err(err) => {
-                    return Err(AdapterError {
-                        code: err.diagnostic_code(),
-                    });
-                },
-            }
-
+            // Registration is live before CNI becomes ready. Host-network bootstrap
+            // workloads and heartbeats must continue while Node Ready is false.
             // 3. Signal readiness to supervisor coordinator
             if !context.ready() {
                 return Err(AdapterError {
@@ -102,6 +89,10 @@ impl Adapter for KubeletAdapter {
                 self.heartbeat_interval,
             ));
 
+            let changed = std::sync::Arc::new(tokio::sync::Notify::new());
+            let signal = changed.clone();
+            let client = self.service.client();
+            let watch_handle = tokio::spawn(run_watch_loop(client, signal));
             loop {
                 tokio::select! {
                     biased;
@@ -110,7 +101,7 @@ impl Adapter for KubeletAdapter {
                             break;
                         }
                     }
-                    _ = reconcile.tick() => {
+                    () = async { tokio::select! { _ = reconcile.tick() => {}, () = changed.notified() => {} } } => {
                         match self.service.reconcile_once().await {
                             Ok(report) if report.bound + report.failed + report.orphans_stopped > 0 => {
                                 log_event("kubelet_reconcile", &format!(
@@ -127,6 +118,8 @@ impl Adapter for KubeletAdapter {
                     }
                 }
             }
+            watch_handle.abort();
+            let _ = watch_handle.await;
             heartbeat_handle.abort();
             let _ = heartbeat_handle.await;
             self.service.stop();
@@ -154,5 +147,14 @@ async fn run_heartbeat_loop(service: KubeletService, interval: Duration) {
                 &format!("\"code\":\"{}\"", err.diagnostic_code()),
             );
         }
+    }
+}
+
+async fn run_watch_loop(client: crate::api::NodeApi, signal: std::sync::Arc<tokio::sync::Notify>) {
+    loop {
+        if client.watch_pods().await.is_err() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        signal.notify_one();
     }
 }

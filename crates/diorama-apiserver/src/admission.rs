@@ -1358,6 +1358,8 @@ pub fn default_pod_spec(pod: &mut Value) {
 
     spec.entry("terminationGracePeriodSeconds".to_string())
         .or_insert_with(|| json!(30));
+    spec.entry("schedulerName".to_string())
+        .or_insert_with(|| json!("default-scheduler"));
     spec.entry("restartPolicy".to_string())
         .or_insert_with(|| json!("Always"));
     spec.entry("dnsPolicy".to_string())
@@ -1501,6 +1503,17 @@ pub fn default_admitted_object(
     if is_pod {
         default_pod_spec(obj);
         return Ok(());
+    }
+
+    if resource.group.is_empty()
+        && matches!(
+            resource.resource.as_str(),
+            "persistentvolumeclaims" | "persistentvolumes"
+        )
+        && let Some(spec) = obj.get_mut("spec").and_then(Value::as_object_mut)
+        && spec.get("volumeMode").is_none_or(Value::is_null)
+    {
+        spec.insert("volumeMode".into(), json!("Filesystem"));
     }
 
     let is_flow_control = resource.group == "flowcontrol.apiserver.k8s.io"
@@ -3479,8 +3492,14 @@ struct PatchOperation {
     path: String,
     #[serde(default)]
     from: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_patch_value")]
     value: Option<Value>,
+}
+
+fn deserialize_patch_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// Applies an RFC 6902 `JSONPatch` document to a JSON value.
@@ -3515,6 +3534,16 @@ pub fn apply_json_patch(target: &mut Value, patch_bytes: &[u8]) -> Result<(), Ap
                     field: op.path.clone(),
                     reason: "test operation missing 'value'".to_string(),
                 })?;
+                // Match Kubernetes' JSON patch implementation for optional object
+                // members, e.g. Cilium testing absent Node taints against null.
+                if value.is_null()
+                    && get_pointer(target, &op.path).is_none()
+                    && op.path.rsplit_once('/').is_some_and(|(parent, _)| {
+                        get_pointer(target, parent).is_some_and(Value::is_object)
+                    })
+                {
+                    continue;
+                }
                 let actual =
                     get_pointer(target, &op.path).ok_or_else(|| ApiserverError::InvalidInput {
                         field: op.path.clone(),
@@ -3863,6 +3892,17 @@ mod tests {
 
     #[test]
     fn test_json_patch_operations() {
+        let mut node = json!({"spec": {}});
+        apply_json_patch(&mut node, br#"[{"op":"test","path":"/spec/taints","value":null},{"op":"add","path":"/spec/taints","value":[]}]"#).unwrap();
+        assert_eq!(node["spec"]["taints"], json!([]));
+        assert!(apply_json_patch(&mut node, br#"[{"op":"test","path":"/spec/taints"}]"#).is_err());
+        assert!(
+            apply_json_patch(
+                &mut node,
+                br#"[{"op":"test","path":"/missing/taints","value":null}]"#
+            )
+            .is_err()
+        );
         let mut doc = json!({
             "apiVersion": "v1",
             "kind": "Pod",

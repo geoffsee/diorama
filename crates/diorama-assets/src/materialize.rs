@@ -212,6 +212,7 @@ impl AssetLayout {
     /// Default relative path for an asset within the root.
     pub fn default_relative_path(id: AssetId) -> &'static str {
         match id {
+            AssetId::KubeScheduler => "bin/kube-scheduler",
             AssetId::Containerd => "bin/containerd",
             AssetId::ContainerdShim => "bin/containerd-shim-runc-v2",
             AssetId::Crun => "bin/crun",
@@ -1058,6 +1059,7 @@ fn create_staged_file(_staging: &File, _path: &Path) -> Result<File, Materializa
 
 fn id_tag(id: AssetId) -> &'static str {
     match id {
+        AssetId::KubeScheduler => "kube-scheduler",
         AssetId::Containerd => "containerd",
         AssetId::ContainerdShim => "containerd-shim-runc-v2",
         AssetId::Crun => "crun",

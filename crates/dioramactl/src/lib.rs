@@ -25,6 +25,7 @@ mod parse;
 pub mod preparation;
 pub mod service;
 pub mod sudo_env;
+pub mod token;
 pub mod upgrade;
 mod upgrade_integrity;
 
@@ -101,6 +102,7 @@ pub trait CheckInputs {
 pub fn help(topic: HelpTopic) -> &'static str {
     match topic {
         HelpTopic::Addon => crate::addon::HELP,
+        HelpTopic::Token => crate::token::HELP,
         HelpTopic::Root => {
             "diorama Kube management commands\n\nUsage:\n  dioramactl [command]\n\nCommands:\n  addon       Load an offline add-on pack\n  check       Check host prerequisites\n  completion  Generate shell completion scripts\n  config      Manage diorama configuration\n  d2k         Manage Docker-to-Kubernetes (d2k) API translator\n  download    Download the binary bundle for offline installation\n  install     Install diorama and configure the system service\n  kubeconfig  Manage kubeconfig context and cluster access\n  reset       Reset cluster data and restart services\n  uninstall   Uninstall diorama and remove associated system resources\n  upgrade     Upgrade diorama to a different version\n  version     Print version information\n\nUse dioramactl [command] --help for more information about a command.\n"
         },
@@ -220,6 +222,7 @@ pub fn execute_with_handler(
             stderr.write_all(help(HelpTopic::Root).as_bytes())?;
             Ok(0)
         },
+        Ok(Command::Token(options)) => Ok(crate::token::execute(&options, stdout, stderr)),
         Ok(Command::Addon(options)) => crate::addon::execute(&options, stdout, stderr),
         Ok(Command::Version) => {
             writeln!(stdout, "dioramactl {version}")?;

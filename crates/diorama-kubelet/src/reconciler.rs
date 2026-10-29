@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use diorama_apiserver::time::{now_rfc3339, now_unix, parse_rfc3339_seconds};
-use diorama_apiserver::{ApiserverError, ApiserverService, KubernetesApiClient};
+use diorama_apiserver::{ApiserverError, ApiserverService};
 
 use crate::config::{
     DEFAULT_CLUSTER_DNS, DEFAULT_CLUSTER_DOMAIN, detect_host_cpu_count, format_cpuset,
@@ -35,8 +35,7 @@ use crate::workload::{
     parse_cpu_quantity_milli, parse_memory_quantity_bytes, pod_fs_group, prune_stale_volume_files,
     resolve_downward_field_path, resolve_downward_resource_field, safe_volume_path, sandbox_labels,
     secs_from_nanos, stage_configmap_files, stage_projected_clustertrustbundle,
-    stage_projected_downward_api, stage_projected_sa_token, stage_secret_files,
-    truncate_pod_hostname, write_volume_file,
+    stage_projected_downward_api, stage_secret_files, truncate_pod_hostname, write_volume_file,
 };
 
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 10;
@@ -113,178 +112,6 @@ fn state_of(status: &cri::ContainerStatus) -> cri::ContainerState {
     cri::ContainerState::try_from(status.state).unwrap_or(cri::ContainerState::ContainerUnknown)
 }
 
-/// Extracts effective priority from Pod spec or well-known `PriorityClasses`.
-#[must_use]
-pub fn pod_priority(pod: &Value) -> i64 {
-    let p_opt = pod.pointer("/spec/priority").and_then(Value::as_i64);
-    if let Some(p) = p_opt
-        && p != 0
-    {
-        return p;
-    }
-    if let Some(class_name) = pod
-        .pointer("/spec/priorityClassName")
-        .and_then(Value::as_str)
-    {
-        if let Some(p) = class_name
-            .strip_prefix('p')
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            return p;
-        }
-        match class_name {
-            "system-node-critical" => 2_000_001_000,
-            "system-cluster-critical" => 2_000_000_000,
-            s if s.contains("high") || s.contains("preemptor") => 1000,
-            s if s.contains("medium") => 500,
-            s if s.contains("low") => 100,
-            _ => p_opt.unwrap_or(0),
-        }
-    } else {
-        p_opt.unwrap_or(0)
-    }
-}
-
-/// Checks whether the Pod allows preemption under `spec.preemptionPolicy`.
-#[must_use]
-pub fn pod_allows_preemption(pod: &Value) -> bool {
-    pod.pointer("/spec/preemptionPolicy")
-        .and_then(Value::as_str)
-        != Some("Never")
-}
-
-fn match_values_operator(
-    node_val: Option<&str>,
-    operator: &str,
-    values: Option<&[Value]>,
-    key_exists: bool,
-) -> bool {
-    match operator {
-        "In" => {
-            let Some(nv) = node_val else { return false };
-            let Some(vals) = values else { return false };
-            vals.iter().any(|v| v.as_str() == Some(nv))
-        },
-        "NotIn" => {
-            let Some(nv) = node_val else { return true };
-            let Some(vals) = values else { return true };
-            !vals.iter().any(|v| v.as_str() == Some(nv))
-        },
-        "Exists" => key_exists,
-        "DoesNotExist" => !key_exists,
-        "Gt" => {
-            let Some(nv) = node_val.and_then(|s| s.parse::<i64>().ok()) else {
-                return false;
-            };
-            let Some(target) = values
-                .and_then(|vals| vals.first())
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<i64>().ok())
-            else {
-                return false;
-            };
-            nv > target
-        },
-        "Lt" => {
-            let Some(nv) = node_val.and_then(|s| s.parse::<i64>().ok()) else {
-                return false;
-            };
-            let Some(target) = values
-                .and_then(|vals| vals.first())
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<i64>().ok())
-            else {
-                return false;
-            };
-            nv < target
-        },
-        _ => false,
-    }
-}
-
-fn match_requirement(labels: Option<&serde_json::Map<String, Value>>, req: &Value) -> bool {
-    let Some(key) = req.get("key").and_then(Value::as_str) else {
-        return false;
-    };
-    let op = req.get("operator").and_then(Value::as_str).unwrap_or("In");
-    let values = req
-        .get("values")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice);
-    let key_exists = labels.is_some_and(|l| l.contains_key(key));
-    let node_val = labels.and_then(|l| l.get(key)).and_then(Value::as_str);
-    match_values_operator(node_val, op, values, key_exists)
-}
-
-fn match_field_requirement(node: &Value, req: &Value) -> bool {
-    let Some(key) = req.get("key").and_then(Value::as_str) else {
-        return false;
-    };
-    let op = req.get("operator").and_then(Value::as_str).unwrap_or("In");
-    let values = req
-        .get("values")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice);
-    let (node_val, key_exists) = if key == "metadata.name" {
-        let name = node.pointer("/metadata/name").and_then(Value::as_str);
-        (name, name.is_some())
-    } else {
-        (None, false)
-    };
-    match_values_operator(node_val, op, values, key_exists)
-}
-
-fn term_matches_node(node: &Value, term: &Value) -> bool {
-    let labels = node.pointer("/metadata/labels").and_then(Value::as_object);
-    if let Some(exprs) = term.get("matchExpressions").and_then(Value::as_array) {
-        for expr in exprs {
-            if !match_requirement(labels, expr) {
-                return false;
-            }
-        }
-    }
-    if let Some(fields) = term.get("matchFields").and_then(Value::as_array) {
-        for field in fields {
-            if !match_field_requirement(node, field) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn node_matches_node_selector(node: &Value, pod: &Value) -> bool {
-    let Some(selector) = pod.pointer("/spec/nodeSelector").and_then(Value::as_object) else {
-        return true;
-    };
-    let labels = node.pointer("/metadata/labels").and_then(Value::as_object);
-    selector
-        .iter()
-        .all(|(k, v)| labels.and_then(|l| l.get(k)).and_then(Value::as_str) == v.as_str())
-}
-
-fn node_matches_node_affinity(node: &Value, pod: &Value) -> bool {
-    let Some(req) =
-        pod.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution")
-    else {
-        return true;
-    };
-    let Some(terms) = req.get("nodeSelectorTerms").and_then(Value::as_array) else {
-        return true;
-    };
-    if terms.is_empty() {
-        return false;
-    }
-    terms.iter().any(|term| term_matches_node(node, term))
-}
-
-fn node_matches_affinity_and_selector(node: &Value, pod: &Value) -> Result<(), String> {
-    if !node_matches_node_selector(node, pod) || !node_matches_node_affinity(node, pod) {
-        return Err("node(s) didn't match Pod's node affinity/selector".to_string());
-    }
-    Ok(())
-}
-
 fn toleration_matches_taint(toleration: &Value, taint: &Value) -> bool {
     let taint_effect = taint.get("effect").and_then(Value::as_str).unwrap_or("");
     if let Some(tol_effect) = toleration.get("effect").and_then(Value::as_str)
@@ -312,103 +139,6 @@ fn toleration_matches_taint(toleration: &Value, taint: &Value) -> bool {
         let taint_val = taint.get("value").and_then(Value::as_str).unwrap_or("");
         tol_key == taint_key && tol_val == taint_val
     }
-}
-
-fn node_tolerates_taints(node: &Value, pod: &Value) -> Result<(), String> {
-    let Some(taints) = node.pointer("/spec/taints").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    let pod_tolerations = pod
-        .pointer("/spec/tolerations")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-
-    for taint in taints {
-        let effect = taint.get("effect").and_then(Value::as_str).unwrap_or("");
-        if effect == "NoSchedule" || effect == "NoExecute" {
-            let tolerated = pod_tolerations
-                .iter()
-                .any(|tol| toleration_matches_taint(tol, taint));
-            if !tolerated {
-                return Err("node(s) had untolerated taint".to_string());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn pod_fits_node_resources(
-    node: &Value,
-    committed: &BTreeMap<String, i128>,
-    pod: &Value,
-) -> Result<(), String> {
-    if node.pointer("/spec/unschedulable").and_then(Value::as_bool) == Some(true) {
-        return Err("node(s) were unschedulable".to_string());
-    }
-    let usage = diorama_apiserver::quota::pod_usage(pod);
-    for (resource, key, label) in [
-        ("pods", "pods", "Too many pods"),
-        ("cpu", "requests.cpu", "Insufficient cpu"),
-        ("memory", "requests.memory", "Insufficient memory"),
-        (
-            "ephemeral-storage",
-            "requests.ephemeral-storage",
-            "Insufficient ephemeral-storage",
-        ),
-    ] {
-        let Some(want) = usage.get(key).copied().filter(|v| *v > 0) else {
-            continue;
-        };
-        let Some(alloc) = node
-            .pointer(&format!("/status/allocatable/{resource}"))
-            .or_else(|| node.pointer(&format!("/status/capacity/{resource}")))
-            .and_then(Value::as_str)
-            .and_then(diorama_apiserver::quota::parse_quantity_milli)
-        else {
-            continue;
-        };
-        let used = committed.get(key).copied().unwrap_or(0);
-        if used + want > alloc {
-            return Err(label.to_string());
-        }
-    }
-    for (k, want) in &usage {
-        if let Some(resource_name) = k.strip_prefix("requests.")
-            && resource_name.contains('/')
-            && *want > 0
-        {
-            let alloc_opt = node
-                .pointer("/status/allocatable")
-                .and_then(|a| a.get(resource_name))
-                .or_else(|| {
-                    node.pointer("/status/capacity")
-                        .and_then(|c| c.get(resource_name))
-                })
-                .and_then(Value::as_str)
-                .and_then(diorama_apiserver::quota::parse_quantity_milli);
-            let Some(alloc) = alloc_opt else {
-                return Err(format!("Insufficient {resource_name}"));
-            };
-            let used = committed.get(k).copied().unwrap_or(0);
-            if used + *want > alloc {
-                return Err(format!("Insufficient {resource_name}"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Minimal scheduler predicates: nodeSelector, nodeAffinity, pod count
-/// and CPU/memory/ephemeral-storage requests against node allocatable capacity.
-fn pod_fits_node(
-    node: &Value,
-    committed: &BTreeMap<String, i128>,
-    pod: &Value,
-) -> Result<(), String> {
-    node_matches_affinity_and_selector(node, pod)?;
-    node_tolerates_taints(node, pod)?;
-    pod_fits_node_resources(node, committed, pod)?;
-    Ok(())
 }
 
 /// Declared container or initContainer hostPort mapping.
@@ -809,17 +539,6 @@ fn is_earlier_active_pod(existing: &Value, candidate: &Value) -> bool {
     }
 }
 
-fn has_conflicting_pod_on_node(candidate: &Value, node_name: &str, all_pods: &[Value]) -> bool {
-    all_pods.iter().any(|other| {
-        other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
-            && is_active_pod(other)
-            && other.pointer("/metadata/deletionTimestamp").is_none()
-            && !is_same_pod(other, candidate)
-            && !is_pod_unschedulable(other)
-            && pods_have_host_port_conflict(candidate, other)
-    })
-}
-
 fn has_conflicting_earlier_pod_on_node(
     candidate: &Value,
     node_name: &str,
@@ -1095,6 +814,9 @@ fn sandbox_config_base(pod: &Value, attempt: u32) -> cri::PodSandboxConfig {
         port_mappings,
         ..cri::PodSandboxConfig::default()
     };
+    if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str) {
+        config.labels.insert("diorama.io/node".into(), node.into());
+    }
     apply_sandbox_linux(pod, &mut config);
     config
 }
@@ -1926,6 +1648,15 @@ fn build_container_mounts(
                     container_path: mount_path.to_string(),
                     host_path: host_path.to_string_lossy().to_string(),
                     readonly,
+                    propagation: match vm.get("mountPropagation").and_then(Value::as_str) {
+                        Some("HostToContainer") => {
+                            cri::MountPropagation::PropagationHostToContainer as i32
+                        },
+                        Some("Bidirectional") => {
+                            cri::MountPropagation::PropagationBidirectional as i32
+                        },
+                        _ => cri::MountPropagation::PropagationPrivate as i32,
+                    },
                     ..cri::Mount::default()
                 });
             }
@@ -2500,7 +2231,7 @@ pub async fn resolve_container(
 /// Pod reconciler driving pod lifecycle on the registered node.
 #[derive(Clone, Debug)]
 pub struct PodReconciler {
-    client: Arc<KubernetesApiClient>,
+    client: crate::api::NodeApi,
     runtime: Arc<dyn RuntimeProvider>,
     node_name: String,
     node_ip: String,
@@ -2513,7 +2244,6 @@ pub struct PodReconciler {
     backoff: Arc<Mutex<BTreeMap<String, RestartBackoff>>>,
     terminating: Arc<Mutex<BTreeSet<String>>>,
     probe_trackers: Arc<Mutex<BTreeMap<String, ProbeTracker>>>,
-    registered_nodes: Arc<Mutex<BTreeSet<String>>>,
     pod_certificates: PodCertificateCache,
     started_pods: Arc<Mutex<BTreeSet<String>>>,
     observed_taint_times: Arc<Mutex<BTreeMap<(String, String), u64>>>,
@@ -2522,17 +2252,10 @@ pub struct PodReconciler {
 type CachedPodCertificateKey = diorama_pki::PodCertificateKeyData;
 type PodCertificateCache = Arc<Mutex<BTreeMap<(String, String, String), CachedPodCertificateKey>>>;
 
-#[derive(Debug, Clone)]
-struct PreemptionOutcome {
-    nominated_node: String,
-    victims: Vec<Value>,
-    can_schedule_immediately: bool,
-}
-
 impl PodReconciler {
     #[must_use]
     pub fn new(
-        client: Arc<KubernetesApiClient>,
+        client: impl Into<crate::api::NodeApi>,
         runtime: Arc<dyn RuntimeProvider>,
         node_name: impl Into<String>,
         node_ip: impl Into<String>,
@@ -2551,7 +2274,7 @@ impl PodReconciler {
             PathBuf::from("/tmp/diorama-node/cpu_manager_state"),
         ));
         Self {
-            client,
+            client: client.into(),
             runtime,
             node_name: node_name.into(),
             node_ip: effective_ip,
@@ -2564,7 +2287,6 @@ impl PodReconciler {
             backoff: Arc::new(Mutex::new(BTreeMap::new())),
             terminating: Arc::new(Mutex::new(BTreeSet::new())),
             probe_trackers: Arc::new(Mutex::new(BTreeMap::new())),
-            registered_nodes: Arc::new(Mutex::new(BTreeSet::new())),
             pod_certificates: Arc::new(Mutex::new(BTreeMap::new())),
             started_pods: Arc::new(Mutex::new(BTreeSet::new())),
             observed_taint_times: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2700,49 +2422,10 @@ impl PodReconciler {
         self.runtime.exec_sync(&id, cmd, EXEC_TIMEOUT_SECS).await
     }
 
-    /// Returns the companion worker node name for this reconciler's primary node.
-    #[must_use]
-    pub fn companion_node_name(&self) -> String {
-        crate::config::companion_node_name(&self.node_name)
-    }
-
-    /// Checks if a node name matches the primary node, companion node, or any registered cluster node.
+    /// Checks this kubelet's exact node identity.
     #[must_use]
     pub fn is_managed_node(&self, name: &str) -> bool {
-        if name.is_empty() {
-            return false;
-        }
-        if name == self.node_name
-            || name == self.companion_node_name()
-            || name.starts_with("diorama-node")
-        {
-            return true;
-        }
-        if let Ok(set) = self.registered_nodes.lock()
-            && set.contains(name)
-        {
-            return true;
-        }
-        false
-    }
-
-    /// Selects the appropriate target node for an unscheduled or selector-targeted pod.
-    #[must_use]
-    pub fn select_target_node_for_pod(&self, pod: &Value) -> String {
-        if let Some(node) = pod.pointer("/spec/nodeName").and_then(Value::as_str)
-            && self.is_managed_node(node)
-        {
-            return node.to_string();
-        }
-        if let Some(selector) = pod.pointer("/spec/nodeSelector").and_then(Value::as_object)
-            && let Some(hostname) = selector
-                .get("kubernetes.io/hostname")
-                .and_then(Value::as_str)
-            && self.is_managed_node(hostname)
-        {
-            return hostname.to_string();
-        }
-        self.node_name.clone()
+        name == self.node_name
     }
 
     /// Reports workload-restart needs for surviving external-runtime containers when
@@ -2756,7 +2439,6 @@ impl PodReconciler {
             return Ok(reports);
         }
         let pod_list = self.client.list_pods(namespace).await?;
-        let companion_name = self.companion_node_name();
         for pod in pod_list
             .get("items")
             .and_then(Value::as_array)
@@ -2766,12 +2448,6 @@ impl PodReconciler {
             reports.extend(check_pod_restart_need(
                 pod,
                 &self.node_name,
-                self.runtime.provider_name(),
-                namespace,
-            ));
-            reports.extend(check_pod_restart_need(
-                pod,
-                &companion_name,
                 self.runtime.provider_name(),
                 namespace,
             ));
@@ -2823,318 +2499,12 @@ impl PodReconciler {
         Ok(reconciled)
     }
 
-    fn record_committed_quota(committed: &mut BTreeMap<String, i128>, pod: &Value) {
-        for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
-            *committed.entry(k).or_insert(0) += v;
-        }
-    }
-
-    fn deduct_committed_quota(committed: &mut BTreeMap<String, i128>, pod: &Value) {
-        for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
-            if let Some(entry) = committed.get_mut(&k) {
-                *entry = (*entry - v).max(0);
-            }
-        }
-    }
-
-    fn find_node_for_pod(
-        pod: &Value,
-        nodes: &[Value],
-        committed_by_node: &BTreeMap<String, BTreeMap<String, i128>>,
-        all_pods: &[Value],
-    ) -> Result<String, String> {
-        let mut port_conflict = false;
-        let mut other_reason = None;
-
-        for node_doc in nodes {
-            let Some(c_name) = node_doc.pointer("/metadata/name").and_then(Value::as_str) else {
-                continue;
-            };
-            let default_committed = BTreeMap::new();
-            let c_committed = committed_by_node.get(c_name).unwrap_or(&default_committed);
-
-            if let Err(reason) = pod_fits_node(node_doc, c_committed, pod) {
-                if other_reason.is_none() {
-                    other_reason = Some(reason);
-                }
-                continue;
-            }
-            if has_conflicting_pod_on_node(pod, c_name, all_pods) {
-                port_conflict = true;
-                continue;
-            }
-            return Ok(c_name.to_string());
-        }
-
-        if port_conflict {
-            Err("node(s) didn't have free ports for the requested pod ports".to_string())
-        } else {
-            Err(other_reason.unwrap_or_else(|| {
-                "node(s) didn't have free ports for the requested pod ports".to_string()
-            }))
-        }
-    }
-
-    fn node_preemption_priority_tuple(
-        node: &Value,
-        all_pods: &[Value],
-        candidate: &Value,
-        candidate_priority: i64,
-    ) -> (i64, i64, String) {
-        let name = node
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let mut prios: Vec<i64> = all_pods
-            .iter()
-            .filter(|p| {
-                p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(name)
-                    && is_active_pod(p)
-                    && !is_same_pod(p, candidate)
-                    && pod_priority(p) < candidate_priority
-            })
-            .map(pod_priority)
-            .collect();
-        if prios.is_empty() {
-            (i64::MAX, i64::MAX, name.to_string())
-        } else {
-            prios.sort_unstable();
-            (
-                prios[0],
-                *prios.last().unwrap_or(&prios[0]),
-                name.to_string(),
-            )
-        }
-    }
-
-    fn evaluate_node_preemption(
-        node: &Value,
-        candidate: &Value,
-        candidate_priority: i64,
-        committed_by_node: &BTreeMap<String, BTreeMap<String, i128>>,
-        all_pods: &[Value],
-    ) -> Option<PreemptionOutcome> {
-        let node_name = node.pointer("/metadata/name").and_then(Value::as_str)?;
-
-        // Preemption cannot overcome affinity, selector, or taint mismatch
-        if node_matches_affinity_and_selector(node, candidate).is_err()
-            || node_tolerates_taints(node, candidate).is_err()
-        {
-            return None;
-        }
-
-        // Check if node could EVER fit the pod (against empty node capacity)
-        let empty_committed = BTreeMap::new();
-        if pod_fits_node_resources(node, &empty_committed, candidate).is_err() {
-            return None;
-        }
-
-        // Find candidate victims on this node (strictly lower priority)
-        let mut victims: Vec<Value> = all_pods
-            .iter()
-            .filter(|other| {
-                other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
-                    && is_active_pod(other)
-                    && !is_same_pod(other, candidate)
-                    && pod_priority(other) < candidate_priority
-            })
-            .cloned()
-            .collect();
-
-        if victims.is_empty() {
-            return None;
-        }
-
-        // Sort victims: lowest priority first, then newest creation timestamp first
-        victims.sort_by(|a, b| {
-            pod_priority(a).cmp(&pod_priority(b)).then_with(|| {
-                let t_a = a
-                    .pointer("/metadata/creationTimestamp")
-                    .and_then(Value::as_str);
-                let t_b = b
-                    .pointer("/metadata/creationTimestamp")
-                    .and_then(Value::as_str);
-                t_b.cmp(&t_a)
-            })
-        });
-
-        // Simulate evicting victims one by one
-        let mut simulated_committed = committed_by_node
-            .get(node_name)
-            .cloned()
-            .unwrap_or_default();
-        let mut active_pods_on_node: Vec<Value> = all_pods
-            .iter()
-            .filter(|p| {
-                p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name)
-                    && is_active_pod(p)
-                    && !is_same_pod(p, candidate)
-            })
-            .cloned()
-            .collect();
-
-        let mut chosen_victims = Vec::new();
-        let mut fits = false;
-
-        for victim in victims {
-            chosen_victims.push(victim.clone());
-            Self::deduct_committed_quota(&mut simulated_committed, &victim);
-            if let Some(pos) = active_pods_on_node
-                .iter()
-                .position(|p| is_same_pod(p, &victim))
-            {
-                active_pods_on_node.remove(pos);
-            }
-
-            let resources_fit =
-                pod_fits_node_resources(node, &simulated_committed, candidate).is_ok();
-            let ports_fit = !active_pods_on_node.iter().any(|other| {
-                !is_pod_unschedulable(other) && pods_have_host_port_conflict(candidate, other)
-            });
-
-            if resources_fit && ports_fit {
-                fits = true;
-                break;
-            }
-        }
-
-        if !fits {
-            return None;
-        }
-
-        let any_victim_has_finalizers = chosen_victims.iter().any(|v| {
-            v.pointer("/metadata/finalizers")
-                .and_then(Value::as_array)
-                .is_some_and(|f| !f.is_empty())
-        });
-        let can_schedule_immediately = !any_victim_has_finalizers;
-
-        Some(PreemptionOutcome {
-            nominated_node: node_name.to_string(),
-            victims: chosen_victims,
-            can_schedule_immediately,
-        })
-    }
-
-    fn evaluate_preemption_for_pod(
-        candidate: &Value,
-        nodes: &[Value],
-        committed_by_node: &BTreeMap<String, BTreeMap<String, i128>>,
-        all_pods: &[Value],
-    ) -> Option<PreemptionOutcome> {
-        if !pod_allows_preemption(candidate) {
-            return None;
-        }
-        let candidate_priority = pod_priority(candidate);
-
-        let mut sorted_nodes = nodes.to_vec();
-        sorted_nodes.sort_by_key(|n| {
-            Self::node_preemption_priority_tuple(n, all_pods, candidate, candidate_priority)
-        });
-
-        let mut best_outcome: Option<PreemptionOutcome> = None;
-
-        for node in &sorted_nodes {
-            let Some(outcome) = Self::evaluate_node_preemption(
-                node,
-                candidate,
-                candidate_priority,
-                committed_by_node,
-                all_pods,
-            ) else {
-                continue;
-            };
-
-            if let Some(ref current_best) = best_outcome {
-                let current_max_prio = current_best
-                    .victims
-                    .iter()
-                    .map(pod_priority)
-                    .max()
-                    .unwrap_or(i64::MAX);
-                let outcome_max_prio = outcome
-                    .victims
-                    .iter()
-                    .map(pod_priority)
-                    .max()
-                    .unwrap_or(i64::MAX);
-                if outcome_max_prio < current_max_prio
-                    || (outcome_max_prio == current_max_prio
-                        && outcome.victims.len() < current_best.victims.len())
-                {
-                    best_outcome = Some(outcome);
-                }
-            } else {
-                best_outcome = Some(outcome);
-            }
-        }
-
-        best_outcome
-    }
-
-    fn update_known_pod(all_pods: &mut Vec<Value>, pod: Value) {
-        if let Some(pos) = all_pods.iter().position(|p| is_same_pod(p, &pod)) {
-            all_pods[pos] = pod;
-        } else {
-            all_pods.push(pod);
-        }
-    }
-
     async fn discover_cluster_nodes(&self) -> Vec<Value> {
-        let mut node_docs: Vec<Value> = match self.client.list_nodes().await {
-            Ok(list) => list
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
-
-        if !node_docs
-            .iter()
-            .any(|n| n.pointer("/metadata/name").and_then(Value::as_str) == Some(&self.node_name))
-            && let Ok(p) = self.client.get_node(&self.node_name).await
-        {
-            node_docs.push(p);
-        }
-        let companion_name = self.companion_node_name();
-        if !node_docs
-            .iter()
-            .any(|n| n.pointer("/metadata/name").and_then(Value::as_str) == Some(&companion_name))
-            && let Ok(c) = self.client.get_node(&companion_name).await
-        {
-            node_docs.push(c);
-        }
-
-        let primary = self.node_name.clone();
-        node_docs.sort_by(|a, b| {
-            let name_a = a
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let name_b = b
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if name_a == primary && name_b != primary {
-                std::cmp::Ordering::Less
-            } else if name_b == primary && name_a != primary {
-                std::cmp::Ordering::Greater
-            } else {
-                name_a.cmp(name_b)
-            }
-        });
-
-        if let Ok(mut set) = self.registered_nodes.lock() {
-            set.clear();
-            for n in &node_docs {
-                if let Some(name) = n.pointer("/metadata/name").and_then(Value::as_str) {
-                    set.insert(name.to_string());
-                }
-            }
-        }
-
-        node_docs
+        self.client
+            .get_node(&self.node_name)
+            .await
+            .into_iter()
+            .collect()
     }
 
     fn prune_stale_taints(
@@ -3240,537 +2610,43 @@ impl PodReconciler {
         false
     }
 
-    async fn emit_failed_scheduling_event(&self, namespace: &str, pod: &Value, message: &str) {
-        let name = pod_name(pod);
-        let uid = pod
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let now = now_rfc3339();
-        let event_name = format!("{name}.failedscheduling");
-        let doc = json!({
-            "apiVersion": "v1",
-            "kind": "Event",
-            "metadata": {
-                "name": event_name,
-                "namespace": namespace,
-            },
-            "involvedObject": {
-                "kind": "Pod",
-                "namespace": namespace,
-                "name": name,
-                "uid": uid,
-                "apiVersion": "v1",
-            },
-            "reason": "FailedScheduling",
-            "message": message,
-            "source": {
-                "component": "default-scheduler",
-            },
-            "reportingComponent": "default-scheduler",
-            "reportingInstance": format!("default-scheduler-{}", self.node_name),
-            "type": "Warning",
-            "count": 1,
-            "firstTimestamp": now,
-            "lastTimestamp": now,
-        });
-        if let Some(apiserver) = &self.apiserver {
-            let _ = apiserver
-                .admin_client()
-                .create_namespaced_object("", "Event", "events", namespace, doc)
-                .await;
-        } else {
-            let _ = self
-                .client
-                .create_namespaced_object("", "Event", "events", namespace, doc)
-                .await;
-        }
-    }
-
-    async fn check_bound_pod_admission(
-        &self,
-        pod: &Value,
-        node: &Value,
-        node_count: usize,
-        all_current_pods: &[Value],
-    ) -> bool {
-        let assigned = pod
-            .pointer("/spec/nodeName")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("default");
-        let is_running = pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running");
-        if is_running {
-            return true;
-        }
-        let mut committed = BTreeMap::new();
-        for other in all_current_pods {
-            if other.pointer("/spec/nodeName").and_then(Value::as_str) == Some(assigned)
-                && is_active_pod(other)
-                && !is_same_pod(other, pod)
-            {
-                for (k, v) in diorama_apiserver::quota::pod_usage(other) {
-                    *committed.entry(k).or_insert(0) += v;
-                }
-            }
-        }
-        if let Err(reason) = pod_fits_node(node, &committed, pod) {
-            let mut committed_by_node = BTreeMap::new();
-            committed_by_node.insert(assigned.to_string(), committed);
-            if let Some(outcome) = Self::evaluate_preemption_for_pod(
-                pod,
-                std::slice::from_ref(node),
-                &committed_by_node,
-                all_current_pods,
-            ) {
-                let mut pod_mut = pod.clone();
-                let mut current_pods_mut = all_current_pods.to_vec();
-                self.apply_preemption(
-                    &mut pod_mut,
-                    outcome,
-                    node_count,
-                    &mut committed_by_node,
-                    &mut current_pods_mut,
-                )
-                .await;
-            } else {
-                self.mark_unschedulable(namespace, pod, &reason, node_count)
-                    .await;
-            }
-            return false;
-        }
-        true
-    }
-
-    async fn reconcile_bound_pod(
-        &self,
-        pod: &Value,
-        node_count: usize,
-        all_current_pods: &[Value],
-        node_docs: &[Value],
-        report: &mut ReconcileReport,
-    ) {
-        let assigned = pod
-            .pointer("/spec/nodeName")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !self.is_managed_node(assigned) {
-            return;
-        }
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("default");
-        let name = pod_name(pod);
-
-        let node_doc = node_docs
-            .iter()
-            .find(|n| n.pointer("/metadata/name").and_then(Value::as_str) == Some(assigned));
-
-        if pod.pointer("/metadata/deletionTimestamp").is_none() {
-            if let Some(node) = node_doc
-                && self.should_evict_for_no_execute_taint(pod, node)
-            {
-                let _ = self
-                    .client
-                    .delete_pod_options(namespace, name, Some(0))
-                    .await;
-                return;
-            }
-
-            if has_conflicting_earlier_pod_on_node(pod, assigned, all_current_pods) {
-                self.mark_bound_pod_failed_hostport(namespace, pod).await;
-                return;
-            }
-
-            if is_active_deadline_exceeded(pod) {
-                let outcome = self.stop_pod_for_deadline_exceeded(namespace, pod).await;
-                match outcome {
-                    Ok(()) => report.synced += 1,
-                    Err(e) => {
-                        report.failed += 1;
-                        eprintln!(
-                            "Failed to handle active deadline exceeded for {namespace}/{name}: {e}"
-                        );
-                    },
-                }
-                return;
-            }
-
-            if let Some(node) = node_doc
-                && !self
-                    .check_bound_pod_admission(pod, node, node_count, all_current_pods)
-                    .await
-            {
-                return;
-            }
-        }
-
-        let outcome = if pod.pointer("/metadata/deletionTimestamp").is_some() {
-            self.terminate_pod(namespace, pod).await
-        } else {
-            self.sync_pod(namespace, pod).await
-        };
-        match outcome {
-            Ok(()) => report.synced += 1,
-            Err(e) => {
-                report.failed += 1;
-                eprintln!("Failed to sync pod {namespace}/{name}: {e}");
-            },
-        }
-    }
-
-    async fn evict_victims(
-        &self,
-        outcome: &PreemptionOutcome,
-        committed_by_node: &mut BTreeMap<String, BTreeMap<String, i128>>,
-        all_current_pods: &mut Vec<Value>,
-    ) {
-        for victim in &outcome.victims {
-            let v_ns = victim
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            let v_name = pod_name(victim);
-
-            let mut v_status = victim.get("status").cloned().unwrap_or_else(|| json!({}));
-            let mut conds: Vec<Value> = v_status
-                .get("conditions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let disruption_cond = json!({
-                "type": "DisruptionTarget",
-                "status": "True",
-                "reason": "PreemptionByScheduler",
-                "message": "Preempted by higher priority pod",
-                "lastProbeTime": Value::Null,
-                "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
-            });
-            if let Some(pos) = conds
-                .iter()
-                .position(|c| c.get("type").and_then(Value::as_str) == Some("DisruptionTarget"))
-            {
-                conds[pos] = disruption_cond;
-            } else {
-                conds.push(disruption_cond);
-            }
-            v_status["conditions"] = json!(conds);
-            let _ = self
-                .client
-                .patch_pod_status(v_ns, v_name, v_status.clone())
-                .await;
-            let has_finalizers = victim
-                .pointer("/metadata/finalizers")
-                .and_then(Value::as_array)
-                .is_some_and(|f| !f.is_empty());
-            if has_finalizers {
-                let _ = self.client.delete_pod(v_ns, v_name).await;
-            } else {
-                let _ = self.client.delete_pod_options(v_ns, v_name, Some(0)).await;
-            }
-
-            if let Some(committed) = committed_by_node.get_mut(&outcome.nominated_node) {
-                Self::deduct_committed_quota(committed, victim);
-            }
-
-            if outcome.can_schedule_immediately {
-                let _ = self.terminate_pod(v_ns, victim).await;
-                all_current_pods.retain(|p| !is_same_pod(p, victim));
-            } else {
-                let mut v_clone = victim.clone();
-                v_clone["status"] = v_status;
-                if v_clone.pointer("/metadata/deletionTimestamp").is_none() {
-                    v_clone["metadata"]["deletionTimestamp"] =
-                        json!(diorama_apiserver::time::now_rfc3339());
-                }
-                Self::update_known_pod(all_current_pods, v_clone);
-            }
-        }
-    }
-
-    async fn apply_preemption(
-        &self,
-        pod: &mut Value,
-        outcome: PreemptionOutcome,
-        node_count: usize,
-        committed_by_node: &mut BTreeMap<String, BTreeMap<String, i128>>,
-        all_current_pods: &mut Vec<Value>,
-    ) -> (String, bool) {
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("default")
-            .to_string();
-        let name = pod_name(pod).to_string();
-
-        self.evict_victims(&outcome, committed_by_node, all_current_pods)
-            .await;
-
-        let mut candidate_status = pod.get("status").cloned().unwrap_or_else(|| json!({}));
-        candidate_status["nominatedNodeName"] = json!(outcome.nominated_node);
-
-        if outcome.can_schedule_immediately {
-            match self
-                .client
-                .patch_pod_status(&namespace, &name, candidate_status.clone())
-                .await
-            {
-                Ok(updated) => *pod = updated,
-                Err(_) => pod["status"] = candidate_status,
-            }
-            (outcome.nominated_node, true)
-        } else {
-            candidate_status["phase"] = json!("Pending");
-            let mut conds: Vec<Value> = candidate_status
-                .get("conditions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let message = format!(
-                "0/{node_count} nodes are available: 1 Waiting for pod preemption to finish."
-            );
-            let unsched_cond = json!({
-                "type": "PodScheduled",
-                "status": "False",
-                "reason": "Unschedulable",
-                "message": message.clone(),
-                "lastProbeTime": Value::Null,
-                "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
-            });
-            if let Some(pos) = conds
-                .iter()
-                .position(|c| c.get("type").and_then(Value::as_str) == Some("PodScheduled"))
-            {
-                conds[pos] = unsched_cond;
-            } else {
-                conds.push(unsched_cond);
-            }
-            candidate_status["conditions"] = json!(conds);
-            match self
-                .client
-                .patch_pod_status(&namespace, &name, candidate_status.clone())
-                .await
-            {
-                Ok(updated) => *pod = updated,
-                Err(_) => pod["status"] = candidate_status,
-            }
-            self.emit_failed_scheduling_event(&namespace, pod, &message)
-                .await;
-            (outcome.nominated_node, false)
-        }
-    }
-
-    async fn reconcile_unscheduled_pods(
-        &self,
-        mut unscheduled_pods: Vec<Value>,
-        node_docs: &[Value],
-        committed_by_node: &mut BTreeMap<String, BTreeMap<String, i128>>,
-        all_current_pods: &mut Vec<Value>,
-        report: &mut ReconcileReport,
-    ) {
-        unscheduled_pods.sort_by(|a, b| {
-            pod_priority(b)
-                .cmp(&pod_priority(a))
-                .then_with(|| {
-                    let t_a = a
-                        .pointer("/metadata/creationTimestamp")
-                        .and_then(Value::as_str);
-                    let t_b = b
-                        .pointer("/metadata/creationTimestamp")
-                        .and_then(Value::as_str);
-                    t_a.cmp(&t_b)
-                })
-                .then_with(|| {
-                    let n_a = a.pointer("/metadata/name").and_then(Value::as_str);
-                    let n_b = b.pointer("/metadata/name").and_then(Value::as_str);
-                    n_a.cmp(&n_b)
-                })
-        });
-
-        for mut pod in unscheduled_pods {
-            if pod.pointer("/metadata/deletionTimestamp").is_some() {
-                continue;
-            }
-            let namespace = pod
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_string();
-            let name = pod_name(&pod).to_string();
-
-            let direct_node =
-                Self::find_node_for_pod(&pod, node_docs, committed_by_node, all_current_pods);
-
-            let (target_node, should_bind_now) = match direct_node {
-                Ok(node_name) => (node_name, true),
-                Err(reason) => {
-                    if let Some(outcome) = Self::evaluate_preemption_for_pod(
-                        &pod,
-                        node_docs,
-                        committed_by_node,
-                        all_current_pods,
-                    ) {
-                        self.apply_preemption(
-                            &mut pod,
-                            outcome,
-                            node_docs.len(),
-                            committed_by_node,
-                            all_current_pods,
-                        )
-                        .await
-                    } else {
-                        self.mark_unschedulable(&namespace, &pod, &reason, node_docs.len())
-                            .await;
-                        continue;
-                    }
-                },
-            };
-
-            if should_bind_now {
-                let mut pod_to_bind = pod.clone();
-                if let Some(nom) = pod
-                    .pointer("/status/nominatedNodeName")
-                    .and_then(Value::as_str)
-                {
-                    pod_to_bind["status"]["nominatedNodeName"] = json!(nom);
-                }
-                let bound = match self
-                    .bind_pod_to_specific_node(&namespace, &pod_to_bind, &target_node)
-                    .await
-                {
-                    Ok(bound) => bound,
-                    Err(e) => {
-                        report.failed += 1;
-                        eprintln!("Failed to bind pod {namespace}/{name}: {e}");
-                        continue;
-                    },
-                };
-
-                report.bound += 1;
-                Self::record_committed_quota(
-                    committed_by_node.entry(target_node.clone()).or_default(),
-                    &bound,
-                );
-                Self::update_known_pod(all_current_pods, bound.clone());
-
-                let outcome = self.sync_pod(&namespace, &bound).await;
-                match outcome {
-                    Ok(()) => report.synced += 1,
-                    Err(e) => {
-                        report.failed += 1;
-                        eprintln!("Failed to sync pod {namespace}/{name}: {e}");
-                    },
-                }
-            }
-        }
-    }
-
     /// Reconciles every pod in the cluster: binds unscheduled pods across managed nodes,
     /// syncs or terminates the pods assigned here, and removes sandboxes whose Pod is gone.
     pub async fn reconcile_all(&self) -> Result<ReconcileReport, KubeletError> {
         let pod_list = self.client.list_all_pods().await?;
         let mut report = ReconcileReport::default();
         let mut live_uids = BTreeSet::new();
-
-        let node_docs = self.discover_cluster_nodes().await;
-
-        let mut committed_by_node: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
-        for node in &node_docs {
-            if let Some(n_name) = node.pointer("/metadata/name").and_then(Value::as_str) {
-                committed_by_node.insert(
-                    n_name.to_string(),
-                    Self::committed_usage_for_node(&pod_list, n_name),
-                );
+        for pod in pod_list["items"].as_array().into_iter().flatten() {
+            if pod.pointer("/spec/nodeName").and_then(Value::as_str)
+                != Some(self.node_name.as_str())
+            {
+                continue;
             }
-        }
-
-        let items = pod_list
-            .get("items")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        for pod in &items {
             if let Some(uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) {
                 live_uids.insert(uid.to_string());
             }
+            let namespace = pod
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            let result = if pod
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|v| !v.is_null())
+            {
+                self.terminate_pod(namespace, pod).await
+            } else {
+                self.sync_pod(namespace, pod).await
+            };
+            match result {
+                Ok(()) => report.synced += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    eprintln!("pod reconciliation failed: {e}");
+                },
+            }
         }
-
-        let mut all_current_pods = items.clone();
-
-        let (bound_pods, unscheduled_pods): (Vec<Value>, Vec<Value>) =
-            items.into_iter().partition(|p| {
-                p.pointer("/spec/nodeName")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-            });
-
-        for pod in bound_pods {
-            self.reconcile_bound_pod(
-                &pod,
-                node_docs.len(),
-                &all_current_pods,
-                &node_docs,
-                &mut report,
-            )
-            .await;
-        }
-
-        self.reconcile_unscheduled_pods(
-            unscheduled_pods,
-            &node_docs,
-            &mut committed_by_node,
-            &mut all_current_pods,
-            &mut report,
-        )
-        .await;
-
         report.orphans_stopped = self.stop_orphaned_pods(&live_uids).await?;
         Ok(report)
-    }
-
-    /// Resource requests already committed by live pods bound to managed nodes.
-    #[must_use]
-    pub fn committed_usage(&self, pod_list: &Value) -> BTreeMap<String, i128> {
-        let mut committed = BTreeMap::new();
-        for pod in pod_list
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|p| {
-                p.pointer("/spec/nodeName")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| self.is_managed_node(n))
-            })
-        {
-            for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
-                *committed.entry(k).or_insert(0) += v;
-            }
-        }
-        committed
-    }
-
-    /// Resource requests committed by live pods bound to a specific node.
-    #[must_use]
-    pub fn committed_usage_for_node(pod_list: &Value, node_name: &str) -> BTreeMap<String, i128> {
-        let mut committed = BTreeMap::new();
-        for pod in pod_list
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|p| p.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node_name))
-        {
-            for (k, v) in diorama_apiserver::quota::pod_usage(pod) {
-                *committed.entry(k).or_insert(0) += v;
-            }
-        }
-        committed
     }
 
     async fn mark_bound_pod_failed_hostport(&self, namespace: &str, pod: &Value) {
@@ -3793,111 +2669,6 @@ impl PodReconciler {
             .await;
     }
 
-    /// Records `PodScheduled=False/Unschedulable` once for a pod that cannot fit.
-    async fn mark_unschedulable(
-        &self,
-        namespace: &str,
-        pod: &Value,
-        reason: &str,
-        total_nodes: usize,
-    ) {
-        let nodes_count = if total_nodes == 0 { 2 } else { total_nodes };
-        let message = if reason.contains("nodes are available") {
-            reason.to_string()
-        } else if pod.pointer("/spec/nodeName").is_some() {
-            format!("0/1 nodes are available: 1 {reason}.")
-        } else {
-            format!("0/{nodes_count} nodes are available: {nodes_count} {reason}.")
-        };
-        let already = pod
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .is_some_and(|conds| {
-                conds.iter().any(|c| {
-                    c.get("type").and_then(Value::as_str) == Some("PodScheduled")
-                        && c.get("status").and_then(Value::as_str) == Some("False")
-                        && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
-                        && c.get("message").and_then(Value::as_str) == Some(message.as_str())
-                })
-            });
-        if already {
-            return;
-        }
-        let mut status = pod
-            .get("status")
-            .cloned()
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({}));
-        status["phase"] = json!("Pending");
-        let mut conds: Vec<Value> = status
-            .get("conditions")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let new_cond = json!({
-            "type": "PodScheduled",
-            "status": "False",
-            "reason": "Unschedulable",
-            "message": message,
-            "lastProbeTime": Value::Null,
-            "lastTransitionTime": diorama_apiserver::time::now_rfc3339(),
-        });
-        if let Some(pos) = conds
-            .iter()
-            .position(|c| c.get("type").and_then(Value::as_str) == Some("PodScheduled"))
-        {
-            conds[pos] = new_cond;
-        } else {
-            conds.push(new_cond);
-        }
-        status["conditions"] = json!(conds);
-        let _ = self
-            .client
-            .patch_pod_status(namespace, pod_name(pod), status)
-            .await;
-        self.emit_failed_scheduling_event(namespace, pod, &message)
-            .await;
-    }
-
-    /// Assigns an unscheduled pod to a managed node.
-    pub async fn bind_pod_to_node(
-        &self,
-        namespace: &str,
-        pod: &Value,
-    ) -> Result<Value, KubeletError> {
-        let target_node = self.select_target_node_for_pod(pod);
-        self.bind_pod_to_specific_node(namespace, pod, &target_node)
-            .await
-    }
-
-    /// Assigns an unscheduled pod to a specific node.
-    pub async fn bind_pod_to_specific_node(
-        &self,
-        namespace: &str,
-        pod: &Value,
-        node_name: &str,
-    ) -> Result<Value, KubeletError> {
-        let name = pod_name(pod);
-        let mut bound = match self.client.get_pod(namespace, name).await {
-            Ok(latest) => latest,
-            Err(_) => pod.clone(),
-        };
-        if let Some(nom) = pod
-            .pointer("/status/nominatedNodeName")
-            .and_then(Value::as_str)
-        {
-            bound["status"]["nominatedNodeName"] = json!(nom);
-        }
-        bound["spec"]["nodeName"] = json!(node_name);
-        self.client
-            .update_pod(namespace, name, bound)
-            .await
-            .map_err(|e| KubeletError::PodReconciliationFailed {
-                pod: format!("{namespace}/{name}"),
-                reason: format!("failed to bind pod to node {node_name}: {e}"),
-            })
-    }
-
     /// Removes sandboxes (and their containers) whose Pod object no longer exists.
     pub async fn stop_orphaned_pods(
         &self,
@@ -3916,6 +2687,11 @@ impl PodReconciler {
             let Some(uid) = sandbox.labels.get(LABEL_POD_UID) else {
                 continue;
             };
+            if sandbox.labels.get("diorama.io/node").map(String::as_str)
+                != Some(self.node_name.as_str())
+            {
+                continue;
+            }
             if !live_uids.contains(uid) {
                 if let (Some(ns), Some(p_name)) = (
                     sandbox.labels.get(LABEL_POD_NAMESPACE),
@@ -4479,7 +3255,7 @@ impl PodReconciler {
     }
 
     fn enrich_pod_for_sync(&self, pod: &Value) -> Value {
-        let mut enriched = self.pod_with_service_account_volume(pod);
+        let mut enriched = Self::pod_with_service_account_volume(pod);
         if enriched
             .pointer("/status/hostIP")
             .and_then(Value::as_str)
@@ -4683,6 +3459,12 @@ impl PodReconciler {
     /// Synchronizes an individual pod's runtime state and updates its API status.
     #[allow(clippy::too_many_lines)]
     pub async fn sync_pod(&self, namespace: &str, pod: &Value) -> Result<(), KubeletError> {
+        if pod.pointer("/spec/nodeName").and_then(Value::as_str) != Some(self.node_name.as_str()) {
+            return Ok(());
+        }
+        if !pod_bool(pod, "hostNetwork") && !self.runtime.network_ready().await? {
+            return Ok(());
+        }
         let orig_pod = pod;
         let name = pod_name(pod);
         pod_uid(pod)?;
@@ -5829,6 +4611,7 @@ impl PodReconciler {
         Ok((liveness_ok, readiness_ok))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn stage_projected_source(
         &self,
         vol_dir: &Path,
@@ -5839,13 +4622,49 @@ impl PodReconciler {
         written: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<(), KubeletError> {
         if let Some(sa_tok) = source.get("serviceAccountToken") {
-            written.extend(stage_projected_sa_token(
+            let sa_name = pod
+                .pointer("/spec/serviceAccountName")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            let audiences = sa_tok
+                .get("audience")
+                .and_then(Value::as_str)
+                .map_or_else(Vec::new, |a| vec![a.to_string()]);
+            let request = json!({"apiVersion":"authentication.k8s.io/v1", "kind":"TokenRequest", "spec":{"audiences":audiences,"expirationSeconds":sa_tok.get("expirationSeconds").and_then(Value::as_u64).unwrap_or(3600), "boundObjectRef":{"apiVersion":"v1", "kind":"Pod", "name":pod.pointer("/metadata/name"), "uid":pod.pointer("/metadata/uid")}}});
+            let response = self
+                .client
+                .create_token_request(namespace, sa_name, request)
+                .await?;
+            let token = response
+                .pointer("/status/token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| KubeletError::AuthenticationFailed {
+                    reason: "TokenRequest returned no token".into(),
+                })?;
+            let path = safe_volume_path(
                 vol_dir,
-                namespace,
-                pod,
-                sa_tok,
-                self.apiserver.as_ref(),
-            )?);
+                sa_tok
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("token"),
+            )?;
+            write_volume_file(&path, token.as_bytes())?;
+            chmod_volume_file(&path, crate::workload::volume_file_mode(None, proj));
+            written.insert(path);
+            let ns_path = safe_volume_path(vol_dir, "namespace")?;
+            write_volume_file(&ns_path, namespace.as_bytes())?;
+            chmod_volume_file(&ns_path, crate::workload::volume_file_mode(None, proj));
+            written.insert(ns_path);
+            let ca = self
+                .client
+                .get_configmap(namespace, "kube-root-ca.crt")
+                .await?;
+            if let Some(ca) = ca.pointer("/data/ca.crt").and_then(Value::as_str) {
+                let path = safe_volume_path(vol_dir, "ca.crt")?;
+                write_volume_file(&path, ca.as_bytes())?;
+                chmod_volume_file(&path, crate::workload::volume_file_mode(None, proj));
+                written.insert(path);
+            }
         }
 
         let with_default_mode = |spec: &Value| -> Value {
@@ -6623,11 +5442,8 @@ impl PodReconciler {
     }
 
     /// Prepares and populates volume mounts (Secrets, `ConfigMaps`, Projected) on the host filesystem.
-    fn pod_with_service_account_volume(&self, pod: &Value) -> Value {
-        if self.apiserver.is_none()
-            || !automount_service_account_token(pod)
-            || pod_has_service_account_token(pod)
-        {
+    fn pod_with_service_account_volume(pod: &Value) -> Value {
+        if !automount_service_account_token(pod) || pod_has_service_account_token(pod) {
             return pod.clone();
         }
         let mut enriched = pod.clone();
@@ -7764,1137 +6580,6 @@ mod tests {
         let _ = client.create_node(node).await.expect("create test node");
     }
 
-    #[tokio::test]
-    async fn test_nodeselector_targeting_second_node_schedules_onto_it() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        // Create both nodes
-        create_test_node(&client, "diorama-node").await;
-        create_test_node(&client, "diorama-node-worker").await;
-
-        // Pod targeting second node (companion worker)
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "worker-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node-worker"
-                },
-                "containers": [{
-                    "name": "worker-c",
-                    "image": "busybox:latest"
-                }]
-            }
-        });
-        client.create_pod("default", pod).await.expect("create pod");
-
-        // Reconcile
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 1);
-        assert_eq!(report.synced, 1);
-
-        let bound_pod = client
-            .get_pod("default", "worker-pod")
-            .await
-            .expect("get pod");
-        assert_eq!(
-            bound_pod.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node-worker")
-        );
-        assert_eq!(
-            bound_pod.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hostport_conflict_with_wildcard_hostip_marks_second_pod_unschedulable() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_test_node(&client, "diorama-node").await;
-        create_test_node(&client, "diorama-node-worker").await;
-
-        // First pod binds hostPort 8080 with 0.0.0.0 on diorama-node
-        let pod1 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod1", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c1",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8080,
-                        "protocol": "TCP",
-                        "hostIP": "0.0.0.0"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod1)
-            .await
-            .expect("create pod1");
-
-        // First reconcile runs pod1
-        let report1 = reconciler.reconcile_all().await.expect("reconcile 1");
-        assert_eq!(report1.bound, 1);
-        assert_eq!(report1.synced, 1);
-        let bound1 = client.get_pod("default", "pod1").await.expect("get pod1");
-        assert_eq!(
-            bound1.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            bound1.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-
-        // Second pod requests same hostPort 8080 with specific hostIP 127.0.0.1 targeted to diorama-node
-        let pod2 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod2", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c2",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8080,
-                        "protocol": "TCP",
-                        "hostIP": "127.0.0.1"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod2)
-            .await
-            .expect("create pod2");
-
-        // Second reconcile should detect conflict and mark pod2 unschedulable
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 0);
-
-        let pod2_state = client.get_pod("default", "pod2").await.expect("get pod2");
-        assert_eq!(
-            pod2_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-
-        let conds = pod2_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched_cond = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched_cond["status"], "False");
-        assert_eq!(sched_cond["reason"], "Unschedulable");
-        let msg = sched_cond["message"].as_str().expect("message string");
-        assert!(
-            msg.contains("node(s) didn't have free ports for the requested pod ports"),
-            "expected free ports message, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hostport_conflict_with_omitted_hostip_marks_second_pod_unschedulable() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_test_node(&client, "diorama-node").await;
-        create_test_node(&client, "diorama-node-worker").await;
-
-        // Pod 1 omits hostIP (implicit wildcard)
-        let pod1 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "wildcard-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c1",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8088,
-                        "protocol": "TCP"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod1)
-            .await
-            .expect("create pod1");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        // Pod 2 has specific hostIP on the same node
-        let pod2 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "specific-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c2",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8088,
-                        "protocol": "TCP",
-                        "hostIP": "10.0.0.5"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod2)
-            .await
-            .expect("create pod2");
-        reconciler.reconcile_all().await.expect("reconcile 2");
-
-        let pod2_state = client
-            .get_pod("default", "specific-pod")
-            .await
-            .expect("get pod2");
-        assert_eq!(
-            pod2_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-        let conds = pod2_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched_cond = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched_cond["status"], "False");
-        assert_eq!(sched_cond["reason"], "Unschedulable");
-    }
-
-    #[tokio::test]
-    async fn test_hostport_conflict_with_explicit_spec_nodename_leaves_pending() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_test_node(&client, "diorama-node").await;
-        create_test_node(&client, "diorama-node-worker").await;
-
-        // Pod 1 running on diorama-node
-        let pod1 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "running-pod", "namespace": "default" },
-            "spec": {
-                "nodeName": "diorama-node",
-                "containers": [{
-                    "name": "c1",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8099,
-                        "protocol": "TCP",
-                        "hostIP": "0.0.0.0"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod1)
-            .await
-            .expect("create pod1");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        // Verify pod1 has a running sandbox
-        let filter = cri::PodSandboxFilter::default();
-        let sandboxes_before = runtime.list_pod_sandbox(Some(&filter)).await.unwrap();
-        assert_eq!(sandboxes_before.len(), 1);
-
-        // Pod 2 created with nodeName explicitly set to diorama-node, with conflicting port
-        let pod2 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "conflicting-pod", "namespace": "default" },
-            "spec": {
-                "nodeName": "diorama-node",
-                "containers": [{
-                    "name": "c2",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 8099,
-                        "protocol": "TCP",
-                        "hostIP": "127.0.0.1"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", pod2)
-            .await
-            .expect("create pod2");
-        reconciler.reconcile_all().await.expect("reconcile 2");
-
-        // No new sandbox started for pod 2!
-        let sandboxes_after = runtime.list_pod_sandbox(Some(&filter)).await.unwrap();
-        assert_eq!(sandboxes_after.len(), 1);
-
-        let pod2_state = client
-            .get_pod("default", "conflicting-pod")
-            .await
-            .expect("get pod2");
-        assert_eq!(
-            pod2_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Failed")
-        );
-        assert_eq!(
-            pod2_state.pointer("/status/reason").and_then(Value::as_str),
-            Some("PodFitsHostPorts")
-        );
-        assert_eq!(
-            pod2_state
-                .pointer("/status/message")
-                .and_then(Value::as_str),
-            Some("Pod Node didn't have enough resource: pods, requested: 1")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hostport_on_different_nodes_no_conflict() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_test_node(&client, "diorama-node").await;
-        create_test_node(&client, "diorama-node-worker").await;
-
-        let pod1 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "node1-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c1",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 9100,
-                        "protocol": "TCP",
-                        "hostIP": "0.0.0.0"
-                    }]
-                }]
-            }
-        });
-        let pod2 = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "node2-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node-worker"
-                },
-                "containers": [{
-                    "name": "c2",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 9100,
-                        "protocol": "TCP",
-                        "hostIP": "127.0.0.1"
-                    }]
-                }]
-            }
-        });
-
-        client
-            .create_pod("default", pod1)
-            .await
-            .expect("create pod1");
-        client
-            .create_pod("default", pod2)
-            .await
-            .expect("create pod2");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 2);
-        assert_eq!(report.synced, 2);
-
-        let p1 = client
-            .get_pod("default", "node1-pod")
-            .await
-            .expect("get pod1");
-        let p2 = client
-            .get_pod("default", "node2-pod")
-            .await
-            .expect("get pod2");
-        assert_eq!(
-            p1.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            p2.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node-worker")
-        );
-        assert_eq!(
-            p1.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-        assert_eq!(
-            p2.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
-    async fn create_custom_test_node(
-        client: &diorama_apiserver::KubernetesApiClient,
-        name: &str,
-        labels: Value,
-        allocatable: Value,
-    ) {
-        let node = json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {
-                "name": name,
-                "labels": labels,
-            },
-            "status": {
-                "conditions": [{
-                    "type": "Ready",
-                    "status": "True",
-                    "reason": "KubeletReady",
-                    "message": "kubelet is posting ready status"
-                }],
-                "allocatable": allocatable
-            }
-        });
-        let _ = client
-            .create_node(node)
-            .await
-            .expect("create custom test node");
-    }
-
-    fn make_test_priority_pod(name: &str, priority: i64, finalizers: &[&str]) -> Value {
-        let mut p = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": name, "namespace": "default" },
-            "spec": {
-                "priority": priority,
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest",
-                    "resources": {
-                        "requests": { "cpu": "2" }
-                    }
-                }]
-            }
-        });
-        if !finalizers.is_empty() {
-            p["metadata"]["finalizers"] = json!(finalizers);
-        }
-        p
-    }
-
-    #[tokio::test]
-    async fn test_node_selector_matching_multi_node() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({
-                "kubernetes.io/hostname": "diorama-node",
-                "topology.kubernetes.io/zone": "zone-a"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-        create_custom_test_node(
-            &client,
-            "diorama-node-2",
-            json!({
-                "kubernetes.io/hostname": "diorama-node-2",
-                "topology.kubernetes.io/zone": "zone-b"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "zone-b-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "topology.kubernetes.io/zone": "zone-b"
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest"
-                }]
-            }
-        });
-        client.create_pod("default", pod).await.expect("create pod");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 1);
-        assert_eq!(report.synced, 1);
-
-        let p = client
-            .get_pod("default", "zone-b-pod")
-            .await
-            .expect("get pod");
-        assert_eq!(
-            p.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node-2")
-        );
-        assert_eq!(
-            p.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_node_selector_not_matching_leaves_pending() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({
-                "kubernetes.io/hostname": "diorama-node",
-                "topology.kubernetes.io/zone": "zone-a"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-        create_custom_test_node(
-            &client,
-            "diorama-node-2",
-            json!({
-                "kubernetes.io/hostname": "diorama-node-2",
-                "topology.kubernetes.io/zone": "zone-b"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "unmatched-pod", "namespace": "default" },
-            "spec": {
-                "nodeSelector": {
-                    "topology.kubernetes.io/zone": "zone-c"
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest"
-                }]
-            }
-        });
-        client.create_pod("default", pod).await.expect("create pod");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 0);
-
-        let p = client
-            .get_pod("default", "unmatched-pod")
-            .await
-            .expect("get pod");
-        assert!(p.pointer("/spec/nodeName").is_none());
-        assert_eq!(
-            p.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-
-        let conds = p
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched["status"], "False");
-        assert_eq!(sched["reason"], "Unschedulable");
-        let msg = sched["message"].as_str().unwrap_or("");
-        assert!(
-            msg.contains("didn't match Pod's node affinity/selector"),
-            "expected selector message, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_node_affinity_match_expressions_matching() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({
-                "kubernetes.io/hostname": "diorama-node",
-                "env": "prod",
-                "tier": "frontend"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-        create_custom_test_node(
-            &client,
-            "diorama-node-2",
-            json!({
-                "kubernetes.io/hostname": "diorama-node-2",
-                "env": "prod",
-                "tier": "backend"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "backend-affinity-pod", "namespace": "default" },
-            "spec": {
-                "affinity": {
-                    "nodeAffinity": {
-                        "requiredDuringSchedulingIgnoredDuringExecution": {
-                            "nodeSelectorTerms": [{
-                                "matchExpressions": [{
-                                    "key": "tier",
-                                    "operator": "In",
-                                    "values": ["backend"]
-                                }]
-                            }]
-                        }
-                    }
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest"
-                }]
-            }
-        });
-        client.create_pod("default", pod).await.expect("create pod");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 1);
-        assert_eq!(report.synced, 1);
-
-        let p = client
-            .get_pod("default", "backend-affinity-pod")
-            .await
-            .expect("get pod");
-        assert_eq!(
-            p.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node-2")
-        );
-        assert_eq!(
-            p.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_node_affinity_not_matching_leaves_pending() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({
-                "kubernetes.io/hostname": "diorama-node",
-                "tier": "frontend"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-        create_custom_test_node(
-            &client,
-            "diorama-node-2",
-            json!({
-                "kubernetes.io/hostname": "diorama-node-2",
-                "tier": "backend"
-            }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "database-affinity-pod", "namespace": "default" },
-            "spec": {
-                "affinity": {
-                    "nodeAffinity": {
-                        "requiredDuringSchedulingIgnoredDuringExecution": {
-                            "nodeSelectorTerms": [{
-                                "matchExpressions": [{
-                                    "key": "tier",
-                                    "operator": "In",
-                                    "values": ["database"]
-                                }]
-                            }]
-                        }
-                    }
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest"
-                }]
-            }
-        });
-        client.create_pod("default", pod).await.expect("create pod");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 0);
-
-        let p = client
-            .get_pod("default", "database-affinity-pod")
-            .await
-            .expect("get pod");
-        assert!(p.pointer("/spec/nodeName").is_none());
-        assert_eq!(
-            p.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-
-        let conds = p
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched["status"], "False");
-        assert_eq!(sched["reason"], "Unschedulable");
-    }
-
-    #[tokio::test]
-    async fn test_preemption_cpu_exhaustion_schedules_higher_priority_pod() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let low_pod = make_test_priority_pod("low-pri-cpu-pod", 100, &[]);
-        client
-            .create_pod("default", low_pod)
-            .await
-            .expect("create low pod");
-
-        let report1 = reconciler.reconcile_all().await.expect("reconcile 1");
-        assert_eq!(report1.bound, 1);
-        assert_eq!(report1.synced, 1);
-
-        let low_state = client
-            .get_pod("default", "low-pri-cpu-pod")
-            .await
-            .expect("get low pod");
-        assert_eq!(
-            low_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-
-        let high_pod = make_test_priority_pod("high-pri-cpu-pod", 1000, &[]);
-        client
-            .create_pod("default", high_pod)
-            .await
-            .expect("create high pod");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 1);
-
-        let high_state = client
-            .get_pod("default", "high-pri-cpu-pod")
-            .await
-            .expect("get high pod");
-        assert_eq!(
-            high_state.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            high_state
-                .pointer("/status/nominatedNodeName")
-                .and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            high_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-
-        assert!(client.get_pod("default", "low-pri-cpu-pod").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_preemption_hostport_exhaustion_schedules_higher_priority_pod() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let low_pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "low-pri-port-pod", "namespace": "default" },
-            "spec": {
-                "priority": 100,
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 9200,
-                        "protocol": "TCP"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", low_pod)
-            .await
-            .expect("create low pod");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        let high_pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "high-pri-port-pod", "namespace": "default" },
-            "spec": {
-                "priority": 500,
-                "nodeSelector": {
-                    "kubernetes.io/hostname": "diorama-node"
-                },
-                "containers": [{
-                    "name": "c",
-                    "image": "busybox:latest",
-                    "ports": [{
-                        "containerPort": 80,
-                        "hostPort": 9200,
-                        "protocol": "TCP"
-                    }]
-                }]
-            }
-        });
-        client
-            .create_pod("default", high_pod)
-            .await
-            .expect("create high pod");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 1);
-
-        let high_state = client
-            .get_pod("default", "high-pri-port-pod")
-            .await
-            .expect("get high pod");
-        assert_eq!(
-            high_state.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            high_state
-                .pointer("/status/nominatedNodeName")
-                .and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            high_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-
-        assert!(client.get_pod("default", "low-pri-port-pod").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_preemption_with_finalizer_preserves_victim_until_removed() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let protected_pod =
-            make_test_priority_pod("protected-victim", 100, &["test.example.com/protect"]);
-        client
-            .create_pod("default", protected_pod)
-            .await
-            .expect("create protected pod");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        let high_pod = make_test_priority_pod("waiting-candidate", 1000, &[]);
-        client
-            .create_pod("default", high_pod)
-            .await
-            .expect("create waiting candidate");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 0);
-
-        let candidate_state = client
-            .get_pod("default", "waiting-candidate")
-            .await
-            .expect("get candidate");
-        assert_eq!(
-            candidate_state
-                .pointer("/status/phase")
-                .and_then(Value::as_str),
-            Some("Pending")
-        );
-        assert_eq!(
-            candidate_state
-                .pointer("/status/nominatedNodeName")
-                .and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        let conds = candidate_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched["status"], "False");
-        assert_eq!(sched["reason"], "Unschedulable");
-        let msg = sched["message"].as_str().unwrap_or("");
-        assert!(msg.contains("Waiting for pod preemption to finish"));
-
-        let victim_state = client
-            .get_pod("default", "protected-victim")
-            .await
-            .expect("get protected victim");
-        assert!(
-            victim_state
-                .pointer("/metadata/deletionTimestamp")
-                .is_some()
-        );
-        let v_conds = victim_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("victim conditions");
-        let disruption = v_conds
-            .iter()
-            .find(|c| c["type"] == "DisruptionTarget")
-            .expect("DisruptionTarget condition");
-        assert_eq!(disruption["status"], "True");
-        assert_eq!(disruption["reason"], "PreemptionByScheduler");
-
-        let _ = client
-            .delete_pod_options("default", "protected-victim", Some(0))
-            .await
-            .expect("delete with 0 grace period");
-
-        let report3 = reconciler.reconcile_all().await.expect("reconcile 3");
-        assert_eq!(report3.bound, 1);
-        assert_eq!(report3.synced, 1);
-
-        let scheduled_candidate = client
-            .get_pod("default", "waiting-candidate")
-            .await
-            .expect("get candidate");
-        assert_eq!(
-            scheduled_candidate
-                .pointer("/spec/nodeName")
-                .and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            scheduled_candidate
-                .pointer("/status/phase")
-                .and_then(Value::as_str),
-            Some("Running")
-        );
-        assert_eq!(
-            scheduled_candidate
-                .pointer("/status/nominatedNodeName")
-                .and_then(Value::as_str),
-            Some("diorama-node")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_preemption_lower_or_equal_priority_cannot_preempt() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let running_pod = make_test_priority_pod("running-pri-500", 500, &[]);
-        client
-            .create_pod("default", running_pod)
-            .await
-            .expect("create running pod");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        let equal_pod = make_test_priority_pod("equal-pri-500", 500, &[]);
-        client
-            .create_pod("default", equal_pod)
-            .await
-            .expect("create equal pod");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 0);
-
-        let eq_state = client
-            .get_pod("default", "equal-pri-500")
-            .await
-            .expect("get equal pod");
-        assert_eq!(
-            eq_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-        let conds = eq_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched["status"], "False");
-        assert_eq!(sched["reason"], "Unschedulable");
-
-        let running_state = client
-            .get_pod("default", "running-pri-500")
-            .await
-            .expect("get running pod");
-        assert_eq!(
-            running_state
-                .pointer("/status/phase")
-                .and_then(Value::as_str),
-            Some("Running")
-        );
-        assert!(
-            running_state
-                .pointer("/metadata/deletionTimestamp")
-                .is_none()
-        );
-        let r_conds = running_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions");
-        assert!(!r_conds.iter().any(|c| c["type"] == "DisruptionTarget"));
-    }
-
-    #[tokio::test]
-    async fn test_preemption_policy_never_cannot_preempt() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "110" }),
-        )
-        .await;
-
-        let low_pod = make_test_priority_pod("low-pri-worker", 100, &[]);
-        client
-            .create_pod("default", low_pod)
-            .await
-            .expect("create low pod");
-        reconciler.reconcile_all().await.expect("reconcile 1");
-
-        let mut never_pod = make_test_priority_pod("never-preempt-pod", 1000, &[]);
-        never_pod["spec"]["preemptionPolicy"] = json!("Never");
-        client
-            .create_pod("default", never_pod)
-            .await
-            .expect("create never pod");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 0);
-
-        let n_state = client
-            .get_pod("default", "never-preempt-pod")
-            .await
-            .expect("get never pod");
-        assert_eq!(
-            n_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Pending")
-        );
-        let conds = n_state
-            .pointer("/status/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions array");
-        let sched = conds
-            .iter()
-            .find(|c| c["type"] == "PodScheduled")
-            .expect("PodScheduled condition");
-        assert_eq!(sched["status"], "False");
-        assert_eq!(sched["reason"], "Unschedulable");
-
-        let low_state = client
-            .get_pod("default", "low-pri-worker")
-            .await
-            .expect("get low pod");
-        assert_eq!(
-            low_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-        assert!(low_state.pointer("/metadata/deletionTimestamp").is_none());
-    }
-
     #[test]
     fn test_active_deadline_seconds_evaluation() {
         let pod_active = json!({
@@ -9020,153 +6705,6 @@ mod tests {
         assert_eq!(no_deadline, None);
     }
 
-    #[tokio::test]
-    async fn test_failed_scheduling_event_emitted() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "1", "memory": "2Gi", "pods": "10" }),
-        )
-        .await;
-
-        let huge_pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "huge-pod", "namespace": "default" },
-            "spec": {
-                "containers": [{
-                    "name": "c",
-                    "image": "nginx:1.27",
-                    "resources": {
-                        "requests": { "cpu": "10" }
-                    }
-                }]
-            }
-        });
-        client
-            .create_pod("default", huge_pod)
-            .await
-            .expect("create huge pod");
-
-        let report = reconciler.reconcile_all().await.expect("reconcile");
-        assert_eq!(report.bound, 0);
-
-        let events = client
-            .list_namespaced_objects("", "EventList", "events", "default")
-            .await
-            .expect("list events");
-        let items = events["items"].as_array().expect("events array");
-        let failed_event = items
-            .iter()
-            .find(|e| e["reason"] == "FailedScheduling")
-            .expect("FailedScheduling event");
-        assert_eq!(failed_event["type"], "Warning");
-        assert_eq!(failed_event["source"]["component"], "default-scheduler");
-        assert_eq!(failed_event["involvedObject"]["name"], "huge-pod");
-    }
-
-    #[tokio::test]
-    async fn test_preemption_extended_resource_disruption_target() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "diorama-node");
-
-        create_custom_test_node(
-            &client,
-            "diorama-node",
-            json!({ "kubernetes.io/hostname": "diorama-node" }),
-            json!({ "cpu": "4", "memory": "8Gi", "pods": "110", "example.com/gpu": "1" }),
-        )
-        .await;
-
-        let low_gpu_pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": "low-gpu-pod",
-                "namespace": "default",
-                "finalizers": ["test.example.com/preserve"]
-            },
-            "spec": {
-                "priorityClassName": "low-priority",
-                "containers": [{
-                    "name": "worker",
-                    "image": "nginx:1.27",
-                    "resources": {
-                        "requests": { "example.com/gpu": "1" }
-                    }
-                }]
-            }
-        });
-        client
-            .create_pod("default", low_gpu_pod)
-            .await
-            .expect("create low gpu pod");
-        let report1 = reconciler.reconcile_all().await.expect("reconcile 1");
-        assert_eq!(report1.bound, 1);
-
-        let high_gpu_pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "high-gpu-pod", "namespace": "default" },
-            "spec": {
-                "priorityClassName": "high-priority",
-                "containers": [{
-                    "name": "critical-worker",
-                    "image": "nginx:1.27",
-                    "resources": {
-                        "requests": { "example.com/gpu": "1" }
-                    }
-                }]
-            }
-        });
-        client
-            .create_pod("default", high_gpu_pod)
-            .await
-            .expect("create high gpu pod");
-
-        let report2 = reconciler.reconcile_all().await.expect("reconcile 2");
-        assert_eq!(report2.bound, 0);
-
-        let victim_state = client
-            .get_pod("default", "low-gpu-pod")
-            .await
-            .expect("get victim");
-        let conds = victim_state["status"]["conditions"]
-            .as_array()
-            .expect("conditions");
-        let disruption = conds
-            .iter()
-            .find(|c| c["type"] == "DisruptionTarget")
-            .expect("disruption");
-        assert_eq!(disruption["reason"], "PreemptionByScheduler");
-        assert_eq!(disruption["message"], "Preempted by higher priority pod");
-
-        let _ = client
-            .delete_pod_options("default", "low-gpu-pod", Some(0))
-            .await
-            .expect("delete victim with 0 grace period");
-
-        let report3 = reconciler.reconcile_all().await.expect("reconcile 3");
-        assert_eq!(report3.bound, 1);
-
-        let high_state = client
-            .get_pod("default", "high-gpu-pod")
-            .await
-            .expect("get high");
-        assert_eq!(
-            high_state.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("diorama-node")
-        );
-        assert_eq!(
-            high_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
     #[test]
     fn test_write_pod_cert_files_bundle_format() {
         let temp = tempfile::tempdir().unwrap();
@@ -9191,27 +6729,6 @@ mod tests {
         let key_pos = bundle_content.find("BEGIN PRIVATE KEY").unwrap();
         let cert_pos = bundle_content.find("BEGIN CERTIFICATE").unwrap();
         assert!(key_pos < cert_pos);
-    }
-
-    #[test]
-    fn test_pod_priority_p_prefix_mapping() {
-        for (class_name, expected) in [
-            ("p1", 1),
-            ("p2", 2),
-            ("p3", 3),
-            ("p4", 4),
-            ("p100", 100),
-            ("high-priority", 1000),
-            ("medium-priority", 500),
-            ("low-priority", 100),
-        ] {
-            let pod = json!({
-                "spec": {
-                    "priorityClassName": class_name
-                }
-            });
-            assert_eq!(pod_priority(&pod), expected, "class_name: {class_name}");
-        }
     }
 
     #[tokio::test]
@@ -9256,63 +6773,6 @@ mod tests {
         assert!(res2);
     }
 
-    #[tokio::test]
-    async fn test_preemption_lowest_priority_victim_across_nodes() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "node-1");
-
-        create_custom_test_node(
-            &client,
-            "node-1",
-            json!({ "kubernetes.io/hostname": "node-1" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "10" }),
-        )
-        .await;
-
-        create_custom_test_node(
-            &client,
-            "node-2",
-            json!({ "kubernetes.io/hostname": "node-2" }),
-            json!({ "cpu": "2", "memory": "4Gi", "pods": "10" }),
-        )
-        .await;
-
-        let mut pod_node1 = make_test_priority_pod("pod-node1-low", 100, &[]);
-        pod_node1["spec"]["nodeSelector"] = json!({ "kubernetes.io/hostname": "node-1" });
-        client.create_pod("default", pod_node1).await.unwrap();
-
-        let mut pod_node2 = make_test_priority_pod("pod-node2-med", 200, &[]);
-        pod_node2["spec"]["nodeSelector"] = json!({ "kubernetes.io/hostname": "node-2" });
-        client.create_pod("default", pod_node2).await.unwrap();
-
-        let r1 = reconciler.reconcile_all().await.unwrap();
-        assert_eq!(r1.bound, 2);
-
-        let mut high_pod = make_test_priority_pod("high-pri-pod", 1000, &[]);
-        high_pod["spec"]
-            .as_object_mut()
-            .unwrap()
-            .remove("nodeSelector");
-        client.create_pod("default", high_pod).await.unwrap();
-
-        let r2 = reconciler.reconcile_all().await.unwrap();
-        assert_eq!(r2.bound, 1);
-
-        let high_state = client.get_pod("default", "high-pri-pod").await.unwrap();
-        assert_eq!(
-            high_state.pointer("/spec/nodeName").and_then(Value::as_str),
-            Some("node-1")
-        );
-
-        assert!(client.get_pod("default", "pod-node1-low").await.is_err());
-
-        let med_state = client.get_pod("default", "pod-node2-med").await.unwrap();
-        assert_eq!(
-            med_state.pointer("/status/phase").and_then(Value::as_str),
-            Some("Running")
-        );
-    }
-
     #[test]
     fn resize_policy_restart_container_increments_restarts() {
         let mut cs = json!({
@@ -9341,7 +6801,7 @@ mod tests {
     #[tokio::test]
     async fn bind_pod_preserves_concurrent_owner_references() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (client, reconciler, _runtime) = setup_reconciler_test(&temp, "node-1");
+        let (client, _reconciler, _runtime) = setup_reconciler_test(&temp, "node-1");
 
         let pod = json!({
             "apiVersion": "v1",
@@ -9369,10 +6829,8 @@ mod tests {
             .await
             .unwrap();
 
-        let bound = reconciler
-            .bind_pod_to_specific_node("default", &stale_snapshot, "node-1")
-            .await
-            .unwrap();
+        client.bind_pod("default", "shared-pod", json!({"metadata":{"uid":stale_snapshot["metadata"]["uid"]}, "target":{"kind":"Node","name":"node-1"}})).await.unwrap();
+        let bound = client.get_pod("default", "shared-pod").await.unwrap();
         assert_eq!(bound["spec"]["nodeName"], "node-1");
         assert_eq!(
             bound["metadata"]["ownerReferences"]
@@ -9381,5 +6839,44 @@ mod tests {
                 .len(),
             2
         );
+    }
+    #[tokio::test]
+    async fn only_exact_api_assignments_execute_and_priority_does_not_preempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, reconciler, runtime) = setup_reconciler_test(&temp, "node-a");
+        for name in ["node-a", "node-a-worker", "node-b"] {
+            create_test_node(&client, name).await;
+        }
+        for (name, node) in [
+            ("own", "node-a"),
+            ("companion", "node-a-worker"),
+            ("other", "node-b"),
+            ("pending", ""),
+        ] {
+            client.create_pod("default", json!({"metadata":{"name":name},"spec":{"nodeName":node,"automountServiceAccountToken":false,"priority":if node.is_empty() {100} else {0},"containers":[{"name":"test","image":"pause"}]}})).await.unwrap();
+        }
+        let report = reconciler.reconcile_all().await.unwrap();
+        assert_eq!((report.bound, report.synced, report.failed), (0, 1, 0));
+        let own = client.get_pod("default", "own").await.unwrap();
+        let uid = own["metadata"]["uid"].as_str().unwrap();
+        assert!(runtime.is_pod_active(uid));
+        assert_eq!(
+            client.get_pod("default", "pending").await.unwrap()["spec"]["nodeName"],
+            ""
+        );
+        reconciler.reconcile_all().await.unwrap();
+        assert!(
+            runtime.is_pod_active(uid),
+            "a pending high priority Pod cannot preempt locally"
+        );
+        client
+            .bind_pod(
+                "default",
+                "pending",
+                json!({"target":{"kind":"Node","name":"node-a"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciler.reconcile_all().await.unwrap().synced, 2);
     }
 }

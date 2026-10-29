@@ -35,6 +35,8 @@ pub const DEFAULT_CONTAINERD_RUNTIME_ENDPOINT: &str = "unix:///run/containerd/co
 /// Comprehensive Kubelet configuration options.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KubeletConfigOptions {
+    #[serde(default)]
+    pub bootstrap_token_file: Option<PathBuf>,
     pub node_name: String,
     pub node_ip: String,
     pub disable_ipv6: bool,
@@ -68,7 +70,8 @@ impl Default for KubeletConfigOptions {
     fn default() -> Self {
         let root = PathBuf::from(DEFAULT_KUBELET_ROOT_DIR);
         Self {
-            node_name: "diorama-node".to_string(),
+            bootstrap_token_file: None,
+            node_name: String::new(),
             node_ip: String::new(),
             disable_ipv6: false,
             config_dir: root.clone(),
@@ -109,6 +112,7 @@ impl KubeletConfigOptions {
     ) -> Self {
         let name = node_name.into();
         Self {
+            bootstrap_token_file: None,
             node_name: name,
             node_ip: node_ip.into(),
             disable_ipv6: false,
@@ -137,12 +141,6 @@ impl KubeletConfigOptions {
             port: DEFAULT_KUBELET_PORT,
             read_only_port: DEFAULT_KUBELET_READ_ONLY_PORT,
         }
-    }
-
-    /// Returns the companion worker node name for this configuration's node.
-    #[must_use]
-    pub fn companion_node_name(&self) -> String {
-        companion_node_name(&self.node_name)
     }
 
     /// Resolves the cgroup driver to use.
@@ -513,12 +511,6 @@ impl KubeletConfigOptions {
 
         Ok(())
     }
-}
-
-/// Returns the companion worker node name for a given primary node name.
-#[must_use]
-pub fn companion_node_name(node_name: &str) -> String {
-    format!("{node_name}-worker")
 }
 
 fn validate_policy_options(options: &BTreeMap<String, String>) -> Result<(), KubeletError> {

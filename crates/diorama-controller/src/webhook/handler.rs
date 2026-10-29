@@ -21,9 +21,6 @@ pub struct NodeSetterHandler {
     node_name: String,
     load_balancer_ip: String,
     load_balancer: bool,
-    node_name_patch_b64: String,
-    node_selector_patch_b64: String,
-    pvc_annotation_patch_b64: String,
     load_balancer_update_locks: Arc<Mutex<HashSet<String>>>,
     client: Arc<tokio::sync::RwLock<Option<Arc<dyn LoadBalancerClient>>>>,
     max_steps: usize,
@@ -47,47 +44,10 @@ impl std::fmt::Debug for NodeSetterHandler {
 impl NodeSetterHandler {
     #[must_use]
     pub fn new(node_name: &str, load_balancer_ip: &str, load_balancer: bool) -> Self {
-        let node_name_patch_obj = json!([
-            {
-                "op": "add",
-                "path": "/spec/nodeName",
-                "value": node_name,
-            }
-        ]);
-        let node_name_patch_bytes = serde_json::to_vec(&node_name_patch_obj).unwrap();
-        let node_name_patch_b64 = diorama_pki::base64_encode(&node_name_patch_bytes);
-
-        let node_selector_patch_obj = json!([
-            {
-                "op": "add",
-                "path": "/spec/template/spec/nodeSelector",
-                "value": {
-                    "kubernetes.io/hostname": node_name,
-                },
-            }
-        ]);
-        let node_selector_patch_bytes = serde_json::to_vec(&node_selector_patch_obj).unwrap();
-        let node_selector_patch_b64 = diorama_pki::base64_encode(&node_selector_patch_bytes);
-
-        let pvc_annotation_patch_obj = json!([
-            {
-                "op": "add",
-                "path": "/metadata/annotations",
-                "value": {
-                    "volume.kubernetes.io/selected-node": node_name,
-                },
-            }
-        ]);
-        let pvc_annotation_patch_bytes = serde_json::to_vec(&pvc_annotation_patch_obj).unwrap();
-        let pvc_annotation_patch_b64 = diorama_pki::base64_encode(&pvc_annotation_patch_bytes);
-
         Self {
             node_name: node_name.to_string(),
             load_balancer_ip: load_balancer_ip.to_string(),
             load_balancer,
-            node_name_patch_b64,
-            node_selector_patch_b64,
-            pvc_annotation_patch_b64,
             load_balancer_update_locks: Arc::new(Mutex::new(HashSet::new())),
             client: Arc::new(tokio::sync::RwLock::new(None)),
             max_steps: 5,
@@ -152,59 +112,6 @@ impl NodeSetterHandler {
         let object = request.get("object");
 
         match kind {
-            "Pod" => {
-                let Some(obj) = object else {
-                    return Ok((None, false));
-                };
-
-                // If spec is not an object (e.g. malformed_typed_object where spec is "invalid"),
-                // upstream KubeSolo unmarshal fails and logs an error, returning no patch.
-                let Some(spec) = obj.get("spec") else {
-                    return Ok((Some(self.node_name_patch_b64.clone()), false));
-                };
-
-                if !spec.is_object() {
-                    return Ok((None, false));
-                }
-
-                let current_node = spec.get("nodeName").and_then(Value::as_str).unwrap_or("");
-                if current_node.is_empty() {
-                    Ok((Some(self.node_name_patch_b64.clone()), false))
-                } else {
-                    Ok((None, false))
-                }
-            },
-            "PersistentVolumeClaim" => {
-                let Some(obj) = object else {
-                    return Ok((None, false));
-                };
-
-                if let Some(annotations) = obj.get("metadata").and_then(|m| m.get("annotations"))
-                    && annotations
-                        .get("volume.kubernetes.io/selected-node")
-                        .is_some()
-                {
-                    return Ok((None, false));
-                }
-
-                Ok((Some(self.pvc_annotation_patch_b64.clone()), false))
-            },
-            "Job" => {
-                let Some(obj) = object else {
-                    return Ok((None, false));
-                };
-
-                if let Some(spec) = obj.get("spec")
-                    && let Some(template) = spec.get("template")
-                    && let Some(tspec) = template.get("spec")
-                    && let Some(selector) = tspec.get("nodeSelector")
-                    && selector.get("kubernetes.io/hostname").is_some()
-                {
-                    return Ok((None, false));
-                }
-
-                Ok((Some(self.node_selector_patch_b64.clone()), false))
-            },
             "Service" => {
                 let dry_run = request
                     .get("dryRun")

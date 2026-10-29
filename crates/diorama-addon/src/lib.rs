@@ -174,7 +174,7 @@ pub fn resources(settings: &Settings) -> Result<Vec<Value>> {
             json!([{"name":"tls","mountPath":"/etc/d2k/tls","readOnly":true}]);
         container["readinessProbe"] = json!({"tcpSocket":{"port":2376},"initialDelaySeconds":2});
     }
-    deployment["spec"] = json!({"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":{"app":name}},"template":{"metadata":{"labels":{"app":name}},"spec":{"nodeName":settings.node,"serviceAccountName":account,"containers":[container]}}});
+    deployment["spec"] = json!({"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":{"app":name}},"template":{"metadata":{"labels":{"app":name}},"spec":{"nodeSelector":{"diorama.io/runtime":"ordinary","kubernetes.io/hostname":settings.node},"serviceAccountName":account,"containers":[container]}}});
     if !agent {
         deployment["spec"]["template"]["spec"]["volumes"] =
             json!([{"name":"tls","secret":{"secretName":"d2k-tls"}}]);
@@ -205,7 +205,7 @@ pub fn installation_job(settings: &Settings) -> Result<Value> {
     role["metadata"]["name"] = json!(identity);
     let mut job = resource("Job", &name, Some(ns));
     job["spec"] = json!({"backoffLimit":0,"activeDeadlineSeconds":360,"template":{"spec":{
-        "nodeName":settings.node,"serviceAccountName":name,"restartPolicy":"Never",
+        "nodeSelector":{"diorama.io/runtime":"ordinary","kubernetes.io/hostname":settings.node},"serviceAccountName":name,"restartPolicy":"Never",
         "containers":[{"name":"installer","image":settings.image,"imagePullPolicy":"Never",
             "command":["/diorama-addon"],"env":[
                 {"name":"DIORAMA_ADDON","value":settings.addon},

@@ -310,7 +310,7 @@ kind: Pod\n\
 metadata:\n  \
   name: helper-pod\n\
 spec:\n  \
-  priorityClassName: system-node-critical\n  \
+  nodeSelector:\n    diorama.io/runtime: ordinary\n  priorityClassName: system-node-critical\n  \
   tolerations:\n    \
     - key: node.kubernetes.io/disk-pressure\n      \
       operator: Exists\n      \
@@ -369,7 +369,15 @@ pub fn generate_storage_class(config: &LocalPathConfig) -> StorageClass {
             ..Default::default()
         },
         provisioner: LOCAL_PATH_PROVISIONER_NAME.to_string(),
-        volume_binding_mode: Some(config.volume_binding_mode.clone()),
+        volume_binding_mode: Some("WaitForFirstConsumer".into()),
+        allowed_topologies: Some(vec![k8s_openapi::api::core::v1::TopologySelectorTerm {
+            match_label_expressions: Some(vec![
+                k8s_openapi::api::core::v1::TopologySelectorLabelRequirement {
+                    key: "diorama.io/runtime".into(),
+                    values: vec!["ordinary".into()],
+                },
+            ]),
+        }]),
         reclaim_policy: Some(config.reclaim_policy.clone()),
         allow_volume_expansion: Some(config.allow_volume_expansion),
         ..Default::default()
@@ -462,6 +470,10 @@ pub fn generate_deployment(config: &LocalPathConfig, namespace: &str) -> Deploym
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
+                    node_selector: Some(BTreeMap::from([(
+                        "diorama.io/runtime".into(),
+                        "ordinary".into(),
+                    )])),
                     service_account_name: Some(LOCAL_PATH_SERVICE_ACCOUNT_NAME.to_string()),
                     containers: vec![container],
                     volumes: Some(vec![volume]),

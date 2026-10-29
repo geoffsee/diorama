@@ -114,7 +114,7 @@ fn both_release_bundles_have_a_complete_verified_installer_layout() {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(inventory.bundled_assets().len(), 12);
+        assert_eq!(inventory.bundled_assets().len(), 13);
         for (id, path, encoding, _) in inventory.bundled_assets() {
             assert_eq!(path, AssetLayout::default_relative_path(id));
             let kind = catalog().iter().find(|entry| entry.id == id).unwrap().kind;
@@ -356,7 +356,10 @@ fn pinned_inputs_cover_every_runtime_and_workload_role_on_both_release_targets()
             .collect();
         assert_eq!(actual, expected);
         for source in downloads.iter().chain(sources.tools.values()) {
-            assert!(source.url.starts_with("https://github.com/"));
+            assert!(
+                source.url.starts_with("https://github.com/")
+                    || source.url.starts_with("https://dl.k8s.io/release/v1.35.7/")
+            );
             assert_eq!(source.sha256.len(), 64);
             assert!(source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }

@@ -118,6 +118,10 @@ async fn test_cold_startup_reconciliation_real_api() {
         .unwrap();
     assert_eq!(dep["spec"]["replicas"].as_i64().unwrap(), 1);
     assert_eq!(
+        dep["spec"]["template"]["spec"]["nodeSelector"]["diorama.io/runtime"],
+        "ordinary"
+    );
+    assert_eq!(
         dep["spec"]["template"]["spec"]["containers"][0]["image"]
             .as_str()
             .unwrap(),

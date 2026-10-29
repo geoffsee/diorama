@@ -420,3 +420,17 @@ configuration runs with the invoking user's identity and Docker configuration,
 not root's configuration under sudo. Exported credentials may remain after a
 Docker context error, but the command reports failure and never claims the
 context was configured. These unit-tested adapters do not qualify live D2K nodes.
+
+## Worker credentials
+
+`token create --role=worker --expiry=24h --kubeconfig PATH` creates a live bootstrap
+Secret and prints a base64-encoded kubeconfig containing the endpoint, CA, and
+token. Duration suffixes are `s`, `m`, `h`, and `d`. `token list` prints IDs and
+expiry timestamps without token secrets; `token invalidate ID` revokes bootstrap
+access. The default administrative kubeconfig is
+`/var/lib/diorama/pki/admin.kubeconfig`.
+
+`token export --token-file PATH` writes the decoded standard bootstrap kubeconfig
+to stdout. It performs no runtime operations and starts no process. Protect both
+outputs as credentials. Revoking a bootstrap token does not revoke already issued
+client certificates. See [worker joining](../../README.md#join-workers).

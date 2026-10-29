@@ -22,7 +22,7 @@ In External Mode, diorama observes strict non-ownership boundaries across the en
 | **Runtime Configuration** | Manages daemon configuration (`/etc/containerd/config.toml`, `/etc/crio/crio.conf`). | Out of scope. Never overwrites, edits, or alters host daemon configuration. |
 | **Registry Configurations** | Configures mirror endpoints, TLS certificates (`certs.d`), and authentication. | Out of scope. External runtime pulls images using host-configured credentials/mirrors. |
 | **Cgroups & System Settings** | Configures systemd/cgroupfs drivers, kernel sysctls, and storage drivers. | Queries `RuntimeConfig` to negotiate driver (`systemd` vs `cgroupfs`) and propagates setting to Kubelet. |
-| **CNI Installation** | Installs host network plugins and system CNI if host-managed networking is chosen. | Out of scope. External mode manages only diorama-owned CNI configuration (deferred to E15); never mutates `/etc/cni/net.d`. |
+| **CNI Installation** | Installs host network plugins and system CNI if host-managed networking is chosen. | Out of scope. External mode manages only diorama-owned CNI configuration (`/opt/diorama/cni/bin` and `/etc/diorama/cni/net.d`); never mutates `/etc/cni/net.d`. |
 | **Workload Isolation** | Executes other system or third-party containers and sandboxes on the node. | Scopes container/sandbox management to diorama-owned workloads. Never terminates or alters unrelated workloads. |
 | **State Cleanup & Teardown** | Purges host state directories (`/var/lib/containerd`, `/var/lib/crio`) upon node decommissioning. | Never executes bundled-runtime cleanup (`clean_stale_runtime_state`) against host paths on restart or uninstall. |
 
@@ -32,7 +32,7 @@ In External Mode, diorama observes strict non-ownership boundaries across the en
 
 ### 3.1 Start / Preflight
 - Validates the provided Unix domain socket via `probe_cri_readiness`.
-- Confirms runtime engine is supported (`containerd` or `cri-o`).
+- Confirms runtime engine is supported (`containerd`, `cri-o`, or `oci-cri`).
 - Queries `RuntimeService::RuntimeConfig` to negotiate cgroup driver (`systemd` vs `cgroupfs`), falling back seamlessly to host cgroup detection if absent or unimplemented.
 - **Never** executes bundled containerd cleanup routines or purges host `/var/lib/containerd` or `/var/lib/crio`.
 - **Never** creates or mutates host registry host files.
@@ -73,3 +73,12 @@ The ownership invariants are tested under `crates/diorama-cri/tests/runtime_owne
 3. **Preservation of unrelated workloads** running on the host runtime.
 4. **Validation of the build profile and runtime mode matrix**.
 5. **Enforcement of owned CNI path restrictions**.
+
+## Foreign workers
+
+A foreign worker is distinct from an ordinary worker attached to an external CRI.
+Its operator owns both kubelet and CRI, joins using an exported standard bootstrap
+kubeconfig, and supplies the foreign label and taint. Diorama has no foreign socket
+or supervisor entry. Credential export never starts, stops, or probes either
+process. Ordinary readiness explicitly rejects `v8-matrix-wasi`. Foreign runtimes
+retain their own sandbox validation, including rejection of nonempty DNS.

@@ -81,8 +81,10 @@ impl Adapter for ApiserverAdapter {
                 },
             };
             if let Ok(addr) = listener.local_addr() {
+                let advertised =
+                    std::net::SocketAddr::new(self.service.config().advertise_address, addr.port());
+                update_admin_kubeconfig(&self.service.config().pki_dir, advertised);
                 self.service.set_bound_addr(addr);
-                update_admin_kubeconfig(&self.service.config().pki_dir, addr);
                 let _ = writeln!(
                     std::io::stderr(),
                     "{{\"schema\":1,\"level\":\"info\",\"event\":\"apiserver_listening\",\"address\":\"https://{addr}\"}}"
@@ -140,5 +142,5 @@ fn update_admin_kubeconfig(pki_dir: &std::path::Path, addr: std::net::SocketAddr
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = std::fs::write(&admin_kubeconfig, format!("{updated}\n"));
+    let _ = diorama_pki::atomic_write(&admin_kubeconfig, format!("{updated}\n").as_bytes(), 0o600);
 }

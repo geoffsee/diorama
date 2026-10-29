@@ -52,12 +52,11 @@ async fn combined_runtime_attempt(collision: bool) -> bool {
     let mut stored = config.clone();
     stored.kubernetes.node_name = "selected-file-node".into();
     write_document(&config_path, &stored).unwrap();
-    let runtime = diorama::runtime::NodeRuntime::from_config_with_context(
-        config.validate(&host).unwrap(),
-        config_path,
-        host,
-    )
-    .unwrap();
+    let validated = config.validate(&host).unwrap();
+    crate::install_scheduler_process_fixture(&validated);
+    let runtime =
+        diorama::runtime::NodeRuntime::from_config_with_context(validated, config_path, host)
+            .unwrap();
     assert!(runtime.metrics_registry().is_some());
     let mut observer = runtime.observer();
     let (stop, receiver) = diorama_supervisor::stop_channel();
@@ -312,7 +311,7 @@ async fn test_config_api_reads_and_schema() {
     assert_eq!(status, 200);
     assert_eq!(schema_body["apiVersion"], diorama_config::API_VERSION);
     let settings = schema_body["settings"].as_array().expect("settings array");
-    assert_eq!(settings.len(), 31);
+    assert_eq!(settings.len(), 35);
     assert!(
         settings
             .iter()

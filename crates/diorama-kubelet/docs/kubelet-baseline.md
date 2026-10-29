@@ -4,15 +4,15 @@ Tracks [E13.01](https://github.com/geoffsee/diorama/issues/69).
 
 ## Architecture & Responsibilities
 
-`dioramalet` provides the Rust orchestration layer for Kubelet configuration generation, identity and RBAC integration, CRI runtime attachment, Node registration, and single-node workload execution.
+`dioramalet` provides the Rust orchestration layer for Kubelet configuration generation, identity and RBAC integration, CRI runtime attachment, Node registration, and execution of Pods assigned to its exact node identity.
 
 ### Component Boundaries
 
 - **Configuration Generation**: Generates `kubelet.config.k8s.io/v1beta1` `KubeletConfiguration` YAML documents matching the official Kubernetes v1.35.7 schema and KubeSolo golden fixture specifications.
 - **Identity & RBAC**: Operates as `system:node:<node-name>` within the `system:nodes` group. Authorizes Node creation, status patching, and Lease renewals in `kube-node-lease` without granting administrative cluster privileges.
 - **Runtime Provider Attachment**: Connects to CRI endpoints for both managed containerd (`unix:///run/containerd/containerd.sock`) and external runtime providers (containerd, CRI-O) negotiated via `diorama-cri`.
-- **Node Registration & Heartbeat**: Registers the single-node `Node` resource with status `Ready=True`, absence of disk/memory/PID pressure, capacity and allocatable definitions, and updates 40-second renewal leases in `kube-node-lease`.
-- **Manually Assigned Workload Execution**: Detects and synchronizes pods assigned to this node (`spec.nodeName == self.node_name`), drives container creation through the runtime provider, and records running container statuses and conditions.
+- **Node Registration & Heartbeat**: Registers only its own Node and renews its Lease. Ready follows CRI runtime and network readiness; capacity comes from host CPU and memory discovery. Registration, heartbeats, and host-network reconciliation begin before CNI readiness. Status patches preserve controller-owned Node fields.
+- **Assigned Workload Execution**: Detects and synchronizes pods assigned to this node (`spec.nodeName == self.node_name`), drives container creation through the runtime provider, and records running container statuses and conditions.
 - **Health & Diagnostic Reporting**: Exposes `/healthz` status, tracks node readiness, and reports actionable diagnostic error codes upon prerequisite and startup failures.
 
 ## Configuration Parity & Defaults
@@ -56,3 +56,19 @@ Startup and prerequisite checks isolate failure causes to the responsible subsys
 | `kubelet-config-invalid` | Configuration | Invalid file paths, blocked parent directories, or malformed parameters |
 | `kubelet-node-registration-failed` | Control Plane | Failed to post Node status or Lease heartbeat |
 | `kubelet-pod-reconciliation-failed` | Workload Execution | Runtime container creation error or status update failure |
+
+## API boundary and ownership
+
+Production kubelets, including a co-located one, use `NodeApi::Https` for every
+node-facing operation. The in-process adapter supports isolated tests. Bootstrap
+creates a local private key and CSR; the control plane validates its subject,
+signer, requester, and usages before approving and signing. Renewal starts after
+70% of the certificate lifetime. API requests reload the installed credentials.
+
+Assigned-Pod list/watch uses `spec.nodeName=<identity>` and relists after API
+interruptions. No kubelet scheduling, preemption, companion-name, prefix, or
+discovered-node ownership is used. Cleanup selects this node's sandbox ownership
+label; logs and exec require the same exact assignment. Projected service-account
+credentials come from Pod-bound API TokenRequests. CRI mounts preserve Kubernetes
+mount propagation. Ordinary external runtime readiness supports containerd, CRI-O,
+and oci-cri and rejects v8-matrix-wasi.

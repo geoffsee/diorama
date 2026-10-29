@@ -157,6 +157,16 @@
         "encoded_bytes": 85689657,
         "sha256": "868c6b3b9b563800bbe02b14219f549314138415955d8537d6dc2701c518a678"
       }
+    },
+    {
+      "id": "kube-scheduler",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-scheduler",
+        "encoding": "identity",
+        "encoded_bytes": 44630200,
+        "sha256": "571faf2a0d19951aade0b3d4f5f2e0b2504ee3a14ccdd2cdd0668ccd04a3c33c"
+      }
     }
   ]
 }

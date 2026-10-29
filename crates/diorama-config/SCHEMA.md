@@ -41,11 +41,14 @@ this default example.
 | `d2k.namespace` | string | `"d2k"` | d2k-namespace | KUBESOLO_D2K_NAMESPACE | restart | false |
 | `kubernetes.apiServer.extraSANs` | array | `null` | apiserver-extra-sans | KUBESOLO_APISERVER_EXTRA_SANS | restart | false |
 | `kubernetes.apiServer.startupTimeoutSeconds` | integer | `600` | startup-timeout | KUBESOLO_STARTUP_TIMEOUT | restart | false |
+| `kubernetes.disableLocalKubelet` | boolean | `false` | disable-local-kubelet | KUBESOLO_DISABLE_LOCAL_KUBELET | immutable | false |
 | `kubernetes.kubelet.cpuManager.policy` | string | `"none"` | cpu-manager-policy | KUBESOLO_CPU_MANAGER_POLICY | restart | false |
 | `kubernetes.kubelet.cpuManager.policyOptions` | object | `null` | cpu-manager-policy-options | KUBESOLO_CPU_MANAGER_POLICY_OPTIONS | restart | false |
 | `kubernetes.kubelet.cpuManager.reservedCPUs` | string | `""` | reserved-cpus | KUBESOLO_RESERVED_CPUS | restart | false |
 | `kubernetes.kubelet.systemReserved` | object | `null` | system-reserved | KUBESOLO_SYSTEM_RESERVED | restart | false |
 | `kubernetes.nodeName` | string | `""` | — | KUBESOLO_NODE_NAME | restart | false |
+| `kubernetes.role` | string | `"control-plane"` | role | KUBESOLO_ROLE | immutable | false |
+| `kubernetes.tokenFile` | string | `""` | token-file | KUBESOLO_TOKEN_FILE | immutable | false |
 | `logging.debug` | boolean | `false` | debug | KUBESOLO_DEBUG | restart | false |
 | `logging.pprof` | boolean | `false` | pprof-server | KUBESOLO_PPROF_SERVER | restart | false |
 | `metrics.bindAddress` | string | `"127.0.0.1:9105"` | metrics-bind-address | KUBESOLO_METRICS_BIND_ADDRESS | restart | false |
@@ -55,6 +58,7 @@ this default example.
 | `network.loadBalancer.ip` | string | `""` | load-balancer-ip | KUBESOLO_LOAD_BALANCER_IP | restart | false |
 | `network.mtu` | integer | `0` | mtu | KUBESOLO_MTU | restart | false |
 | `network.nodeIP` | string | `""` | node-ip | KUBESOLO_NODE_IP | restart | false |
+| `network.podAddressPool` | string | `"10.42.0.0/16"` | pod-address-pool | KUBESOLO_POD_ADDRESS_POOL | immutable | false |
 | `path` | string | `"/var/lib/diorama"` | path | KUBESOLO_PATH | immutable | false |
 | `portainer.async` | boolean | `false` | portainer-edge-async | KUBESOLO_PORTAINER_EDGE_ASYNC | restart | false |
 | `portainer.edgeID` | string | `""` | portainer-edge-id | KUBESOLO_PORTAINER_EDGE_ID | restart | false |

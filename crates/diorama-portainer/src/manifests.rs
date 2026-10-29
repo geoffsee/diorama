@@ -381,6 +381,10 @@ fn generate_deployment(config: &PortainerAgentConfig) -> Deployment {
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
+                    node_selector: Some(BTreeMap::from([(
+                        "diorama.io/runtime".into(),
+                        "ordinary".into(),
+                    )])),
                     service_account_name: Some(PORTAINER_AGENT_SERVICE_ACCOUNT_NAME.to_string()),
                     containers: vec![generate_agent_container(config)],
                     ..Default::default()

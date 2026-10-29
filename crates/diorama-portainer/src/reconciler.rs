@@ -552,7 +552,8 @@ impl PortainerReconciler {
                                 "labels": { "app": PORTAINER_AGENT_DEPLOYMENT_NAME }
                             },
                             "spec": {
-                                "serviceAccountName": PORTAINER_AGENT_SERVICE_ACCOUNT_NAME,
+                                "nodeSelector": {"diorama.io/runtime":"ordinary"},
+                        "serviceAccountName": PORTAINER_AGENT_SERVICE_ACCOUNT_NAME,
                                 "containers": [{
                                     "name": "portainer-agent",
                                     "image": self.config.image,

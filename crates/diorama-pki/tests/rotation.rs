@@ -15,7 +15,7 @@ fn test_fresh_reconcile_generates_all() {
     let pki = ClusterPki::new(config);
     let report = pki.reconcile().unwrap();
 
-    assert_eq!(report.rotated.len(), 11);
+    assert_eq!(report.rotated.len(), 12);
     assert_eq!(report.preserved.len(), 0);
 
     // Verify files on disk
@@ -75,7 +75,7 @@ fn test_unchanged_restart_preserves_all() {
     // Reconcile again with same config
     let report = pki.reconcile().unwrap();
     assert_eq!(report.rotated.len(), 0);
-    assert_eq!(report.preserved.len(), 11);
+    assert_eq!(report.preserved.len(), 12);
 
     let ca_fp_after = pki.ca_fingerprint().unwrap();
     assert_eq!(ca_fp_before, ca_fp_after);

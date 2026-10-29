@@ -899,15 +899,15 @@ mod workload_conformance_lane_t07 {
         client.update_node("node-gpu", node_obj).await.unwrap();
 
         let _ = wm.reconcile_namespace(ns).await.unwrap();
-        assert!(client.get_pod(ns, "gpu-monitor-node-gpu").await.is_err());
+        assert!(client.get_pod(ns, "gpu-monitor-node-gpu").await.is_ok());
 
         let ds_obj = client.get_daemonset(ns, "gpu-monitor").await.unwrap();
-        assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 0);
-        assert_eq!(ds_obj["status"]["currentNumberScheduled"], 0);
+        assert_eq!(ds_obj["status"]["desiredNumberScheduled"], 1);
+        assert_eq!(ds_obj["status"]["currentNumberScheduled"], 1);
     }
 
     #[tokio::test]
-    async fn test_daemonset_companion_worker_pod_naming() {
+    async fn test_daemonset_uses_affinity_for_each_registered_node() {
         let temp = TempDir::new().unwrap();
         let svc = setup_controller(&temp);
         svc.start().await.unwrap();
@@ -965,12 +965,12 @@ mod workload_conformance_lane_t07 {
         let _ = wm.reconcile_namespace(ns).await.unwrap();
 
         let primary_pod = client
-            .get_pod(ns, "marker-node")
+            .get_pod(ns, "marker-diorama")
             .await
             .expect("marker-node must exist");
         assert_eq!(
             primary_pod
-                .pointer("/spec/nodeName")
+                .pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchFields/0/values/0")
                 .and_then(Value::as_str),
             Some("diorama")
         );
@@ -980,7 +980,7 @@ mod workload_conformance_lane_t07 {
             .await
             .expect("marker-diorama-worker must exist");
         assert_eq!(
-            worker_pod.pointer("/spec/nodeName").and_then(Value::as_str),
+            worker_pod.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchFields/0/values/0").and_then(Value::as_str),
             Some("diorama-worker")
         );
 

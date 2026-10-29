@@ -36,6 +36,10 @@ impl ProcessCommand {
             .stderr(Stdio::null());
         Self(command)
     }
+    pub fn inherit_stderr(mut self) -> Self {
+        self.0.stderr(Stdio::inherit());
+        self
+    }
     pub fn arg(mut self, value: impl AsRef<OsStr>) -> Self {
         self.0.arg(value);
         self

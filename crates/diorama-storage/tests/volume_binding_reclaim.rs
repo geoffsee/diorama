@@ -702,7 +702,7 @@ async fn test_default_storage_class_dynamic_provisioning_and_verify_binding() {
 }
 
 #[tokio::test]
-async fn test_wait_for_first_consumer_delayed_binding_pass() {
+async fn test_service_leaves_selected_claim_for_node_local_provisioner() {
     let temp = TempDir::new().unwrap();
     let (apiserver, client) = setup_test_cluster(&temp);
     apiserver.check_prerequisites().await.unwrap();
@@ -738,7 +738,7 @@ async fn test_wait_for_first_consumer_delayed_binding_pass() {
     let service = LocalPathService::new(config.clone(), std::sync::Arc::new(client.clone()));
 
     // 1. Binder pass without selected-node annotation: should NOT bind
-    service.bind_pending_volumes().await;
+    service.reconcile().await.unwrap();
 
     let pvc = client.get_pvc(ns, "delayed-claim").await.unwrap();
     assert_eq!(pvc["status"]["phase"], "Pending");
@@ -759,23 +759,12 @@ async fn test_wait_for_first_consumer_delayed_binding_pass() {
         .unwrap();
 
     // 3. Binder pass now picks up the annotated PVC
-    service.bind_pending_volumes().await;
+    service.reconcile().await.unwrap();
 
-    let bound_pvc = client.get_pvc(ns, "delayed-claim").await.unwrap();
-    assert_eq!(bound_pvc["status"]["phase"], "Bound");
-    let pv_name = bound_pvc["spec"]["volumeName"].as_str().unwrap();
-
-    let pv = client.get_pv(pv_name).await.unwrap();
-    assert_eq!(pv["status"]["phase"], "Bound");
-    assert_eq!(
-        pv["metadata"]["annotations"][VOLUME_SELECTED_NODE_ANNOTATION],
-        "worker-node-42"
-    );
-    let node_affinity = &pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"];
-    assert_eq!(
-        node_affinity[0]["matchExpressions"][0]["values"][0],
-        "worker-node-42"
-    );
+    let pending = client.get_pvc(ns, "delayed-claim").await.unwrap();
+    assert_eq!(pending["status"]["phase"], "Pending");
+    assert!(pending["spec"].get("volumeName").is_none());
+    assert_eq!(std::fs::read_dir(&storage_root).unwrap().count(), 0);
 }
 
 #[tokio::test]

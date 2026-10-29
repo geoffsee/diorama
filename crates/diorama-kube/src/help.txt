@@ -1,7 +1,7 @@
-usage: kubesolo [<flags>]
+usage: diorama [<flags>]
 
-Ultra-lightweight, OCI-compliant, single-node Kubernetes built for constrained
-environments such as IoT or IIoT devices running in embedded environments.
+Kubernetes with one control-plane process group and independently joining workers.
+Configuration describes this process; workers join through authenticated HTTPS.
 
 
 Flags:
@@ -15,6 +15,18 @@ Flags:
       --config="/etc/diorama/config.yaml"
                              Path to the KubeSolo configuration file.
                              ($KUBESOLO_CONFIG)
+      --role=ROLE           Process role: control-plane (default) or worker.
+                             ($KUBESOLO_ROLE)
+      --token-file=PATH     Encoded bootstrap kubeconfig for an ordinary worker.
+                             Create with dioramactl token create --role=worker.
+                             ($KUBESOLO_TOKEN_FILE)
+      --[no-]disable-local-kubelet
+                             Disable the control plane's local ordinary kubelet.
+                             Defaults to false. ($KUBESOLO_DISABLE_LOCAL_KUBELET)
+      --pod-address-pool=CIDR
+                             Cilium cluster-pool IPv4 address range, configured
+                             on the control plane. Defaults to 10.42.0.0/16.
+                             ($KUBESOLO_POD_ADDRESS_POOL)
       --[no-]print-config    Print the effective configuration to stdout
                              and exit, without starting anything. Useful for
                              migrating an existing flag-based install: run it
@@ -41,8 +53,8 @@ Flags:
                              a private (RFC 1918) address. Deprecated:
                              set this in the KubeSolo config file instead.
                              ($KUBESOLO_NODE_IP)
-      --mtu=MTU              Override the auto-detected network MTU used by the
-                             embedded CNI bridge (cni0) and pod veth interfaces.
+      --mtu=MTU              Override Cilium's auto-detected underlying network
+                             MTU. Set on the control plane for the cluster.
                              Useful on hosts whose primary interface has a
                              reduced MTU (e.g. VPN/tunnel/PPPoE links). Defaults
                              to 0, meaning auto-detect. Deprecated: set this in

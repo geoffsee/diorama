@@ -137,6 +137,16 @@
       "delivery": {
         "kind": "registry-required"
       }
+    },
+    {
+      "id": "kube-scheduler",
+      "delivery": {
+        "kind": "bundled",
+        "path": "fixtures/kube-scheduler",
+        "encoding": "identity",
+        "encoded_bytes": 44630200,
+        "sha256": "571faf2a0d19951aade0b3d4f5f2e0b2504ee3a14ccdd2cdd0668ccd04a3c33c"
+      }
     }
   ]
 }

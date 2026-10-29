@@ -51,8 +51,14 @@ cargo test -p diorama --locked
 cargo clippy -p diorama --all-targets --all-features --locked -- -D warnings
 ```
 
-Live CRI connection, host installation, and multi-node cluster lifecycle
-remain separate implementation and qualification work.
+Production assembly selects the process role before opening a datastore or
+reconciling cluster PKI. Workers assemble only their ordinary CRI attachment and
+HTTPS kubelet. The control plane owns the datastore, API, controller manager,
+Cilium installation, and upstream kube-scheduler v1.35.7. Scheduler startup requires
+its pinned executable at `<state>/bin/kube-scheduler`; leader Lease renewal supplies
+its readiness signal. `disableLocalKubelet` allows a control plane with no Node.
+See [joining and ownership](../../README.md) and the
+[Linux qualification fixture](../../tests/multinode/README.md).
 
 `tests/evidence/linux-arm64.json` records a fresh disposable comparison against
 committed main revision `cd673944bed3c5ab85b35b550edc3f9511f5ea02`.

@@ -150,8 +150,42 @@ impl RuntimeProvider for CriRuntimeProvider {
                 endpoint: self.socket_path.display().to_string(),
                 reason: s.to_string(),
             })?;
+        if !matches!(
+            diorama_cri::detect_provider(&resp.runtime_name),
+            diorama_cri::CriProvider::Containerd
+                | diorama_cri::CriProvider::Crio
+                | diorama_cri::CriProvider::OciCri
+        ) {
+            return Err(KubeletError::RuntimeUnavailable {
+                endpoint: self.socket_path.display().to_string(),
+                reason: "unsupported ordinary runtime provider".into(),
+            });
+        }
         self.record_version(resp);
         Ok(())
+    }
+
+    async fn network_ready(&self) -> Result<bool, KubeletError> {
+        let client = self.client().await?;
+        let mut runtime =
+            diorama_cri::runtime::v1::runtime_service_client::RuntimeServiceClient::new(
+                client.runtime_channel(),
+            );
+        let status = runtime
+            .status(cri::StatusRequest { verbose: false })
+            .await
+            .map_err(|s| map_status("status", &s))?
+            .into_inner();
+        Ok(status.status.is_some_and(|status| {
+            status
+                .conditions
+                .iter()
+                .any(|c| c.r#type == "RuntimeReady" && c.status)
+                && status
+                    .conditions
+                    .iter()
+                    .any(|c| c.r#type == "NetworkReady" && c.status)
+        }))
     }
 
     async fn run_pod_sandbox(

@@ -48,7 +48,7 @@ pub struct ControllerManagerConfig {
     pub secure_port: u16,
     /// Bind address for secure HTTPS endpoint.
     pub bind_address: IpAddr,
-    /// Whether leader election is enabled (false for dedicated single-node diorama).
+    /// Whether Lease-based leader election is enabled.
     pub leader_elect: bool,
     /// Optional node IP.
     pub node_ip: Option<IpAddr>,
@@ -68,7 +68,7 @@ impl Default for ControllerManagerConfig {
             concurrent_endpoint_syncs: DEFAULT_CONCURRENT_ENDPOINT_SYNCS,
             secure_port: DEFAULT_SECURE_PORT,
             bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            leader_elect: false,
+            leader_elect: true,
             node_ip: None,
         }
     }
@@ -88,7 +88,7 @@ impl ControllerManagerConfig {
             concurrent_endpoint_syncs: DEFAULT_CONCURRENT_ENDPOINT_SYNCS,
             secure_port: DEFAULT_SECURE_PORT,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            leader_elect: false,
+            leader_elect: true,
             node_ip: Some(node_ip),
         }
     }

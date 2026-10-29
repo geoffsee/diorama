@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diorama::lifecycle_sink::FlushPolicy;
-use diorama::runtime::{COMPONENT_APISERVER, COMPONENT_DATASTORE, NodeRuntime, RuntimeBuilder};
+use diorama::runtime::{COMPONENT_APISERVER, COMPONENT_DATASTORE, RuntimeBuilder};
 use diorama_apiserver::ApiserverConfig;
 use diorama_apiserver::client::KubernetesApiClient;
 use diorama_apiserver::service::ApiserverService;
@@ -209,7 +209,7 @@ async fn crash_runtime_child() {
     let root = std::env::var_os("DIORAMA_RECOVERY_FIXTURE_ROOT").expect("private fixture root");
     let root = Path::new(&root);
     let config = test_config(&root.join("diorama-state"), "127.0.0.1", false, false);
-    let runtime = NodeRuntime::from_config(config).expect("fixture runtime");
+    let runtime = crate::runtime_fixture(config).expect("fixture runtime");
     let client = runtime.client().expect("fixture client").clone();
     let (_stop, receiver) = stop_channel();
     let task = tokio::spawn(runtime.run(receiver));
@@ -299,7 +299,7 @@ async fn test_crash_reboot_preserves_datastore_pki_and_ownership() {
 
     // ----------------- Reboot / Second Boot -----------------
     let runtime2 =
-        NodeRuntime::from_config(config.clone()).expect("re-assemble runtime on existing path");
+        crate::runtime_fixture(config.clone()).expect("re-assemble runtime on existing path");
     let client2 = runtime2.client().expect("client").clone();
     let probe2 = LogProbe::default();
     let (stop2, recv2) = stop_channel();
@@ -346,7 +346,10 @@ async fn test_crash_reboot_preserves_datastore_pki_and_ownership() {
     let ownership_after = collect_owned_relative_paths(&state_dir);
     for rel_path in &ownership_after {
         assert!(
-            rel_path.starts_with("pki") || rel_path.starts_with("datastore"),
+            rel_path.starts_with("pki")
+                || rel_path.starts_with("datastore")
+                || rel_path.starts_with("scheduler")
+                || rel_path.starts_with("bin"),
             "unowned file detected in state dir after reboot: {rel_path}"
         );
     }
@@ -423,7 +426,7 @@ async fn test_mock_core_failure_policy_and_diagnostic_retention() {
 
     // Verify post-kill recovery: a fresh runtime starts cleanly
     let recovery_runtime =
-        NodeRuntime::from_config(config).expect("assemble post-kill recovery runtime");
+        crate::runtime_fixture(config).expect("assemble post-kill recovery runtime");
     let client = recovery_runtime.client().expect("client").clone();
     let (stop_rec, recv_rec) = stop_channel();
     let rec_handle = tokio::spawn(recovery_runtime.run(recv_rec));
@@ -515,7 +518,7 @@ async fn test_node_ip_change_rotates_leaf_sans_and_updates_kubeconfig_both_forma
     // 1. Initial run on 127.0.0.1
     let config_ip1 = test_config(&state_dir, "127.0.0.1", false, false);
     let runtime1 =
-        NodeRuntime::from_config(config_ip1.clone()).expect("assemble runtime on 127.0.0.1");
+        crate::runtime_fixture(config_ip1.clone()).expect("assemble runtime on 127.0.0.1");
     let client1 = runtime1.client().expect("client").clone();
     let (stop1, recv1) = stop_channel();
     let handle1 = tokio::spawn(runtime1.run(recv1));
@@ -541,7 +544,7 @@ async fn test_node_ip_change_rotates_leaf_sans_and_updates_kubeconfig_both_forma
 
     // 2. Reconfigure node IP to 192.168.1.188
     let config_ip2 = test_config(&state_dir, "192.168.1.188", false, false);
-    let runtime2 = NodeRuntime::from_config(config_ip2).expect("re-assemble with updated node IP");
+    let runtime2 = crate::runtime_fixture(config_ip2).expect("re-assemble with updated node IP");
     let client2 = runtime2.client().expect("client").clone();
     let (stop2, recv2) = stop_channel();
     let handle2 = tokio::spawn(runtime2.run(recv2));
@@ -741,8 +744,8 @@ async fn test_lifecycle_interruption_during_startup_leaves_clean_ownership() {
     );
 
     // Verify subsequent startup succeeds without lock contention or manual cleanup
-    let clean_runtime = NodeRuntime::from_config(config)
-        .expect("subsequent startup must succeed after interruption");
+    let clean_runtime =
+        crate::runtime_fixture(config).expect("subsequent startup must succeed after interruption");
     let client = clean_runtime.client().expect("client").clone();
     let (stop_clean, recv_clean) = stop_channel();
     let clean_handle = tokio::spawn(clean_runtime.run(recv_clean));
@@ -787,7 +790,7 @@ async fn test_required_datastore_corruption_fails_closed_and_blocks_release() {
     }
 
     // 3. NodeRuntime startup without opt-in repair MUST fail closed
-    let runtime_res = NodeRuntime::from_config(config_no_repair);
+    let runtime_res = crate::runtime_fixture(config_no_repair);
     assert!(
         runtime_res.is_err(),
         "runtime must fail closed on corrupt WAL when dbWalRepair is false"
@@ -801,7 +804,7 @@ async fn test_required_datastore_corruption_fails_closed_and_blocks_release() {
 
     // 4. Opt-in repair allows recovery
     let config_with_repair = test_config(&state_dir, "127.0.0.1", false, true);
-    let recovery_res = NodeRuntime::from_config(config_with_repair);
+    let recovery_res = crate::runtime_fixture(config_with_repair);
     assert!(
         recovery_res.is_ok(),
         "runtime must successfully recover corrupt WAL when dbWalRepair is true"

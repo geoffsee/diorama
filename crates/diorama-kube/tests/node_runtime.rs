@@ -11,8 +11,8 @@ use diorama::lifecycle_sink::FlushPolicy;
 use diorama::runtime::{
     COMPONENT_APISERVER, COMPONENT_CONFIG_API, COMPONENT_CONTAINERD, COMPONENT_CONTROLLER_MANAGER,
     COMPONENT_COREDNS, COMPONENT_DATASTORE, COMPONENT_EXTERNAL_CRI, COMPONENT_KUBELET,
-    COMPONENT_LOCAL_PATH, COMPONENT_PORTAINER, COMPONENT_PROXY, NodeRuntime, RuntimeBuilder,
-    RuntimeError, select_runtime_provider,
+    COMPONENT_LOCAL_PATH, COMPONENT_PORTAINER, COMPONENT_PROXY, RuntimeBuilder, RuntimeError,
+    select_runtime_provider,
 };
 use diorama_apiserver::ApiserverConfig;
 use diorama_apiserver::service::ApiserverService;
@@ -419,7 +419,7 @@ async fn test_node_runtime_from_config_and_production_client() {
     let temp = TempDir::new().unwrap();
     let config = test_config(temp.path(), false, true);
 
-    let runtime = NodeRuntime::from_config(config).expect("assemble from config");
+    let runtime = crate::runtime_fixture(config).expect("assemble from config");
     assert!(runtime.client().is_some());
     assert!(runtime.apiserver().is_some());
     assert_eq!(runtime.log_level(), LogLevel::Info);
@@ -708,9 +708,9 @@ async fn test_node_runtime_from_config_with_portainer_enabled() {
         r#"
 path: "{}"
 network:
-  node_ip: "127.0.0.1"
+  nodeIP: "127.0.0.1"
 kubernetes:
-  node_name: "test-node"
+  nodeName: "test-node"
 logging:
   debug: false
 portainer:
@@ -737,7 +737,7 @@ portainer:
     assert_eq!(config.config().portainer.edge_id, "test-edge-id");
     assert_eq!(config.config().portainer.edge_key, "test-edge-key");
 
-    let runtime = NodeRuntime::from_config(config).expect("assemble from config");
+    let runtime = crate::runtime_fixture(config).expect("assemble from config");
     assert!(runtime.client().is_some());
     assert!(runtime.apiserver().is_some());
 
@@ -1115,7 +1115,7 @@ async fn test_issue_341_protected_datastore_loopback_mtls_receipt() {
     let temp = TempDir::new().unwrap();
     let config = test_config(temp.path(), false, false);
     let (stop_handle, stop_receiver) = stop_channel();
-    let runtime = NodeRuntime::from_config(config).expect("build node runtime");
+    let runtime = crate::runtime_fixture(config).expect("build node runtime");
     let datastore_bound_handle = runtime
         .datastore_bound_addr_handle()
         .expect("datastore bound handle");
@@ -1356,7 +1356,7 @@ async fn test_issue_341_kubectl_admin_crud() {
     let temp = TempDir::new().unwrap();
     let config = test_config(temp.path(), false, false);
     let (stop_handle, stop_receiver) = stop_channel();
-    let runtime = NodeRuntime::from_config(config).expect("build node runtime");
+    let runtime = crate::runtime_fixture(config).expect("build node runtime");
     let apiserver = runtime.apiserver().cloned().expect("apiserver service");
     let pki_dir = runtime.pki_dir();
     let kubeconfig_path = pki_dir.join("admin.kubeconfig");
@@ -1401,7 +1401,7 @@ async fn test_issue_345_select_runtime_provider_hook() {
     let temp = TempDir::new().unwrap();
     let config = test_config(temp.path(), false, false);
     let builder = RuntimeBuilder::new(config.clone());
-    let runtime = NodeRuntime::from_config(config.clone()).expect("build node runtime");
+    let runtime = crate::runtime_fixture(config.clone()).expect("build node runtime");
 
     // With default config without managed socket, provider selection depends on whether
     // the host containerd socket /run/containerd/containerd.sock exists on Linux.
@@ -1727,7 +1727,7 @@ async fn test_linux_workload_path_external_cri_wiring_and_dag() {
 fn test_synthetic_mode_fallback_when_no_runtime() {
     let temp = TempDir::new().unwrap();
     let config = test_config(temp.path(), false, false);
-    let runtime = NodeRuntime::from_config(config).expect("build node runtime");
+    let runtime = crate::runtime_fixture(config).expect("build node runtime");
     let ids = runtime.component_ids();
 
     assert!(ids.contains(&COMPONENT_DATASTORE.to_string()));
@@ -1752,4 +1752,38 @@ fn test_runtime_error_network_diagnostic_code() {
         err.to_string()
             .contains("network initialization failure: cni configuration error")
     );
+}
+
+#[test]
+fn worker_assembly_never_opens_datastore_or_creates_cluster_signing_keys() {
+    let temp = TempDir::new().unwrap();
+    let state = temp.path().join("worker");
+    let mut config = diorama_config::Config {
+        path: state.display().to_string(),
+        ..Default::default()
+    };
+    config.kubernetes.role = "worker".into();
+    config.kubernetes.node_name = "independent-worker".into();
+    config.kubernetes.token_file = temp.path().join("join.token").display().to_string();
+    config.runtime.endpoint = "unix:///run/test-ordinary-cri.sock".into();
+    let config = config.validate(&HostContext::default()).unwrap();
+    let runtime = diorama::runtime::NodeRuntime::from_config(config);
+    if cfg!(target_os = "linux") {
+        let runtime = runtime.unwrap();
+        assert_eq!(
+            runtime.component_ids(),
+            [COMPONENT_EXTERNAL_CRI, COMPONENT_KUBELET]
+        );
+        assert!(runtime.client().is_none());
+    } else {
+        assert!(runtime.is_err());
+    }
+    for path in [
+        "datastore",
+        "pki/ca.key",
+        "pki/service-account.key",
+        "scheduler",
+    ] {
+        assert!(!state.join(path).exists(), "worker created {path}");
+    }
 }

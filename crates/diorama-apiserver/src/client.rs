@@ -53,6 +53,15 @@ struct PodUpdateTarget<'a> {
 }
 
 #[derive(Clone)]
+struct AuthorizedPatch {
+    group: String,
+    resource: String,
+    subresource: Option<String>,
+    namespace: Option<String>,
+    name: String,
+}
+
+#[derive(Clone)]
 pub struct KubernetesApiClient {
     storage: KubernetesStorage,
     identity: ClientIdentity,
@@ -67,6 +76,7 @@ pub struct KubernetesApiClient {
     request_header_allowed_names: Vec<String>,
     service_cluster_ip_range: String,
     service_node_port_range: String,
+    authorized_patch: Option<AuthorizedPatch>,
 }
 
 impl std::fmt::Debug for KubernetesApiClient {
@@ -371,12 +381,38 @@ impl KubernetesApiClient {
             request_header_allowed_names: vec!["system:auth-proxy".to_string()],
             service_cluster_ip_range: config.service_cluster_ip_range.clone(),
             service_node_port_range: config.service_node_port_range.clone(),
+            authorized_patch: None,
         }
     }
 
     #[must_use]
     pub fn identity(&self) -> &ClientIdentity {
         &self.identity
+    }
+
+    /// HTTP PATCH authorizes the requested verb once. Its internal read/replace
+    /// operations retain the caller's identity for admission and are restricted
+    /// to this object; they do not require unrelated get/update permissions.
+    pub(crate) fn for_patch(
+        &self,
+        group: &str,
+        resource: &str,
+        subresource: Option<&str>,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Self, ApiserverError> {
+        let target =
+            subresource.map_or_else(|| resource.to_owned(), |sub| format!("{resource}/{sub}"));
+        self.check_auth_detailed("patch", group, &target, namespace, Some(name))?;
+        let mut client = self.clone();
+        client.authorized_patch = Some(AuthorizedPatch {
+            group: group.into(),
+            resource: resource.into(),
+            subresource: subresource.map(str::to_owned),
+            namespace: namespace.map(str::to_owned),
+            name: name.into(),
+        });
+        Ok(client)
     }
 
     #[must_use]
@@ -587,6 +623,33 @@ impl KubernetesApiClient {
     }
 
     fn check_rbac_permission(&self, req: &AuthzRequest<'_>) -> Result<(), ApiserverError> {
+        if req.username.starts_with("system:bootstrap:") {
+            return if req.api_group == "certificates.k8s.io"
+                && req.resource == "certificatesigningrequests"
+                && matches!(req.verb, "create" | "get" | "list" | "watch")
+            {
+                Ok(())
+            } else {
+                Err(ApiserverError::Unauthorized {
+                    reason: "bootstrap credentials only permit requesting a kubelet certificate"
+                        .into(),
+                })
+            };
+        }
+        if req.username.starts_with("system:node:")
+            && req.api_group == "certificates.k8s.io"
+            && req.resource.starts_with("certificatesigningrequests")
+        {
+            return if req.resource == "certificatesigningrequests"
+                && matches!(req.verb, "create" | "get" | "list" | "watch")
+            {
+                Ok(())
+            } else {
+                Err(ApiserverError::Unauthorized {
+                    reason: "nodes cannot approve or sign certificates".into(),
+                })
+            };
+        }
         if self.rbac.authorize(req) {
             Ok(())
         } else {
@@ -631,6 +694,19 @@ impl KubernetesApiClient {
         namespace: Option<&str>,
         resource_name: Option<&str>,
     ) -> Result<(), ApiserverError> {
+        if let Some(patch) = &self.authorized_patch
+            && matches!(verb, "get" | "update" | "create" | "patch")
+            && api_group == patch.group
+            && namespace == patch.namespace.as_deref()
+            && resource_name == Some(patch.name.as_str())
+            && (resource == patch.resource
+                || patch
+                    .subresource
+                    .as_ref()
+                    .is_some_and(|sub| resource == format!("{}/{sub}", patch.resource)))
+        {
+            return Ok(());
+        }
         let base_req = AuthzRequest {
             username: "",
             groups: &[],
@@ -825,6 +901,7 @@ impl KubernetesApiClient {
             ("pods", "pod", true, "Pod", &["po"], FULL_VERBS, None),
             ("pods/log", "", true, "Pod", &[], &["get"], None),
             ("pods/status", "", true, "Pod", &[], STATUS_VERBS, None),
+            ("pods/binding", "", true, "Binding", &[], &["create"], None),
             (
                 "pods/ephemeralcontainers",
                 "",
@@ -2559,6 +2636,27 @@ impl KubernetesApiClient {
 
     // --- Secret CRUD ---
 
+    fn normalize_secret(doc: &mut Value) -> Result<(), ApiserverError> {
+        let Some(strings) = doc.as_object_mut().and_then(|obj| obj.remove("stringData")) else {
+            return Ok(());
+        };
+        let strings = strings
+            .as_object()
+            .ok_or_else(|| ApiserverError::BadRequest {
+                message: "Secret stringData must be a string map".into(),
+            })?;
+        if doc.get("data").is_none() {
+            doc["data"] = json!({});
+        }
+        for (key, value) in strings {
+            let value = value.as_str().ok_or_else(|| ApiserverError::BadRequest {
+                message: "Secret stringData must contain strings".into(),
+            })?;
+            doc["data"][key] = json!(diorama_pki::base64_encode(value.as_bytes()));
+        }
+        Ok(())
+    }
+
     fn validate_secret_doc(doc: &Value) -> Result<(), ApiserverError> {
         for field in ["data", "stringData"] {
             if let Some(map) = doc.get(field).and_then(Value::as_object) {
@@ -2580,6 +2678,7 @@ impl KubernetesApiClient {
             .await?;
 
         self.check_auth_detailed("create", "", "secrets", Some(namespace), Some(&name))?;
+        Self::normalize_secret(&mut doc)?;
         Self::validate_secret_doc(&doc)?;
         let key = format!("{}/secrets/{namespace}/{name}", self.storage.prefix());
         let cur_rev = self.storage.current_revision().await + 1;
@@ -2866,6 +2965,13 @@ impl KubernetesApiClient {
         sa_name: &str,
         mut doc: Value,
     ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed(
+            "create",
+            "",
+            "serviceaccounts/token",
+            Some(namespace),
+            Some(sa_name),
+        )?;
         let sa = self.get_service_account(namespace, sa_name).await?;
         let sa_uid = sa
             .pointer("/metadata/uid")
@@ -2892,7 +2998,35 @@ impl KubernetesApiClient {
             .ok_or_else(|| ApiserverError::Config {
                 reason: "token service unavailable".to_string(),
             })?;
-        let token = ts.issue_token(namespace, sa_name, sa_uid, &audiences, lifetime)?;
+        let bound: Option<crate::token::BoundObjectRef> = doc
+            .pointer("/spec/boundObjectRef")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        if let Some(bound) = &bound
+            && bound.kind == "Pod"
+        {
+            let pod = self.get_pod(namespace, &bound.name).await?;
+            if pod.pointer("/metadata/uid").and_then(Value::as_str) != bound.uid.as_deref()
+                || pod
+                    .pointer("/spec/serviceAccountName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    != sa_name
+            {
+                return Err(ApiserverError::Unauthorized {
+                    reason: "TokenRequest bound Pod does not match service account".into(),
+                });
+            }
+        }
+        let token = ts.issue_token_bound(
+            namespace,
+            sa_name,
+            sa_uid,
+            &audiences,
+            lifetime,
+            bound.as_ref(),
+        )?;
         let now_unix = crate::time::now_unix();
         let exp_timestamp = crate::time::rfc3339_seconds(now_unix + exp_secs);
 
@@ -2969,6 +3103,8 @@ impl KubernetesApiClient {
         };
         spec.entry("terminationGracePeriodSeconds".to_string())
             .or_insert_with(|| json!(30));
+        spec.entry("schedulerName".to_string())
+            .or_insert_with(|| json!("default-scheduler"));
         spec.entry("restartPolicy".to_string())
             .or_insert_with(|| json!("Always"));
         spec.entry("dnsPolicy".to_string())
@@ -3887,6 +4023,70 @@ impl KubernetesApiClient {
         self.update_pod_options(namespace, name, pod, false).await
     }
 
+    /// Atomically assigns an unbound Pod. The datastore revision check makes competing
+    /// scheduler decisions conflict and publishes the assignment to ordinary watches.
+    pub async fn bind_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        binding: Value,
+    ) -> Result<Value, ApiserverError> {
+        self.check_auth_detailed("create", "", "pods/binding", Some(namespace), Some(name))?;
+        let target = binding
+            .pointer("/target/name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ApiserverError::BadRequest {
+                message: "binding requires target.name".into(),
+            })?;
+        if binding.pointer("/target/kind").and_then(Value::as_str) != Some("Node")
+            || binding
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n != name)
+            || binding
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n != namespace)
+        {
+            return Err(ApiserverError::BadRequest {
+                message: "binding must identify this Pod and target a Node".into(),
+            });
+        }
+        let key = format!("{}/pods/{namespace}/{name}", self.storage.prefix());
+        let kv = self
+            .storage
+            .get(&key)
+            .await?
+            .ok_or_else(|| ApiserverError::NotFound {
+                resource: "pods".into(),
+                name: name.into(),
+            })?;
+        let mut pod: Value = serde_json::from_slice(&kv.value)?;
+        let uid_matches = binding
+            .pointer("/metadata/uid")
+            .is_none_or(|uid| Some(uid) == pod.pointer("/metadata/uid"));
+        if !uid_matches
+            || pod
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|v| !v.is_null())
+            || pod
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
+        {
+            return Err(ApiserverError::Conflict {
+                resource: "pods/binding".into(),
+                name: name.into(),
+            });
+        }
+        pod["spec"]["nodeName"] = json!(target);
+        self.storage
+            .update(&key, serde_json::to_vec(&pod)?, Some(kv.mod_revision))
+            .await?;
+        Ok(json!({"apiVersion":"v1", "kind":"Status", "status":"Success", "code":201}))
+    }
+
     fn validate_pod_node_immutability(
         old_pod: &Value,
         new_pod: &Value,
@@ -4101,7 +4301,12 @@ impl KubernetesApiClient {
         dry_run: bool,
         subresource: Option<&str>,
     ) -> Result<Value, ApiserverError> {
-        self.check_auth_detailed("update", "", "pods", Some(namespace), Some(name))?;
+        let resource = if subresource == Some("status") {
+            "pods/status"
+        } else {
+            "pods"
+        };
+        self.check_auth_detailed("update", "", resource, Some(namespace), Some(name))?;
         let key = format!("{}/pods/{namespace}/{name}", self.storage.prefix());
         let existing = self
             .storage
@@ -4847,6 +5052,9 @@ impl KubernetesApiClient {
         name: &str,
         mut doc: Value,
     ) -> Result<Value, ApiserverError> {
+        if group.is_empty() && plural == "secrets" {
+            Self::normalize_secret(&mut doc)?;
+        }
         self.check_auth_detailed("update", group, plural, None, Some(name))?;
         let key = cluster_key(self.storage.prefix(), group, plural, name);
         let existing = self
@@ -5054,6 +5262,9 @@ impl KubernetesApiClient {
             .resolve_metadata_name(&mut doc, &format!("{kind} requires metadata.name"))
             .await?;
         self.check_auth_detailed("create", group, plural, None, Some(&name))?;
+        if group == "certificates.k8s.io" && plural == "certificatesigningrequests" {
+            crate::bootstrap::prepare_csr(self, &mut doc).await?;
+        }
         let cur_rev = self.storage.current_revision().await + 1;
         if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
             Self::stamp_creation_and_uid(meta, plural, &name, cur_rev);

@@ -9,10 +9,13 @@ kind: Config
 kubernetes:
   apiServer:
     startupTimeoutSeconds: 600
+  disableLocalKubelet: false
   kubelet:
     cpuManager:
       policy: none
       reservedCPUs: ""
+  role: control-plane
+  tokenFile: ""
 logging:
   debug: false
   pprof: false
@@ -26,6 +29,7 @@ network:
     ip: ""
   mtu: 0
   nodeIP: ""
+  podAddressPool: 10.42.0.0/16
 path: /var/lib/diorama
 portainer:
   async: false

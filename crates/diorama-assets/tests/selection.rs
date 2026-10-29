@@ -54,6 +54,7 @@ fn build_offline_archive() -> (diorama_assets::DeclaredInventory, Vec<u8>) {
         if delivery_kind == "bundled" {
             let id = match id_str {
                 "containerd" => AssetId::Containerd,
+                "kube-scheduler" => AssetId::KubeScheduler,
                 "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
                 "containerd-shim-runc-v2" => AssetId::ContainerdShim,
                 "crun" => AssetId::Crun,

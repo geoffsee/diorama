@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum AssetId {
     Containerd,
+    KubeScheduler,
     #[serde(rename = "containerd-shim-runc-v2")]
     ContainerdShim,
     Crun,
@@ -40,7 +41,12 @@ pub struct CatalogEntry {
     pub reference: &'static str,
     pub encoding: Encoding,
 }
-const ENTRIES: [CatalogEntry; 15] = [
+const ENTRIES: [CatalogEntry; 16] = [
+    entry(
+        AssetId::KubeScheduler,
+        "kubernetes/v1.35.7/kube-scheduler",
+        Encoding::Identity,
+    ),
     entry(AssetId::Containerd, "containerd/v2.2.5", Encoding::Identity),
     entry(
         AssetId::ContainerdShim,

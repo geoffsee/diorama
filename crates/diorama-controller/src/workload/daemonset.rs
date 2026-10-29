@@ -95,18 +95,14 @@ impl DaemonSetReconciler {
             .cloned()
             .unwrap_or_default();
 
-        let has_nodes = !raw_nodes.is_empty();
         let schedulable_nodes = filter_schedulable_nodes(&raw_nodes);
         let matching_node_names = find_matching_node_names(&schedulable_nodes, &p.template_spec);
-        let use_generic_pod_name = is_generic_pod_naming(&raw_nodes, &p.template_spec);
 
         let max_unavailable = parse_max_unavailable(ds, matching_node_names.len());
         let cfg = DaemonSetConfig {
             name: p.name,
             uid: p.uid,
             generation: p.generation,
-            has_nodes,
-            use_generic_pod_name,
             rev_hash: &rev_hash,
             update_strategy: &p.update_strategy,
             max_unavailable,
@@ -142,7 +138,6 @@ impl DaemonSetReconciler {
             &matching_node_names,
             &updated_pods,
             p.name,
-            has_nodes,
             &rev_hash,
         );
 
@@ -519,11 +514,7 @@ impl DaemonSetReconciler {
         template_labels: &Value,
         failed_or_deleted_names: &[String],
     ) -> Result<(), ControllerError> {
-        let base_name = if cfg.use_generic_pod_name && !node_name.ends_with("-worker") {
-            format!("{}-node", cfg.name)
-        } else {
-            format!("{}-{node_name}", cfg.name)
-        };
+        let base_name = format!("{}-{node_name}", cfg.name);
 
         let mut pod_name = base_name.clone();
         if !failed_or_deleted_names.is_empty()
@@ -549,11 +540,10 @@ impl DaemonSetReconciler {
         }
 
         let mut pod_spec = template_spec.clone();
-        if cfg.has_nodes
-            && let Some(spec_obj) = pod_spec.as_object_mut()
-        {
-            spec_obj.insert("nodeName".to_string(), json!(node_name));
-        }
+        pod_spec.as_object_mut().unwrap().remove("nodeName");
+        pod_spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"] = json!({"nodeSelectorTerms":[{"matchFields":[{"key":"metadata.name","operator":"In","values":[node_name]}]}]});
+
+        add_daemon_tolerations(&mut pod_spec);
 
         let mut pod_labels = template_labels.clone();
         if let Some(l_obj) = pod_labels.as_object_mut() {
@@ -614,8 +604,6 @@ struct DaemonSetConfig<'a> {
     name: &'a str,
     uid: &'a str,
     generation: i64,
-    has_nodes: bool,
-    use_generic_pod_name: bool,
     rev_hash: &'a str,
     update_strategy: &'a str,
     max_unavailable: usize,
@@ -637,61 +625,12 @@ fn parse_max_unavailable(ds: &Value, total_nodes: usize) -> usize {
     1
 }
 
-fn has_explicit_node_placement(template_spec: &Value) -> bool {
-    let has_node_selector = template_spec
-        .get("nodeSelector")
-        .and_then(Value::as_object)
-        .is_some_and(|m| !m.is_empty());
-    let has_node_affinity = template_spec
-        .pointer("/affinity/nodeAffinity")
-        .is_some_and(|v| !v.is_null())
-        || template_spec
-            .get("nodeAffinity")
-            .is_some_and(|v| !v.is_null());
-    has_node_selector || has_node_affinity
-}
-
-fn is_generic_pod_naming(raw_nodes: &[Value], template_spec: &Value) -> bool {
-    if has_explicit_node_placement(template_spec) {
-        return false;
-    }
-    if raw_nodes.len() <= 1 {
-        return true;
-    }
-    let non_worker_count = raw_nodes
-        .iter()
-        .filter(|n| {
-            !n.pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .ends_with("-worker")
-        })
-        .count();
-    non_worker_count <= 1
-}
-
 fn filter_schedulable_nodes(raw_nodes: &[Value]) -> Vec<Value> {
-    if raw_nodes.is_empty() {
-        vec![json!({
-            "metadata": {
-                "name": "node",
-                "labels": {}
-            }
-        })]
-    } else {
-        raw_nodes
-            .iter()
-            .filter(|node| {
-                let terminating = node.pointer("/metadata/deletionTimestamp").is_some();
-                let unschedulable = node
-                    .pointer("/spec/unschedulable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                !terminating && !unschedulable
-            })
-            .cloned()
-            .collect()
-    }
+    raw_nodes
+        .iter()
+        .filter(|node| node.pointer("/metadata/deletionTimestamp").is_none())
+        .cloned()
+        .collect()
 }
 
 fn find_matching_node_names(
@@ -712,7 +651,6 @@ fn compute_daemonset_status(
     matching_node_names: &BTreeSet<String>,
     updated_pods: &[Value],
     name: &str,
-    has_nodes: bool,
     rev_hash: &str,
 ) -> Value {
     let desired_number_scheduled = if deleting {
@@ -739,7 +677,7 @@ fn compute_daemonset_status(
             if pod_rev == Some(rev_hash) || rev_hash.is_empty() {
                 updated_number_scheduled += 1;
             }
-            if !has_nodes || super::is_pod_ready(pod) {
+            if super::is_pod_ready(pod) {
                 number_ready += 1;
             }
         }
@@ -760,21 +698,34 @@ fn compute_daemonset_status(
     })
 }
 
-fn get_pod_node<'a>(pod: &'a Value, ds_name: &str) -> Option<&'a str> {
-    if let Some(n) = pod
-        .pointer("/spec/nodeName")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        return Some(n);
+fn add_daemon_tolerations(spec: &mut Value) {
+    let mut required = vec![
+        ("node.kubernetes.io/not-ready", "NoExecute"),
+        ("node.kubernetes.io/unreachable", "NoExecute"),
+        ("node.kubernetes.io/disk-pressure", "NoSchedule"),
+        ("node.kubernetes.io/memory-pressure", "NoSchedule"),
+        ("node.kubernetes.io/pid-pressure", "NoSchedule"),
+        ("node.kubernetes.io/unschedulable", "NoSchedule"),
+    ];
+    if spec["hostNetwork"] == true {
+        required.push(("node.kubernetes.io/network-unavailable", "NoSchedule"));
     }
-    let pname = pod.pointer("/metadata/name").and_then(Value::as_str)?;
-    let prefix = format!("{ds_name}-");
-    let rest = pname.strip_prefix(&prefix)?;
-    if rest == "node" || rest.starts_with("node-") {
-        return Some("node");
+    let mut tolerations = spec["tolerations"].as_array().cloned().unwrap_or_default();
+    for (key, effect) in required {
+        if !tolerations.iter().any(|t| {
+            t["key"] == key
+                && t["operator"] == "Exists"
+                && (t["effect"] == effect || t.get("effect").is_none())
+        }) {
+            tolerations.push(json!({"key":key,"operator":"Exists","effect":effect}));
+        }
     }
-    Some(rest)
+    spec["tolerations"] = Value::Array(tolerations);
+}
+
+fn get_pod_node<'a>(pod: &'a Value, _ds_name: &str) -> Option<&'a str> {
+    pod.pointer("/spec/nodeName").and_then(Value::as_str).filter(|s| !s.is_empty())
+        .or_else(|| pod.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchFields/0/values/0").and_then(Value::as_str))
 }
 
 fn node_matches_daemonset(node: &Value, template_spec: &Value) -> bool {

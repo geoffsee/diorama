@@ -27,6 +27,18 @@ fn resolve(
 }
 fn samples(path: &str, kind: FieldType) -> (&'static str, &'static str, Value, Value) {
     match path {
+        "kubernetes.role" => (
+            "control-plane",
+            "worker",
+            json!("control-plane"),
+            json!("worker"),
+        ),
+        "network.podAddressPool" => (
+            "10.42.0.0/16",
+            "10.50.0.0/16",
+            json!("10.42.0.0/16"),
+            json!("10.50.0.0/16"),
+        ),
         "runtime.backend" => ("auto", "oci-cri", json!("auto"), json!("oci-cri")),
         "kubernetes.kubelet.cpuManager.policy" => {
             ("none", "static", json!("none"), json!("static"))
@@ -68,13 +80,16 @@ fn samples(path: &str, kind: FieldType) -> (&'static str, &'static str, Value, V
 }
 #[test]
 fn every_binding_obeys_file_environment_explicit_flag_precedence() {
-    assert_eq!(INPUT_BINDINGS.len(), 31);
+    assert_eq!(INPUT_BINDINGS.len(), 35);
     for binding in INPUT_BINDINGS {
         let field = FIELDS.iter().find(|v| v.path == binding.path).unwrap();
         let (lo, hi, low, high) = samples(binding.path, field.kind);
         let mut base = serde_json::to_value(Config::default()).unwrap();
         if binding.path.ends_with("policyOptions") || binding.path.ends_with("reservedCPUs") {
             base["kubernetes"]["kubelet"]["cpuManager"]["policy"] = json!("static");
+        }
+        if binding.path == "kubernetes.role" {
+            base["kubernetes"]["tokenFile"] = json!("/join-token");
         }
         let pointer = format!("/{}", binding.path.replace('.', "/"));
         *base.pointer_mut(&pointer).unwrap() = low.clone();
@@ -171,7 +186,7 @@ fn go_layer_and_print_observations_match_independent_expected_outputs() {
             );
             if !has_unicode_break(&serde_json::to_value(&config).unwrap()) {
                 assert_eq!(
-                    render_effective_yaml(&config).unwrap(),
+                    legacy_render(&config),
                     case["stdout"].as_str().unwrap(),
                     "{} print",
                     case["id"]
@@ -196,12 +211,18 @@ fn every_binding_matches_the_independent_go_schema_capture() {
     let source: Value =
         serde_json::from_str(include_str!("fixtures/bindings-reference.json")).unwrap();
     let settings = source["settings"].as_array().unwrap();
-    assert_eq!(settings.len() + 1, INPUT_BINDINGS.len());
+    assert_eq!(settings.len() + 5, INPUT_BINDINGS.len());
     // The managed backend selector extends the captured Go schema.
-    for binding in INPUT_BINDINGS
-        .iter()
-        .filter(|binding| binding.path != "runtime.backend")
-    {
+    for binding in INPUT_BINDINGS.iter().filter(|binding| {
+        !matches!(
+            binding.path,
+            "runtime.backend"
+                | "kubernetes.role"
+                | "kubernetes.tokenFile"
+                | "kubernetes.disableLocalKubelet"
+                | "network.podAddressPool"
+        )
+    }) {
         let expected = settings
             .iter()
             .find(|field| field["path"] == binding.path)
@@ -241,7 +262,12 @@ fn direct_go_print_capture_preserves_escaped_control_data_with_named_deviation()
         let config = decode(case["input"].as_str().unwrap()).unwrap().config;
         let printed = render_effective_yaml(&config).unwrap();
         if !has_unicode_break(&serde_json::to_value(&config).unwrap()) {
-            assert_eq!(printed, case["printed"].as_str().unwrap(), "{}", case["id"]);
+            assert_eq!(
+                legacy_render(&config),
+                case["printed"].as_str().unwrap(),
+                "{}",
+                case["id"]
+            );
         }
         assert_eq!(
             decode(&printed)
@@ -414,4 +440,27 @@ fn managed_runtime_selector_rejects_unknown_backends_and_external_endpoints() {
     let cleared =
         diorama_config::apply_merge_patch(&config, &json!({"runtime":{"backend":null}})).unwrap();
     assert_eq!(cleared.runtime.backend, "");
+}
+
+// The captured Go document predates worker roles; retain its exact legacy output
+// comparison while checking the four added settings separately above.
+fn legacy_render(config: &Config) -> String {
+    render_effective_yaml(config)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            ![
+                "  role:",
+                "  tokenFile:",
+                "  disableLocalKubelet:",
+                "  podAddressPool:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+        .fold(String::new(), |mut output, line| {
+            output.push_str(line);
+            output.push('\n');
+            output
+        })
 }

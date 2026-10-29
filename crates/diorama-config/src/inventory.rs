@@ -19,6 +19,34 @@ pub struct FieldSpec {
 /// All baseline registry fields. apiVersion/kind are separately owned schema metadata.
 pub const FIELDS: &[FieldSpec] = &[
     FieldSpec {
+        path: "kubernetes.role",
+        kind: FieldType::String,
+        owner: "multi-node",
+        secret: false,
+        immutable: true,
+    },
+    FieldSpec {
+        path: "kubernetes.tokenFile",
+        kind: FieldType::String,
+        owner: "multi-node",
+        secret: false,
+        immutable: true,
+    },
+    FieldSpec {
+        path: "kubernetes.disableLocalKubelet",
+        kind: FieldType::Boolean,
+        owner: "multi-node",
+        secret: false,
+        immutable: true,
+    },
+    FieldSpec {
+        path: "network.podAddressPool",
+        kind: FieldType::String,
+        owner: "multi-node",
+        secret: false,
+        immutable: true,
+    },
+    FieldSpec {
         path: "api.enabled",
         kind: FieldType::Boolean,
         owner: "E23",

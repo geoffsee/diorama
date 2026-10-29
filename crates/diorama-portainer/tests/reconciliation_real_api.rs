@@ -133,7 +133,8 @@ async fn test_cold_startup_reconciliation_real_api() {
         .get("stringData")
         .or_else(|| secret.get("data"))
         .unwrap();
-    assert_eq!(secret_val["edge.key"], "edge-fixture-key");
+    assert_eq!(secret_val["edge.key"], "ZWRnZS1maXh0dXJlLWtleQ==");
+    assert!(secret.get("stringData").is_none());
 
     // 7. Verify Service in real API
     let svc = client
@@ -264,7 +265,8 @@ async fn verify_mutated_portainer_resources_preserved(client: &KubernetesApiClie
         .get("stringData")
         .or_else(|| secret.get("data"))
         .unwrap();
-    assert_eq!(secret_val["edge.key"], "edge-fixture-key");
+    assert_eq!(secret_val["edge.key"], "ZWRnZS1maXh0dXJlLWtleQ==");
+    assert!(secret.get("stringData").is_none());
 }
 
 #[tokio::test]

@@ -249,24 +249,81 @@ impl RbacAuthorizer {
         });
 
         self.add_cluster_role(ClusterRole {
-            name: "system:kube-scheduler".to_string(),
-            rules: vec![PolicyRule {
-                verbs: vec![
-                    "get".to_string(),
-                    "list".to_string(),
-                    "watch".to_string(),
-                    "create".to_string(),
-                    "update".to_string(),
-                ],
-                api_groups: vec![String::new()],
-                resources: vec![
-                    "pods".to_string(),
-                    "bindings".to_string(),
-                    "nodes".to_string(),
-                ],
-                resource_names: Vec::new(),
-                non_resource_urls: Vec::new(),
-            }],
+            name: "system:kube-scheduler".into(),
+            rules: vec![
+                PolicyRule {
+                    verbs: vec!["get".into(), "list".into(), "watch".into()],
+                    api_groups: vec![
+                        String::new(),
+                        "events.k8s.io".into(),
+                        "apps".into(),
+                        "storage.k8s.io".into(),
+                        "policy".into(),
+                        "scheduling.k8s.io".into(),
+                        "resource.k8s.io".into(),
+                    ],
+                    resources: vec![
+                        "pods",
+                        "events",
+                        "nodes",
+                        "namespaces",
+                        "services",
+                        "persistentvolumes",
+                        "persistentvolumeclaims",
+                        "replicasets",
+                        "replicationcontrollers",
+                        "statefulsets",
+                        "storageclasses",
+                        "csinodes",
+                        "csidrivers",
+                        "csistoragecapacities",
+                        "volumeattachments",
+                        "poddisruptionbudgets",
+                        "priorityclasses",
+                        "resourceclaims",
+                        "resourceslices",
+                        "deviceclasses",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    resource_names: vec![],
+                    non_resource_urls: vec![],
+                },
+                PolicyRule {
+                    verbs: vec!["create".into(), "update".into(), "patch".into()],
+                    api_groups: vec![String::new(), "events.k8s.io".into()],
+                    resources: vec![
+                        "pods/binding",
+                        "pods/status",
+                        "persistentvolumes",
+                        "persistentvolumeclaims",
+                        "events",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                    resource_names: vec![],
+                    non_resource_urls: vec![],
+                },
+                PolicyRule {
+                    verbs: vec!["delete".into()],
+                    api_groups: vec![String::new()],
+                    resources: vec!["pods".into()],
+                    resource_names: vec![],
+                    non_resource_urls: vec![],
+                },
+                PolicyRule {
+                    verbs: vec!["get", "create", "update"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    api_groups: vec!["coordination.k8s.io".into()],
+                    resources: vec!["leases".into()],
+                    resource_names: vec!["kube-scheduler".into()],
+                    non_resource_urls: vec![],
+                },
+            ],
         });
 
         self.add_cluster_role(ClusterRole {
@@ -297,6 +354,25 @@ impl RbacAuthorizer {
             name: "system:node".to_string(),
             rules: vec![
                 PolicyRule {
+                    verbs: vec!["get".into(), "list".into(), "watch".into()],
+                    api_groups: vec!["node.k8s.io".into(), "storage.k8s.io".into()],
+                    resources: vec!["runtimeclasses".into(), "csidrivers".into()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
+                    verbs: vec![
+                        "get".into(),
+                        "create".into(),
+                        "update".into(),
+                        "patch".into(),
+                    ],
+                    api_groups: vec!["storage.k8s.io".into()],
+                    resources: vec!["csinodes".into()],
+                    resource_names: Vec::new(),
+                    non_resource_urls: Vec::new(),
+                },
+                PolicyRule {
                     verbs: vec![
                         "get".to_string(),
                         "list".to_string(),
@@ -325,7 +401,7 @@ impl RbacAuthorizer {
                     non_resource_urls: Vec::new(),
                 },
                 PolicyRule {
-                    verbs: vec!["get".to_string()],
+                    verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
                     api_groups: vec![String::new()],
                     resources: vec![
                         "secrets".to_string(),
@@ -458,6 +534,16 @@ impl RbacAuthorizer {
         });
 
         self.add_cluster_role(ClusterRole {
+            name: "system:discovery".to_string(),
+            rules: vec![PolicyRule {
+                verbs: vec!["get".to_string()],
+                api_groups: vec![String::new()],
+                resources: vec!["discovery".to_string()],
+                resource_names: Vec::new(),
+                non_resource_urls: Vec::new(),
+            }],
+        });
+        self.add_cluster_role(ClusterRole {
             name: "system:service-account-issuer-discovery".to_string(),
             rules: vec![PolicyRule {
                 verbs: vec!["get".to_string()],
@@ -546,6 +632,13 @@ impl RbacAuthorizer {
             ],
         });
 
+        self.add_cluster_role_binding(ClusterRoleBinding {
+            name: "system:discovery".to_string(),
+            role_ref: "system:discovery".to_string(),
+            subjects: vec![Subject::Group {
+                name: "system:authenticated".to_string(),
+            }],
+        });
         self.add_cluster_role_binding(ClusterRoleBinding {
             name: "system:service-account-issuer-discovery".to_string(),
             role_ref: "system:service-account-issuer-discovery".to_string(),

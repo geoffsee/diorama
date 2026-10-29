@@ -4,14 +4,10 @@ use std::time::Duration;
 
 use diorama_apiserver::client::KubernetesApiClient;
 use diorama_apiserver::service::ApiserverService;
-use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::config::{
-    LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LOCAL_PATH_STORAGE_CLASS_NAME,
-    LocalPathConfig,
-};
+use crate::config::{LOCAL_PATH_DEPLOYMENT_NAME, LOCAL_PATH_NAMESPACE, LocalPathConfig};
 use crate::error::{Result, StorageError};
 use crate::health::LocalPathHealthReport;
 use crate::reconciler::{LocalPathReconciler, ReconciliationReport};
@@ -71,88 +67,6 @@ impl LocalPathService {
     #[must_use]
     pub fn volume_manager(&self) -> LocalPathVolumeManager {
         LocalPathVolumeManager::new(self.config.clone(), (*self.client).clone())
-    }
-
-    /// Binds local-path PVCs that are not yet bound.
-    ///
-    /// The in-process manager creates the volume. It does not wait for the
-    /// provisioner pod, which only has to exist for the addon health check.
-    pub async fn bind_pending_volumes(&self) {
-        let Ok(ns_list) = self.client.list_namespaces().await else {
-            return;
-        };
-        let mut namespaces = Vec::new();
-        if let Some(items) = ns_list.get("items").and_then(Value::as_array) {
-            for item in items {
-                if let Some(name) = item
-                    .get("metadata")
-                    .and_then(|meta| meta.get("name"))
-                    .and_then(Value::as_str)
-                {
-                    namespaces.push(name.to_string());
-                }
-            }
-        }
-        if !namespaces.iter().any(|name| name == "default") {
-            namespaces.push("default".to_string());
-        }
-
-        let default_node = match self.client.list_nodes().await {
-            Ok(nodes) => nodes
-                .pointer("/items/0/metadata/name")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            Err(_) => None,
-        };
-        let volume_manager = self.volume_manager();
-        if let Err(error) = volume_manager.release_deleted_claims().await {
-            tracing::warn!(%error, "could not reconcile released local-path volumes");
-        }
-
-        for namespace in &namespaces {
-            self.bind_pod_volumes(namespace, &volume_manager).await;
-            self.bind_unbound_pvcs(namespace, &volume_manager, default_node.as_deref())
-                .await;
-        }
-    }
-
-    async fn bind_pod_volumes(&self, namespace: &str, volume_manager: &LocalPathVolumeManager) {
-        let Ok(pod_list) = self.client.list_pods(namespace).await else {
-            return;
-        };
-        let Some(pods) = pod_list.get("items").and_then(Value::as_array) else {
-            return;
-        };
-        for pod in pods {
-            let Some(pod_name) = scheduled_pod_with_pvc(pod) else {
-                continue;
-            };
-            let _ = volume_manager
-                .bind_volumes_for_pod(namespace, pod_name)
-                .await;
-        }
-    }
-
-    async fn bind_unbound_pvcs(
-        &self,
-        namespace: &str,
-        volume_manager: &LocalPathVolumeManager,
-        default_node: Option<&str>,
-    ) {
-        let Ok(pvc_list) = self.client.list_pvcs(namespace).await else {
-            return;
-        };
-        let Some(pvcs) = pvc_list.get("items").and_then(Value::as_array) else {
-            return;
-        };
-        for pvc in pvcs {
-            let Some((pvc_name, node)) = unbound_local_path_claim(pvc, default_node) else {
-                continue;
-            };
-            let _ = volume_manager
-                .provision_volume_for_pvc(namespace, pvc_name, &node)
-                .await;
-        }
     }
 
     #[must_use]
@@ -304,45 +218,4 @@ impl LocalPathService {
         self.running.store(false, Ordering::SeqCst);
         self.ready.store(false, Ordering::SeqCst);
     }
-}
-
-fn scheduled_pod_with_pvc(pod: &Value) -> Option<&str> {
-    pod.pointer("/spec/nodeName").and_then(Value::as_str)?;
-    let volumes = pod.pointer("/spec/volumes").and_then(Value::as_array)?;
-    let has_claim = volumes
-        .iter()
-        .any(|vol| vol.get("persistentVolumeClaim").is_some());
-    if !has_claim {
-        return None;
-    }
-    pod.pointer("/metadata/name").and_then(Value::as_str)
-}
-
-fn unbound_local_path_claim<'a>(
-    pvc: &'a Value,
-    default_node: Option<&str>,
-) -> Option<(&'a str, String)> {
-    let storage_class = pvc
-        .pointer("/spec/storageClassName")
-        .and_then(Value::as_str);
-    let is_local_path = match storage_class {
-        None => true,
-        Some(name) if name == LOCAL_PATH_STORAGE_CLASS_NAME => true,
-        Some(_) => false,
-    };
-    if !is_local_path {
-        return None;
-    }
-    let phase = pvc.pointer("/status/phase").and_then(Value::as_str);
-    let volume_name = pvc.pointer("/spec/volumeName").and_then(Value::as_str);
-    if phase == Some("Bound") && volume_name.is_some() {
-        return None;
-    }
-    let selected_node = pvc
-        .pointer("/metadata/annotations/volume.kubernetes.io~1selected-node")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let node = selected_node.or_else(|| default_node.map(ToString::to_string))?;
-    let name = pvc.pointer("/metadata/name").and_then(Value::as_str)?;
-    Some((name, node))
 }

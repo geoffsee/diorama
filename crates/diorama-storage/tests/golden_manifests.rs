@@ -177,7 +177,13 @@ fn test_golden_fixtures_parity_all_variants() {
         );
         assert_eq!(
             cm_data.get("helperPod.yaml").unwrap(),
-            cm_golden["data"]["helperPod.yaml"].as_str().unwrap(),
+            &cm_golden["data"]["helperPod.yaml"]
+                .as_str()
+                .unwrap()
+                .replace(
+                    "spec:\n",
+                    "spec:\n  nodeSelector:\n    diorama.io/runtime: ordinary\n"
+                ),
             "variant {variant}: helperPod.yaml exact match"
         );
 
@@ -399,7 +405,10 @@ fn test_storage_class_custom_reclaim_and_binding() {
         .with_volume_binding_mode("Immediate");
     let sc = generate_storage_class(&custom_config);
     assert_eq!(sc.reclaim_policy.as_deref(), Some("Delete"));
-    assert_eq!(sc.volume_binding_mode.as_deref(), Some("Immediate"));
+    assert_eq!(
+        sc.volume_binding_mode.as_deref(),
+        Some("WaitForFirstConsumer")
+    );
 }
 
 #[test]

@@ -94,6 +94,19 @@ pub(crate) async fn dispatch(
     query: Option<&str>,
     body: &[u8],
 ) -> Result<Outcome, ApiserverError> {
+    let authorized;
+    let client = if method == Method::PATCH {
+        authorized = client.for_patch(
+            &path.group,
+            &path.resource,
+            path.subresource.as_deref(),
+            path.namespace.as_deref(),
+            path.name.as_deref().unwrap_or(""),
+        )?;
+        &authorized
+    } else {
+        client
+    };
     if let Some(outcome) = maybe_dispatch_aggregated(client, method, path, query, body).await? {
         return Ok(outcome);
     }
@@ -2242,12 +2255,21 @@ async fn update_cluster(
     }
 }
 
-fn decode_body(
+pub(crate) fn decode_body(
     content_type: Option<&str>,
     query: Option<&str>,
     body: &[u8],
     path: &ResourcePath,
 ) -> Result<Value, ApiserverError> {
+    if path.resource == "serviceaccounts" && path.subresource.as_deref() == Some("token") {
+        let token_path = ResourcePath {
+            group: "authentication.k8s.io".into(),
+            resource: "tokenrequests".into(),
+            subresource: None,
+            ..path.clone()
+        };
+        return decode_body(content_type, query, body, &token_path);
+    }
     if body.is_empty() {
         return Ok(Value::Null);
     }
@@ -2298,6 +2320,7 @@ pub(crate) fn kind_name(resource: &str) -> Option<&'static str> {
         "endpoints" => "Endpoints",
         "endpointslices" => "EndpointSlice",
         "serviceaccounts" => "ServiceAccount",
+        "tokenrequests" => "TokenRequest",
         "nodes" => "Node",
         "persistentvolumeclaims" => "PersistentVolumeClaim",
         "persistentvolumes" => "PersistentVolume",
@@ -2585,6 +2608,31 @@ async fn subresource_dispatch(
         });
     }
     match (path.group.as_str(), path.resource.as_str(), subresource) {
+        ("", "pods", "binding") => {
+            if *method != Method::POST {
+                return Ok(status_outcome(
+                    http::StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "binding requires POST",
+                ));
+            }
+            let namespace =
+                path.namespace
+                    .as_deref()
+                    .ok_or_else(|| ApiserverError::BadRequest {
+                        message: "binding requires namespace".into(),
+                    })?;
+            let binding_path = ResourcePath {
+                resource: "bindings".into(),
+                subresource: None,
+                ..path.clone()
+            };
+            let doc = decode_body(content_type, query, body, &binding_path)?;
+            client
+                .bind_pod(namespace, path.name.as_deref().unwrap(), doc)
+                .await
+                .map(created_json)
+        },
         ("", "serviceaccounts", "token") => {
             if *method != Method::POST {
                 return Ok(status_outcome(
@@ -2776,7 +2824,7 @@ async fn subresource_dispatch(
                         }
                     }
                 }
-                if subresource == "resize"
+                if matches!(subresource, "resize" | "status")
                     && path.resource == "pods"
                     && let Some(namespace) = &path.namespace
                 {
@@ -2786,7 +2834,7 @@ async fn subresource_dispatch(
                             name,
                             updated,
                             is_dry_run(query),
-                            Some("resize"),
+                            Some(subresource),
                         )
                         .await
                         .map(ok_json)
@@ -3547,7 +3595,8 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn cluster_wide_list_does_not_require_namespace_discovery_permission() {
+    #[allow(clippy::too_many_lines)]
+    async fn list_and_patch_require_only_the_requested_resource_and_verb() {
         use crate::{
             ApiserverConfig, ApiserverService, ClusterRole, ClusterRoleBinding, KubernetesStorage,
             PolicyRule, Subject,
@@ -3612,6 +3661,63 @@ mod tests {
             ));
         }
         assert!(list_all_namespaces(&reader, "", "secrets").await.is_err());
+        assert!(reader.discover_apis().is_ok());
+        admin
+            .create_cluster_role(ClusterRole {
+                name: "patcher".into(),
+                rules: vec![PolicyRule {
+                    verbs: vec!["patch".into()],
+                    api_groups: vec![String::new()],
+                    resources: vec!["configmaps".into()],
+                    resource_names: vec!["proof".into()],
+                    non_resource_urls: vec![],
+                }],
+            })
+            .await
+            .unwrap();
+        admin
+            .create_cluster_role_binding(ClusterRoleBinding {
+                name: "patcher".into(),
+                role_ref: "patcher".into(),
+                subjects: vec![Subject::ServiceAccount {
+                    namespace: "alpha".into(),
+                    name: "reader".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(reader.get_configmap("alpha", "proof").await.is_err());
+        let path = ResourcePath {
+            group: String::new(),
+            version: "v1".into(),
+            resource: "configmaps".into(),
+            namespace: Some("alpha".into()),
+            name: Some("proof".into()),
+            subresource: None,
+            trailing_slash: false,
+        };
+        dispatch(
+            &service,
+            &reader,
+            &Method::PATCH,
+            &path,
+            Some("application/merge-patch+json"),
+            None,
+            br#"{"data":{"patched":"yes"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            admin.get_configmap("alpha", "proof").await.unwrap()["data"]["patched"],
+            "yes"
+        );
+        // The scoped internal read does not escape to another namespace or name.
+        let scoped = reader
+            .for_patch("", "configmaps", None, Some("alpha"), "proof")
+            .unwrap();
+        assert!(scoped.get_configmap("beta", "proof").await.is_err());
+        assert!(scoped.get_configmap("alpha", "another").await.is_err());
+        assert!(reader.get_configmap("alpha", "proof").await.is_err());
     }
 
     #[test]

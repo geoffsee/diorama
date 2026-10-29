@@ -82,7 +82,7 @@ struct Started {
     runtime: Arc<MockRuntimeProvider>,
 }
 
-/// Creates the given pods unbound and runs the first kubelet pass over them.
+/// Binds Pods through the scheduler endpoint before running the kubelet.
 async fn start_pods(pods: Vec<Value>) -> Started {
     let dir = TempDir::new().unwrap();
     let (apiserver, options) = setup(&dir);
@@ -94,13 +94,18 @@ async fn start_pods(pods: Vec<Value>) -> Started {
     let admin = apiserver.admin_client();
     let count = pods.len();
     for pod in pods {
-        admin.create_pod("default", pod).await.unwrap();
+        let pod = admin.create_pod("default", pod).await.unwrap();
+        admin
+            .bind_pod(
+                "default",
+                pod["metadata"]["name"].as_str().unwrap(),
+                json!({"target":{"kind":"Node","name":"test-node"}}),
+            )
+            .await
+            .unwrap();
     }
     let report = kubelet.reconcile_once().await.unwrap();
-    assert_eq!(
-        (report.bound, report.synced, report.failed),
-        (count, count, 0)
-    );
+    assert_eq!((report.bound, report.synced, report.failed), (0, count, 0));
     Started {
         _dir: dir,
         kubelet,
@@ -121,7 +126,7 @@ async fn resource_version(admin: &KubernetesApiClient, name: &str) -> Value {
 }
 
 #[tokio::test]
-async fn unbound_pod_is_bound_started_and_reported_running() {
+async fn api_bound_pod_is_started_and_reported_running() {
     let Started {
         kubelet,
         admin,
@@ -319,6 +324,14 @@ async fn always_policy_restarts_with_crash_loop_back_off_and_keeps_previous_logs
         .create_pod("default", pod_with_policy("onfail", "OnFailure"))
         .await
         .unwrap();
+    admin
+        .bind_pod(
+            "default",
+            "onfail",
+            json!({"target":{"kind":"Node","name":"test-node"}}),
+        )
+        .await
+        .unwrap();
     kubelet.reconcile_once().await.unwrap();
     let onfail_uid = uid_of(&admin, "onfail").await;
     runtime.set_container_exit(&onfail_uid, "hello", 0);
@@ -378,6 +391,14 @@ async fn deleting_a_running_pod_stops_it_with_grace_then_removes_it() {
         .create_pod("default", pod_with_policy("web", "Always"))
         .await
         .unwrap();
+    admin
+        .bind_pod(
+            "default",
+            "web",
+            json!({"target":{"kind":"Node","name":"test-node"}}),
+        )
+        .await
+        .unwrap();
     kubelet.reconcile_once().await.unwrap();
     let again = admin.get_pod("default", "web").await.unwrap();
     assert_eq!(phase(&again), "Running");
@@ -411,7 +432,7 @@ async fn log_reader_rejects_pods_that_are_not_running_here() {
 }
 
 #[tokio::test]
-async fn log_and_exec_sources_accept_companion_node_pods() {
+async fn log_and_exec_sources_reject_companion_node_pods() {
     let dir = TempDir::new().unwrap();
     let (apiserver, options) = setup(&dir);
     let runtime = Arc::new(MockRuntimeProvider::new("mock"));
@@ -431,12 +452,18 @@ async fn log_and_exec_sources_accept_companion_node_pods() {
         .await
         .unwrap_err();
     assert!(
-        log_err
-            .to_string()
-            .contains("waiting to start: ContainerCreating"),
-        "expected waiting container error, got: {log_err}"
+        log_err.to_string().contains("not assigned"),
+        "expected node ownership rejection, got: {log_err}"
     );
 
+    assert!(
+        exec_source
+            .exec_in_pod(&companion_pod, "hello", &["ls".into()])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not assigned")
+    );
     let mut other_pod = companion_pod.clone();
     other_pod["spec"]["nodeName"] = json!("other-node");
     let other_log_err = log_source
