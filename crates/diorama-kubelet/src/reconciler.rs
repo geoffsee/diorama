@@ -1653,7 +1653,7 @@ fn container_config_with_env(
     let root = root_dir.unwrap_or(default_root);
     let mounts = build_container_mounts(container, spec_volumes, root, uid, &envs, pod)?;
     let resources = build_container_resources(container);
-    let security_context = build_security_context(pod, container)?;
+    let security_context = build_security_context(pod, container, root)?;
     let linux =
         (resources.is_some() || security_context.is_some()).then_some(cri::LinuxContainerConfig {
             resources,
@@ -2008,6 +2008,7 @@ fn attach_termination_log(mounts: &mut Vec<cri::Mount>, root: &Path, uid: &str, 
 fn build_security_context(
     pod: &Value,
     container: &Value,
+    root: &Path,
 ) -> Result<Option<cri::LinuxContainerSecurityContext>, KubeletError> {
     let pod_sc = pod.pointer("/spec/securityContext");
     let container_sc = container.get("securityContext");
@@ -2066,21 +2067,8 @@ fn build_security_context(
             ..cri::Capability::default()
         })
         .filter(|caps| !caps.add_capabilities.is_empty() || !caps.drop_capabilities.is_empty());
-    let selinux_options = container_sc
-        .and_then(|sc| sc.get("seLinuxOptions"))
-        .or_else(|| pod_sc.and_then(|sc| sc.get("seLinuxOptions")))
-        .map(|options| cri::SeLinuxOption {
-            user: security_str_field(options, "user"),
-            role: security_str_field(options, "role"),
-            r#type: security_str_field(options, "type"),
-            level: security_str_field(options, "level"),
-        })
-        .filter(|options| {
-            !options.user.is_empty()
-                || !options.role.is_empty()
-                || !options.r#type.is_empty()
-                || !options.level.is_empty()
-        });
+    let selinux_options = build_selinux_options(pod_sc, container_sc);
+    let seccomp = build_seccomp_profile(pod_sc, container_sc, root)?;
     let no_new_privs = container_sc
         .and_then(|sc| sc.get("allowPrivilegeEscalation"))
         .and_then(Value::as_bool)
@@ -2092,6 +2080,7 @@ fn build_security_context(
         && !readonly_rootfs
         && capabilities.is_none()
         && selinux_options.is_none()
+        && seccomp.is_none()
         && !no_new_privs
     {
         return Ok(None);
@@ -2105,7 +2094,83 @@ fn build_security_context(
         capabilities,
         selinux_options,
         no_new_privs,
+        seccomp,
         ..cri::LinuxContainerSecurityContext::default()
+    }))
+}
+
+fn build_selinux_options(
+    pod_sc: Option<&Value>,
+    container_sc: Option<&Value>,
+) -> Option<cri::SeLinuxOption> {
+    container_sc
+        .and_then(|sc| sc.get("seLinuxOptions"))
+        .or_else(|| pod_sc.and_then(|sc| sc.get("seLinuxOptions")))
+        .map(|options| cri::SeLinuxOption {
+            user: security_str_field(options, "user"),
+            role: security_str_field(options, "role"),
+            r#type: security_str_field(options, "type"),
+            level: security_str_field(options, "level"),
+        })
+        .filter(|options| {
+            !options.user.is_empty()
+                || !options.role.is_empty()
+                || !options.r#type.is_empty()
+                || !options.level.is_empty()
+        })
+}
+
+fn build_seccomp_profile(
+    pod_security: Option<&Value>,
+    container_security: Option<&Value>,
+    root: &Path,
+) -> Result<Option<cri::SecurityProfile>, KubeletError> {
+    let Some(profile) = container_security
+        .and_then(|sc| sc.get("seccompProfile"))
+        .or_else(|| pod_security.and_then(|sc| sc.get("seccompProfile")))
+    else {
+        return Ok(None);
+    };
+    let invalid = |reason: &str| KubeletError::InvalidConfiguration {
+        field: "securityContext.seccompProfile".into(),
+        reason: reason.into(),
+    };
+    let (kind, localhost_ref) = match profile.get("type").and_then(Value::as_str) {
+        Some("RuntimeDefault") => (
+            cri::security_profile::ProfileType::RuntimeDefault,
+            String::new(),
+        ),
+        Some("Unconfined") => (
+            cri::security_profile::ProfileType::Unconfined,
+            String::new(),
+        ),
+        Some("Localhost") => {
+            let local = profile
+                .get("localhostProfile")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid("Localhost requires localhostProfile"))?;
+            if Path::new(local)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(invalid(
+                    "localhostProfile must be relative to the kubelet seccomp directory without traversal",
+                ));
+            }
+            (
+                cri::security_profile::ProfileType::Localhost,
+                root.join("seccomp")
+                    .join(local)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        },
+        _ => return Err(invalid("expected RuntimeDefault, Unconfined, or Localhost")),
+    };
+    Ok(Some(cri::SecurityProfile {
+        profile_type: kind as i32,
+        localhost_ref,
     }))
 }
 
@@ -7182,6 +7247,54 @@ mod tests {
     }
 
     #[test]
+    fn active_reconciler_preserves_seccomp_inheritance_and_overrides() {
+        let pod = json!({"spec":{"securityContext":{"seccompProfile":{"type":"RuntimeDefault"}}}});
+        let root = Path::new("/node/kubelet");
+        let inherited = build_security_context(&pod, &json!({}), root)
+            .unwrap()
+            .unwrap()
+            .seccomp
+            .unwrap();
+        assert_eq!(
+            inherited.profile_type,
+            cri::security_profile::ProfileType::RuntimeDefault as i32
+        );
+        let overridden = build_security_context(
+            &pod,
+            &json!({"securityContext":{"seccompProfile":{"type":"Unconfined"}}}),
+            root,
+        )
+        .unwrap()
+        .unwrap()
+        .seccomp
+        .unwrap();
+        assert_eq!(
+            overridden.profile_type,
+            cri::security_profile::ProfileType::Unconfined as i32
+        );
+        let local = build_security_context(&pod, &json!({"securityContext":{"seccompProfile":{"type":"Localhost","localhostProfile":"profiles/test.json"}}}), root).unwrap().unwrap().seccomp.unwrap();
+        assert_eq!(
+            local.localhost_ref,
+            "/node/kubelet/seccomp/profiles/test.json"
+        );
+        for profile in [
+            json!({"type":"Typo"}),
+            json!({"type":"Localhost"}),
+            json!({"type":"Localhost","localhostProfile":"../escape.json"}),
+            json!({"type":"Localhost","localhostProfile":"/absolute.json"}),
+        ] {
+            assert!(
+                build_security_context(
+                    &pod,
+                    &json!({"securityContext":{"seccompProfile":profile}}),
+                    root
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn security_context_absent_without_security_fields() {
         let pod = json!({
             "metadata": { "name": "app", "namespace": "default", "uid": "uid-1" },
@@ -8824,7 +8937,8 @@ mod tests {
                 "allowPrivilegeEscalation": false
             }
         });
-        let sc = build_security_context(&pod, &container).expect("security context build");
+        let sc = build_security_context(&pod, &container, Path::new("/kubelet"))
+            .expect("security context build");
         assert!(sc.is_some());
         assert!(sc.unwrap().no_new_privs);
     }

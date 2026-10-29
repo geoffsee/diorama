@@ -1,6 +1,6 @@
 //! External CRI runtime provider selection and metadata.
 //!
-//! Recognizes official Kubernetes container runtime providers (containerd and CRI-O)
+//! Recognizes supported CRI runtime providers (containerd, CRI-O, and oci-cri)
 //! and classifies unrecognized engines with informative error reporting.
 
 use std::fmt;
@@ -12,6 +12,8 @@ pub enum CriProvider {
     Containerd,
     /// CRI-O container runtime.
     Crio,
+    /// oci-lib's libcontainer-backed CRI runtime.
+    OciCri,
     /// Unrecognized or unsupported runtime engine (e.g. dockershim, frakti).
     Unsupported(String),
 }
@@ -20,7 +22,7 @@ impl CriProvider {
     /// Returns true if this provider is supported for diorama Kube execution.
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        matches!(self, Self::Containerd | Self::Crio)
+        matches!(self, Self::Containerd | Self::Crio | Self::OciCri)
     }
 
     /// Canonical identifier for the provider.
@@ -29,6 +31,7 @@ impl CriProvider {
         match self {
             Self::Containerd => "containerd",
             Self::Crio => "cri-o",
+            Self::OciCri => "oci-cri",
             Self::Unsupported(name) => name.as_str(),
         }
     }
@@ -44,7 +47,9 @@ impl fmt::Display for CriProvider {
 #[must_use]
 pub fn detect_provider(runtime_name: &str) -> CriProvider {
     let lower = runtime_name.trim().to_lowercase();
-    if lower.contains("containerd") {
+    if lower == "oci-cri" {
+        CriProvider::OciCri
+    } else if lower.contains("containerd") {
         CriProvider::Containerd
     } else if lower.contains("cri-o") || lower.contains("crio") {
         CriProvider::Crio
@@ -85,6 +90,10 @@ mod tests {
 
     #[test]
     fn detect_supported_providers() {
+        assert_eq!(detect_provider("oci-cri"), CriProvider::OciCri);
+        assert_eq!(detect_provider(" OCI-CRI "), CriProvider::OciCri);
+        assert!(CriProvider::OciCri.is_supported());
+        assert_eq!(CriProvider::OciCri.as_str(), "oci-cri");
         assert_eq!(detect_provider("containerd"), CriProvider::Containerd);
         assert_eq!(
             detect_provider("io.containerd.runc.v2"),
@@ -101,6 +110,7 @@ mod tests {
 
     #[test]
     fn detect_unsupported_providers() {
+        assert!(!detect_provider("not-oci-cri").is_supported());
         let dockershim = detect_provider("docker");
         assert_eq!(dockershim, CriProvider::Unsupported("docker".into()));
         assert!(!dockershim.is_supported());

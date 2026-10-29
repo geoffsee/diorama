@@ -24,13 +24,21 @@ fn leaves(value: &Value, prefix: &str, output: &mut BTreeSet<String>) {
 fn complete_descriptors_match_the_independent_actual_go_schema() {
     let reference: Value = serde_json::from_str(include_str!("fixtures/bindings-reference.json"))
         .expect("reviewed actual Go capture");
-    assert_eq!(json!(describe_settings()), reference["settings"]);
+    assert_eq!(
+        json!(
+            describe_settings()
+                .into_iter()
+                .filter(|field| field.path != "runtime.backend")
+                .collect::<Vec<_>>()
+        ),
+        reference["settings"]
+    );
 }
 
 #[test]
 fn inventory_is_complete_unique_sorted_and_has_model_leaves_and_bindings() {
     let descriptors = describe_settings();
-    assert_eq!(descriptors.len(), 30);
+    assert_eq!(descriptors.len(), 31);
     assert!(
         descriptors
             .windows(2)

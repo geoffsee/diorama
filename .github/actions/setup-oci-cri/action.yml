@@ -1,0 +1,15 @@
+name: Set up native oci-cri build
+description: Install the Go compiler and seccomp headers used by the optional CRI runtime.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      with:
+        go-version: '1.26.10'
+        # The Go module belongs to the pinned Cargo git dependency.
+        cache: false
+    - name: Install native dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends build-essential pkg-config libseccomp-dev

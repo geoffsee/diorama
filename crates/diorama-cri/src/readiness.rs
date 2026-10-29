@@ -56,7 +56,7 @@ impl fmt::Display for ReadinessError {
             } => {
                 write!(
                     f,
-                    "unsupported external CRI provider '{runtime_name}' (version: {runtime_version}); only containerd and CRI-O are supported"
+                    "unsupported external CRI provider '{runtime_name}' (version: {runtime_version}); supported providers are containerd, CRI-O, and oci-cri"
                 )
             },
             Self::RpcFailed { service, status } => {

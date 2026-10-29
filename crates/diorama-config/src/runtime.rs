@@ -22,7 +22,7 @@ pub struct RuntimeEndpoint {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSettings {
-    /// All thirty desired-state fields remain typed and available to their owners.
+    /// All desired-state fields remain typed and available to their owners.
     pub desired: Config,
     pub probe: RuntimeProbe,
     pub node_name: String,
@@ -239,7 +239,15 @@ impl ValidatedConfig {
         let url = endpoint.unwrap_or_else(|| {
             format!(
                 "unix://{}",
-                join(&config.path, "containerd/containerd.sock").display()
+                join(
+                    &config.path,
+                    if config.runtime.backend == "oci-cri" {
+                        "oci-cri/cri.sock"
+                    } else {
+                        "containerd/containerd.sock"
+                    }
+                )
+                .display()
             )
         });
         let socket = PathBuf::from(url.strip_prefix("unix://").unwrap_or(&url));

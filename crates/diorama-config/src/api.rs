@@ -14,6 +14,7 @@ pub const STRUCT_FIELD_PATHS: &[&str] = &[
     "network.disableIPv6",
     "network.loadBalancer.enabled",
     "network.loadBalancer.ip",
+    "runtime.backend",
     "runtime.endpoint",
     "runtime.containerMode",
     "kubernetes.nodeName",
@@ -222,6 +223,10 @@ pub fn serialize_api_config(config: &Config) -> String {
     out.push_str(&serde_json::to_string(&config.network.load_balancer.ip).unwrap());
     out.push_str("}},\"runtime\":{\"endpoint\":");
     out.push_str(&serde_json::to_string(&config.runtime.endpoint).unwrap());
+    if !config.runtime.backend.is_empty() {
+        out.push_str(",\"backend\":");
+        out.push_str(&serde_json::to_string(&config.runtime.backend).unwrap());
+    }
     if let Some(cm) = config.runtime.container_mode {
         out.push_str(",\"containerMode\":");
         out.push_str(if cm { "true" } else { "false" });

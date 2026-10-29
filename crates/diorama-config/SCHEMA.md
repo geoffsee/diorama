@@ -60,6 +60,7 @@ this default example.
 | `portainer.edgeID` | string | `""` | portainer-edge-id | KUBESOLO_PORTAINER_EDGE_ID | restart | false |
 | `portainer.edgeKey` | string | `null` | portainer-edge-key | KUBESOLO_PORTAINER_EDGE_KEY | restart | true |
 | `portainer.image` | string | `"docker.io/portainer/agent:lts"` | portainer-edge-image | KUBESOLO_PORTAINER_EDGE_IMAGE | restart | false |
+| `runtime.backend` | string | `""` | container-runtime | KUBESOLO_CONTAINER_RUNTIME | restart | false |
 | `runtime.containerMode` | boolean | `null` | container-mode | KUBESOLO_CONTAINER_MODE | restart | false |
 | `runtime.endpoint` | string | `""` | container-runtime-endpoint | KUBESOLO_CONTAINER_RUNTIME_ENDPOINT | restart | false |
 | `storage.dbWALRepair` | boolean | `false` | db-wal-repair | KUBESOLO_DB_WAL_REPAIR | restart | false |
@@ -75,3 +76,8 @@ array, including null defaults, omitted optional metadata and sorted order.
 Other tests ensure every inventory entry has a model leaf and input binding,
 and that the checked-in example decodes to the complete default model and renders
 back byte-for-byte. These checks require no host discovery or running cluster.
+
+`runtime.backend` is a diorama extension: empty or `auto` preserves automatic
+runtime selection; `containerd` and `oci-cri` explicitly select a managed runtime.
+Managed selections conflict with `runtime.endpoint`. `oci-cri` requires Linux and
+a build with the `oci-cri` feature.

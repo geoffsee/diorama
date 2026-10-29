@@ -325,6 +325,18 @@ impl RuntimeBuilder {
         self.register_component(Registration::new(spec, service))
     }
 
+    /// Registers an in-process oci-cri runtime. Call `diorama_oci::startup`
+    /// before starting the executor and make kubelet depend on `oci-cri`.
+    #[cfg(feature = "oci-cri")]
+    #[must_use]
+    pub fn register_oci_cri(self, service: diorama_oci::OciCriService) -> Self {
+        let timeout = self.policy.startup_timeout();
+        let spec = self
+            .policy
+            .apply(diorama_oci::OciCriService::component_spec(timeout));
+        self.register_component(Registration::new(spec, service))
+    }
+
     /// Registers the external CRI runtime component under supervision.
     #[must_use]
     pub fn register_external_cri(self, service: ExternalRuntimeService) -> Self {
@@ -472,6 +484,8 @@ impl NodeRuntime {
         host: diorama_config::HostContext,
     ) -> Result<Self, RuntimeError> {
         let state_dir = PathBuf::from(&config.config().path);
+        // Reject unsupported explicit selections before creating node state.
+        detect_workload_runtime(config.config(), &state_dir)?;
         std::fs::create_dir_all(&state_dir)?;
 
         let (node_ip, pki_dir, node_name) = initialize_pki(&state_dir, &config)?;
@@ -551,7 +565,11 @@ impl NodeRuntime {
         builder = register_workload_path(builder, workload_ctx)?;
 
         if builder.config().config().storage.local_path.enabled {
-            let storage_config = LocalPathConfig::new().with_enabled(true);
+            let managed_containerd = builder
+                .registrations()
+                .iter()
+                .any(|registration| registration.spec.id == COMPONENT_CONTAINERD);
+            let storage_config = local_path_config(builder.config().config(), managed_containerd);
             let storage_service = LocalPathService::new(storage_config, Arc::new(client.clone()));
             let storage_reg = LocalPathAdapter::registration(
                 COMPONENT_LOCAL_PATH,
@@ -744,8 +762,12 @@ pub fn select_runtime_provider(
         if !cfg!(target_os = "linux") {
             return None;
         }
-        let managed = PathBuf::from(&config.path).join("containerd/containerd.sock");
-        if managed.exists() {
+        let managed = PathBuf::from(&config.path).join(if config.runtime.backend == "oci-cri" {
+            "oci-cri/cri.sock"
+        } else {
+            "containerd/containerd.sock"
+        });
+        if managed.exists() || config.runtime.backend == "oci-cri" {
             managed
         } else {
             let host = PathBuf::from("/run/containerd/containerd.sock");
@@ -901,22 +923,60 @@ fn is_dir_writable(dir: &Path) -> bool {
 fn detect_workload_runtime(
     config: &diorama_config::Config,
     state_dir: &Path,
-) -> Option<(&'static str, PathBuf, bool)> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let containerd_paths = ContainerdPaths::from_base(state_dir);
-    let endpoint_configured = !config.runtime.endpoint.trim().is_empty();
-    let managed_binary_exists = containerd_paths.binary_path.exists();
+) -> Result<Option<(&'static str, PathBuf)>, RuntimeError> {
+    detect_workload_runtime_for_host(
+        config,
+        state_dir,
+        cfg!(target_os = "linux"),
+        cfg!(feature = "oci-cri"),
+    )
+}
 
-    if endpoint_configured {
+fn detect_workload_runtime_for_host(
+    config: &diorama_config::Config,
+    state_dir: &Path,
+    linux: bool,
+    oci_enabled: bool,
+) -> Result<Option<(&'static str, PathBuf)>, RuntimeError> {
+    let invalid =
+        |message| RuntimeError::from(io::Error::new(io::ErrorKind::InvalidInput, message));
+    if matches!(config.runtime.backend.as_str(), "containerd" | "oci-cri")
+        && !config.runtime.endpoint.trim().is_empty()
+    {
+        return Err(invalid(
+            "managed runtime selection conflicts with runtime.endpoint",
+        ));
+    }
+    if config.runtime.backend == "oci-cri" {
+        if !linux {
+            return Err(invalid("managed oci-cri requires Linux"));
+        }
+        if !oci_enabled {
+            return Err(invalid(
+                "managed oci-cri requires a build with --features oci-cri",
+            ));
+        }
+        return Ok(Some(("oci-cri", state_dir.join("oci-cri/cri.sock"))));
+    }
+    if !linux {
+        if config.runtime.backend == "containerd" {
+            return Err(invalid("managed containerd requires Linux"));
+        }
+        return Ok(None);
+    }
+    let paths = ContainerdPaths::from_base(state_dir);
+    if !config.runtime.endpoint.trim().is_empty() {
         let ep = config.runtime.endpoint.trim();
         let socket = ep.strip_prefix("unix://").unwrap_or(ep);
-        Some((COMPONENT_EXTERNAL_CRI, PathBuf::from(socket), false))
-    } else if managed_binary_exists {
-        Some((COMPONENT_CONTAINERD, containerd_paths.socket_path, true))
+        Ok(Some((COMPONENT_EXTERNAL_CRI, PathBuf::from(socket))))
+    } else if paths.binary_path.is_file() {
+        Ok(Some((COMPONENT_CONTAINERD, paths.socket_path)))
+    } else if config.runtime.backend == "containerd" {
+        Err(invalid(
+            "managed containerd binary is missing from the state directory",
+        ))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -924,13 +984,49 @@ fn register_container_runtime(
     builder: RuntimeBuilder,
     state_dir: &Path,
     socket_path: &Path,
-    is_managed: bool,
+    runtime_id: &str,
     mtu: u32,
     pod_cidr: Option<&str>,
 ) -> Result<RuntimeBuilder, RuntimeError> {
     let containerd_paths = ContainerdPaths::from_base(state_dir);
     let etc_cni = Path::new("/etc/cni/net.d");
-    if is_managed {
+    if runtime_id == "oci-cri" {
+        #[cfg(feature = "oci-cri")]
+        {
+            let base = state_dir.join("oci-cri");
+            let cni_conf = base.join("cni/net.d");
+            let missing = diorama_network::warn_missing_cni_plugins(&containerd_paths.cni_bin_dir);
+            if !missing.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("oci-cri CNI prerequisites: {}", missing.join("; ")),
+                )
+                .into());
+            }
+            std::fs::create_dir_all(&cni_conf)?;
+            diorama_network::write_cni_config_file(
+                &cni_conf.join(diorama_network::DEFAULT_CNI_CONFIG_NAME),
+                mtu,
+                pod_cidr,
+            )?;
+            let config = diorama_oci::Config {
+                socket: socket_path.to_path_buf(),
+                root: base.join("root"),
+                state_root: base.join("state"),
+                cni_bin_dir: Some(containerd_paths.cni_bin_dir),
+                cni_conf_dir: Some(cni_conf),
+                pod_cidr: pod_cidr.unwrap_or_default().to_string(),
+                ..diorama_oci::Config::default()
+            };
+            let timeout = builder.policy.startup_timeout();
+            return Ok(builder.register_oci_cri(diorama_oci::OciCriService::new(config, timeout)));
+        }
+        #[cfg(not(feature = "oci-cri"))]
+        return Err(
+            io::Error::new(io::ErrorKind::Unsupported, "oci-cri feature is disabled").into(),
+        );
+    }
+    if runtime_id == COMPONENT_CONTAINERD {
         diorama_network::write_managed_cni_config(
             state_dir,
             mtu,
@@ -971,9 +1067,9 @@ fn register_workload_path(
     mut builder: RuntimeBuilder,
     ctx: WorkloadContext<'_>,
 ) -> Result<RuntimeBuilder, RuntimeError> {
-    let detected_runtime = detect_workload_runtime(builder.config().config(), ctx.state_dir);
+    let detected_runtime = detect_workload_runtime(builder.config().config(), ctx.state_dir)?;
 
-    if let Some((runtime_id, socket_path, is_managed)) = detected_runtime {
+    if let Some((runtime_id, socket_path)) = detected_runtime {
         let mtu = u32::try_from(builder.config().config().network.mtu)
             .ok()
             .filter(|&m| m > 0)
@@ -984,7 +1080,7 @@ fn register_workload_path(
             builder,
             ctx.state_dir,
             &socket_path,
-            is_managed,
+            runtime_id,
             mtu,
             pod_cidr,
         )?;
@@ -1035,8 +1131,60 @@ fn register_workload_path(
     }
 }
 
+fn local_path_config(config: &diorama_config::Config, managed_containerd: bool) -> LocalPathConfig {
+    let mut storage = LocalPathConfig::from_diorama_config(config);
+    // Only managed containerd imports these archives. External runtimes and
+    // oci-cri need the public image even when a containerd bundle is on disk.
+    if managed_containerd {
+        let images = ContainerdPaths::from_base(&config.path).images_dir;
+        storage.provisioner_image = ImageImportConfig::from_config(config, images)
+            .local_path_image()
+            .into();
+    }
+    storage
+}
+
 fn runtime_exit_code(cause: &StopCause) -> u8 {
     u8::from(!matches!(cause, StopCause::Requested))
+}
+
+#[cfg(test)]
+mod storage_config_tests {
+    use super::*;
+
+    #[test]
+    fn storage_image_matches_the_selected_runtime_and_preserves_storage_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = diorama_config::Config {
+            path: root.path().to_str().unwrap().into(),
+            ..Default::default()
+        };
+        config.storage.local_path.shared_path = "/shared/volumes".into();
+        let public = "docker.io/rancher/local-path-provisioner:v0.0.36";
+        for managed_containerd in [false, true] {
+            let storage = local_path_config(&config, managed_containerd);
+            assert_eq!(storage.provisioner_image, public);
+            assert_eq!(
+                storage.storage_path,
+                root.path().join("local-path-storage").to_str().unwrap()
+            );
+            assert_eq!(storage.shared_path.as_deref(), Some("/shared/volumes"));
+        }
+
+        let images = ContainerdPaths::from_base(root.path()).images_dir;
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(
+            images.join("local-path-provisioner.tar.gz"),
+            b"bundled archive",
+        )
+        .unwrap();
+        assert_eq!(
+            local_path_config(&config, true).provisioner_image,
+            diorama_containerd::image::BUNDLED_LOCAL_PATH_IMAGE
+        );
+        // A bundle on disk does not mean an external runtime or oci-cri loaded it.
+        assert_eq!(local_path_config(&config, false).provisioner_image, public);
+    }
 }
 
 #[cfg(test)]
@@ -1102,5 +1250,51 @@ mod node_ip_for_config_tests {
     fn empty_config_with_only_loopback_stays_loopback() {
         let ip = node_ip_for_config("", &[loopback()]);
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+}
+
+#[cfg(test)]
+mod runtime_selection_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_oci_selection_checks_platform_feature_and_endpoint() {
+        let mut config = diorama_config::Config::default();
+        config.runtime.backend = "oci-cri".into();
+        let base = Path::new("/test/node");
+        assert!(detect_workload_runtime_for_host(&config, base, false, true).is_err());
+        assert!(detect_workload_runtime_for_host(&config, base, true, false).is_err());
+        assert_eq!(
+            detect_workload_runtime_for_host(&config, base, true, true).unwrap(),
+            Some(("oci-cri", base.join("oci-cri/cri.sock")))
+        );
+        config.runtime.endpoint = "/host/cri.sock".into();
+        assert!(detect_workload_runtime_for_host(&config, base, true, true).is_err());
+    }
+
+    #[test]
+    fn automatic_selection_preserves_external_and_containerd_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = diorama_config::Config::default();
+        assert!(
+            detect_workload_runtime_for_host(&config, dir.path(), true, true)
+                .unwrap()
+                .is_none()
+        );
+        config.runtime.backend = "containerd".into();
+        assert!(detect_workload_runtime_for_host(&config, dir.path(), true, true).is_err());
+        let paths = ContainerdPaths::from_base(dir.path());
+        std::fs::create_dir_all(paths.binary_path.parent().unwrap()).unwrap();
+        std::fs::write(&paths.binary_path, []).unwrap();
+        assert_eq!(
+            detect_workload_runtime_for_host(&config, dir.path(), true, true).unwrap(),
+            Some((COMPONENT_CONTAINERD, paths.socket_path))
+        );
+        config.runtime.backend = "auto".into();
+        config.runtime.endpoint = "unix:///host/cri.sock".into();
+        assert_eq!(
+            detect_workload_runtime_for_host(&config, dir.path(), true, true).unwrap(),
+            Some((COMPONENT_EXTERNAL_CRI, PathBuf::from("/host/cri.sock")))
+        );
     }
 }

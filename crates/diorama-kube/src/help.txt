@@ -131,6 +131,8 @@ Flags:
                              Only honoured when --d2k is set. Defaults to d2k.
                              Deprecated: set this in the KubeSolo config file
                              instead. ($KUBESOLO_D2K_NAMESPACE)
+      --container-runtime=CONTAINER-RUNTIME
+                                 Managed runtime: auto, containerd, or oci-cri (Linux, oci-cri feature)
       --container-runtime-endpoint=CONTAINER-RUNTIME-ENDPOINT
                              CRI endpoint of a host-managed container runtime,
                              for example unix:///run/containerd/containerd.sock

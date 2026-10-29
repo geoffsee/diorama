@@ -11,7 +11,9 @@ use tonic::transport::Channel;
 
 pub const DEFAULT_COREDNS_IMAGE: &str = "docker.io/coredns/coredns:1.14.4";
 pub const DEFAULT_PAUSE_IMAGE: &str = "docker.io/portainer/pause:latest";
-pub const DEFAULT_LOCAL_PATH_IMAGE: &str =
+pub const DEFAULT_LOCAL_PATH_IMAGE: &str = "docker.io/rancher/local-path-provisioner:v0.0.36";
+/// Reference carried by the smaller, locally built offline archive.
+pub const BUNDLED_LOCAL_PATH_IMAGE: &str =
     "ghcr.io/geoffsee/diorama-local-path-provisioner:v0.0.36-1";
 pub const DEFAULT_BUSYBOX_IMAGE: &str = "docker.io/library/busybox:latest";
 pub const DEFAULT_PORTAINER_AGENT_IMAGE: &str = "docker.io/portainer/agent:lts";
@@ -79,7 +81,7 @@ impl ImageImportConfig {
         if self.local_storage_enabled {
             targets.push(ImageTarget {
                 id: AssetId::ImageLocalPath,
-                reference: DEFAULT_LOCAL_PATH_IMAGE.into(),
+                reference: self.local_path_image().into(),
                 filename: "local-path-provisioner.tar.gz".into(),
                 required: true,
             });
@@ -120,6 +122,18 @@ impl ImageImportConfig {
         }
 
         targets
+    }
+
+    /// Match the storage deployment to the image this runtime imports or pulls.
+    /// The bundled reference is not published for anonymous registry pulls.
+    pub fn local_path_image(&self) -> &'static str {
+        if std::fs::metadata(self.images_dir.join("local-path-provisioner.tar.gz"))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            BUNDLED_LOCAL_PATH_IMAGE
+        } else {
+            DEFAULT_LOCAL_PATH_IMAGE
+        }
     }
 
     /// Returns list of disabled image asset IDs that must NOT be imported.

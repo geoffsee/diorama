@@ -54,6 +54,11 @@ pub const INPUT_BINDINGS: &[InputBinding] = &[
         flag: Some("load-balancer-ip"),
     },
     InputBinding {
+        path: "runtime.backend",
+        environment: "KUBESOLO_CONTAINER_RUNTIME",
+        flag: Some("container-runtime"),
+    },
+    InputBinding {
         path: "runtime.endpoint",
         environment: "KUBESOLO_CONTAINER_RUNTIME_ENDPOINT",
         flag: Some("container-runtime-endpoint"),
