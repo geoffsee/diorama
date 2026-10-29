@@ -147,7 +147,7 @@ impl KubeletConfigOptions {
 
     /// Resolves the cgroup driver to use.
     ///
-    /// Precedence matches upstream `KubeSolo`:
+    /// Precedence order:
     /// 1. Runtime-reported cgroup driver (from CRI runtime), if present.
     /// 2. If in container mode, defaults to "cgroupfs".
     /// 3. Explicit cgroup driver if configured (and not "auto").

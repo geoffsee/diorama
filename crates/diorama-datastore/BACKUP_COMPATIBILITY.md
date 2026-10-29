@@ -1,6 +1,6 @@
 # Datastore Storage Format, Backup Compatibility, and Migration
 
-This document defines the storage format, consistent backup/restore prerequisites, and non-interchangeability boundaries for the KubeSolo Kubernetes state datastore in `crates/diorama-datastore`.
+This document defines the storage format, consistent backup/restore prerequisites, and non-interchangeability boundaries for the diorama Kubernetes state datastore in `crates/diorama-datastore`.
 
 ---
 

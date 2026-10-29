@@ -7,9 +7,9 @@ only that spec's timeout; identity, dependencies, component kind and required or
 optional failure policy remain the caller's decisions. This pure boundary performs
 no registration, host probing, component startup or CLI dispatch.
 
-The read-only KubeSolo baseline `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`
+The read-only diorama baseline `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`
 sets a shared retry count only for positive configured values in
-`cmd/kubesolo/main.go:144–146`. `types/const.go` defines the default startup budget
+`cmd/diorama/main.go:144–146`. `types/const.go` defines the default startup budget
 as 600 seconds and the polling interval as five seconds; `types/var.go` initializes
 the retry count from those defaults. Therefore zero and negative configuration
 values retain a 600-second effective budget. The configuration document remains

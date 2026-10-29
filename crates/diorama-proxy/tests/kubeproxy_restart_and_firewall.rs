@@ -343,16 +343,16 @@ async fn test_unrelated_firewall_and_e15_egress_rules_remain_intact_nftables() {
     let kubeconfig = temp.path().join("admin.kubeconfig");
     fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\n").unwrap();
 
-    // Nftables host with existing E15 table "kubesolo-masq" and foreign table "ip nat"
+    // Nftables host with existing E15 table "diorama-masq" and foreign table "ip nat"
     let mock = Arc::new(MockCommandExecutor::new_nftables_host());
 
     // Create E15 pod masquerade table
-    mock.run("nft", &["add", "table", "ip", "kubesolo-masq"])
+    mock.run("nft", &["add", "table", "ip", "diorama-masq"])
         .unwrap();
 
     let before_snapshot = FirewallSnapshot::capture(mock.as_ref(), ProxyMode::Nftables);
     assert!(before_snapshot.e15_masquerade_present);
-    assert!(before_snapshot.foreign_nft_tables.contains("kubesolo-masq"));
+    assert!(before_snapshot.foreign_nft_tables.contains("diorama-masq"));
     let initial_unrelated_count = mock.unrelated_nat_rules_count();
 
     // Initialize kube-proxy in nftables mode
@@ -372,7 +372,7 @@ async fn test_unrelated_firewall_and_e15_egress_rules_remain_intact_nftables() {
         let after_startup_snapshot = service.capture_firewall_snapshot();
         assert!(
             after_startup_snapshot.e15_masquerade_present,
-            "startup must not flush E15 masquerade table kubesolo-masq"
+            "startup must not flush E15 masquerade table diorama-masq"
         );
         before_snapshot
             .verify_preserved(&after_startup_snapshot)

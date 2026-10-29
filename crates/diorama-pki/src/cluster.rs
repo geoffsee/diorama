@@ -207,9 +207,9 @@ impl ClusterPki {
         // Webhook
         let webhook_dns = vec![
             "localhost".to_string(),
-            "kubesolo-webhook".to_string(),
-            "kubesolo-webhook.default".to_string(),
-            "kubesolo-webhook.default.svc".to_string(),
+            "diorama-webhook".to_string(),
+            "diorama-webhook.default".to_string(),
+            "diorama-webhook.default.svc".to_string(),
         ];
         let webhook_ips = vec!["127.0.0.1".parse().unwrap()];
         handle_leaf(
@@ -304,7 +304,7 @@ impl ClusterPki {
             write_kubeconfig(
                 &kubeconfig_path,
                 &server_url,
-                "kubesolo",
+                "diorama",
                 user,
                 &ca_b64,
                 &BASE64_STANDARD.encode(&client_cert),

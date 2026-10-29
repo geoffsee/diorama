@@ -393,9 +393,9 @@ mod tests {
     #[test]
     fn container_names_flat_paths_port_and_output_are_preserved() {
         for (instance, container) in [
-            ("dev", "kubesolo-dev"),
-            ("diorama", "kubesolo"),
-            ("dev.cluster", "kubesolo-dev.cluster"),
+            ("dev", "diorama-dev"),
+            ("diorama", "diorama"),
+            ("dev.cluster", "diorama-dev.cluster"),
         ] {
             let (_temporary, mut options, environment) = fixture();
             options.name = Some(instance.into());

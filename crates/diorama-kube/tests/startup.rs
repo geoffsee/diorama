@@ -37,12 +37,6 @@ impl StartupInputs for Inputs {
         })
     }
 }
-fn diorama_host_paths(text: &str) -> String {
-    text.replace("/var/lib/kubesolo", "/var/lib/diorama")
-        .replace("/etc/kubesolo", "/etc/diorama")
-        .replace("/usr/local/bin/kubesolo", "/usr/local/bin/diorama")
-}
-
 fn assert_output(case: &Value, stdout: &str, stderr: &str) {
     let combined = format!("{stdout}{stderr}");
     for (name, text) in [
@@ -51,13 +45,13 @@ fn assert_output(case: &Value, stdout: &str, stderr: &str) {
         ("combined", combined.as_str()),
     ] {
         if let Some(expected) = case["expect"][format!("{name}_equals")].as_str() {
-            assert_eq!(text, diorama_host_paths(expected), "{} {name}", case["id"]);
+            assert_eq!(text, expected, "{} {name}", case["id"]);
         }
         if let Some(markers) = case["expect"][format!("{name}_contains")].as_array() {
             for marker in markers {
-                let marker = diorama_host_paths(marker.as_str().expect("fixture marker"));
+                let marker = marker.as_str().expect("fixture marker");
                 assert!(
-                    text.contains(&marker),
+                    text.contains(marker),
                     "{} {name}: missing {marker} in {text}",
                     case["id"]
                 );
@@ -194,7 +188,7 @@ fn actual_executable_version_bypasses_invalid_environment() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_diorama"))
         .args(["--version", "--config=/tmp"])
         .env_clear()
-        .env("KUBESOLO_MTU", "invalid")
+        .env("DIORAMA_MTU", "invalid")
         .output()
         .expect("version process");
     assert!(output.status.success());
@@ -221,7 +215,7 @@ fn startup_action_debug_does_not_disclose_resolved_values() {
 #[cfg(any())]
 #[test]
 fn runtime_receives_selected_config_file_and_original_host_snapshot() {
-    let environment = BTreeMap::from([("KUBESOLO_CONFIG".into(), "/ignored.yaml".into())]);
+    let environment = BTreeMap::from([("DIORAMA_CONFIG".into(), "/ignored.yaml".into())]);
     let mut inputs = Inputs::default();
     let action = diorama::execute(
         &["--config=/selected.yaml".into()],
@@ -265,8 +259,7 @@ fn actual_executable_prints_then_enters_supervised_startup() {
         assert_eq!(output.status.success(), expected_success);
         if printing {
             assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .contains("apiVersion: kubesolo.io/v1alpha1")
+                String::from_utf8_lossy(&output.stdout).contains("apiVersion: diorama.io/v1alpha1")
             );
             assert!(!String::from_utf8_lossy(&output.stderr).contains("runtime startup"));
         } else {

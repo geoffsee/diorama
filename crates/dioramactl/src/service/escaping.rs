@@ -1,4 +1,4 @@
-//! Shell escaping and sanitization utilities matching `KubeSolo` characterization.
+//! Shell escaping and sanitization utilities.
 
 /// Quotes a string argument for POSIX shell command lines (`'val'`).
 /// Replaces internal single quotes with `'\''`.
@@ -7,8 +7,7 @@ pub fn shell_quote(s: &str) -> String {
     if sanitized.is_empty() {
         return "''".to_string();
     }
-    // If it only contains safe characters, we could leave it bare, but KubeSolo
-    // characters always wrap or single-quote:
+    // Single-quote and escape internal single quotes:
     // strings.ReplaceAll(s, "'", "'\\''") -> "'" + s + "'"
     format!("'{}'", sanitized.replace('\'', r"'\''"))
 }

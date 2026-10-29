@@ -14,7 +14,7 @@ Unknown module family prevents all preparation effects. A configured external
 runtime still requires these shared host-network attempts; runtime processes,
 configuration, OCI/CNI binaries and images remain host-owned.
 
-Modules follow pinned KubeSolo `internal/system/modules.go`: `br_netfilter`,
+Modules follow pinned diorama `internal/system/modules.go`: `br_netfilter`,
 `overlay`, six CNI xtables modules, then five nft modules or four legacy modules.
 Every attempt runs fixed `modprobe <enum-selected-name>` with working directory
 `/`, a cleared environment, system-only PATH and `LANG=C`. A five-second execution
@@ -59,7 +59,7 @@ complete-value parsing instead of accepting any first byte `1`, refusing writes
 after malformed/other unreadable input, no create/truncate, and readback instead of
 claiming a successful write changed the value. Fixed command environment, bounded
 capture and deadline/cleanup handling replace inherited unbounded execution.
-Baseline `cmd/kubesolo/main.go:508–515` establishes modules before IPv6 and warnings
+Baseline `cmd/diorama/main.go:508–515` establishes modules before IPv6 and warnings
 without aborting startup; this API preserves that order without starting a node.
 Unknown backend detection stays unknown rather than assuming nft on failure.
 

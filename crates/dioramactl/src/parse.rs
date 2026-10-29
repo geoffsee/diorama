@@ -149,87 +149,87 @@ pub fn parse_command(
     }
 
     let mut check_opts = CheckOptions {
-        install_prerequisites: environment_bool(environment, "KUBESOLO_INSTALL_PREREQS"),
-        pprof: environment_bool(environment, "KUBESOLO_PPROF_SERVER"),
+        install_prerequisites: environment_bool(environment, "DIORAMA_INSTALL_PREREQS"),
+        pprof: environment_bool(environment, "DIORAMA_PPROF_SERVER"),
     };
 
     let mut download_opts = DownloadOptions {
         run_mode: "service".into(),
         version: environment
-            .get("KUBESOLO_VERSION")
+            .get("DIORAMA_VERSION")
             .cloned()
             .unwrap_or_else(|| DEFAULT_VERSION.to_string()),
         path: environment
-            .get("KUBESOLO_DOWNLOAD_DIR")
+            .get("DIORAMA_DOWNLOAD_DIR")
             .map_or_else(|| PathBuf::from("."), PathBuf::from),
         arch: None,
         custom_url: environment
-            .get("KUBESOLO_BIN_URL")
-            .or_else(|| environment.get("KUBESOLO_CUSTOM_URL"))
+            .get("DIORAMA_BIN_URL")
+            .or_else(|| environment.get("DIORAMA_CUSTOM_URL"))
             .cloned(),
         temp_dir: environment
-            .get("KUBESOLO_TEMP_DIR")
+            .get("DIORAMA_TEMP_DIR")
             .or_else(|| environment.get("TEMP_DIR"))
             .map(PathBuf::from),
-        proxy: environment.get("KUBESOLO_PROXY").cloned(),
-        offline: environment_bool(environment, "KUBESOLO_OFFLINE"),
+        proxy: environment.get("DIORAMA_PROXY").cloned(),
+        offline: environment_bool(environment, "DIORAMA_OFFLINE"),
         libc: None,
     };
 
     let mut install_opts = InstallOptions {
         version: environment
-            .get("KUBESOLO_VERSION")
+            .get("DIORAMA_VERSION")
             .cloned()
             .unwrap_or_else(|| DEFAULT_VERSION.to_string()),
-        path: environment.get("KUBESOLO_PATH").map_or_else(
+        path: environment.get("DIORAMA_PATH").map_or_else(
             || PathBuf::from(crate::artifact::DEFAULT_DATA_PATH),
             PathBuf::from,
         ),
-        apiserver_extra_sans: environment.get("KUBESOLO_APISERVER_EXTRA_SANS").cloned(),
-        node_ip: environment.get("KUBESOLO_NODE_IP").cloned(),
-        mtu: environment.get("KUBESOLO_MTU").cloned(),
-        portainer_edge_id: environment.get("KUBESOLO_PORTAINER_EDGE_ID").cloned(),
-        portainer_edge_key: environment.get("KUBESOLO_PORTAINER_EDGE_KEY").cloned(),
-        portainer_edge_async: environment_bool(environment, "KUBESOLO_PORTAINER_EDGE_ASYNC"),
-        portainer_edge_image: environment.get("KUBESOLO_PORTAINER_EDGE_IMAGE").cloned(),
-        local_storage: environment_bool(environment, "KUBESOLO_LOCAL_STORAGE"),
-        debug: environment_bool(environment, "KUBESOLO_DEBUG"),
-        pprof_server: environment_bool(environment, "KUBESOLO_PPROF_SERVER"),
+        apiserver_extra_sans: environment.get("DIORAMA_APISERVER_EXTRA_SANS").cloned(),
+        node_ip: environment.get("DIORAMA_NODE_IP").cloned(),
+        mtu: environment.get("DIORAMA_MTU").cloned(),
+        portainer_edge_id: environment.get("DIORAMA_PORTAINER_EDGE_ID").cloned(),
+        portainer_edge_key: environment.get("DIORAMA_PORTAINER_EDGE_KEY").cloned(),
+        portainer_edge_async: environment_bool(environment, "DIORAMA_PORTAINER_EDGE_ASYNC"),
+        portainer_edge_image: environment.get("DIORAMA_PORTAINER_EDGE_IMAGE").cloned(),
+        local_storage: environment_bool(environment, "DIORAMA_LOCAL_STORAGE"),
+        debug: environment_bool(environment, "DIORAMA_DEBUG"),
+        pprof_server: environment_bool(environment, "DIORAMA_PPROF_SERVER"),
         run_mode: environment
-            .get("KUBESOLO_RUN_MODE")
+            .get("DIORAMA_RUN_MODE")
             .cloned()
             .unwrap_or_else(|| "service".to_string()),
-        proxy: environment.get("KUBESOLO_PROXY").cloned(),
+        proxy: environment.get("DIORAMA_PROXY").cloned(),
         offline_install: environment
-            .get("KUBESOLO_OFFLINE_INSTALL")
+            .get("DIORAMA_OFFLINE_INSTALL")
             .map(PathBuf::from),
-        install_prereqs: environment_bool(environment, "KUBESOLO_INSTALL_PREREQS"),
-        d2k: environment_bool(environment, "KUBESOLO_D2K"),
+        install_prereqs: environment_bool(environment, "DIORAMA_INSTALL_PREREQS"),
+        d2k: environment_bool(environment, "DIORAMA_D2K"),
         d2k_namespace: environment
-            .get("KUBESOLO_D2K_NAMESPACE")
+            .get("DIORAMA_D2K_NAMESPACE")
             .cloned()
             .unwrap_or_else(|| "d2k".to_string()),
         cpu_manager_policy: environment
-            .get("KUBESOLO_CPU_MANAGER_POLICY")
+            .get("DIORAMA_CPU_MANAGER_POLICY")
             .cloned()
             .unwrap_or_else(|| "none".to_string()),
         cpu_manager_policy_options: environment
-            .get("KUBESOLO_CPU_MANAGER_POLICY_OPTIONS")
+            .get("DIORAMA_CPU_MANAGER_POLICY_OPTIONS")
             .cloned(),
-        reserved_cpus: environment.get("KUBESOLO_RESERVED_CPUS").cloned(),
-        system_reserved: environment.get("KUBESOLO_SYSTEM_RESERVED").cloned(),
-        container_image: environment.get("KUBESOLO_IMAGE").cloned(),
-        container_ports: environment.get("KUBESOLO_CONTAINER_PORTS").cloned(),
+        reserved_cpus: environment.get("DIORAMA_RESERVED_CPUS").cloned(),
+        system_reserved: environment.get("DIORAMA_SYSTEM_RESERVED").cloned(),
+        container_image: environment.get("DIORAMA_IMAGE").cloned(),
+        container_ports: environment.get("DIORAMA_CONTAINER_PORTS").cloned(),
         name: environment
-            .get("KUBESOLO_NAME")
+            .get("DIORAMA_NAME")
             .cloned()
             .unwrap_or_else(|| "diorama".to_string()),
         custom_url: environment
-            .get("KUBESOLO_BIN_URL")
-            .or_else(|| environment.get("KUBESOLO_CUSTOM_URL"))
+            .get("DIORAMA_BIN_URL")
+            .or_else(|| environment.get("DIORAMA_CUSTOM_URL"))
             .cloned(),
         temp_dir: environment
-            .get("KUBESOLO_TEMP_DIR")
+            .get("DIORAMA_TEMP_DIR")
             .or_else(|| environment.get("TEMP_DIR"))
             .map(PathBuf::from),
     };

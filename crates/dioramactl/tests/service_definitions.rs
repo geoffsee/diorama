@@ -95,12 +95,12 @@ fn test_systemd_default_definition() {
     let mut env = BTreeMap::new();
     env.insert("HTTP_PROXY".to_string(), "http://10.0.0.1:8080".to_string());
     env.insert(
-        "KUBESOLO_EXTRA".to_string(),
+        "DIORAMA_EXTRA".to_string(),
         "percent%and\"quote".to_string(),
     );
 
     let config = ServiceConfig {
-        name: "kubesolo".to_string(),
+        name: "diorama".to_string(),
         binary_path: PathBuf::from("/usr/local/bin/diorama"),
         args: vec![
             "--debug".to_string(),
@@ -117,14 +117,14 @@ fn test_systemd_default_definition() {
     assert_eq!(def.backend, Some(InitBackend::Systemd));
     assert_eq!(
         def.primary_file,
-        PathBuf::from("/etc/systemd/system/kubesolo.service")
+        PathBuf::from("/etc/systemd/system/diorama.service")
     );
     assert_eq!(def.files.len(), 1);
 
     let unit_file = &def.files[0];
     assert_eq!(
         unit_file.path,
-        PathBuf::from("/etc/systemd/system/kubesolo.service")
+        PathBuf::from("/etc/systemd/system/diorama.service")
     );
     assert_eq!(unit_file.mode, 0o644);
 
@@ -140,7 +140,7 @@ fn test_systemd_default_definition() {
         )
     );
     assert!(content.contains("Environment=\"HTTP_PROXY=http://10.0.0.1:8080\"\n"));
-    assert!(content.contains("Environment=\"KUBESOLO_EXTRA=percent%%and\\\"quote\"\n"));
+    assert!(content.contains("Environment=\"DIORAMA_EXTRA=percent%%and\\\"quote\"\n"));
     assert!(content.contains("[Install]\nWantedBy=multi-user.target"));
 }
 
@@ -197,10 +197,10 @@ fn test_openrc_default_definition() {
 #[test]
 fn test_sysvinit_default_definition() {
     let mut env = BTreeMap::new();
-    env.insert("KUBESOLO_ENV".to_string(), "production".to_string());
+    env.insert("DIORAMA_ENV".to_string(), "production".to_string());
 
     let config = ServiceConfig {
-        name: "kubesolo".to_string(),
+        name: "diorama".to_string(),
         binary_path: PathBuf::from("/usr/local/bin/diorama"),
         args: vec!["--mtu".to_string(), "1450".to_string()],
         environment: env,
@@ -211,24 +211,20 @@ fn test_sysvinit_default_definition() {
 
     let def = generate_service_definition(&config).expect("sysvinit definition");
     assert_eq!(def.backend, Some(InitBackend::SysVinit));
-    assert_eq!(def.primary_file, PathBuf::from("/etc/init.d/kubesolo"));
+    assert_eq!(def.primary_file, PathBuf::from("/etc/init.d/diorama"));
     assert_eq!(def.files.len(), 1);
 
     let script = &def.files[0];
     assert_eq!(script.mode, 0o755);
     assert!(script.content.starts_with("#!/bin/sh"));
     assert!(script.content.contains("### BEGIN INIT INFO"));
-    assert!(script.content.contains("# Provides:          kubesolo"));
+    assert!(script.content.contains("# Provides:          diorama"));
     assert!(script.content.contains("DAEMON=\"/usr/local/bin/diorama\""));
     assert!(script.content.contains("DAEMON_ARGS=\" '--mtu' '1450'\""));
-    assert!(script.content.contains("PIDFILE=\"/var/run/kubesolo.pid\""));
-    assert!(script.content.contains("LOGFILE=\"/var/log/kubesolo.log\""));
+    assert!(script.content.contains("PIDFILE=\"/var/run/diorama.pid\""));
+    assert!(script.content.contains("LOGFILE=\"/var/log/diorama.log\""));
     assert!(script.content.contains("start-stop-daemon --start"));
-    assert!(
-        script
-            .content
-            .contains("export KUBESOLO_ENV=\"production\"")
-    );
+    assert!(script.content.contains("export DIORAMA_ENV=\"production\""));
 }
 
 #[test]
@@ -237,7 +233,7 @@ fn test_upstart_default_definition() {
     env.insert("FOO".to_string(), "bar".to_string());
 
     let config = ServiceConfig {
-        name: "kubesolo".to_string(),
+        name: "diorama".to_string(),
         binary_path: PathBuf::from("/usr/local/bin/diorama"),
         args: vec!["--local-storage".to_string()],
         environment: env,
@@ -248,7 +244,7 @@ fn test_upstart_default_definition() {
 
     let def = generate_service_definition(&config).expect("upstart definition");
     assert_eq!(def.backend, Some(InitBackend::Upstart));
-    assert_eq!(def.primary_file, PathBuf::from("/etc/init/kubesolo.conf"));
+    assert_eq!(def.primary_file, PathBuf::from("/etc/init/diorama.conf"));
     assert_eq!(def.files.len(), 1);
 
     let conf = &def.files[0];
@@ -269,7 +265,7 @@ fn test_runit_default_definition() {
     env.insert("MY_VAR".to_string(), "val".to_string());
 
     let config = ServiceConfig {
-        name: "kubesolo".to_string(),
+        name: "diorama".to_string(),
         binary_path: PathBuf::from("/usr/local/bin/diorama"),
         args: vec![],
         environment: env,
@@ -280,10 +276,7 @@ fn test_runit_default_definition() {
 
     let def = generate_service_definition(&config).expect("runit definition");
     assert_eq!(def.backend, Some(InitBackend::Runit));
-    assert_eq!(
-        def.primary_file,
-        PathBuf::from("/etc/runit/sv/kubesolo/run")
-    );
+    assert_eq!(def.primary_file, PathBuf::from("/etc/runit/sv/diorama/run"));
     assert_eq!(def.files.len(), 1);
 
     let run_file = &def.files[0];
@@ -296,20 +289,20 @@ fn test_runit_default_definition() {
     assert_eq!(
         def.symlinks[0],
         (
-            PathBuf::from("/etc/runit/sv/kubesolo"),
-            PathBuf::from("/var/service/kubesolo")
+            PathBuf::from("/etc/runit/sv/diorama"),
+            PathBuf::from("/var/service/diorama")
         )
     );
     assert_eq!(
         def.directories,
-        vec![(PathBuf::from("/etc/runit/sv/kubesolo"), 0o755)]
+        vec![(PathBuf::from("/etc/runit/sv/diorama"), 0o755)]
     );
 }
 
 #[test]
 fn test_s6_default_definition() {
     let config = ServiceConfig {
-        name: "kubesolo".to_string(),
+        name: "diorama".to_string(),
         binary_path: PathBuf::from("/usr/local/bin/diorama"),
         args: vec!["--debug".to_string()],
         environment: BTreeMap::new(),
@@ -320,11 +313,11 @@ fn test_s6_default_definition() {
 
     let def = generate_service_definition(&config).expect("s6 definition");
     assert_eq!(def.backend, Some(InitBackend::S6));
-    assert_eq!(def.primary_file, PathBuf::from("/etc/s6/sv/kubesolo/run"));
+    assert_eq!(def.primary_file, PathBuf::from("/etc/s6/sv/diorama/run"));
     assert_eq!(def.files.len(), 2);
 
     let run = &def.files[0];
-    assert_eq!(run.path, PathBuf::from("/etc/s6/sv/kubesolo/run"));
+    assert_eq!(run.path, PathBuf::from("/etc/s6/sv/diorama/run"));
     assert_eq!(run.mode, 0o755);
     assert!(
         run.content
@@ -332,7 +325,7 @@ fn test_s6_default_definition() {
     );
 
     let finish = &def.files[1];
-    assert_eq!(finish.path, PathBuf::from("/etc/s6/sv/kubesolo/finish"));
+    assert_eq!(finish.path, PathBuf::from("/etc/s6/sv/diorama/finish"));
     assert_eq!(finish.mode, 0o755);
     assert!(finish.content.contains("Service exited with code $1"));
 
@@ -340,8 +333,8 @@ fn test_s6_default_definition() {
     assert_eq!(
         def.symlinks[0],
         (
-            PathBuf::from("/etc/s6/sv/kubesolo"),
-            PathBuf::from("/etc/s6/adminsv/default/kubesolo")
+            PathBuf::from("/etc/s6/sv/diorama"),
+            PathBuf::from("/etc/s6/adminsv/default/diorama")
         )
     );
 }
@@ -475,7 +468,7 @@ fn test_lifecycle_plans_for_all_backends() {
     for backend in backends {
         for action in actions {
             let config = ServiceConfig {
-                name: "kubesolo".to_string(),
+                name: "diorama".to_string(),
                 backend: Some(backend),
                 run_mode: RunMode::Service,
                 ..ServiceConfig::default()

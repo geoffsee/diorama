@@ -49,7 +49,7 @@ on every success/error path. A setup, bind or listen failure is `BindFailed`, no
 proof of a particular PID, service or even occupancy. Successful observation
 reserves nothing and cannot promise a later bind will succeed.
 
-The reference is KubeSolo `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`,
+The reference is diorama `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`,
 `internal/cli/preflight/preflight.go`: `kernelRelease`, `CheckIptablesComment`,
 `CheckPorts`, and Alpine's exact rc-service check. Existing independent actual-Go
 fixtures in `tools/parity/fixtures/preflight-policy` retain `.zst`/one-level disk

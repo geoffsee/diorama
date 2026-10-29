@@ -190,11 +190,9 @@ fn persisted_yaml_matches_independent_go_writer_document() {
     let mut config = Config::default();
     config.portainer.edge_key = "fixture-synthetic-key".into();
     write_document(&root.path(), &config).unwrap();
-    // Captured Go documents use `/var/lib/kubesolo`. diorama persists `/var/lib/diorama`.
-    let diorama_path = |document: &str| document.replace("/var/lib/kubesolo", "/var/lib/diorama");
     assert_eq!(
         fs::read_to_string(root.path()).unwrap(),
-        diorama_path(reference[0]["first"].as_str().unwrap())
+        reference[0]["first"].as_str().unwrap()
     );
     config.network.mtu = 1400;
     write_document(&root.path(), &config).unwrap();

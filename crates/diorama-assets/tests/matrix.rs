@@ -189,12 +189,12 @@ fn management_targets_and_windows_exclusion() {
         assert_eq!(parsed.target, target);
     }
 
-    // Baseline prefix kubesoloctl
-    let kubesolo_parsed = ArtifactNaming::parse_management_binary("kubesoloctl-darwin-arm64")
-        .expect("parse baseline kubesoloctl");
-    assert_eq!(kubesolo_parsed.prefix, "kubesoloctl");
+    // Baseline prefix dioramactl
+    let baseline_parsed = ArtifactNaming::parse_management_binary("dioramactl-darwin-arm64")
+        .expect("parse baseline dioramactl");
+    assert_eq!(baseline_parsed.prefix, "dioramactl");
     assert_eq!(
-        kubesolo_parsed.target,
+        baseline_parsed.target,
         ManagementTarget::new(ManagementOs::Darwin, ManagementArch::Arm64)
     );
 
@@ -211,7 +211,7 @@ fn management_targets_and_windows_exclusion() {
         Err(ArtifactNamingError::WindowsExcluded(_))
     ));
 
-    let win_err3 = ArtifactNaming::parse_management_binary("kubesoloctl-windows-arm64.exe");
+    let win_err3 = ArtifactNaming::parse_management_binary("dioramactl-windows-arm64.exe");
     assert!(matches!(
         win_err3,
         Err(ArtifactNamingError::WindowsExcluded(_))
@@ -220,7 +220,7 @@ fn management_targets_and_windows_exclusion() {
 
 #[test]
 fn node_archive_naming_and_roundtrip_all_16_cells() {
-    let prefixes = ["diorama", "kubesolo"];
+    let prefixes = ["diorama"];
     let versions = ["0.1.0", "v1.35.7", "v1.1.8"];
 
     for prefix in prefixes {

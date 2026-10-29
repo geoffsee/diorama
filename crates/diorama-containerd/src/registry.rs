@@ -1,6 +1,6 @@
 //! Registry configuration management via containerd's `hosts.toml` directory model.
 //!
-//! `KubeSolo` configures containerd's `config_path` to point to a registry directory
+//! `diorama` configures containerd's `config_path` to point to a registry directory
 //! (default: `<base_path>/containerd/registry`). Within this directory, operators
 //! place per-host configurations:
 //!

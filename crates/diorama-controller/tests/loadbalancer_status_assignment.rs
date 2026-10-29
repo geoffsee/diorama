@@ -603,7 +603,7 @@ async fn test_restart_and_address_change_characterization_without_background_con
     webhook_service_2.start().await.unwrap();
 
     // 3. Confirm that WITHOUT an update event, the existing service retains the initial IP
-    // (Characterizing that diorama/KubeSolo does NOT have an unsolicited background reconciliation controller)
+    // (Characterizing that diorama does NOT have an unsolicited background reconciliation controller)
     tokio::time::sleep(Duration::from_millis(300)).await;
     let existing = client.get_service(ns, "static-svc").await.unwrap();
     let retained_ip = existing

@@ -11,7 +11,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
@@ -26,7 +26,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
@@ -41,13 +41,13 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_DEBUG": "invalid"
+        "DIORAMA_DEBUG": "invalid"
       }
     },
     {
@@ -59,13 +59,13 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_MTU": "invalid"
+        "DIORAMA_MTU": "invalid"
       }
     },
     {
@@ -77,13 +77,13 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_SYSTEM_RESERVED": "invalid"
+        "DIORAMA_SYSTEM_RESERVED": "invalid"
       }
     },
     {
@@ -96,7 +96,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
@@ -112,7 +112,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "kubesolo version",
+          "diorama version",
           "version"
         ]
       },
@@ -172,7 +172,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "usage: kubesolo",
+          "usage: diorama",
           "--[no-]print-config"
         ]
       },
@@ -187,13 +187,13 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "usage: kubesolo",
+          "usage: diorama",
           "--[no-]print-config"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_DEBUG": "invalid"
+        "DIORAMA_DEBUG": "invalid"
       }
     },
     {
@@ -206,7 +206,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "usage: kubesolo",
+          "usage: diorama",
           "--[no-]print-config"
         ]
       },
@@ -374,7 +374,7 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5
@@ -387,7 +387,7 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5
@@ -430,7 +430,7 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5
@@ -476,12 +476,12 @@
         "exit_code": 1,
         "stdout_equals": "",
         "stderr_contains": [
-          "KUBESOLO_DEBUG"
+          "DIORAMA_DEBUG"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_DEBUG": "invalid"
+        "DIORAMA_DEBUG": "invalid"
       }
     },
     {
@@ -494,12 +494,12 @@
         "exit_code": 1,
         "stdout_equals": "",
         "stderr_contains": [
-          "KUBESOLO_MTU"
+          "DIORAMA_MTU"
         ]
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_MTU": "invalid"
+        "DIORAMA_MTU": "invalid"
       }
     },
     {
@@ -517,7 +517,7 @@
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_SYSTEM_RESERVED": "invalid"
+        "DIORAMA_SYSTEM_RESERVED": "invalid"
       }
     },
     {
@@ -535,7 +535,7 @@
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_MTU": "invalid"
+        "DIORAMA_MTU": "invalid"
       }
     },
     {
@@ -545,12 +545,12 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_FULL": ""
+        "DIORAMA_FULL": ""
       }
     },
     {
@@ -560,12 +560,12 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5,
       "env": {
-        "KUBESOLO_CONFIG": ""
+        "DIORAMA_CONFIG": ""
       }
     },
     {
@@ -576,7 +576,7 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5
@@ -589,7 +589,7 @@
       ],
       "expect": {
         "exit_code": 0,
-        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+        "stdout_equals": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
         "stderr_equals": ""
       },
       "timeout_seconds": 5
@@ -603,7 +603,7 @@
         "exit_code": 0,
         "stdout_equals": "",
         "stderr_contains": [
-          "usage: kubesolo",
+          "usage: diorama",
           "--[no-]print-config"
         ]
       },

@@ -8,7 +8,7 @@ Tracks [E13.01](https://github.com/geoffsee/diorama/issues/69).
 
 ### Component Boundaries
 
-- **Configuration Generation**: Generates `kubelet.config.k8s.io/v1beta1` `KubeletConfiguration` YAML documents matching the official Kubernetes v1.35.7 schema and KubeSolo golden fixture specifications.
+- **Configuration Generation**: Generates `kubelet.config.k8s.io/v1beta1` `KubeletConfiguration` YAML documents matching the official Kubernetes v1.35.7 schema and diorama golden fixture specifications.
 - **Identity & RBAC**: Operates as `system:node:<node-name>` within the `system:nodes` group. Authorizes Node creation, status patching, and Lease renewals in `kube-node-lease` without granting administrative cluster privileges.
 - **Runtime Provider Attachment**: Connects to CRI endpoints for both managed containerd (`unix:///run/containerd/containerd.sock`) and external runtime providers (containerd, CRI-O) negotiated via `diorama-cri`.
 - **Node Registration & Heartbeat**: Registers the single-node `Node` resource with status `Ready=True`, absence of disk/memory/PID pressure, capacity and allocatable definitions, and updates 40-second renewal leases in `kube-node-lease`.

@@ -1,4 +1,4 @@
-//! Golden containerd configuration tests asserting parity with `KubeSolo` requirements.
+//! Golden containerd configuration tests asserting parity with `diorama` requirements.
 
 use diorama_containerd::{
     CONTAINERD_CONFIG_VERSION, ContainerdConfigFile, ContainerdConfigOptions,

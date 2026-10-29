@@ -12,7 +12,7 @@ use diorama_containerd::{
 #[test]
 fn registry_snippets_survive_config_regeneration() {
     let temp = TempDir::new().unwrap();
-    let base_dir = temp.path().join("kubesolo_data");
+    let base_dir = temp.path().join("diorama_data");
     let paths = ContainerdServicePaths::from_base_dir(&base_dir);
     let options = ContainerdConfigOptions::default();
 

@@ -11,7 +11,7 @@ use crate::routing::ServiceRoutingTable;
 pub const KUBE_PROXY_NFT_TABLE: &str = "kube-proxy";
 
 /// Name of the dedicated nftables table owned by E15 pod egress masquerade.
-pub const KUBESOLO_MASQ_NFT_TABLE: &str = "kubesolo-masq";
+pub const DIORAMA_MASQ_NFT_TABLE: &str = "diorama-masq";
 
 /// Snapshot of host firewall state, tracking foreign rules and E15 egress rules.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +117,7 @@ impl FirewallSnapshot {
                 let Some(name) = parts.nth(1) else {
                     continue;
                 };
-                if name == KUBESOLO_MASQ_NFT_TABLE {
+                if name == DIORAMA_MASQ_NFT_TABLE {
                     e15_masquerade_present = true;
                 }
                 if name != KUBE_PROXY_NFT_TABLE {
@@ -126,13 +126,13 @@ impl FirewallSnapshot {
             }
         }
 
-        // Direct check for kubesolo-masq table if not detected in tables list
+        // Direct check for diorama-masq table if not detected in tables list
         if !e15_masquerade_present
-            && let Ok(out) = executor.run("nft", &["list", "table", "ip", KUBESOLO_MASQ_NFT_TABLE])
+            && let Ok(out) = executor.run("nft", &["list", "table", "ip", DIORAMA_MASQ_NFT_TABLE])
             && out.success
         {
             e15_masquerade_present = true;
-            foreign_nft_tables.insert(KUBESOLO_MASQ_NFT_TABLE.to_string());
+            foreign_nft_tables.insert(DIORAMA_MASQ_NFT_TABLE.to_string());
         }
 
         // List rules in foreign tables to track their preservation

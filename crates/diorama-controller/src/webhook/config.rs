@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::error::WebhookError;
 
-pub const DEFAULT_WEBHOOK_NAME: &str = "webhook.kubesolo.io";
+pub const DEFAULT_WEBHOOK_NAME: &str = "webhook.diorama.io";
 pub const DEFAULT_WEBHOOK_PORT: u16 = 10443;
 pub const DEFAULT_MUTATE_URL: &str = "https://127.0.0.1:10443/mutate";
 

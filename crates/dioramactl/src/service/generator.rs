@@ -1,6 +1,6 @@
 //! Service definition generators for all supported backends.
 //!
-//! Replicates upstream `KubeSolo` service templates with precision:
+//! Service templates:
 //! - Systemd: unit template, `LimitNOFILE`, `KillMode=process`, Environment lines
 //! - `OpenRC`: `#!/sbin/openrc-run`, unquoted `command_args`, `command_background=true`
 //! - `SysVinit`: LSB init script headers, `start-stop-daemon`

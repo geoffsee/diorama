@@ -13,7 +13,7 @@ use diorama_containerd::{
 #[test]
 fn custom_root_is_completely_self_contained() {
     let temp = TempDir::new().unwrap();
-    let custom_root = temp.path().join("isolated_workspace/custom_kubesolo");
+    let custom_root = temp.path().join("isolated_workspace/custom_diorama");
 
     let paths = ContainerdServicePaths::from_base_dir(&custom_root);
     let options = ContainerdConfigOptions {

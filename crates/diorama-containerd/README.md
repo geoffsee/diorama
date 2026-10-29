@@ -4,7 +4,7 @@ Managed containerd runtime configuration, shim resolution, image handling, and l
 
 ## Features
 
-- **TOML Configuration Generator**: Generates containerd v3 configuration matching official KubeSolo contracts (`version = 3`, `io.containerd.runc.v2`, `crun` binary options, CRI images and runtime plugins).
+- **TOML Configuration Generator**: Generates containerd v3 configuration matching official diorama contracts (`version = 3`, `io.containerd.runc.v2`, `crun` binary options, CRI images and runtime plugins).
 - **Shim Resolution**: Enforces `runtime_type = "io.containerd.runc.v2"` without `runtime_path` overrides, building execution `PATH` to resolve `containerd-shim-runc-v2` cleanly.
 - **Snapshotter Detection**: Detects OverlayFS mounts via statfs magic (`0x794c7630`) and dynamically chooses `overlayfs`, `fuse-overlayfs`, or `native`.
 - **Registry Proxies & Mirrors**: Supports containerd `hosts.toml` configuration directory model, ensuring user snippets survive configuration regeneration and service restarts.

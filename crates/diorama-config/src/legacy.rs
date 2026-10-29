@@ -1,12 +1,12 @@
 //! Legacy service argument extraction and conversion to versioned YAML.
 //!
-//! Upstream contract (`internal/cli/migrate_config.go`):
-//! - Extracts known `KubeSolo` flags from legacy service definitions.
+//! Contract:
+//! - Extracts known `diorama` flags from legacy service definitions.
 //! - Foreign flags (such as sysvinit `start-stop-daemon --start --quiet --pidfile`) are safely ignored.
 //! - Shell quotes (`"..."`, `'...'`) are stripped from values.
 //! - Supports `--no-<flag>` boolean negations (e.g. `--no-local-storage`).
 //! - If `--config` is already present, migration is a no-op (already migrated).
-//! - Resolves extracted flags with default configuration and renders clean `KubeSolo` YAML.
+//! - Resolves extracted flags with default configuration and renders clean `diorama` YAML.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -103,7 +103,7 @@ pub fn service_config_path(content: &str) -> Result<std::path::PathBuf, String> 
     Ok(path)
 }
 
-/// Information about a known `KubeSolo` flag definition.
+/// Information about a known `diorama` flag definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlagKind {
     Bool,
@@ -227,7 +227,6 @@ fn argument_lines(content: &str) -> Vec<(usize, &str)> {
                 || trimmed.starts_with("command_args=")
                 || trimmed.starts_with("DAEMON_ARGS=")
                 || trimmed.starts_with("exec ")
-                || trimmed.starts_with("kubesolo ")
                 || trimmed.starts_with("diorama ")
                 || trimmed.starts_with("start-stop-daemon ")
                 || continuing
@@ -338,7 +337,7 @@ pub fn flags_to_config(
     Ok(resolved.validated.into_config())
 }
 
-/// Converts extracted flags directly into rendered `KubeSolo` YAML string.
+/// Converts extracted flags directly into rendered `diorama` YAML string.
 pub fn render_config_from_flags(
     extracted: &ExtractedFlags,
     host: Option<&HostContext>,
@@ -432,9 +431,7 @@ mod tests {
 
     #[test]
     fn test_has_config_flag() {
-        assert!(has_config_flag(
-            "kubesolo --config=/etc/diorama/config.yaml"
-        ));
+        assert!(has_config_flag("diorama --config=/etc/diorama/config.yaml"));
         assert!(has_config_flag(
             "ExecStart=/usr/local/bin/diorama --config=\"/custom/path.yaml\""
         ));
@@ -451,7 +448,7 @@ mod tests {
         let content = r#"
 [Service]
 ExecStart=/usr/local/bin/diorama \
-  --path=/data/kubesolo \
+  --path=/data/diorama \
   --debug \
   --node-ip="192.168.1.50" \
   --mtu=1400 \
@@ -462,7 +459,7 @@ ExecStart=/usr/local/bin/diorama \
         let extracted = extract_service_flags(content);
         assert_eq!(
             extracted.flags.get("path").map(String::as_str),
-            Some("/data/kubesolo")
+            Some("/data/diorama")
         );
         assert_eq!(
             extracted.flags.get("debug").map(String::as_str),
@@ -499,7 +496,7 @@ start-stop-daemon --start --quiet --pidfile /var/run/diorama.pid \
   --node-ip=10.0.0.1 --debug
 ";
         let extracted = extract_service_flags(content);
-        // Only KubeSolo flags captured
+        // Only diorama flags captured
         assert_eq!(extracted.flags.len(), 2);
         assert_eq!(
             extracted.flags.get("node-ip").map(String::as_str),
@@ -528,12 +525,12 @@ start-stop-daemon --start --quiet --pidfile /var/run/diorama.pid \
 
     #[test]
     fn test_render_config_from_flags() {
-        let content = "--node-ip=10.10.10.10 --debug --path=/var/lib/mykubesolo";
+        let content = "--node-ip=10.10.10.10 --debug --path=/var/lib/mydiorama";
         let extracted = extract_service_flags(content);
         let yaml = render_config_from_flags(&extracted, None).expect("valid rendering");
-        assert!(yaml.contains("apiVersion: kubesolo.io/v1alpha1"));
+        assert!(yaml.contains("apiVersion: diorama.io/v1alpha1"));
         assert!(yaml.contains("kind: Config"));
-        assert!(yaml.contains("path: /var/lib/mykubesolo"));
+        assert!(yaml.contains("path: /var/lib/mydiorama"));
         assert!(yaml.contains("debug: true"));
         assert!(yaml.contains("nodeIP: 10.10.10.10"));
     }

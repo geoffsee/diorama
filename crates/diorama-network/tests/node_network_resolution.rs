@@ -233,7 +233,7 @@ fn test_is_ipv4_address() {
 #[test]
 fn test_is_dns_name() {
     assert!(is_dns_name("kubernetes.default"));
-    assert!(is_dns_name("webhook.kubesolo.io"));
+    assert!(is_dns_name("webhook.diorama.io"));
     assert!(is_dns_name("a"));
     assert!(is_dns_name("node-1"));
 

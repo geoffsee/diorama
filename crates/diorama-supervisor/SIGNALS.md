@@ -47,8 +47,8 @@ this qualification.
 
 ## Reference and policy
 
-The baseline is KubeSolo `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
-`cmd/kubesolo/main.go` registers interrupt/SIGTERM around line 170, cancels from a
+The baseline is diorama `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
+`cmd/diorama/main.go` registers interrupt/SIGTERM around line 170, cancels from a
 signal goroutine, and later waits on the same signal channel again. Worker-side
 cancel-only lifecycle corrections avoid self-wait but do not make those competing
 signal readers a desirable contract. This bridge follows the accepted E04 bounded

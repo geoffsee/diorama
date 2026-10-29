@@ -1,4 +1,4 @@
-//! KubeSolo-compatible versioned configuration decoding without host side effects.
+//! Versioned configuration decoding without host side effects.
 mod model;
 pub use model::*;
 mod decode;

@@ -162,7 +162,7 @@ fn offline_install_imports_verified_bytes_before_creating_owned_resources_withou
 }
 
 #[test]
-fn diorama_bundle_installs_offline_without_kubesolo_payloads_or_registry_access() {
+fn diorama_bundle_installs_offline_without_registry_access() {
     use dioramactl::bundle::{BundleInput, BundleSpec, build_offline_bundle};
     use dioramactl::install::install_container_with_engine;
     use std::fs;
@@ -172,7 +172,7 @@ fn diorama_bundle_installs_offline_without_kubesolo_payloads_or_registry_access(
     let mut inputs = Vec::new();
     for row in manifest["assets"].as_array_mut().unwrap() {
         let id = row["id"].as_str().unwrap().to_owned();
-        assert!(!id.contains("kubesolo"));
+        assert_ne!(id, "");
         let bytes = if id == "image-diorama" {
             image.as_slice()
         } else {

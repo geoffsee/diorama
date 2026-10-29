@@ -20,7 +20,7 @@ const DEFAULT_SOCKET_NAME: &str = "config.sock";
 const RESTART_WARNING: &str = "Warning: Restart required for changes to take effect\n";
 
 /// Resolves the configuration file path.
-/// Priority: explicit `-f`/`--file`, then `$KUBESOLO_CONFIG`, then `/etc/diorama/config.yaml`.
+/// Priority: explicit `-f`/`--file`, then `$DIORAMA_CONFIG`, then `/etc/diorama/config.yaml`.
 #[must_use]
 pub fn resolve_config_path(
     explicit_file: Option<&Path>,
@@ -28,7 +28,7 @@ pub fn resolve_config_path(
 ) -> PathBuf {
     if let Some(path) = explicit_file {
         path.to_path_buf()
-    } else if let Some(env_path) = environment.get("KUBESOLO_CONFIG") {
+    } else if let Some(env_path) = environment.get("DIORAMA_CONFIG") {
         if env_path.is_empty() {
             PathBuf::from(DEFAULT_CONFIG_PATH)
         } else {
@@ -40,7 +40,7 @@ pub fn resolve_config_path(
 }
 
 /// Resolves the Unix domain socket path.
-/// Priority: `$KUBESOLO_API_SOCKET_PATH`, then resolved config `api.socket_path`,
+/// Priority: `$DIORAMA_API_SOCKET_PATH`, then resolved config `api.socket_path`,
 /// then if stored config has `path`, `<path>/config.sock`, then `/var/lib/diorama/config.sock`.
 pub fn resolve_socket_path(
     config_path: &Path,
@@ -54,7 +54,7 @@ pub fn resolve_socket_path(
     if !decoded.config.api.enabled {
         return Ok(None);
     }
-    if let Some(env_socket) = environment.get("KUBESOLO_API_SOCKET_PATH")
+    if let Some(env_socket) = environment.get("DIORAMA_API_SOCKET_PATH")
         && !env_socket.is_empty()
     {
         return Ok(Some(PathBuf::from(env_socket)));

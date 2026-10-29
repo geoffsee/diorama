@@ -212,7 +212,7 @@ impl KubeProxyOptions {
         }
     }
 
-    /// Generates CLI command flags matching upstream `KubeSolo` and Kubernetes flags.
+    /// Generates CLI command flags matching Kubernetes flags.
     #[must_use]
     pub fn generate_flags(&self) -> Vec<String> {
         let mut flags = Vec::new();

@@ -53,8 +53,8 @@ impl Collector for BuildInfoCollector {
         };
 
         vec![MetricFamily::new(
-            "kubesolo_build_info",
-            "KubeSolo build information. Always 1; metadata is in the labels.",
+            "diorama_build_info",
+            "diorama build information. Always 1; metadata is in the labels.",
             MetricType::Gauge,
             vec![sample],
         )]
@@ -95,14 +95,14 @@ impl Collector for UptimeCollector {
 
         vec![
             MetricFamily::new(
-                "kubesolo_start_time_seconds",
-                "Unix timestamp at which the kubesolo metrics endpoint started.",
+                "diorama_start_time_seconds",
+                "Unix timestamp at which the diorama metrics endpoint started.",
                 MetricType::Gauge,
                 vec![Sample::without_labels(self.start_time_seconds as f64)],
             ),
             MetricFamily::new(
-                "kubesolo_uptime_seconds",
-                "Seconds elapsed since the kubesolo metrics endpoint started.",
+                "diorama_uptime_seconds",
+                "Seconds elapsed since the diorama metrics endpoint started.",
                 MetricType::Gauge,
                 vec![Sample::without_labels(uptime as f64)],
             ),
@@ -143,7 +143,7 @@ impl Collector for DatastoreCollector {
             .sum();
 
         vec![MetricFamily::new(
-            "kubesolo_kine_db_size_bytes",
+            "diorama_kine_db_size_bytes",
             "Size in bytes of the managed datastore snapshot and WAL. Unreadable files contribute 0.",
             MetricType::Gauge,
             vec![Sample::without_labels(size)],
@@ -296,13 +296,13 @@ impl Collector for CertificateCollector {
 
         vec![
             MetricFamily::new(
-                "kubesolo_certificate_valid",
+                "diorama_certificate_valid",
                 "1 if the named control plane certificate is readable and currently inside its validity window, 0 otherwise.",
                 MetricType::Gauge,
                 valid_samples,
             ),
             MetricFamily::new(
-                "kubesolo_certificate_expiry_timestamp_seconds",
+                "diorama_certificate_expiry_timestamp_seconds",
                 "Unix timestamp at which the named control plane certificate expires. Absent if the certificate cannot be read or parsed.",
                 MetricType::Gauge,
                 expiry_samples,
@@ -416,20 +416,20 @@ impl Collector for ComponentHealthCollector {
 
         vec![
             MetricFamily::new(
-                "kubesolo_component_up",
+                "diorama_component_up",
                 "1 if the named control plane component is reachable and healthy, 0 otherwise.",
                 MetricType::Gauge,
                 up_samples,
             ),
             MetricFamily::new(
-                "kubesolo_component_ready_timestamp_seconds",
+                "diorama_component_ready_timestamp_seconds",
                 "Unix timestamp at which the named component first signaled readiness. 0 until ready.",
                 MetricType::Gauge,
                 ready_samples,
             ),
             MetricFamily::new(
-                "kubesolo_component_last_probe_timestamp_seconds",
-                "Unix timestamp of the most recent kubesolo health probe for the named component.",
+                "diorama_component_last_probe_timestamp_seconds",
+                "Unix timestamp of the most recent diorama health probe for the named component.",
                 MetricType::Gauge,
                 probe_samples,
             ),

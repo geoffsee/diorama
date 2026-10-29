@@ -45,8 +45,8 @@ cargo run --locked -p diorama -- --print-config
 ```
 
 Configuration precedence is defaults, file, environment, then explicit flags.
-Legacy `KUBESOLO_*` environment variables and the `kubesolo.io/v1alpha1`
-configuration schema remain compatibility inputs. The default configuration file
+`DIORAMA_*` environment variables and the `diorama.io/v1alpha1`
+configuration schema define configuration inputs. The default configuration file
 is `/etc/diorama/config.yaml`; a missing file is allowed. Printed effective
 configuration can contain credentials, so review it before sharing output.
 See the [startup adapter](crates/diorama/README.md) and
@@ -121,7 +121,7 @@ artifacts are available or all platform cells have passed.
 
 [//]: # (The [compatibility contract]&#40;docs/architecture/compatibility-contract.md&#41; defines)
 
-[//]: # (the pinned KubeSolo baseline, retained behavior and deliberate deviations. The)
+[//]: # (the pinned baseline, retained behavior and deliberate deviations. The)
 
 [//]: # ([acceptance matrix]&#40;docs/architecture/acceptance-matrix.md&#41; records the gates for)
 

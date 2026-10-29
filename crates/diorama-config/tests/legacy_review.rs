@@ -18,8 +18,8 @@ fn manager_dependent_expansions_are_rejected_before_conversion() {
         "ExecStart=/usr/local/bin/diorama --path=/var/lib/%H",
         "command_args=\"--path=$DATA_DIR\"",
         "ExecStart=/usr/local/bin/diorama --portainer-edge-key=${EDGE_KEY}",
-        "exec kubesolo --path=`pwd`",
-        "exec kubesolo --path=/var/lib/escaped\\ path",
+        "exec diorama --path=`pwd`",
+        "exec diorama --path=/var/lib/escaped\\ path",
     ] {
         assert!(
             flags_to_config(&extract_service_flags(service), None).is_err(),
@@ -45,8 +45,8 @@ fn extraction_preserves_separate_and_explicit_empty_values() {
 #[test]
 fn rewrite_targets_arguments_and_removes_complete_quoted_tokens() {
     let layouts = [
-        "# kubesolo documentation\nDescription=kubesolo\nExecStart=/usr/local/bin/diorama '--debug' '--node-ip=10.0.0.1'\n",
-        "name=\"kubesolo\"\ncommand=\"/usr/local/bin/diorama\"\ncommand_args=\"--debug --node-ip=10.0.0.1\"\n",
+        "# diorama documentation\nDescription=diorama\nExecStart=/usr/local/bin/diorama '--debug' '--node-ip=10.0.0.1'\n",
+        "name=\"diorama\"\ncommand=\"/usr/local/bin/diorama\"\ncommand_args=\"--debug --node-ip=10.0.0.1\"\n",
         "DAEMON=\"/usr/local/bin/diorama\"\nDAEMON_ARGS=\"--debug --node-ip 10.0.0.1\"\n",
         "start-stop-daemon --start --quiet --pidfile /var/run/diorama.pid \\\n --exec /usr/local/bin/diorama -- \\\n --debug --node-ip=10.0.0.1\n",
         "exec /usr/local/bin/diorama '--debug' --node-ip=10.0.0.1\n",
@@ -59,7 +59,7 @@ fn rewrite_targets_arguments_and_removes_complete_quoted_tokens() {
         assert!(!rewritten.contains("''"));
         if original.contains("command_args=") {
             assert!(rewritten.contains(
-                "name=\"kubesolo\"\ncommand=\"/usr/local/bin/diorama\"\ncommand_args=\"--config="
+                "name=\"diorama\"\ncommand=\"/usr/local/bin/diorama\"\ncommand_args=\"--config="
             ));
         }
         if original.starts_with("start-stop-daemon") {
@@ -67,7 +67,7 @@ fn rewrite_targets_arguments_and_removes_complete_quoted_tokens() {
         }
         if original.starts_with('#') {
             assert!(
-                rewritten.starts_with("# kubesolo documentation\nDescription=kubesolo\nExecStart=")
+                rewritten.starts_with("# diorama documentation\nDescription=diorama\nExecStart=")
             );
         }
     }

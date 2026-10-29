@@ -177,7 +177,7 @@ fn handle_request(req: &Request<Incoming>, registry: &MetricsRegistry) -> Respon
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
         "/" => {
             let html = concat!(
-                "<html><body><h1>kubesolo metrics</h1>",
+                "<html><body><h1>diorama metrics</h1>",
                 "<ul>",
                 "<li><a href=\"/metrics\">/metrics</a></li>",
                 "<li><a href=\"/healthz\">/healthz</a></li>",

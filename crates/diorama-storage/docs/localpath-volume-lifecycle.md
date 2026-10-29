@@ -6,7 +6,7 @@ This document details the volume binding lifecycle, pod placement integration, d
 
 ## 1. First-Consumer Binding (`WaitForFirstConsumer`) & Placement Integration
 
-KubeSolo configures the default `local-path` `StorageClass` with `volumeBindingMode: WaitForFirstConsumer`.
+diorama configures the default `local-path` `StorageClass` with `volumeBindingMode: WaitForFirstConsumer`.
 
 ### Lifecycle States
 1. **PVC Creation (`Pending`)**:
@@ -45,7 +45,7 @@ Because volumes are backed directly by host paths rather than ephemeral containe
 
 ## 3. Reclaim Policies: Retain vs. Delete
 
-### `Retain` Policy (KubeSolo Default)
+### `Retain` Policy (diorama Default)
 - When a PVC is deleted:
   1. The `PersistentVolumeClaim` object is removed from the API server.
   2. The `PersistentVolume` object is **retained** in the API server, with its status phase updated to `Released`.

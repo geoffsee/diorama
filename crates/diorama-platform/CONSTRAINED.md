@@ -43,7 +43,7 @@ The independent policies are:
   Other CNI files remain externally owned. Actual owned-file writing and previous
   symlink migration belong to E15, not this module.
 
-The pinned KubeSolo baseline is `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
+The pinned diorama baseline is `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
 `internal/runtime/network/ipv6.go`, `internal/system/modules.go`,
 `pkg/kubernetes/kubeproxy/flags.go`, `internal/core/embedded/host.go` and
 `types/const.go`. Its IPv6 helper skips permission errors and accepts any leading

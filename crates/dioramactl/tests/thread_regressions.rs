@@ -69,7 +69,7 @@ fn proxy_selection_uses_final_url_scheme_and_preserves_explicit_overrides() {
         }
     }
     let mut env = env;
-    env.insert("KUBESOLO_PROXY".into(), "distribution-specific".into());
+    env.insert("DIORAMA_PROXY".into(), "distribution-specific".into());
     let Command::Download(options) = parse_command(&["download".into()], &env).unwrap() else {
         panic!("download")
     };
@@ -172,9 +172,9 @@ fn custom_url_cannot_inject_curl_options_or_change_protocol_policy() {
 #[test]
 fn sudo_recovery_does_not_restore_privileged_execution_controls() {
     let mut env = BTreeMap::from([("SUDO_USER".into(), "alice".into())]);
-    dioramactl::recover_sudo_env_from_bytes(&mut env, b"KUBESOLO_INSTALL_PREREQS=true\0KUBESOLO_CUSTOM_URL=file:///private\0KUBESOLO_PATH=/root\0KUBESOLO_PORTAINER_EDGE_KEY=key\0KUBESOLO_PORTAINER_EDGE_ID=id\0");
-    assert_eq!(env.get("KUBESOLO_PORTAINER_EDGE_KEY").unwrap(), "key");
-    assert_eq!(env.get("KUBESOLO_PORTAINER_EDGE_ID").unwrap(), "id");
+    dioramactl::recover_sudo_env_from_bytes(&mut env, b"DIORAMA_INSTALL_PREREQS=true\0DIORAMA_CUSTOM_URL=file:///private\0DIORAMA_PATH=/root\0DIORAMA_PORTAINER_EDGE_KEY=key\0DIORAMA_PORTAINER_EDGE_ID=id\0");
+    assert_eq!(env.get("DIORAMA_PORTAINER_EDGE_KEY").unwrap(), "key");
+    assert_eq!(env.get("DIORAMA_PORTAINER_EDGE_ID").unwrap(), "id");
     assert_eq!(env.len(), 3);
 }
 
@@ -192,7 +192,7 @@ fn unrelated_non_utf8_environment_does_not_panic() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_dioramactl"))
         .arg("version")
         .env_clear()
-        .env("KUBESOLO_PATH", std::ffi::OsString::from_vec(vec![0xff]))
+        .env("DIORAMA_PATH", std::ffi::OsString::from_vec(vec![0xff]))
         .output()
         .unwrap();
     assert!(!output.status.success());

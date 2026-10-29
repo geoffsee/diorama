@@ -150,7 +150,7 @@ async fn test_standalone_metrics_server_endpoints_and_shutdown() {
     let (status, headers, body) = http_get(addr, "/", &[]).await;
     assert_eq!(status, 200);
     assert!(headers.contains("text/html"));
-    assert!(body.contains("kubesolo metrics"));
+    assert!(body.contains("diorama metrics"));
     assert!(body.contains("/metrics"));
 
     // 3. Prometheus plain exposition scrape without TLS
@@ -160,12 +160,12 @@ async fn test_standalone_metrics_server_endpoints_and_shutdown() {
     assert!(!body.contains("# EOF"));
     let scrape = parse_scrape(&body).expect("parse Prometheus scrape");
     assert_eq!(
-        scrape.get_first_value("kubesolo_start_time_seconds"),
+        scrape.get_first_value("diorama_start_time_seconds"),
         Some(1_700_000_000.0)
     );
     let build_sample = scrape
         .get_sample(
-            "kubesolo_build_info",
+            "diorama_build_info",
             "rust_version",
             env!("diorama_RUSTC_VERSION"),
         )
@@ -184,7 +184,7 @@ async fn test_standalone_metrics_server_endpoints_and_shutdown() {
     assert!(body.ends_with("# EOF\n"));
     let om_scrape = parse_scrape(&body).expect("parse OpenMetrics scrape");
     assert_eq!(
-        om_scrape.get_first_value("kubesolo_start_time_seconds"),
+        om_scrape.get_first_value("diorama_start_time_seconds"),
         Some(1_700_000_000.0)
     );
 
@@ -378,12 +378,12 @@ async fn metrics_serving_attempt(reclaim_before_bind: bool) -> bool {
     // 2. Parse scrape response
     let scrape = parse_scrape(&body).expect("parse Prometheus scrape");
     assert!(
-        !body.contains("kubesolo_component_up"),
+        !body.contains("diorama_component_up"),
         "unwired lifecycle state must not masquerade as health"
     );
     let datastore_size: f64 = body
         .lines()
-        .find_map(|line| line.strip_prefix("kubesolo_kine_db_size_bytes "))
+        .find_map(|line| line.strip_prefix("diorama_kine_db_size_bytes "))
         .expect("datastore size series")
         .parse()
         .unwrap();
@@ -395,27 +395,27 @@ async fn metrics_serving_attempt(reclaim_before_bind: bool) -> bool {
     // Assert build info is present
     let build_sample = scrape
         .get_sample(
-            "kubesolo_build_info",
+            "diorama_build_info",
             "rust_version",
             env!("diorama_RUSTC_VERSION"),
         )
-        .expect("kubesolo_build_info");
+        .expect("diorama_build_info");
     assert!((build_sample.value - 1.0).abs() < f64::EPSILON);
 
     // Assert certificate metrics are reported (e.g. apiserver, ca, kubelet)
     let apiserver_cert_valid = scrape
-        .get_sample("kubesolo_certificate_valid", "name", "apiserver")
+        .get_sample("diorama_certificate_valid", "name", "apiserver")
         .expect("apiserver cert valid metric");
     assert!((apiserver_cert_valid.value - 1.0).abs() < f64::EPSILON);
 
     let ca_cert_valid = scrape
-        .get_sample("kubesolo_certificate_valid", "name", "ca")
+        .get_sample("diorama_certificate_valid", "name", "ca")
         .expect("ca cert valid metric");
     assert!((ca_cert_valid.value - 1.0).abs() < f64::EPSILON);
 
     let apiserver_expiry = scrape
         .get_sample(
-            "kubesolo_certificate_expiry_timestamp_seconds",
+            "diorama_certificate_expiry_timestamp_seconds",
             "name",
             "apiserver",
         )

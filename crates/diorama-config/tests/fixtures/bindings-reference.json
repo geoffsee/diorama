@@ -4,21 +4,21 @@
   "settings": [
     {
       "default": false,
-      "envar": "KUBESOLO_API_ENABLED",
+      "envar": "DIORAMA_API_ENABLED",
       "mutability": "restart",
       "path": "api.enabled",
       "type": "boolean"
     },
     {
       "default": "",
-      "envar": "KUBESOLO_API_SOCKET_PATH",
+      "envar": "DIORAMA_API_SOCKET_PATH",
       "mutability": "restart",
       "path": "api.socketPath",
       "type": "string"
     },
     {
       "default": false,
-      "envar": "KUBESOLO_D2K",
+      "envar": "DIORAMA_D2K",
       "flag": "d2k",
       "mutability": "restart",
       "path": "d2k.enabled",
@@ -26,7 +26,7 @@
     },
     {
       "default": "d2k",
-      "envar": "KUBESOLO_D2K_NAMESPACE",
+      "envar": "DIORAMA_D2K_NAMESPACE",
       "flag": "d2k-namespace",
       "mutability": "restart",
       "path": "d2k.namespace",
@@ -34,7 +34,7 @@
     },
     {
       "default": null,
-      "envar": "KUBESOLO_APISERVER_EXTRA_SANS",
+      "envar": "DIORAMA_APISERVER_EXTRA_SANS",
       "flag": "apiserver-extra-sans",
       "mutability": "restart",
       "path": "kubernetes.apiServer.extraSANs",
@@ -42,7 +42,7 @@
     },
     {
       "default": 600,
-      "envar": "KUBESOLO_STARTUP_TIMEOUT",
+      "envar": "DIORAMA_STARTUP_TIMEOUT",
       "flag": "startup-timeout",
       "mutability": "restart",
       "path": "kubernetes.apiServer.startupTimeoutSeconds",
@@ -50,7 +50,7 @@
     },
     {
       "default": "none",
-      "envar": "KUBESOLO_CPU_MANAGER_POLICY",
+      "envar": "DIORAMA_CPU_MANAGER_POLICY",
       "flag": "cpu-manager-policy",
       "mutability": "restart",
       "path": "kubernetes.kubelet.cpuManager.policy",
@@ -58,7 +58,7 @@
     },
     {
       "default": null,
-      "envar": "KUBESOLO_CPU_MANAGER_POLICY_OPTIONS",
+      "envar": "DIORAMA_CPU_MANAGER_POLICY_OPTIONS",
       "flag": "cpu-manager-policy-options",
       "mutability": "restart",
       "path": "kubernetes.kubelet.cpuManager.policyOptions",
@@ -66,7 +66,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_RESERVED_CPUS",
+      "envar": "DIORAMA_RESERVED_CPUS",
       "flag": "reserved-cpus",
       "mutability": "restart",
       "path": "kubernetes.kubelet.cpuManager.reservedCPUs",
@@ -74,7 +74,7 @@
     },
     {
       "default": null,
-      "envar": "KUBESOLO_SYSTEM_RESERVED",
+      "envar": "DIORAMA_SYSTEM_RESERVED",
       "flag": "system-reserved",
       "mutability": "restart",
       "path": "kubernetes.kubelet.systemReserved",
@@ -82,14 +82,14 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_NODE_NAME",
+      "envar": "DIORAMA_NODE_NAME",
       "mutability": "restart",
       "path": "kubernetes.nodeName",
       "type": "string"
     },
     {
       "default": false,
-      "envar": "KUBESOLO_DEBUG",
+      "envar": "DIORAMA_DEBUG",
       "flag": "debug",
       "mutability": "restart",
       "path": "logging.debug",
@@ -97,7 +97,7 @@
     },
     {
       "default": false,
-      "envar": "KUBESOLO_PPROF_SERVER",
+      "envar": "DIORAMA_PPROF_SERVER",
       "flag": "pprof-server",
       "mutability": "restart",
       "path": "logging.pprof",
@@ -105,7 +105,7 @@
     },
     {
       "default": "127.0.0.1:9105",
-      "envar": "KUBESOLO_METRICS_BIND_ADDRESS",
+      "envar": "DIORAMA_METRICS_BIND_ADDRESS",
       "flag": "metrics-bind-address",
       "mutability": "restart",
       "path": "metrics.bindAddress",
@@ -113,7 +113,7 @@
     },
     {
       "default": false,
-      "envar": "KUBESOLO_METRICS_SERVER",
+      "envar": "DIORAMA_METRICS_SERVER",
       "flag": "metrics-server",
       "mutability": "restart",
       "path": "metrics.enabled",
@@ -121,7 +121,7 @@
     },
     {
       "default": false,
-      "envar": "KUBESOLO_DISABLE_IPV6",
+      "envar": "DIORAMA_DISABLE_IPV6",
       "flag": "disable-ipv6",
       "mutability": "restart",
       "path": "network.disableIPv6",
@@ -129,7 +129,7 @@
     },
     {
       "default": true,
-      "envar": "KUBESOLO_LOAD_BALANCER",
+      "envar": "DIORAMA_LOAD_BALANCER",
       "flag": "load-balancer",
       "mutability": "restart",
       "path": "network.loadBalancer.enabled",
@@ -137,7 +137,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_LOAD_BALANCER_IP",
+      "envar": "DIORAMA_LOAD_BALANCER_IP",
       "flag": "load-balancer-ip",
       "mutability": "restart",
       "path": "network.loadBalancer.ip",
@@ -145,7 +145,7 @@
     },
     {
       "default": 0,
-      "envar": "KUBESOLO_MTU",
+      "envar": "DIORAMA_MTU",
       "flag": "mtu",
       "mutability": "restart",
       "path": "network.mtu",
@@ -153,7 +153,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_NODE_IP",
+      "envar": "DIORAMA_NODE_IP",
       "flag": "node-ip",
       "mutability": "restart",
       "path": "network.nodeIP",
@@ -161,7 +161,7 @@
     },
     {
       "default": "/var/lib/diorama",
-      "envar": "KUBESOLO_PATH",
+      "envar": "DIORAMA_PATH",
       "flag": "path",
       "mutability": "immutable",
       "path": "path",
@@ -169,7 +169,7 @@
     },
     {
       "default": false,
-      "envar": "KUBESOLO_PORTAINER_EDGE_ASYNC",
+      "envar": "DIORAMA_PORTAINER_EDGE_ASYNC",
       "flag": "portainer-edge-async",
       "mutability": "restart",
       "path": "portainer.async",
@@ -177,7 +177,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_PORTAINER_EDGE_ID",
+      "envar": "DIORAMA_PORTAINER_EDGE_ID",
       "flag": "portainer-edge-id",
       "mutability": "restart",
       "path": "portainer.edgeID",
@@ -185,7 +185,7 @@
     },
     {
       "default": null,
-      "envar": "KUBESOLO_PORTAINER_EDGE_KEY",
+      "envar": "DIORAMA_PORTAINER_EDGE_KEY",
       "flag": "portainer-edge-key",
       "mutability": "restart",
       "path": "portainer.edgeKey",
@@ -194,7 +194,7 @@
     },
     {
       "default": "docker.io/portainer/agent:lts",
-      "envar": "KUBESOLO_PORTAINER_EDGE_IMAGE",
+      "envar": "DIORAMA_PORTAINER_EDGE_IMAGE",
       "flag": "portainer-edge-image",
       "mutability": "restart",
       "path": "portainer.image",
@@ -202,7 +202,7 @@
     },
     {
       "default": null,
-      "envar": "KUBESOLO_CONTAINER_MODE",
+      "envar": "DIORAMA_CONTAINER_MODE",
       "flag": "container-mode",
       "mutability": "restart",
       "path": "runtime.containerMode",
@@ -210,7 +210,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_CONTAINER_RUNTIME_ENDPOINT",
+      "envar": "DIORAMA_CONTAINER_RUNTIME_ENDPOINT",
       "flag": "container-runtime-endpoint",
       "mutability": "restart",
       "path": "runtime.endpoint",
@@ -218,7 +218,7 @@
     },
     {
       "default": false,
-      "envar": "KUBESOLO_DB_WAL_REPAIR",
+      "envar": "DIORAMA_DB_WAL_REPAIR",
       "flag": "db-wal-repair",
       "mutability": "restart",
       "path": "storage.dbWALRepair",
@@ -226,7 +226,7 @@
     },
     {
       "default": true,
-      "envar": "KUBESOLO_LOCAL_STORAGE",
+      "envar": "DIORAMA_LOCAL_STORAGE",
       "flag": "local-storage",
       "mutability": "restart",
       "path": "storage.localPath.enabled",
@@ -234,7 +234,7 @@
     },
     {
       "default": "",
-      "envar": "KUBESOLO_LOCAL_STORAGE_SHARED_PATH",
+      "envar": "DIORAMA_LOCAL_STORAGE_SHARED_PATH",
       "flag": "local-storage-shared-path",
       "mutability": "restart",
       "path": "storage.localPath.sharedPath",

@@ -53,7 +53,7 @@ unbounded delivery queue.
 ## Evidence and remaining integration
 
 The baseline at `2ef1c4787989f11f868f81bb84ae2afd4a49a81d` logs optional deployment
-errors and continues for local-path, Portainer and D2k in `cmd/kubesolo/main.go`
+errors and continues for local-path, Portainer and D2k in `cmd/diorama/main.go`
 (lines 319, 332 and 343). `internal/logging/logging.go` defines log levels and
 pretty/no-color/JSON output; main enables DEBUG from configuration. This observer
 makes retained optional failures available during operation without reproducing

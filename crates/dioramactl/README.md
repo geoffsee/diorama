@@ -64,7 +64,7 @@ be removed explicitly after their Jobs and workloads no longer reference them.
 # A host installation, using its runtime socket and bundled ctr:
 sudo dioramactl addon load ./diorama-v0.1.0-linux-arm64-addon-d2k-offline.tar.gz --path=/var/lib/diorama
 # A named container; --engine=podman is also supported:
-dioramactl addon load ./diorama-v0.1.0-linux-arm64-addon-portainer-agent-offline.tar.gz --container=kubesolo
+dioramactl addon load ./diorama-v0.1.0-linux-arm64-addon-portainer-agent-offline.tar.gz --container=diorama
 ```
 
 Use the published `*-job.json`, or extract `install-job.json` from the add-on
@@ -217,7 +217,7 @@ not prove an already-accepted daemon mutation was cancelled.
 An explicit `--image` override retains registry-pull behavior and takes precedence
 over the offline bundle. Default online selection uses
 `ghcr.io/geoffsee/diorama:<version>`. Offline selection uses the verified archive's
-tag. Neither path requires a kubesolo executable or image.
+tag. Neither path requires a diorama executable or image.
 Tests use synthetic image archives and Engine fixtures. The release workflow also
 runs `container/verify-offline.sh` against a node with network access disabled.
 
@@ -228,8 +228,8 @@ Kubernetes node. Explicit
 opt-in can install missing Alpine networking packages and enable its cgroups
 service; ordinary checks never prepare a host or stop conflicting processes.
 
-The name is an explicit diorama management CLI choice replacing `kubesoloctl` for
-this executable. Help/version text is branded accordingly. KubeSolo environment
+The name is an explicit diorama management CLI choice replacing `dioramactl` for
+this executable. Help/version text is branded accordingly. diorama environment
 keys, on-disk paths, service/runtime/CNI identities and configuration schemas do not
 change. No compatibility executable alias is supplied; existing scripts must select the
 matching dioramactl release.
@@ -255,7 +255,7 @@ file contents, environment values, hostnames or raw OS errors. Output failures
 propagate to a nonzero process exit.
 
 `check` accepts `--pprof-server` and `--install-prereqs`. Environment defaults are
-`KUBESOLO_PPROF_SERVER` and `KUBESOLO_INSTALL_PREREQS`; exact lowercase `true`, `1`
+`DIORAMA_PPROF_SERVER` and `DIORAMA_INSTALL_PREREQS`; exact lowercase `true`, `1`
 and `yes` enable them, `false`, `0`, `no` and other values default false. Explicit
 flags override environment. Boolean `=value` uses Go ParseBool spellings; separate
 boolean-looking words remain positional arguments and are ignored, as by Cobra.
@@ -278,7 +278,7 @@ contains only filesystem observations, never execution controls or port evidence
 reserve ports or establish runtime readiness.
 
 Non-Linux host checking is explicitly unsupported. Unlike baseline macOS
-`kubesoloctl check`, this slice does not contact a container engine; that consumer
+`dioramactl check`, this slice does not contact a container engine; that consumer
 remains separate. Help and version remain usable without Linux host support.
 
 ## Compatibility evidence
@@ -387,7 +387,7 @@ service and Docker qualification remains outstanding.
 When running under sudo, preserve the allowlisted Edge settings explicitly:
 
 ```sh
-sudo --preserve-env=KUBESOLO_PORTAINER_EDGE_ID,KUBESOLO_PORTAINER_EDGE_KEY,KUBESOLO_PORTAINER_EDGE_ASYNC,KUBESOLO_PORTAINER_EDGE_IMAGE dioramactl <command>
+sudo --preserve-env=DIORAMA_PORTAINER_EDGE_ID,DIORAMA_PORTAINER_EDGE_KEY,DIORAMA_PORTAINER_EDGE_ASYNC,DIORAMA_PORTAINER_EDGE_IMAGE dioramactl <command>
 ```
 
 The sudo policy must permit preserving those variables. If it does not, an
@@ -414,7 +414,7 @@ replaced without modifying their targets. Existing directories must belong to
 that user. For privileged export to a different user's identity, precreate the
 output directory as that user; missing directories fail closed instead of
 chowning entries in a directory that the user can rename concurrently.
-Container exports use the managed `kubesolo[-<instance>]` identity and
+Container exports use the managed `diorama[-<instance>]` identity and
 require a valid, unambiguous loopback-reachable published port. Docker context
 configuration runs with the invoking user's identity and Docker configuration,
 not root's configuration under sudo. Exported credentials may remain after a

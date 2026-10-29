@@ -43,7 +43,7 @@ fn file_error(error: &ConfigError, path: &str) -> String {
     match error.kind {
         ErrorKind::Syntax => format!("parse {path}: error converting YAML to JSON: {error}"),
         ErrorKind::Version => format!(
-            "{path}: {}: this version of KubeSolo does not understand (expected kubesolo.io/v1alpha1)",
+            "{path}: {}: this version of diorama does not understand (expected diorama.io/v1alpha1)",
             error.message
         ),
         ErrorKind::Type => format!(
@@ -88,13 +88,13 @@ fn resolution_error(error: &ConfigError) -> String {
 fn warning_text(warning: &ResolutionWarning, path: &str) -> String {
     match warning {
         ResolutionWarning::File(Warning::MissingVersion) => {
-            format!("{path} does not declare an apiVersion; assuming kubesolo.io/v1alpha1")
+            format!("{path} does not declare an apiVersion; assuming diorama.io/v1alpha1")
         },
         ResolutionWarning::File(Warning::UnexpectedKind(kind)) => format!(
-            "{path} declares kind {kind:?}; KubeSolo only has Config, and read the file as one"
+            "{path} declares kind {kind:?}; diorama only has Config, and read the file as one"
         ),
         ResolutionWarning::File(Warning::IgnoredSettings { unknown, duplicate }) => format!(
-            "{path} contains settings this version of KubeSolo does not recognise, which were ignored: unknown={unknown:?}, duplicate={duplicate:?}"
+            "{path} contains settings this version of diorama does not recognise, which were ignored: unknown={unknown:?}, duplicate={duplicate:?}"
         ),
         ResolutionWarning::Validation(warning) => format!("{}: {}", warning.field, warning.message),
     }
@@ -123,7 +123,7 @@ pub fn execute(
         writeln!(
             stderr,
             "{}",
-            json!({"level":"info","version":version,"message":"kubesolo version"})
+            json!({"level":"info","version":version,"message":"diorama version"})
         )?;
         return Ok(StartupAction::Exit(0));
     }
@@ -131,7 +131,7 @@ pub fn execute(
         event(
             stderr,
             "warn",
-            "the --full flag (KUBESOLO_FULL) is deprecated and has no effect; KubeSolo always uses upstream Kubernetes defaults",
+            "the --full flag (DIORAMA_FULL) is deprecated and has no effect; diorama always uses upstream Kubernetes defaults",
             None,
         )?;
     }

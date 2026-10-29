@@ -40,7 +40,7 @@ diorama --container-runtime=oci-cri --path=/var/lib/diorama
 ```
 
 The equivalent file setting is `runtime.backend: oci-cri`; the environment
-variable is `KUBESOLO_CONTAINER_RUNTIME=oci-cri`. Empty or `auto` preserves
+variable is `DIORAMA_CONTAINER_RUNTIME=oci-cri`. Empty or `auto` preserves
 existing selection, and `containerd` explicitly selects managed containerd.
 A managed selection cannot be combined with `runtime.endpoint`.
 

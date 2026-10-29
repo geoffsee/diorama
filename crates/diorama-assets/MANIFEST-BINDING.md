@@ -70,7 +70,7 @@ It does not select an index entry, authenticate a registry/tag/publisher, approv
 production pins, inspect inner-tar paths or filesystem effects, establish ABI
 compatibility, or authorize import, extraction, installation, or deployment.
 
-The read-only KubeSolo baseline `2ef1c4787989f11f868f81bb84ae2afd4a49a81d` pulls a
+The read-only diorama baseline `2ef1c4787989f11f868f81bb84ae2afd4a49a81d` pulls a
 platform image with crane and gzips its Docker-save output in
 `build/download-deps.sh`; `internal/core/embedded/load.go` materializes embedded
 archives. This binding adds an explicit identity check to that archive boundary;

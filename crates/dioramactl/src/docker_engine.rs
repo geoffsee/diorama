@@ -273,7 +273,7 @@ fn parse_container_inspect(v: &Value) -> io::Result<ContainerInspect> {
         })?,
         d2k_enabled: v["Config"]["Env"]
             .as_array()
-            .is_some_and(|env| env.iter().any(|v| v == "KUBESOLO_D2K=true")),
+            .is_some_and(|env| env.iter().any(|v| v == "DIORAMA_D2K=true")),
         exit_code: v["State"]["ExitCode"]
             .as_i64()
             .and_then(|n| i32::try_from(n).ok())
@@ -287,7 +287,7 @@ mod tests {
     use super::*;
     #[test]
     fn inspect_preserves_allocated_api_ports_and_effective_d2k_state() {
-        let raw = serde_json::json!({"Id":"node","Name":"/kubesolo-x","State":{"Running":true,"ExitCode":0},"Config":{"Env":["KUBESOLO_D2K=true"]},"NetworkSettings":{"Ports":{"6443/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}],"2376/tcp":[{"HostIp":"127.0.0.1","HostPort":"32769"}]}}});
+        let raw = serde_json::json!({"Id":"node","Name":"/diorama-x","State":{"Running":true,"ExitCode":0},"Config":{"Env":["DIORAMA_D2K=true"]},"NetworkSettings":{"Ports":{"6443/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}],"2376/tcp":[{"HostIp":"127.0.0.1","HostPort":"32769"}]}}});
         let parsed = parse_container_inspect(&raw).unwrap();
         assert_eq!(parsed.allocated_ports["6443/tcp"], 32768);
         assert!(parsed.d2k_enabled);

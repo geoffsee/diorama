@@ -37,7 +37,7 @@ fn run() -> io::Result<u8> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let environment = std::env::vars_os()
-        .filter(|(key, _)| key.to_str().is_some_and(|key| key.starts_with("KUBESOLO_")))
+        .filter(|(key, _)| key.to_str().is_some_and(|key| key.starts_with("DIORAMA_")))
         .map(|(key, value)| {
             Ok((
                 key.into_string()

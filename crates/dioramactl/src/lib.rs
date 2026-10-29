@@ -204,7 +204,7 @@ pub fn execute_with_handler(
 ) -> io::Result<u8> {
     let mut env = environment.clone();
     if env.contains_key("SUDO_USER")
-        && !env.contains_key("KUBESOLO_PORTAINER_EDGE_KEY")
+        && !env.contains_key("DIORAMA_PORTAINER_EDGE_KEY")
         && let Ok(bytes) = inputs.read_parent_environ()
     {
         recover_sudo_env_from_bytes(&mut env, &bytes);

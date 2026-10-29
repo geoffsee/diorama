@@ -9,8 +9,8 @@ It does not close issues #42, #43, #44, or their parent epic.
 
 The selected external-component boundary is documented in the
 [component ADR](../../experiments/component-boundary/ADR.md). Reference behavior comes
-from pinned KubeSolo [main.go](https://github.com/portainer/kubesolo/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/cmd/kubesolo/main.go),
-[lifecycle.go](https://github.com/portainer/kubesolo/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/internal/runtime/service/lifecycle.go),
+from pinned diorama [main.go](https://github.com/geoffsee/diorama/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/cmd/diorama/main.go),
+[lifecycle.go](https://github.com/geoffsee/diorama/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/internal/runtime/service/lifecycle.go),
 and component executors' worker-side cancel-only shutdown correction. The core
 intentionally implements the accepted bounded supervisor contract rather than the
 baseline's competing signal readers, signal-only waits after cancellation, or

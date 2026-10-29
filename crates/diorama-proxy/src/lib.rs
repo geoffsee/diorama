@@ -33,7 +33,7 @@ pub use dataplane::{
 };
 pub use error::ProxyError;
 pub use firewall::{
-    DataplaneReconciler, FirewallSnapshot, KUBE_PROXY_NFT_TABLE, KUBESOLO_MASQ_NFT_TABLE,
+    DIORAMA_MASQ_NFT_TABLE, DataplaneReconciler, FirewallSnapshot, KUBE_PROXY_NFT_TABLE,
     ReconciliationSummary,
 };
 pub use health::ProxyHealthReport;

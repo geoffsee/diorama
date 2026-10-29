@@ -26,7 +26,7 @@ diorama integrates the **Kubernetes v1.35.7** controller manager component (`kub
 ## 2. Controller Selection & Historical Allowlist Resolution
 
 ### Tracking Upstream Commits
-Historical KubeSolo and edge forks introduced brittle controller allowlists that inadvertently dropped required controllers:
+Historical diorama and edge forks introduced brittle controller allowlists that inadvertently dropped required controllers:
 - **`f4f5ee9` (upstream PR #40)**: Fixed missing `job` and `cronjob` controllers.
 - **`ec05c2c` (upstream PR #68)**: Fixed missing `garbagecollector` controller.
 - **`790b2b0` (upstream PR #111 / KS-29)**: Reverted non-standard EndpointSlice batch periods back to standard `0s` defaults.

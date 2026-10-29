@@ -86,6 +86,6 @@ diorama supports dynamic CustomResourceDefinitions (`apiextensions.k8s.io/v1`):
 | `35d1093` | PR #166 (KS-68) | Remove edge memory overrides | diorama adheres strictly to official Kubernetes v1.35.7 baseline defaults; no low-memory hacks. |
 
 ### Scope Isolation: NodeSetter
-- In legacy KubeSolo, a custom admission plugin (`KubeSoloNodeSetter`) was used to force pods onto the single node.
+- In legacy diorama, a custom admission plugin (`NodeSetter`) was used to force pods onto the single node.
 - In diorama, workload scheduling and `NodeSetter` implementation remain scoped strictly to **Epic E14** (Workload Scheduling & Execution).
 - No custom scheduling hacks or hardcoded node bindings exist in the core API server admission engine.
