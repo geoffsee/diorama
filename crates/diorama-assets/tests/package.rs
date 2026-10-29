@@ -92,6 +92,7 @@ fn resolve_asset_delivery(variant: NodeVariant, id: AssetId) -> (bool, bool, Enc
         && (matches!(
             id,
             AssetId::Containerd
+                | AssetId::KubeScheduler
                 | AssetId::FuseOverlayfsSnapshotter
                 | AssetId::ContainerdShim
                 | AssetId::Crun
@@ -126,6 +127,7 @@ fn resolve_asset_delivery(variant: NodeVariant, id: AssetId) -> (bool, bool, Enc
 fn parse_catalog_asset_id(id_str: &str) -> AssetId {
     match id_str {
         "containerd" => AssetId::Containerd,
+        "kube-scheduler" => AssetId::KubeScheduler,
         "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
         "containerd-shim-runc-v2" => AssetId::ContainerdShim,
         "crun" => AssetId::Crun,

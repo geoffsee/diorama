@@ -33,7 +33,7 @@ use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
 use diorama_portainer::config::PortainerAgentConfig;
 use diorama_portainer::service::PortainerService;
 use diorama_portainer::supervisor::PortainerAdapter;
-use diorama_proxy::{KubeProxyOptions, ProxyAdapter, ProxyMode, ProxyService};
+use diorama_proxy::{ProxyAdapter, ProxyService};
 use diorama_storage::config::LocalPathConfig;
 use diorama_storage::service::LocalPathService;
 use diorama_storage::supervisor::LocalPathAdapter;
@@ -55,6 +55,7 @@ pub const COMPONENT_CONTAINERD: &str = diorama_containerd::COMPONENT_CONTAINERD;
 pub const COMPONENT_EXTERNAL_CRI: &str = diorama_cri::COMPONENT_EXTERNAL_CRI;
 pub const COMPONENT_DATASTORE: &str = "datastore";
 pub const COMPONENT_APISERVER: &str = "apiserver";
+pub const COMPONENT_SCHEDULER: &str = "kube-scheduler";
 pub const COMPONENT_CONTROLLER_MANAGER: &str = "controller-manager";
 pub const COMPONENT_COREDNS: &str = "coredns";
 pub const COMPONENT_LOCAL_PATH: &str = "local-path-provisioner";
@@ -478,14 +479,20 @@ impl NodeRuntime {
 
     /// Assembles runtime services with the file and host context selected at startup.
     /// This keeps stored configuration and API validation bound to that invocation.
+    #[allow(clippy::too_many_lines)]
     pub fn from_config_with_context(
         config: ValidatedConfig,
         config_path: PathBuf,
         host: diorama_config::HostContext,
     ) -> Result<Self, RuntimeError> {
         let state_dir = PathBuf::from(&config.config().path);
+        if config.config().kubernetes.role == "worker" {
+            return assemble_worker(config, &state_dir, &host);
+        }
         // Reject unsupported explicit selections before creating node state.
-        detect_workload_runtime(config.config(), &state_dir)?;
+        if !config.config().kubernetes.disable_local_kubelet {
+            detect_workload_runtime(config.config(), &state_dir)?;
+        }
         std::fs::create_dir_all(&state_dir)?;
 
         let (node_ip, pki_dir, node_name) = initialize_pki(&state_dir, &config)?;
@@ -505,6 +512,9 @@ impl NodeRuntime {
         let storage = KubernetesStorage::new(engine.client(), "/registry");
 
         let mut apiserver_cfg = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+        if !node_ip.is_loopback() {
+            apiserver_cfg.bind_address = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        }
         apiserver_cfg.etcd_servers = vec!["https://127.0.0.1:2379".to_string()];
         apiserver_cfg.etcd_ca_file = Some(pki_dir.join("datastore-ca.crt"));
         apiserver_cfg.etcd_cert_file = Some(pki_dir.join("datastore-client.crt"));
@@ -549,17 +559,28 @@ impl NodeRuntime {
             timeout,
         );
         builder = builder
+            .register_core(
+                COMPONENT_SCHEDULER,
+                vec![COMPONENT_APISERVER.into()],
+                crate::scheduler::adapter(&state_dir, Arc::new(client.clone()))?,
+            )
             .register_component(datastore_reg)
             .register_component(apiserver_reg)
             .register_component(controller_reg);
 
+        let network = crate::system_network::SystemNetwork {
+            client: Arc::new(client.clone()),
+            host: node_ip.to_string(),
+            pool: builder.config().config().network.pod_address_pool.clone(),
+            mtu: builder.config().config().network.mtu,
+        };
+        builder = builder.register_core("cilium", vec![COMPONENT_APISERVER.into()], network);
         let workload_ctx = WorkloadContext {
             state_dir: &state_dir,
             pki_dir: &pki_dir,
             node_name: &node_name,
             node_ip,
             host: &host,
-            apiserver_service: &apiserver_service,
             dns_service,
         };
         builder = register_workload_path(builder, workload_ctx)?;
@@ -850,15 +871,18 @@ fn initialize_pki(
     let candidates = diorama_network::discover_host_interfaces();
     let node_ip = node_ip_for_config(&config.config().network.node_ip, &candidates);
 
-    let node_name = if config.config().kubernetes.node_name.is_empty() {
-        "diorama-node".to_string()
-    } else {
-        config.config().kubernetes.node_name.clone()
-    };
+    let node_name = resolved_node_name(config)?;
 
     let pki_dir = state_dir.join("pki");
     std::fs::create_dir_all(&pki_dir)?;
-    let pki_config = ClusterPkiConfig::new(pki_dir.clone(), node_name.clone(), node_ip);
+    let mut pki_config = ClusterPkiConfig::new(pki_dir.clone(), node_name.clone(), node_ip);
+    pki_config.extra_sans = config
+        .config()
+        .kubernetes
+        .api_server
+        .extra_sans
+        .clone()
+        .unwrap_or_default();
     let pki = ClusterPki::new(pki_config);
     pki.reconcile()?;
     Ok((node_ip, pki_dir, node_name))
@@ -890,34 +914,7 @@ struct WorkloadContext<'a> {
     node_name: &'a str,
     node_ip: IpAddr,
     host: &'a diorama_config::HostContext,
-    apiserver_service: &'a Arc<ApiserverService>,
     dns_service: CoreDnsService,
-}
-
-static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn is_dir_writable(dir: &Path) -> bool {
-    if !dir.exists() && std::fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let count = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let probe_file = dir.join(format!(
-        ".diorama_write_probe_{}_{}",
-        std::process::id(),
-        count
-    ));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe_file)
-    {
-        Ok(file) => {
-            drop(file);
-            let _ = std::fs::remove_file(&probe_file);
-            true
-        },
-        Err(_) => false,
-    }
 }
 
 fn detect_workload_runtime(
@@ -985,38 +982,27 @@ fn register_container_runtime(
     state_dir: &Path,
     socket_path: &Path,
     runtime_id: &str,
-    mtu: u32,
-    pod_cidr: Option<&str>,
 ) -> Result<RuntimeBuilder, RuntimeError> {
-    let containerd_paths = ContainerdPaths::from_base(state_dir);
-    let etc_cni = Path::new("/etc/cni/net.d");
+    let mut paths = ContainerdPaths::from_base(state_dir);
+    let bundled_loopback = paths.cni_bin_dir.join("loopback");
+    paths.cni_bin_dir = PathBuf::from("/opt/diorama/cni/bin");
+    paths.cni_conf_dir = PathBuf::from("/etc/diorama/cni/net.d");
+    std::fs::create_dir_all(&paths.cni_bin_dir)?;
+    std::fs::create_dir_all(&paths.cni_conf_dir)?;
+    if bundled_loopback.is_file() && !paths.cni_bin_dir.join("loopback").exists() {
+        std::fs::copy(bundled_loopback, paths.cni_bin_dir.join("loopback"))?;
+    }
     if runtime_id == "oci-cri" {
         #[cfg(feature = "oci-cri")]
         {
             let base = state_dir.join("oci-cri");
-            let cni_conf = base.join("cni/net.d");
-            let missing = diorama_network::warn_missing_cni_plugins(&containerd_paths.cni_bin_dir);
-            if !missing.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("oci-cri CNI prerequisites: {}", missing.join("; ")),
-                )
-                .into());
-            }
-            std::fs::create_dir_all(&cni_conf)?;
-            diorama_network::write_cni_config_file(
-                &cni_conf.join(diorama_network::DEFAULT_CNI_CONFIG_NAME),
-                mtu,
-                pod_cidr,
-            )?;
             let config = diorama_oci::Config {
-                socket: socket_path.to_path_buf(),
+                socket: socket_path.into(),
                 root: base.join("root"),
                 state_root: base.join("state"),
-                cni_bin_dir: Some(containerd_paths.cni_bin_dir),
-                cni_conf_dir: Some(cni_conf),
-                pod_cidr: pod_cidr.unwrap_or_default().to_string(),
-                ..diorama_oci::Config::default()
+                cni_bin_dir: Some(paths.cni_bin_dir),
+                cni_conf_dir: Some(paths.cni_conf_dir),
+                ..Default::default()
             };
             let timeout = builder.policy.startup_timeout();
             return Ok(builder.register_oci_cri(diorama_oci::OciCriService::new(config, timeout)));
@@ -1027,79 +1013,106 @@ fn register_container_runtime(
         );
     }
     if runtime_id == COMPONENT_CONTAINERD {
-        diorama_network::write_managed_cni_config(
-            state_dir,
-            mtu,
-            pod_cidr,
-            Some(containerd_paths.cni_conf_dir.as_path()),
-        )?;
-        if is_dir_writable(etc_cni) {
-            diorama_network::write_managed_cni_config(state_dir, mtu, pod_cidr, None)?;
-        }
-
-        let image_config =
-            ImageImportConfig::from_config(builder.config().config(), &containerd_paths.images_dir);
-        let containerd_options = ContainerdServiceOptions::new(containerd_paths, image_config);
-        let containerd_service = ContainerdService::new(containerd_options);
-        Ok(builder.register_containerd(containerd_service))
+        let images = ImageImportConfig::from_config(builder.config().config(), &paths.images_dir);
+        Ok(
+            builder.register_containerd(ContainerdService::new(ContainerdServiceOptions::new(
+                paths, images,
+            ))),
+        )
     } else {
-        let conf_target = if is_dir_writable(etc_cni) {
-            etc_cni
-        } else {
-            containerd_paths.cni_conf_dir.as_path()
-        };
-        diorama_network::write_external_cni_config(conf_target, mtu, pod_cidr)?;
-
-        let endpoint_str = format!("unix://{}", socket_path.display());
-        let endpoints = RuntimeEndpoints::parse(&endpoint_str, None).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid CRI endpoint: {e}"),
-            )
-        })?;
-        let cri_options = ExternalRuntimeOptions::new(endpoints);
-        let cri_service = ExternalRuntimeService::new(cri_options);
-        Ok(builder.register_external_cri(cri_service))
+        let endpoints = RuntimeEndpoints::parse(&format!("unix://{}", socket_path.display()), None)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        Ok(
+            builder.register_external_cri(ExternalRuntimeService::new(
+                ExternalRuntimeOptions::new(endpoints),
+            )),
+        )
     }
+}
+
+fn resolved_node_name(config: &ValidatedConfig) -> Result<String, RuntimeError> {
+    let hostname = match diorama_platform::discover(&diorama_platform::DiscoveryRequest::default())
+    {
+        Ok(evidence) => match evidence.hostname {
+            diorama_platform::Observation::Present(name) => name,
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+    let runtime = config
+        .clone()
+        .into_runtime(diorama_config::RuntimeProbe {
+            hostname,
+            ..Default::default()
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    if !diorama_pki::bootstrap::valid_node_name(&runtime.node_name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid node identity").into());
+    }
+    Ok(runtime.node_name)
+}
+
+fn assemble_worker(
+    config: ValidatedConfig,
+    state: &Path,
+    host: &diorama_config::HostContext,
+) -> Result<NodeRuntime, RuntimeError> {
+    let node = resolved_node_name(&config)?;
+    let (runtime, socket) = detect_workload_runtime(config.config(), state)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "worker requires an ordinary CRI runtime",
+        )
+    })?;
+    let pki = state.join("pki");
+    let root = state.join("kubelet");
+    std::fs::create_dir_all(&pki)?;
+    std::fs::create_dir_all(&root)?;
+    let ip = node_ip_for_config(
+        &config.config().network.node_ip,
+        &diorama_network::discover_host_interfaces(),
+    );
+    let mut options = KubeletConfigOptions::default_for_pki(&pki, node, ip.to_string(), &root);
+    options.bootstrap_token_file = Some(PathBuf::from(&config.config().kubernetes.token_file));
+    options.runtime_endpoint = format!("unix://{}", socket.display());
+    options.container_mode = config
+        .config()
+        .runtime
+        .container_mode
+        .unwrap_or(host.detected_container_mode);
+    let service = KubeletService::https(options, Arc::new(CriRuntimeProvider::new(&socket)));
+    let mut builder = RuntimeBuilder::new(config);
+    builder = register_container_runtime(builder, state, &socket, runtime)?;
+    let timeout = builder.policy.startup_timeout();
+    builder
+        .register_component(KubeletAdapter::registration(
+            COMPONENT_KUBELET,
+            service,
+            vec![runtime.into()],
+            timeout,
+        ))
+        .build()
 }
 
 fn register_workload_path(
     mut builder: RuntimeBuilder,
     ctx: WorkloadContext<'_>,
 ) -> Result<RuntimeBuilder, RuntimeError> {
-    let detected_runtime = detect_workload_runtime(builder.config().config(), ctx.state_dir)?;
+    let detected_runtime = if builder.config().config().kubernetes.disable_local_kubelet {
+        None
+    } else {
+        detect_workload_runtime(builder.config().config(), ctx.state_dir)?
+    };
 
     if let Some((runtime_id, socket_path)) = detected_runtime {
-        let mtu = u32::try_from(builder.config().config().network.mtu)
-            .ok()
-            .filter(|&m| m > 0)
-            .unwrap_or(diorama_network::DEFAULT_MTU);
-        let pod_cidr = Some(diorama_network::DEFAULT_POD_CIDR);
+        builder = register_container_runtime(builder, ctx.state_dir, &socket_path, runtime_id)?;
 
-        builder = register_container_runtime(
-            builder,
-            ctx.state_dir,
-            &socket_path,
-            runtime_id,
-            mtu,
-            pod_cidr,
-        )?;
-
-        let proxy_kubeconfig = ctx.pki_dir.join("kube-proxy.kubeconfig");
         let is_container = builder
             .config()
             .config()
             .runtime
             .container_mode
             .unwrap_or(ctx.host.detected_container_mode);
-        let executor = diorama_network::SystemCommandExecutor;
-        let proxy_mode =
-            diorama_proxy::detect_proxy_backend(None, &executor).unwrap_or(ProxyMode::IpTables);
-        let proxy_opts = KubeProxyOptions::new(proxy_kubeconfig, is_container, proxy_mode);
-        let proxy_service = ProxyService::new(proxy_opts)
-            .with_client(Arc::new(ctx.apiserver_service.admin_client()));
-        builder = builder.register_proxy(proxy_service);
-
         let kubelet_dir = ctx.state_dir.join("kubelet");
         std::fs::create_dir_all(&kubelet_dir)?;
         let mut kubelet_opts = KubeletConfigOptions::default_for_pki(
@@ -1112,20 +1125,10 @@ fn register_workload_path(
         kubelet_opts.container_mode = is_container;
         let runtime_provider: Arc<dyn RuntimeProvider> =
             Arc::new(CriRuntimeProvider::new(socket_path));
-        let kubelet_service = KubeletService::new(
-            kubelet_opts,
-            ctx.apiserver_service.clone(),
-            runtime_provider,
-        );
+        let kubelet_service = KubeletService::https(kubelet_opts, runtime_provider);
         builder = builder.register_kubelet(kubelet_service, runtime_id);
 
-        Ok(builder.register_coredns(
-            ctx.dns_service,
-            vec![
-                COMPONENT_APISERVER.to_string(),
-                COMPONENT_KUBELET.to_string(),
-            ],
-        ))
+        Ok(builder.register_coredns(ctx.dns_service, vec![COMPONENT_APISERVER.to_string()]))
     } else {
         Ok(builder.register_coredns(ctx.dns_service, vec![COMPONENT_APISERVER.to_string()]))
     }

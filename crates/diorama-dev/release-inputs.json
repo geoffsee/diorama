@@ -34,6 +34,13 @@
         "files": {
           "containerd-fuse-overlayfs-grpc": "bin/containerd-fuse-overlayfs-grpc"
         }
+      },
+      {
+        "url": "https://dl.k8s.io/release/v1.35.7/bin/linux/amd64/kube-scheduler",
+        "sha256": "93a3e6bb3521416aebef6382b3d0054d3cb304d8ecb37e062f6d7e9f7020e6e5",
+        "files": {
+          "": "bin/kube-scheduler"
+        }
       }
     ],
     "arm64": [
@@ -68,6 +75,13 @@
         "sha256": "94ed6c2c3bece42e0c789ea056565b64fe487de4644121ee0dfb8acd8ef9369c",
         "files": {
           "containerd-fuse-overlayfs-grpc": "bin/containerd-fuse-overlayfs-grpc"
+        }
+      },
+      {
+        "url": "https://dl.k8s.io/release/v1.35.7/bin/linux/arm64/kube-scheduler",
+        "sha256": "571faf2a0d19951aade0b3d4f5f2e0b2504ee3a14ccdd2cdd0668ccd04a3c33c",
+        "files": {
+          "": "bin/kube-scheduler"
         }
       }
     ]

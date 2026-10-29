@@ -231,11 +231,10 @@ async fn test_disposable_nested_runtime_fixture_cgroup_v2_boot() {
         }
     });
 
-    service
-        .client()
-        .create_pod("default", pod_json)
-        .await
-        .unwrap();
+    let dioramalet::api::NodeApi::InProcess(client) = service.client() else {
+        panic!("expected test adapter");
+    };
+    client.create_pod("default", pod_json).await.unwrap();
 
     let reconciled = service
         .reconciler()

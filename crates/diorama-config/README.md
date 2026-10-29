@@ -6,7 +6,7 @@ environment/flag precedence and effective YAML rendering (see [LAYERING.md](LAYE
 [atomic persistence](PERSISTENCE.md), and [model-derived schema output](SCHEMA.md).
 It does not start components or discover host facts.
 
-`Config::default()` and the typed nested structs cover all 30 registry settings;
+`Config::default()` and the typed nested structs cover all 35 registry settings;
 `FIELDS` is the field/type/consumer-epic inventory. E03 owns the shared model and
 schema metadata (`apiVersion`, `kind`); each field names the component owner that
 consumes it. Explicit `Option<bool>` distinguishes detected container mode from
@@ -103,3 +103,16 @@ typed interchange model; the shared YAML renderer owns legacy omission/formattin
 rules and their documented preservation policies. No cluster lifecycle, ARM32
 integer-boundary release qualification, or distribution parity completion is implied.
 E02 and parent E03 integration completion remain separate gates.
+
+## Independent process roles
+
+`kubernetes.role` is `control-plane` (default) or `worker`.
+`kubernetes.tokenFile` supplies the encoded bootstrap kubeconfig for an ordinary
+worker; `kubernetes.disableLocalKubelet` disables only the control plane's ordinary
+kubelet. Workers require a token-file path and cannot disable their kubelet.
+`network.podAddressPool` defaults to `10.42.0.0/16`; Cilium cluster-pool IPAM uses
+aligned IPv4 pools with prefixes 8 through 24 and per-node /24 allocations.
+These immutable fields extend the retained baseline with no node roster.
+`--role`, `--token-file`, `--disable-local-kubelet`, and `--pod-address-pool`
+(and their `KUBESOLO_*` forms) follow existing precedence. The discovered hostname
+is the only fallback for node identity; an empty identity fails validation.

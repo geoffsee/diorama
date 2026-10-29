@@ -22,3 +22,6 @@ mod service_allocation;
 mod storage_readiness;
 #[path = "wave7a_conformance.rs"]
 mod wave7a_conformance;
+
+#[path = "multinode.rs"]
+mod multinode;

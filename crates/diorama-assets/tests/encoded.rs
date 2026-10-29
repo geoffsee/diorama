@@ -123,11 +123,11 @@ impl Read for Failed {
 #[test]
 fn io_source_is_preserved_and_attempts_consume_aggregate_budget() {
     let inventory = inventory(Limits {
-        encoded_total_bytes: 40,
+        encoded_total_bytes: 44,
         ..Limits::default()
     });
     let mut session = inventory.verification_session();
-    for remaining in (0..10).rev() {
+    for remaining in (0..11).rev() {
         let error = session
             .verify_encoded_blob(AssetId::Containerd, Failed)
             .unwrap_err();
@@ -148,7 +148,7 @@ fn io_source_is_preserved_and_attempts_consume_aggregate_budget() {
 #[test]
 fn aggregate_budget_can_verify_each_bundled_input_once() {
     let inventory = inventory(Limits {
-        encoded_total_bytes: 40,
+        encoded_total_bytes: 44,
         ..Limits::default()
     });
     let mut session = inventory.verification_session();

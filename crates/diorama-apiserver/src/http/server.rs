@@ -184,7 +184,12 @@ async fn handle(
 
     let query = request.uri().query().map(str::to_owned);
     let bearer = bearer_token(&request);
-    let client = client_for(service, peer, bearer.as_deref());
+    let client = client_for(service, peer, bearer.as_deref()).await;
+    if is_websocket_upgrade(&request) && super::node_auth::node_name(&client).is_some() {
+        return error_response(&ApiserverError::Unauthorized {
+            reason: "node credentials cannot open proxy sessions".into(),
+        });
+    }
     if is_websocket_upgrade(&request)
         && let Route::Resource(path) = &route
     {
@@ -245,6 +250,20 @@ async fn handle(
         },
     };
 
+    if let Route::Resource(path) = &route
+        && let Err(error) = super::node_auth::authorize(
+            service,
+            &client,
+            &method,
+            path,
+            query.as_deref(),
+            content_type.as_deref(),
+            &body,
+        )
+        .await
+    {
+        return error_response(&error);
+    }
     match route {
         Route::Health | Route::Version | Route::OpenIdConfig | Route::OpenIdJwks => {
             unreachable!("handled above")
@@ -307,7 +326,15 @@ async fn handle(
         Route::Resource(path) => {
             let params = query::parse(query.as_deref());
             if method == Method::GET && path.name.is_none() && is_watch(&params) {
-                return watch_response(service, &client, &path, &params, shutdown).await;
+                return watch_response(
+                    service,
+                    &client,
+                    &path,
+                    &params,
+                    accept.as_deref(),
+                    shutdown,
+                )
+                .await;
             }
             if method == Method::POST && is_table_request(accept.as_deref()) {
                 let res = path.resource.as_str();
@@ -665,6 +692,11 @@ fn outcome_to_response(
     let mut resp = match outcome.body {
         Payload::Json(body) => {
             if outcome.status.is_success()
+                && is_metadata_request(accept)
+                && body.get("kind").and_then(Value::as_str) != Some("Status")
+            {
+                json_response(outcome.status, &metadata_only(&body))
+            } else if outcome.status.is_success()
                 && is_table_request(accept)
                 && supports_table(path)
                 && body.get("kind").and_then(Value::as_str) != Some("Status")
@@ -831,9 +863,21 @@ async fn build_watch_filter(
     params: &BTreeMap<String, String>,
     resource_key_prefix: &str,
 ) -> WatchFilter {
+    let crd = service
+        .admin_client()
+        .list_registered_crds()
+        .into_iter()
+        .find(|crd| {
+            crd["spec"]["group"] == path.group && crd["spec"]["names"]["plural"] == path.resource
+        });
     let name_filter = params
         .get("fieldSelector")
-        .and_then(|selector| selector.strip_prefix("metadata.name="))
+        .and_then(|selector| {
+            selector.split(',').find_map(|term| {
+                term.strip_prefix("metadata.name==")
+                    .or_else(|| term.strip_prefix("metadata.name="))
+            })
+        })
         .map(str::to_owned);
     let object_exists = if let Some(ref name) = name_filter {
         let key = format!("{resource_key_prefix}{name}");
@@ -843,6 +887,7 @@ async fn build_watch_filter(
     };
 
     WatchFilter {
+        metadata_only: false,
         name: name_filter,
         field_selector: params.get("fieldSelector").cloned().unwrap_or_default(),
         label_selector: params.get("labelSelector").cloned().unwrap_or_default(),
@@ -853,14 +898,21 @@ async fn build_watch_filter(
         send_initial_events: params
             .get("sendInitialEvents")
             .is_some_and(|value| value == "true"),
-        namespaced: path.namespace.is_some() || dispatch_is_namespaced(&path.resource),
+        namespaced: path.namespace.is_some()
+            || crd.as_ref().map_or_else(
+                || dispatch_is_namespaced(&path.resource),
+                |crd| crd["spec"]["scope"] == "Namespaced",
+            ),
         namespace: path.namespace.clone(),
         api_version: if path.group.is_empty() {
             path.version.clone()
         } else {
             format!("{}/{}", path.group, path.version)
         },
-        kind: dispatch::kind_name(&path.resource)
+        kind: crd
+            .as_ref()
+            .and_then(|crd| crd["spec"]["names"]["kind"].as_str())
+            .or_else(|| dispatch::kind_name(&path.resource))
             .unwrap_or("Object")
             .to_string(),
         object_exists,
@@ -875,48 +927,74 @@ async fn watch_response(
     client: &KubernetesApiClient,
     path: &ResourcePath,
     params: &BTreeMap<String, String>,
+    accept: Option<&str>,
     shutdown: watch::Receiver<bool>,
 ) -> Response<Body> {
+    let name = params.get("fieldSelector").and_then(|selector| {
+        selector.split(',').find_map(|term| {
+            term.strip_prefix("metadata.name==")
+                .or_else(|| term.strip_prefix("metadata.name="))
+        })
+    });
+    if let Err(error) = client.check_auth_detailed(
+        "watch",
+        &path.group,
+        &path.resource,
+        path.namespace.as_deref(),
+        name,
+    ) {
+        return error_response(&error);
+    }
     let hub = get_or_init_watch_hub(service).await;
     let broadcast_rx = hub.inner.read().await.broadcast_tx.subscribe();
 
     let storage_prefix = service.storage().prefix();
     let resource_key_prefix = compute_resource_key_prefix(storage_prefix, path);
-    let filter = build_watch_filter(service, path, params, &resource_key_prefix).await;
+    let mut filter = build_watch_filter(service, path, params, &resource_key_prefix).await;
+    filter.metadata_only = is_metadata_request(accept);
 
     let timeout = params
         .get("timeoutSeconds")
         .and_then(|value| value.parse().ok())
         .map_or(DEFAULT_WATCH_TIMEOUT, Duration::from_secs);
 
-    let (initial, snapshot_rev, buffered_events) = if params
-        .get("resourceVersion")
-        .map(String::as_str)
-        == Some("0")
-        || filter.send_initial_events
-        || (params.get("resourceVersion").is_none() && filter.label_selector.is_empty())
-    {
-        let initial_doc =
-            match dispatch::dispatch(service, client, &Method::GET, path, None, None, &[]).await {
+    let (initial, snapshot_rev, buffered_events) =
+        if params.get("resourceVersion").map(String::as_str) == Some("0")
+            || filter.send_initial_events
+            || (params.get("resourceVersion").is_none() && filter.label_selector.is_empty())
+        {
+            // The watch permission covers this snapshot. The caller need not also
+            // hold list permission; filtering below preserves the authorized scope.
+            let initial_doc = match dispatch::dispatch(
+                service,
+                &service.admin_client(),
+                &Method::GET,
+                path,
+                None,
+                None,
+                &[],
+            )
+            .await
+            {
                 Ok(outcome) => match outcome.body {
                     Payload::Json(body) => body,
                     Payload::Text(_) | Payload::ChunkedText(_) => Value::Null,
                 },
                 Err(err) => return error_response(&err),
             };
-        let snapshot_rev = hub.inner.read().await.last_assigned_rev;
-        (Some(initial_doc), snapshot_rev, Vec::new())
-    } else {
-        let guard = hub.inner.read().await;
-        let events: Vec<Arc<BufferedWatchEvent>> = guard
-            .buffer
-            .iter()
-            .filter(|ev| ev.resource_version > filter.since)
-            .cloned()
-            .collect();
-        let snapshot_rev = guard.last_assigned_rev;
-        (None, snapshot_rev, events)
-    };
+            let snapshot_rev = hub.inner.read().await.last_assigned_rev;
+            (Some(initial_doc), snapshot_rev, Vec::new())
+        } else {
+            let guard = hub.inner.read().await;
+            let events: Vec<Arc<BufferedWatchEvent>> = guard
+                .buffer
+                .iter()
+                .filter(|ev| ev.resource_version > filter.since)
+                .cloned()
+                .collect();
+            let snapshot_rev = guard.last_assigned_rev;
+            (None, snapshot_rev, events)
+        };
 
     let (sender, channel) = Channel::<Bytes, Infallible>::new(32);
     tokio::spawn(stream_watch(
@@ -946,6 +1024,7 @@ fn dispatch_is_namespaced(resource: &str) -> bool {
 
 #[allow(clippy::struct_excessive_bools)]
 struct WatchFilter {
+    metadata_only: bool,
     name: Option<String>,
     label_selector: String,
     field_selector: String,
@@ -962,6 +1041,18 @@ struct WatchFilter {
 }
 
 impl WatchFilter {
+    async fn send_event(
+        &self,
+        sender: &mut http_body_util::channel::Sender<Bytes, Infallible>,
+        kind: &str,
+        object: &Value,
+    ) -> Result<(), http_body_util::channel::SendError> {
+        if self.metadata_only {
+            send_event(sender, kind, &metadata_only(object)).await
+        } else {
+            send_event(sender, kind, object).await
+        }
+    }
     /// Minimal typed object for a storage key such as `/registry/pods/default/hello`.
     fn object_from_key(&self, key: &str) -> Value {
         let mut segments = key.trim_end_matches('/').rsplit('/');
@@ -1028,7 +1119,11 @@ async fn stream_watch(
             let version = resource_version(&item);
             sent.insert(object_key(&item), version);
             last_delivered_rv = last_delivered_rv.max(version);
-            if send_event(&mut sender, "ADDED", &item).await.is_err() {
+            if filter
+                .send_event(&mut sender, "ADDED", &item)
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -1044,7 +1139,8 @@ async fn stream_watch(
                 "annotations": { "k8s.io/initial-events-end": "true" }
             }
         });
-        if send_event(&mut sender, "BOOKMARK", &bookmark)
+        if filter
+            .send_event(&mut sender, "BOOKMARK", &bookmark)
             .await
             .is_err()
         {
@@ -1108,7 +1204,11 @@ async fn stream_watch(
                     || sent.remove(&key).is_some())
             {
                 sent.remove(&key);
-                if send_event(&mut sender, "DELETED", &object).await.is_err() {
+                if filter
+                    .send_event(&mut sender, "DELETED", &object)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1128,7 +1228,7 @@ async fn stream_watch(
             sent.insert(key, event.resource_version);
         }
         last_delivered_rv = event.resource_version;
-        if send_event(&mut sender, kind, &object).await.is_err() {
+        if filter.send_event(&mut sender, kind, &object).await.is_err() {
             return;
         }
     }
@@ -1148,7 +1248,11 @@ async fn stream_watch(
             "apiVersion": filter.api_version,
             "metadata": metadata,
         });
-        if send_event(&mut sender, "DELETED", &gone).await.is_err() {
+        if filter
+            .send_event(&mut sender, "DELETED", &gone)
+            .await
+            .is_err()
+        {
             return;
         }
         last_delivered_rv = filter.since + 1;
@@ -1223,7 +1327,7 @@ async fn stream_watch(
                             || sent.remove(&key).is_some())
                     {
                         sent.remove(&key);
-                        if send_event(&mut sender, "DELETED", &object).await.is_err() {
+                        if filter.send_event(&mut sender, "DELETED", &object).await.is_err() {
                             return;
                         }
                     }
@@ -1242,7 +1346,7 @@ async fn stream_watch(
                     sent.insert(key, event.resource_version);
                 }
                 last_delivered_rv = event.resource_version;
-                if send_event(&mut sender, kind, &object).await.is_err() {
+                if filter.send_event(&mut sender, kind, &object).await.is_err() {
                     return;
                 }
             }
@@ -1293,7 +1397,7 @@ fn version() -> Value {
     })
 }
 
-/// `v1.37.1` splits into major `1` and minor `37`.
+/// `v1.35.7` splits into major `1` and minor `35`.
 fn split_kubernetes_version(version: &str) -> (&str, &str) {
     let rest = version.strip_prefix('v').unwrap_or(version);
     let (major, rest) = rest.split_once('.').unwrap_or((rest, "0"));
@@ -1707,7 +1811,7 @@ async fn health(service: &ApiserverService, path: &str) -> Response<Body> {
     }
 }
 
-fn client_for(
+async fn client_for(
     service: &ApiserverService,
     peer: Option<&PeerIdentity>,
     bearer: Option<&str>,
@@ -1715,7 +1819,13 @@ fn client_for(
     if let Some(peer) = peer {
         service.user_client(peer.username.clone(), peer.groups.clone())
     } else if let Some(token) = bearer {
-        service.token_client(token)
+        service.bootstrap_client(token).await.unwrap_or_else(|| {
+            if token.split('.').count() == 2 {
+                service.anonymous_client()
+            } else {
+                service.token_client(token)
+            }
+        })
     } else {
         service.anonymous_client()
     }
@@ -2239,19 +2349,94 @@ fn response(status: StatusCode, content_type: &'static str, bytes: Bytes) -> Res
         })
 }
 
+fn is_metadata_request(accept: Option<&str>) -> bool {
+    accept.is_some_and(|accept| {
+        accept.contains("as=PartialObjectMetadata") && accept.contains("g=meta.k8s.io")
+    })
+}
+fn metadata_only(object: &Value) -> Value {
+    if let Some(items) = object["items"].as_array() {
+        json!({"apiVersion":"meta.k8s.io/v1", "kind":"PartialObjectMetadataList", "metadata": object["metadata"], "items": items.iter().map(metadata_only).collect::<Vec<_>>()})
+    } else {
+        json!({"apiVersion":"meta.k8s.io/v1", "kind":"PartialObjectMetadata", "metadata": object["metadata"]})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::group_item;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn metadata_watch_streams_typed_initial_events_and_bookmark() {
+        use http_body_util::BodyExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = diorama_datastore::DatastoreEngine::open(
+            diorama_datastore::DatastoreConfig::new(dir.path().join("db")),
+        )
+        .unwrap();
+        let storage = crate::KubernetesStorage::new(engine.client(), "/registry");
+        let service = crate::ApiserverService::new(
+            crate::ApiserverConfig::default_for_pki(dir.path(), "127.0.0.1".parse().unwrap()),
+            storage,
+        );
+        let admin = service.admin_client();
+        admin
+            .create_node(json!({"metadata":{"name":"ordinary"},"spec":{"podCIDR":"10.42.0.0/24"}}))
+            .await
+            .unwrap();
+        let path = super::ResourcePath {
+            group: String::new(),
+            version: "v1".into(),
+            resource: "nodes".into(),
+            namespace: None,
+            name: None,
+            subresource: None,
+            trailing_slash: false,
+        };
+        let params = super::query::parse(Some("sendInitialEvents=true&timeoutSeconds=0"));
+        let (_, shutdown) = tokio::sync::watch::channel(false);
+        let response = super::watch_response(
+            &service,
+            &admin,
+            &path,
+            &params,
+            Some("application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"),
+            shutdown,
+        )
+        .await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(events[0]["object"]["kind"], "PartialObjectMetadata");
+        assert_eq!(events[0]["object"]["apiVersion"], "meta.k8s.io/v1");
+        assert!(events[0]["object"].get("spec").is_none());
+        assert_eq!(events[1]["type"], "BOOKMARK");
+        assert_eq!(events[1]["object"]["kind"], "PartialObjectMetadata");
+        assert_eq!(
+            events[1]["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"],
+            "true"
+        );
+        let reader = service.user_client("unprivileged", vec![]);
+        let params = super::query::parse(Some("resourceVersion=100&timeoutSeconds=0"));
+        let (_, shutdown) = tokio::sync::watch::channel(false);
+        let denied = super::watch_response(&service, &reader, &path, &params, None, shutdown).await;
+        assert_eq!(denied.status(), http::StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn version_advertises_the_conformance_release() {
         let body = super::version();
         assert_eq!(body["major"], "1");
-        assert_eq!(body["minor"], "37");
-        assert_eq!(body["gitVersion"], "v1.37.1");
+        assert_eq!(body["minor"], "35");
+        assert_eq!(body["gitVersion"], "v1.35.7");
         let spec = crate::openapi::v3_group("apps", "v1");
-        assert_eq!(spec["info"]["version"], "v1.37.1");
+        assert_eq!(spec["info"]["version"], "v1.35.7");
     }
 
     #[test]

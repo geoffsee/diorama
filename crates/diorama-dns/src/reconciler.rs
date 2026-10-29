@@ -336,6 +336,7 @@ impl DnsReconciler {
                     "spec": {
                         "dnsPolicy": "Default",
                         "priorityClassName": "system-cluster-critical",
+                        "nodeSelector": {"diorama.io/runtime":"ordinary"},
                         "serviceAccountName": COREDNS_SERVICE_ACCOUNT_NAME,
                         "containers": [{
                             "name": "coredns",

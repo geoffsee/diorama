@@ -212,6 +212,42 @@ async fn unsupported_provider_fails_readiness() {
 }
 
 #[tokio::test]
+async fn v8_matrix_wasi_is_not_an_ordinary_runtime() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("docker.sock");
+    let stopped = Arc::new(AtomicBool::new(false));
+
+    let _server = spawn_mock_cri_server(
+        socket.clone(),
+        "v8-matrix-wasi".into(),
+        "0.1.0".into(),
+        Arc::clone(&stopped),
+    );
+
+    let endpoints = RuntimeEndpoints::single(CriEndpoint::from_path(&socket).unwrap());
+    let err = probe_cri_readiness(
+        &endpoints,
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect_err("v8-matrix-wasi probe must fail as unsupported");
+
+    match err {
+        ReadinessError::UnsupportedProvider {
+            runtime_name,
+            runtime_version,
+        } => {
+            assert_eq!(runtime_name, "v8-matrix-wasi");
+            assert_eq!(runtime_version, "0.1.0");
+        },
+        other => panic!("expected UnsupportedProvider error, got: {other:?}"),
+    }
+
+    stopped.store(true, Ordering::Relaxed);
+}
+
+#[tokio::test]
 async fn separate_runtime_and_image_sockets() {
     let temp = TempDir::new().unwrap();
     let runtime_sock = temp.path().join("runtime.sock");

@@ -454,7 +454,8 @@ impl LocalPathReconciler {
             "kind": "StorageClass",
             "metadata": metadata,
             "provisioner": LOCAL_PATH_PROVISIONER_NAME,
-            "volumeBindingMode": self.config.volume_binding_mode,
+            "volumeBindingMode": "WaitForFirstConsumer",
+            "allowedTopologies":[{"matchLabelExpressions":[{"key":"diorama.io/runtime","values":["ordinary"]}]}],
             "reclaimPolicy": self.config.reclaim_policy,
             "allowVolumeExpansion": self.config.allow_volume_expansion,
         });
@@ -506,6 +507,7 @@ impl LocalPathReconciler {
                         "labels": labels,
                     },
                     "spec": {
+                        "nodeSelector": {"diorama.io/runtime":"ordinary"},
                         "serviceAccountName": LOCAL_PATH_SERVICE_ACCOUNT_NAME,
                         "containers": [{
                             "name": LOCAL_PATH_DEPLOYMENT_NAME,
@@ -584,6 +586,27 @@ impl LocalPathReconciler {
         report: &mut ReconciliationReport,
     ) -> Result<()> {
         if !self.config.csi_enabled {
+            // Older installations advertised the non-CSI local-path provisioner
+            // as a capacity-reporting driver. That prevents upstream scheduling
+            // because no CSIStorageCapacity objects will ever be published.
+            match client
+                .get_cluster_object("storage.k8s.io", "csidrivers", LOCAL_PATH_PROVISIONER_NAME)
+                .await
+            {
+                Ok(driver) if driver["metadata"]["labels"]["app"] == "local-path-provisioner" => {
+                    client
+                        .delete_cluster_object(
+                            "storage.k8s.io",
+                            "csidrivers",
+                            LOCAL_PATH_PROVISIONER_NAME,
+                        )
+                        .await
+                        .map_err(StorageError::Apiserver)?;
+                    report.csi_driver_updated = true;
+                },
+                Ok(_) | Err(diorama_apiserver::ApiserverError::NotFound { .. }) => {},
+                Err(error) => return Err(StorageError::Apiserver(error)),
+            }
             return Ok(());
         }
 

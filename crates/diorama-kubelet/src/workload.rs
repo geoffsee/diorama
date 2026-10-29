@@ -148,6 +148,12 @@ pub trait RuntimeProvider: std::fmt::Debug + Send + Sync {
         Ok(())
     }
 
+    /// CNI readiness is independent of runtime availability; host-network bootstrap pods
+    /// must run while this is false.
+    async fn network_ready(&self) -> Result<bool, KubeletError> {
+        Ok(true)
+    }
+
     // --- RuntimeService: sandboxes ---
 
     /// Creates and starts a pod sandbox; returns its id.
@@ -887,15 +893,21 @@ pub(crate) fn write_volume_file(path: &Path, content: &[u8]) -> std::io::Result<
     // In addition, regular files are truncated and overwritten in-place rather than unlinked
     // so that existing open file descriptors and subpath mounts stay valid.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        if meta.is_file() && std::fs::read(path).is_ok_and(|old| old == content) {
+            // Avoid spurious filesystem notifications: applications such as
+            // kube-proxy restart when their configuration file changes.
+            return Ok(());
         }
         if meta.file_type().is_symlink() {
             let _ = std::fs::remove_file(path);
         } else if meta.is_dir() {
             let _ = std::fs::remove_dir_all(path);
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
     let mut file = std::fs::OpenOptions::new()
@@ -912,6 +924,9 @@ pub(crate) fn chmod_volume_file(path: &Path, mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o7777 == mode) {
+            return;
+        }
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
     }
     #[cfg(not(unix))]
@@ -2424,6 +2439,26 @@ pub fn materialize_image_volume(reference: &str, vol_dir: &Path) -> Result<(), K
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_volume_content_preserves_modification_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config");
+        super::write_volume_file(&path, b"stable configuration").unwrap();
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        super::chmod_volume_file(&path, 0o400);
+        super::write_volume_file(&path, b"stable configuration").unwrap();
+        super::chmod_volume_file(&path, 0o400);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        super::write_volume_file(&path, b"updated configuration").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"updated configuration");
+    }
     use super::{apply_fs_group_ownership, pod_fs_group, volume_file_mode};
     use serde_json::json;
 

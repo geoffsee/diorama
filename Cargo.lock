@@ -680,6 +680,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustix",
+ "serde-saphyr",
  "serde_json",
  "tempfile",
  "tokio",
@@ -714,6 +715,7 @@ dependencies = [
  "rustls",
  "saphyr-parser",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -916,6 +918,7 @@ dependencies = [
  "rcgen",
  "sha2",
  "tempfile",
+ "time",
  "x509-parser",
 ]
 
@@ -994,8 +997,10 @@ dependencies = [
 name = "dioramactl"
 version = "0.1.0"
 dependencies = [
+ "diorama-apiserver",
  "diorama-assets",
  "diorama-config",
+ "diorama-pki",
  "diorama-platform",
  "diorama-supervisor",
  "rustix",

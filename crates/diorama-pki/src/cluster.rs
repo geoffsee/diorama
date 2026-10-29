@@ -182,6 +182,15 @@ impl ClusterPki {
             &[],
         )?;
 
+        handle_leaf(
+            "kube-scheduler",
+            Component::Scheduler,
+            &ca_crt,
+            &ca_key,
+            &[],
+            &[],
+        )?;
+
         // Kube Proxy
         handle_leaf(
             "kube-proxy",
@@ -293,6 +302,7 @@ impl ClusterPki {
 
         for (name, user) in [
             ("admin", "admin"),
+            ("kube-scheduler", "system:kube-scheduler"),
             ("kubelet", "kubelet"),
             ("kube-controller-manager", "kube-controller-manager"),
             ("kube-proxy", "system:kube-proxy"),

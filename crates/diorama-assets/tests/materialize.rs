@@ -107,6 +107,7 @@ fn build_synthetic_manifest_and_archive(
         if delivery_kind == "bundled" {
             let id = match id_str {
                 "containerd" => AssetId::Containerd,
+                "kube-scheduler" => AssetId::KubeScheduler,
                 "fuse-overlayfs-snapshotter" => AssetId::FuseOverlayfsSnapshotter,
                 "containerd-shim-runc-v2" => AssetId::ContainerdShim,
                 "crun" => AssetId::Crun,

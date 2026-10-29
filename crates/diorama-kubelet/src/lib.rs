@@ -52,3 +52,7 @@ pub use workload::{
     is_container_cpu_pinning_eligible, materialize_image_volume, parse_cpu_quantity_milli,
     parse_memory_quantity_bytes, truncate_pod_hostname,
 };
+
+pub mod api;
+
+mod bootstrap;

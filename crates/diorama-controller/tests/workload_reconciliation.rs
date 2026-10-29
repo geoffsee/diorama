@@ -231,6 +231,10 @@ async fn test_daemonset_node_pod_reconciliation() {
         }
     });
 
+    client
+        .create_node(json!({"metadata":{"name":"node"}}))
+        .await
+        .unwrap();
     client.create_daemonset(ns, daemonset).await.unwrap();
     let _ = wm.reconcile_namespace(ns).await.unwrap();
 
@@ -403,6 +407,10 @@ async fn test_garbage_collection_cascading_deletions() {
             "template": { "spec": { "containers": [{ "name": "app", "image": "exporter" }] } }
         }
     });
+    client
+        .create_node(json!({"metadata":{"name":"node"}}))
+        .await
+        .unwrap();
     client.create_daemonset(ns, ds).await.unwrap();
     let _ = wm.reconcile_namespace(ns).await.unwrap();
     assert!(client.get_pod(ns, "doomed-ds-node").await.is_ok());

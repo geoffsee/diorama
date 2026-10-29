@@ -14,7 +14,7 @@ The workload reconcilers implement standard Kubernetes reconciliation semantics:
 
 ## 2. Decoupling from Scheduler and Container Execution
 In conformance with Kubernetes architectural design and Issue #67 acceptance criteria:
-- **Scheduler Decoupling**: Reconciled child Pods are created with status phase `Pending` and without `spec.nodeName` assignments. Controllers do not require a running scheduler (`kube-scheduler`) to verify object reconciliation. Scheduler integration is verified in Epic E13 ([#13](https://github.com/geoffsee/diorama/issues/13)).
+- **Scheduler Decoupling**: Reconciled child Pods are created with status phase `Pending` and without `spec.nodeName` assignments. Controllers do not require a running scheduler (`kube-scheduler`) to verify object reconciliation. Production binding is performed by upstream kube-scheduler v1.35.7; actual qualification is recorded in `tests/multinode/QUALIFICATION.md`.
 - **Runtime Execution Decoupling**: Pod container execution follow-through (CRI runtime, containerd, cgroups, namespace isolation) is intentionally identified and tracked for Epic E28 (`[E28] Live workload execution and container lifecycle`). Controller reconciliation strictly verifies declarative API object creation, owner reference graphs, and state convergence.
 
 ## 3. Child Resource Generation and Owner References

@@ -67,6 +67,46 @@ async fn until(
 }
 
 #[tokio::test]
+async fn local_path_does_not_advertise_unreported_csi_capacity() {
+    let temp = TempDir::new().unwrap();
+    let (apiserver, client) = setup_test_cluster(&temp);
+    apiserver.check_prerequisites().await.unwrap();
+    let config = LocalPathConfig::new();
+    assert!(!config.csi_enabled);
+    let reconciler = LocalPathReconciler::new(&config);
+    let report = reconciler.reconcile(&client).await.unwrap();
+    assert!(!report.csi_driver_created);
+    let name = diorama_storage::LOCAL_PATH_PROVISIONER_NAME;
+    let driver = diorama_storage::manifests::generate_csi_driver(name, false, true, true);
+    client
+        .create_cluster_object("storage.k8s.io", "CSIDriver", "csidrivers", driver.clone())
+        .await
+        .unwrap();
+    // Upgrade removes only the old component-owned false capacity advertisement.
+    reconciler.reconcile(&client).await.unwrap();
+    assert!(matches!(
+        client
+            .get_cluster_object("storage.k8s.io", "csidrivers", name)
+            .await,
+        Err(diorama_apiserver::ApiserverError::NotFound { .. })
+    ));
+    let mut external = driver;
+    external["metadata"]["labels"] = json!({"app":"operator-owned"});
+    client
+        .create_cluster_object("storage.k8s.io", "CSIDriver", "csidrivers", external)
+        .await
+        .unwrap();
+    reconciler.reconcile(&client).await.unwrap();
+    assert_eq!(
+        client
+            .get_cluster_object("storage.k8s.io", "csidrivers", name)
+            .await
+            .unwrap()["metadata"]["labels"]["app"],
+        "operator-owned"
+    );
+}
+
+#[tokio::test]
 async fn test_cold_startup_reconciliation_real_api() {
     let temp = TempDir::new().unwrap();
     let (apiserver, client) = setup_test_cluster(&temp);
@@ -133,6 +173,10 @@ async fn test_cold_startup_reconciliation_real_api() {
         .await
         .unwrap();
     assert_eq!(dep["spec"]["replicas"].as_i64().unwrap(), 1);
+    assert_eq!(
+        dep["spec"]["template"]["spec"]["nodeSelector"]["diorama.io/runtime"],
+        "ordinary"
+    );
     let container = &dep["spec"]["template"]["spec"]["containers"][0];
     assert_eq!(
         container["image"].as_str().unwrap(),

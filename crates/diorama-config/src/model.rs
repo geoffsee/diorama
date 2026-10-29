@@ -33,6 +33,8 @@ pub struct Logging {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Network {
+    #[serde(default = "default_pod_pool")]
+    pub pod_address_pool: String,
     #[serde(rename = "nodeIP")]
     pub node_ip: String,
     pub mtu: i64,
@@ -60,6 +62,12 @@ pub struct Runtime {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Kubernetes {
+    #[serde(default = "default_role")]
+    pub role: String,
+    #[serde(default)]
+    pub token_file: String,
+    #[serde(default)]
+    pub disable_local_kubelet: bool,
     pub node_name: String,
     pub api_server: ApiServer,
     pub kubelet: Kubelet,
@@ -154,6 +162,7 @@ impl Default for Config {
             path: "/var/lib/diorama".into(),
             logging: Logging::default(),
             network: Network {
+                pod_address_pool: default_pod_pool(),
                 node_ip: String::new(),
                 mtu: 0,
                 disable_ipv6: false,
@@ -164,6 +173,9 @@ impl Default for Config {
             },
             runtime: Runtime::default(),
             kubernetes: Kubernetes {
+                role: default_role(),
+                token_file: String::new(),
+                disable_local_kubelet: false,
                 node_name: String::new(),
                 api_server: ApiServer {
                     extra_sans: None,
@@ -202,4 +214,11 @@ impl Default for Config {
             api: ConfigApi::default(),
         }
     }
+}
+
+fn default_role() -> String {
+    "control-plane".into()
+}
+fn default_pod_pool() -> String {
+    "10.42.0.0/16".into()
 }

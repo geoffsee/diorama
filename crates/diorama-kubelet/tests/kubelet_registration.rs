@@ -7,6 +7,82 @@ use diorama_datastore::{DatastoreConfig, DatastoreEngine};
 use diorama_pki::cluster::{ClusterPki, ClusterPkiConfig};
 use dioramalet::{KubeletConfigOptions, KubeletError, KubeletService, MockRuntimeProvider, cri};
 
+#[tokio::test]
+async fn https_kubelet_executes_an_api_bound_pod() {
+    use diorama_apiserver::ApiserverAdapter;
+    use dioramalet::RuntimeProvider;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    let temp = TempDir::new().unwrap();
+    let (service, options) = setup_test_environment(&temp);
+    let registration =
+        ApiserverAdapter::registration("api", service.clone(), vec![], Duration::from_secs(10));
+    let supervisor = diorama_supervisor::Supervisor::new(vec![registration]).unwrap();
+    let (stop, rx) = diorama_supervisor::stop_channel();
+    let task = tokio::spawn(supervisor.run(rx));
+    let address = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(address) = service.bound_addr() {
+                break address;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut config: Value = diorama_apiserver::transport::HttpsClient::new(&options.kubeconfig)
+        .document()
+        .unwrap();
+    config["clusters"][0]["cluster"]["server"] = json!(format!("https://{address}"));
+    std::fs::write(&options.kubeconfig, serde_json::to_vec(&config).unwrap()).unwrap();
+    let runtime = Arc::new(MockRuntimeProvider::new("containerd"));
+    let kubelet = KubeletService::https(options, runtime.clone());
+    kubelet.start().await.unwrap();
+    let admin = service.admin_client();
+    admin.create_pod("default", json!({"metadata":{"name":"bound"},"spec":{"containers":[{"name":"app","image":"busybox:1.37"}]}})).await.unwrap();
+    admin
+        .bind_pod(
+            "default",
+            "bound",
+            json!({"target":{"kind":"Node","name":"test-node"}}),
+        )
+        .await
+        .unwrap();
+    let report = kubelet.reconcile_once().await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(runtime.list_containers(None).await.unwrap().len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let pod = admin.get_pod("default", "bound").await.unwrap();
+        let uid = pod["metadata"]["uid"].as_str().unwrap();
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.get("projected").is_some())
+            .unwrap();
+        let token = kubelet
+            .get_pod_volume_dir(
+                uid,
+                "kubernetes.io~projected",
+                volume["name"].as_str().unwrap(),
+            )
+            .join("token");
+        assert_eq!(
+            std::fs::metadata(token).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+    assert_eq!(
+        admin.get_pod("default", "bound").await.unwrap()["status"]["phase"],
+        "Running"
+    );
+    stop.stop();
+    task.await.unwrap();
+}
+
 fn setup_test_environment(dir: &TempDir) -> (ApiserverService, KubeletConfigOptions) {
     let node_ip: IpAddr = "192.0.2.1".parse().unwrap();
     let pki_dir = dir.path().join("pki");
@@ -364,6 +440,7 @@ async fn test_node_heartbeat_preserves_custom_labels_annotations_spec_and_resour
     assert_custom_node_fields(&patched_node);
 
     // Perform node heartbeat / registration update
+    kubelet.registration().set_ready(true);
     kubelet.registration().register_or_update().await.unwrap();
 
     // Verify node after heartbeat retains custom labels, annotations, spec, and extended resources

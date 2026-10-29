@@ -77,10 +77,16 @@ async fn test_unassigned_vs_explicit_pod_placement_and_immutability() {
     });
 
     let created_unassigned = client.create_pod(ns, unassigned_pod).await.unwrap();
-    assert_eq!(
-        created_unassigned["spec"]["nodeName"], "test-node",
-        "Unassigned pod must be assigned to test-node"
-    );
+    assert!(created_unassigned["spec"]["nodeName"].is_null());
+    client
+        .bind_pod(
+            ns,
+            "unassigned-pod",
+            json!({"target":{"kind":"Node","name":"test-node"}}),
+        )
+        .await
+        .unwrap();
+    let created_unassigned = client.get_pod(ns, "unassigned-pod").await.unwrap();
 
     // 2. Explicitly assigned Pod: should remain unchanged
     let explicit_pod = json!({
@@ -188,8 +194,9 @@ async fn test_pvc_selected_node_annotation_and_preservation() {
 
     let created_pvc = client.create_pvc(ns, unannotated_pvc).await.unwrap();
     assert_eq!(
-        created_pvc["metadata"]["annotations"]["volume.kubernetes.io/selected-node"], "test-node",
-        "Unassigned PVC must receive volume.kubernetes.io/selected-node annotation"
+        created_pvc["metadata"]["annotations"]["volume.kubernetes.io/selected-node"],
+        serde_json::Value::Null,
+        "PVC placement waits for the scheduler"
     );
 
     // 2. Explicitly annotated PVC: should remain unchanged and preserve other annotations
@@ -227,17 +234,14 @@ async fn test_pvc_selected_node_annotation_and_preservation() {
 
     // 3. Update PVC: NodeSetter CREATE-only rule does not overwrite or mutate on UPDATE
     let mut updated_pvc = created_pvc.clone();
-    updated_pvc["metadata"]["annotations"]
-        .as_object_mut()
-        .unwrap()
-        .insert("app.kubernetes.io/name".to_string(), json!("db"));
+    updated_pvc["metadata"]["annotations"] = json!({"app.kubernetes.io/name":"db"});
     let res = client
         .update_pvc(ns, "auto-pvc", updated_pvc)
         .await
         .unwrap();
     assert_eq!(
         res["metadata"]["annotations"]["volume.kubernetes.io/selected-node"],
-        "test-node"
+        serde_json::Value::Null
     );
     assert_eq!(
         res["metadata"]["annotations"]["app.kubernetes.io/name"],
@@ -287,8 +291,8 @@ async fn test_job_node_selector_and_immutability() {
     let created_job = client.create_job(ns, unassigned_job).await.unwrap();
     assert_eq!(
         created_job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
-        "test-node",
-        "Unassigned Job template must have nodeSelector kubernetes.io/hostname = test-node"
+        serde_json::Value::Null,
+        "Jobs must remain schedulable on independent nodes"
     );
 
     // 2. Explicitly assigned Job: preserves existing hostname and extra selectors
@@ -362,7 +366,7 @@ async fn test_job_node_selector_and_immutability() {
 }
 
 #[tokio::test]
-async fn test_controller_workloads_execute_through_integrated_node() {
+async fn test_controller_workloads_wait_for_scheduler() {
     let temp = TempDir::new().unwrap();
     let (apiserver, webhook_service, controller_service) = setup_test_cluster(&temp);
 
@@ -427,7 +431,8 @@ async fn test_controller_workloads_execute_through_integrated_node() {
     assert_eq!(deploy_pods.len(), 2, "Expected 2 deployment-managed pods");
     for p in deploy_pods {
         assert_eq!(
-            p["spec"]["nodeName"], "test-node",
+            p["spec"]["nodeName"],
+            serde_json::Value::Null,
             "All pods created by ReplicaSet controller must have nodeName = test-node"
         );
     }
@@ -462,14 +467,20 @@ async fn test_controller_workloads_execute_through_integrated_node() {
     let ss_pod_0 = client.get_pod(ns, "controller-ss-0").await.unwrap();
     let ss_pod_1 = client.get_pod(ns, "controller-ss-1").await.unwrap();
     assert_eq!(
-        ss_pod_0["spec"]["nodeName"], "test-node",
+        ss_pod_0["spec"]["nodeName"],
+        serde_json::Value::Null,
         "StatefulSet ordinal pod 0 must be placed on test-node"
     );
     assert_eq!(
-        ss_pod_1["spec"]["nodeName"], "test-node",
+        ss_pod_1["spec"]["nodeName"],
+        serde_json::Value::Null,
         "StatefulSet ordinal pod 1 must be placed on test-node"
     );
 
+    client
+        .create_node(json!({"metadata":{"name":"test-node"}}))
+        .await
+        .unwrap();
     // 3. DaemonSet -> Pods
     let daemonset = json!({
         "apiVersion": "apps/v1",
@@ -508,7 +519,8 @@ async fn test_controller_workloads_execute_through_integrated_node() {
         })
         .expect("DaemonSet pod generated");
     assert_eq!(
-        ds_pod["spec"]["nodeName"], "test-node",
+        ds_pod["spec"]["nodeName"],
+        serde_json::Value::Null,
         "DaemonSet pod must be placed on test-node"
     );
 
@@ -549,7 +561,7 @@ async fn test_controller_workloads_execute_through_integrated_node() {
         .unwrap();
     assert_eq!(
         child_job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
-        "test-node",
+        serde_json::Value::Null,
         "Child job created by CronJob controller must receive kubernetes.io/hostname selector"
     );
 
@@ -561,7 +573,8 @@ async fn test_controller_workloads_execute_through_integrated_node() {
         .await
         .unwrap();
     assert_eq!(
-        job_pod["spec"]["nodeName"], "test-node",
+        job_pod["spec"]["nodeName"],
+        serde_json::Value::Null,
         "Pod generated by Job reconciler must be placed on test-node"
     );
 
@@ -601,7 +614,8 @@ async fn test_dry_run_placement_and_side_effect_isolation() {
 
     let mutated_pod = client.create_pod_options(ns, dry_pod, true).await.unwrap();
     assert_eq!(
-        mutated_pod["spec"]["nodeName"], "test-node",
+        mutated_pod["spec"]["nodeName"],
+        serde_json::Value::Null,
         "Dry-run Pod creation must still evaluate mutating admission"
     );
 
@@ -630,7 +644,8 @@ async fn test_dry_run_placement_and_side_effect_isolation() {
 
     let mutated_pvc = client.create_pvc_options(ns, dry_pvc, true).await.unwrap();
     assert_eq!(
-        mutated_pvc["metadata"]["annotations"]["volume.kubernetes.io/selected-node"], "test-node",
+        mutated_pvc["metadata"]["annotations"]["volume.kubernetes.io/selected-node"],
+        serde_json::Value::Null,
         "Dry-run PVC creation must evaluate selected-node annotation"
     );
 
@@ -664,7 +679,7 @@ async fn test_dry_run_placement_and_side_effect_isolation() {
     let mutated_job = client.create_job_options(ns, dry_job, true).await.unwrap();
     assert_eq!(
         mutated_job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
-        "test-node",
+        serde_json::Value::Null,
         "Dry-run Job creation must evaluate node selector mutation"
     );
 

@@ -2,7 +2,10 @@
 
 ## 1. Upstream Kubernetes Baseline
 
-diorama integrates the **Kubernetes v1.35.7** controller manager component (`kube-controller-manager`). It operates with standard Kubernetes configuration, endpoints, security contracts, and single-node reconciliation semantics:
+diorama retains its Rust controller manager and its Kubernetes **v1.35.7**
+configuration and identity contracts. The upstream executable in the runtime is
+kube-scheduler; the controller manager runs in process. The following generated
+configuration flags describe its compatibility surface:
 
 - **Secure Port & Binding**:
   - `--bind-address=0.0.0.0` (or `127.0.0.1` in loopback / single-node mode)
@@ -35,7 +38,7 @@ Historical KubeSolo and edge forks introduced brittle controller allowlists that
 ### Controller Enforcement in diorama
 In diorama:
 1. **Default Controller Set**: Defaults to `["*"]`, enabling all official upstream Kubernetes v1.35.7 controllers.
-2. **Anti-Omission Validation**: If an explicit controller list is specified, `ControllerManagerConfig::validate_controllers()` enforces that no critical single-node controller is omitted or explicitly disabled with `-`. The required set includes:
+2. **Anti-Omission Validation**: If an explicit controller list is specified, `ControllerManagerConfig::validate_controllers()` enforces that no critical controller is omitted or explicitly disabled with `-`. The required set includes:
    - `job`
    - `cronjob`
    - `garbagecollector`
@@ -70,3 +73,23 @@ The controller manager component is managed by `diorama-supervisor` through `Con
   2. **Start**: Initializes the service lifecycle state and verifies supervised readiness.
   3. **Readiness Check**: Confirms ongoing authenticated API connectivity and reports configured controller status. Signals readiness via `context.ready()`.
   4. **Supervised Shutdown**: Listens on `context.changed()` for `StopPhase::Graceful` or `StopPhase::Force`, shutting down the service cleanly.
+
+## Independent workers and scheduling
+
+The controller manager acquires and renews a `kube-controller-manager` Lease before
+reconciliation. This prevents competing reconcilers from acting concurrently in
+the tested lease contract; it does not establish control-plane HA, and the datastore
+continues to require one exclusive owner.
+
+Pods remain unbound until upstream kube-scheduler uses the binding endpoint.
+DaemonSet Pods receive required node affinity for an actual registered node;
+there is no fallback Node or direct `nodeName` assignment. NodeSetter's Pod, PVC,
+and Job placement mutations are removed. Its retained Service mutation concerns
+load-balancer behavior only.
+
+The bootstrap controller rejects invalid signer names, CSR signatures, identities,
+groups, or usages. It signs valid bootstrap requests only while their token remains
+valid and the node name is not already registered. An authenticated node can renew
+only its own identity. Approved certificates have a bounded lifetime; CA keys stay
+in control-plane PKI. Expired bootstrap-token Secrets are removed with revision
+checks. See [joining](../../../README.md#join-workers).

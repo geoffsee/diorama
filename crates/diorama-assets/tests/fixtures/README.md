@@ -1,5 +1,5 @@
 Independent structural fixtures, not a production asset lock. The JSON manifests
-declare the eight runtime executables and seven images in the diorama inventory,
+declare the nine runtime executables and seven images in the diorama inventory,
 including `image-diorama`. Their sizes and digests are placeholders; no corresponding
 production payloads are supplied.
 

@@ -11,7 +11,6 @@ use diorama::lifecycle_sink::FlushPolicy;
 use diorama::metrics::{
     BuildInfoCollector, MetricsRegistry, MetricsServer, UptimeCollector, parse_scrape,
 };
-use diorama::runtime::NodeRuntime;
 use diorama_config::{
     EnvironmentMode, ExplicitFlags, HostContext, ValidatedConfig, decode, resolve_layers,
 };
@@ -54,9 +53,9 @@ fn test_config_metrics(
         r#"
 path: "{}"
 network:
-  node_ip: "127.0.0.1"
+  nodeIP: "127.0.0.1"
 kubernetes:
-  node_name: "test-node"
+  nodeName: "test-node"
   apiServer:
     startupTimeoutSeconds: 5
 logging:
@@ -215,7 +214,7 @@ async fn test_node_runtime_disabled_mode_opens_no_listener() {
     assert!(!config.config().metrics.enabled);
     assert_eq!(config.config().metrics.bind_address, "127.0.0.1:9105");
 
-    let runtime = NodeRuntime::from_config(config).expect("assemble runtime");
+    let runtime = crate::runtime_fixture(config).expect("assemble runtime");
     assert!(!runtime.is_metrics_enabled());
     assert_eq!(runtime.metrics_bind_address(), "127.0.0.1:9105");
     assert!(runtime.metrics_registry().is_none());
@@ -260,7 +259,7 @@ async fn disabled_metrics_does_not_touch_an_existing_listener() {
     let addr = listener.local_addr().unwrap();
     let temp = TempDir::new().unwrap();
     let runtime =
-        NodeRuntime::from_config(test_config_metrics(temp.path(), false, &addr.to_string()))
+        crate::runtime_fixture(test_config_metrics(temp.path(), false, &addr.to_string()))
             .expect("assemble disabled metrics runtime");
     assert!(runtime.metrics_registry().is_none());
     let client = runtime.client().unwrap().clone();
@@ -324,7 +323,7 @@ async fn metrics_serving_attempt(reclaim_before_bind: bool) -> bool {
     let config = test_config_metrics(temp.path(), true, &addr.to_string());
     assert!(config.config().metrics.enabled);
 
-    let runtime = NodeRuntime::from_config(config).expect("assemble runtime");
+    let runtime = crate::runtime_fixture(config).expect("assemble runtime");
     assert!(runtime.is_metrics_enabled());
     assert!(runtime.metrics_registry().is_some());
     let mut observer = runtime.observer();
@@ -448,7 +447,7 @@ async fn test_node_runtime_metrics_bind_failure_is_observable_and_nonfatal() {
 
     // NodeRuntime assembly succeeds (bind is deferred to adapter run)
     let runtime =
-        NodeRuntime::from_config(config).expect("assemble runtime succeeds despite conflict");
+        crate::runtime_fixture(config).expect("assemble runtime succeeds despite conflict");
 
     let client = runtime.client().expect("client present").clone();
     let probe = LogProbe::default();

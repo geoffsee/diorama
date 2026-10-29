@@ -324,13 +324,13 @@ pub fn v3_group_with_crds(group: &str, version: &str, crds: &[Value]) -> Value {
     })
 }
 
-/// Minimal valid Protobuf encoding of `openapi_v2.Document` (swagger="2.0", title="Kubernetes", version="v1.37.1").
+/// Minimal valid Protobuf encoding of `openapi_v2.Document` (swagger="2.0", title="Kubernetes", version="v1.35.7").
 pub const OPENAPI_V2_PROTO_BYTES: &[u8] = &[
     0x0a, 0x03, b'2', b'.', b'0', // 1: swagger = "2.0"
     0x12, 0x15, // 2: info (21 bytes)
     0x0a, 0x0a, b'K', b'u', b'b', b'e', b'r', b'n', b'e', b't', b'e',
     b's', // 1: title = "Kubernetes"
-    0x12, 0x07, b'v', b'1', b'.', b'3', b'7', b'.', b'1', // 2: version = "v1.37.1"
+    0x12, 0x07, b'v', b'1', b'.', b'3', b'5', b'.', b'7', // 2: version = "v1.35.7"
 ];
 
 /// `GET /openapi/v2`: Swagger 2.0 document publishing `ObjectMeta` and dynamic CRD schemas.

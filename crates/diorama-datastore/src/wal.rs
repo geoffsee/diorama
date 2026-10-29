@@ -209,8 +209,13 @@ impl Wal {
             .map_err(|_| DatastoreError::Fatal("record payload exceeds 4GB limit".into()))?;
         let len_bytes = len_u32.to_be_bytes();
 
-        self.file.write_all(&len_bytes)?;
-        self.file.write_all(&record_bytes)?;
+        // Submit the complete frame together. A process kill between separate
+        // header and payload writes otherwise leaves a header-only tail even
+        // when the underlying write can accept the entire small record.
+        let mut frame = Vec::with_capacity(len_bytes.len() + record_bytes.len());
+        frame.extend_from_slice(&len_bytes);
+        frame.extend_from_slice(&record_bytes);
+        self.file.write_all(&frame)?;
         self.file.flush()?;
         self.file.sync_data()?;
 

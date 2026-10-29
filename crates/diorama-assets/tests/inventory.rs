@@ -119,6 +119,7 @@ fn all_sixteen_target_variant_cells_have_exact_declared_roles() {
         "image-portainer-agent",
         "image-d2k",
         "image-diorama",
+        "kube-scheduler",
     ];
     let mut cells = 0;
     for (architecture, name, unavailable) in [
@@ -152,13 +153,13 @@ fn all_sixteen_target_variant_cells_have_exact_declared_roles() {
                     Limits::default(),
                 )
                 .expect("complete cell");
-                assert_eq!(inventory.assets().len(), 15);
+                assert_eq!(inventory.assets().len(), 16);
                 assert_eq!(
                     inventory.bundled_assets().len(),
                     if variant == Variant::Online {
-                        10
+                        11
                     } else {
-                        15 - unavailable
+                        16 - unavailable
                     }
                 );
                 assert_eq!(
@@ -233,8 +234,8 @@ fn structural_linux_arm64_glibc_manifests_validate_both_variants() {
             Limits::default(),
         )
         .expect("valid online arm64 glibc inventory");
-    assert_eq!(online.assets().len(), 15);
-    assert_eq!(online.bundled_assets().len(), 10);
+    assert_eq!(online.assets().len(), 16);
+    assert_eq!(online.bundled_assets().len(), 11);
     assert_image_contract(&online, Architecture::Arm64, Variant::Online);
     assert_optional_support(&online, Architecture::Arm64);
 
@@ -246,8 +247,8 @@ fn structural_linux_arm64_glibc_manifests_validate_both_variants() {
             Limits::default(),
         )
         .expect("valid offline arm64 glibc inventory");
-    assert_eq!(offline.assets().len(), 15);
-    assert_eq!(offline.bundled_assets().len(), 15);
+    assert_eq!(offline.assets().len(), 16);
+    assert_eq!(offline.bundled_assets().len(), 16);
     assert_image_contract(&offline, Architecture::Arm64, Variant::Offline);
     assert_optional_support(&offline, Architecture::Arm64);
     assert_structural_placeholders(online_bytes, &online);
@@ -264,8 +265,8 @@ fn structural_linux_amd64_glibc_manifest_validates_online_variant() {
             Limits::default(),
         )
         .expect("valid online amd64 glibc inventory");
-    assert_eq!(online.assets().len(), 15);
-    assert_eq!(online.bundled_assets().len(), 10);
+    assert_eq!(online.assets().len(), 16);
+    assert_eq!(online.bundled_assets().len(), 11);
     assert_image_contract(&online, Architecture::Amd64, Variant::Online);
     assert_optional_support(&online, Architecture::Amd64);
     assert_structural_placeholders(online_bytes, &online);
@@ -322,6 +323,11 @@ const EXPECTED_ONLINE_AMD64: &[(AssetId, u64, &str)] = &[
         340_417,
         "a4afc718f83d14fbbdf30d39349451f859fc2b663c302e22bfe80012e4800401",
     ),
+    (
+        AssetId::KubeScheduler,
+        47_636_664,
+        "93a3e6bb3521416aebef6382b3d0054d3cb304d8ecb37e062f6d7e9f7020e6e5",
+    ),
 ];
 
 const EXPECTED_ONLINE_ARM64: &[(AssetId, u64, &str)] = &[
@@ -374,6 +380,11 @@ const EXPECTED_ONLINE_ARM64: &[(AssetId, u64, &str)] = &[
         AssetId::ImagePause,
         277_677,
         "012543d9e326717065a20db77e054190ae25e6bdfcf68b3e3793d4b55727f0c5",
+    ),
+    (
+        AssetId::KubeScheduler,
+        44_630_200,
+        "571faf2a0d19951aade0b3d4f5f2e0b2504ee3a14ccdd2cdd0668ccd04a3c33c",
     ),
 ];
 
@@ -453,6 +464,11 @@ const EXPECTED_OFFLINE_ARM64: &[(AssetId, u64, &str)] = &[
         85_689_657,
         "868c6b3b9b563800bbe02b14219f549314138415955d8537d6dc2701c518a678",
     ),
+    (
+        AssetId::KubeScheduler,
+        44_630_200,
+        "571faf2a0d19951aade0b3d4f5f2e0b2504ee3a14ccdd2cdd0668ccd04a3c33c",
+    ),
 ];
 
 fn assert_structural_placeholders(raw: &[u8], inventory: &DeclaredInventory) {
@@ -522,7 +538,9 @@ fn assert_structural_placeholders(raw: &[u8], inventory: &DeclaredInventory) {
         (Architecture::Arm64, Variant::Offline) => EXPECTED_OFFLINE_ARM64,
         other => panic!("unexpected fixture {other:?}"),
     };
-    assert_eq!(actual.as_slice(), expected);
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(|entry| entry.0);
+    assert_eq!(actual, expected);
 }
 #[test]
 fn absent_or_truncated_manifest_bytes_fail_before_inventory_validation() {

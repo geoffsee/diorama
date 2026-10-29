@@ -44,7 +44,7 @@ async fn test_manually_assigned_pod_runs_through_managed_provider() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // 1. Create a manually assigned pod
     let pod_spec = serde_json::json!({
@@ -114,7 +114,7 @@ async fn test_manually_assigned_pod_runs_through_external_provider() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -172,7 +172,7 @@ async fn test_unassigned_or_differently_assigned_pod_is_ignored() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // Pod 1: No nodeName assigned
     let unscheduled = serde_json::json!({

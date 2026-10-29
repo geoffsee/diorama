@@ -585,7 +585,7 @@ mod bundle_tests {
             (
                 BundleKind::Host,
                 vec![Capability::Core, Capability::LocalStorage],
-                12,
+                13,
             ),
             (
                 BundleKind::Container,

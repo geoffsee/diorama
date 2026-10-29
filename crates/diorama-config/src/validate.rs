@@ -491,6 +491,33 @@ fn validate_cpu(kubelet: &mut crate::Kubelet, cpu_count: usize) -> Result<(), Co
     Ok(())
 }
 
+fn validate_pod_pool(config: &Config) -> Result<(), ConfigError> {
+    let pool_valid =
+        config
+            .network
+            .pod_address_pool
+            .split_once('/')
+            .is_some_and(|(address, mask)| {
+                let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
+                    return false;
+                };
+                let Ok(prefix) = mask.parse::<u32>() else {
+                    return false;
+                };
+                (8..=24).contains(&prefix)
+                    && u32::from(address)
+                        .checked_shl(prefix)
+                        .is_some_and(|bits| bits == 0)
+            });
+    if !pool_valid {
+        return Err(invalid(
+            "network.podAddressPool",
+            "expected an aligned IPv4 CIDR with prefix 8 through 24 for Cilium cluster-pool IPAM",
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn resolve_container_mode(&self, detected: bool) -> bool {
         self.runtime.container_mode.unwrap_or(detected)
@@ -498,6 +525,28 @@ impl Config {
 
     /// Validate only after all desired-state layers have been applied.
     pub fn validate(mut self, host: &HostContext) -> Result<ValidatedConfig, ConfigError> {
+        if !matches!(self.kubernetes.role.as_str(), "control-plane" | "worker") {
+            return Err(invalid(
+                "kubernetes.role",
+                "expected control-plane or worker",
+            ));
+        }
+        if self.kubernetes.role == "worker" {
+            if self.kubernetes.token_file.is_empty() {
+                return Err(invalid(
+                    "kubernetes.tokenFile",
+                    "workers require a bootstrap token file",
+                ));
+            }
+            if self.kubernetes.disable_local_kubelet {
+                return Err(invalid(
+                    "kubernetes.disableLocalKubelet",
+                    "workers require their local kubelet",
+                ));
+            }
+        }
+
+        validate_pod_pool(&self)?;
         let mut warnings = Vec::new();
         if self.d2k.enabled && matches!(host.architecture.as_str(), "arm" | "riscv64") {
             self.d2k.enabled = false;

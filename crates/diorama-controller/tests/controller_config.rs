@@ -11,7 +11,7 @@ fn test_default_config_matches_kubernetes_v1_35_7_specification() {
     assert_eq!(config.endpoint_updates_batch_period, Duration::ZERO);
     assert_eq!(config.concurrent_endpoint_syncs, 5);
     assert_eq!(config.secure_port, 10257);
-    assert!(!config.leader_elect);
+    assert!(config.leader_elect);
 
     // Validation must pass on defaults
     assert!(config.validate_controllers().is_ok());

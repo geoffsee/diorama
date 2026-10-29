@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-29",
+  "platform": "Linux arm64",
+  "result": "PASS",
+  "checks": [
+    "control plane and scheduler bootstrap without Nodes, CNI, DNS, or Service routing",
+    "real registration, status, and advancing Lease: ordinary-1",
+    "real registration, status, and advancing Lease: ordinary-2",
+    "real registration, status, and advancing Lease: foreign-1",
+    "real registration, status, and advancing Lease: foreign-2",
+    "system workloads select ordinary nodes only",
+    "compatible API workload executes on either initial foreign node as availability changes",
+    "real registration, status, and advancing Lease: foreign-3",
+    "additional foreign worker joins without cluster configuration changes",
+    "foreign ClusterFirst and isolated nonempty-DNS cases fail",
+    "real registration, status, and advancing Lease: ordinary-1",
+    "real registration, status, and advancing Lease: ordinary-2",
+    "real registration, status, and advancing Lease: foreign-1",
+    "real registration, status, and advancing Lease: foreign-2",
+    "real registration, status, and advancing Lease: foreign-3",
+    "foreign processes survive diorama restart; sockets inaccessible; API clients and scheduler leadership recover",
+    "cross-node Pod traffic",
+    "Service routing",
+    "CoreDNS resolution at 10.43.0.10",
+    "scheduler-selected node-local PVC contains the written data",
+    "system workloads select ordinary nodes only",
+    "foreign workers receive no ordinary PodCIDR allocation"
+  ]
+}

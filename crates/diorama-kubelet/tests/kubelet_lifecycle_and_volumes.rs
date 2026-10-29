@@ -53,7 +53,7 @@ async fn test_pod_lifecycle_probes_and_logs_exec_managed_runtime() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // 1. Configure initial probe responses so both readiness and liveness pass
     runtime.set_exec_response(
@@ -310,7 +310,7 @@ async fn test_pod_lifecycle_probes_and_logs_exec_external_runtime() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     runtime.set_exec_response(
         "cat /tmp/ready",
@@ -439,7 +439,7 @@ async fn test_secret_and_configmap_volume_mounts() {
     kubelet.start().await.unwrap();
 
     let admin_client = apiserver_arc.admin_client();
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // 1. Create Secret in default namespace
     let mut secret_data = std::collections::BTreeMap::new();
@@ -593,7 +593,7 @@ async fn test_projected_volume_and_persistence_across_kubelet_restart() {
     kubelet1.start().await.unwrap();
 
     let admin_client = apiserver_arc.admin_client();
-    let client = kubelet1.client();
+    let client = apiserver_arc.admin_client();
 
     // Create supporting ConfigMap and Secret
     let mut cm_data = std::collections::BTreeMap::new();
@@ -784,7 +784,7 @@ async fn test_cri_volume_mounts_and_exec_sync_reading() {
     kubelet.start().await.unwrap();
 
     let admin_client = apiserver_arc.admin_client();
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // 1. Create Secret
     let mut secret_data = std::collections::BTreeMap::new();
@@ -1010,7 +1010,7 @@ async fn test_init_containers_sequential_execution_and_status() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -1137,7 +1137,7 @@ async fn test_init_container_failure_with_restart_policy_never() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -1206,7 +1206,7 @@ async fn test_http_and_tcp_probes_readiness_and_liveness() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // Mock probe successes
     runtime.set_exec_response(
@@ -1367,7 +1367,7 @@ async fn test_pre_stop_hook_and_linux_resources_and_port_mappings() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -1743,7 +1743,7 @@ async fn service_links_publish_kubernetes_even_when_disabled_and_skip_headless()
         .unwrap();
     let web_ip = web["spec"]["clusterIP"].as_str().unwrap().to_string();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
     client
         .create_pod(
             "default",
@@ -1826,7 +1826,7 @@ async fn test_pod_with_custom_projected_token_still_receives_default_service_acc
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -1912,7 +1912,7 @@ async fn test_restartable_init_container_sidecar_lifecycle() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -2009,7 +2009,7 @@ async fn test_container_lifecycle_hooks_post_start_failure_emits_event() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     runtime.set_exec_response(
         "/bin/fail-hook",
@@ -2089,7 +2089,7 @@ async fn test_etc_hosts_and_host_aliases_bind_mount() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -2160,7 +2160,7 @@ async fn test_observed_generation_and_dynamic_volume_refresh() {
     );
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let cm = serde_json::json!({
         "apiVersion": "v1",
@@ -2303,7 +2303,7 @@ async fn test_grpc_probe_health_check() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime.clone());
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
         "apiVersion": "v1",
@@ -2373,7 +2373,7 @@ async fn test_conformance_hostname_truncation_optional_volumes_and_etc_hosts() {
     );
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let long_hostname_prefix = "a".repeat(60);
     let pod_spec = serde_json::json!({
@@ -2493,7 +2493,7 @@ async fn test_podcertificate_request_contains_valid_stub_pkcs10_request() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
     let admin_client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
@@ -2583,7 +2583,7 @@ async fn test_projected_podcertificate_user_annotations() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
     let admin_client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
@@ -2666,7 +2666,7 @@ async fn test_running_pod_emits_started_normal_event() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
     let admin_client = apiserver_arc.admin_client();
 
     let pod_spec = serde_json::json!({
@@ -2733,7 +2733,7 @@ async fn test_bound_pod_hostport_conflict_is_failed_podfitshostports() {
     let kubelet = KubeletService::new(kubelet_options, apiserver_arc.clone(), runtime);
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     let pod1 = serde_json::json!({
         "apiVersion": "v1",

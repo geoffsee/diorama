@@ -5,6 +5,7 @@ pub enum Component {
     Apiserver,
     Kubelet,
     ControllerManager,
+    Scheduler,
     KubeProxy,
     Admin,
     Webhook,
@@ -48,6 +49,18 @@ pub fn profile(component: Component) -> CertificateParams {
             params
                 .distinguished_name
                 .push(rcgen::DnType::OrganizationName, "system:nodes");
+            params
+        },
+        Component::Scheduler => {
+            let mut params = CertificateParams::default();
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            params.key_usages = vec![
+                KeyUsagePurpose::DigitalSignature,
+                KeyUsagePurpose::KeyEncipherment,
+            ];
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "system:kube-scheduler");
             params
         },
         Component::ControllerManager => {

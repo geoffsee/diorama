@@ -384,6 +384,7 @@ async fn test_exclusive_cpu_allocation_and_checkpoint_state() {
         &kubelet_options.node_name,
         &kubelet_options.node_ip,
     )
+    .with_root_dir(&kubelet_options.root_dir)
     .with_cpu_manager(cpu_manager.clone());
 
     // 1. Create an eligible Guaranteed Pod requesting 2 cores
@@ -567,7 +568,7 @@ async fn test_external_runtime_workload_restart_diagnostics() {
     );
     kubelet.start().await.unwrap();
 
-    let client = kubelet.client();
+    let client = apiserver_arc.admin_client();
 
     // 1. Create and reconcile a Guaranteed pinned pod
     let guaranteed_pod = serde_json::json!({

@@ -1,0 +1,43 @@
+# Single supported network profile; rendered with Cilium Helm chart 1.20.4.
+k8sServiceHost: DIORAMA_API_HOST
+k8sServicePort: "6443"
+kubeProxyReplacement: "false"
+hubble:
+  enabled: false
+envoy:
+  enabled: false
+routingMode: tunnel
+tunnelProtocol: vxlan
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList: ["10.42.0.0/16"]
+    clusterPoolIPv4MaskSize: 24
+ipv4:
+  enabled: true
+ipv6:
+  enabled: false
+cni:
+  binPath: /opt/diorama/cni/bin
+  confPath: /etc/diorama/cni/net.d
+  exclusive: false
+nodeSelector:
+  kubernetes.io/os: linux
+  diorama.io/runtime: ordinary
+tolerations: &bootstrap
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+  - key: node.kubernetes.io/network-unavailable
+    operator: Exists
+  - key: node.cilium.io/agent-not-ready
+    operator: Exists
+operator:
+  replicas: 1
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/os: linux
+    diorama.io/runtime: ordinary
+  tolerations: *bootstrap
+  affinity: {}
