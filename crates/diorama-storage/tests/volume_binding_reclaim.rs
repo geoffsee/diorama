@@ -119,7 +119,7 @@ async fn test_first_consumer_binding_with_placement_integration() {
     }
 
     // 6. Now simulate scheduler placing the pod onto a node
-    let placed_node = "kubesolo-worker-01";
+    let placed_node = "diorama-worker-01";
     let mut pod = client.get_pod(ns, "writer-pod").await.unwrap();
     pod["spec"]["nodeName"] = json!(placed_node);
     client.update_pod(ns, "writer-pod", pod).await.unwrap();

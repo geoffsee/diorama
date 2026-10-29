@@ -89,7 +89,7 @@ fn populate_preserved_inputs(paths: &ContainerdPaths) -> (PathBuf, PathBuf, Path
 #[test]
 fn test_clean_stale_runtime_state_purges_disposable_and_preserves_inputs() {
     let temp = TempDir::new().unwrap();
-    let base = temp.path().join("kubesolo-root");
+    let base = temp.path().join("diorama-root");
     let paths = ContainerdPaths::from_base(&base);
 
     fs::create_dir_all(&paths.root_dir).unwrap();
@@ -150,7 +150,7 @@ fn test_clean_stale_runtime_state_purges_disposable_and_preserves_inputs() {
 #[test]
 fn test_unrelated_and_external_runtime_data_remains_intact() {
     let temp = TempDir::new().unwrap();
-    let base = temp.path().join("kubesolo-root");
+    let base = temp.path().join("diorama-root");
     let paths = ContainerdPaths::from_base(&base);
 
     let host_dir = temp.path().join("host-containerd");

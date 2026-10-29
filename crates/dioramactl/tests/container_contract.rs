@@ -103,7 +103,7 @@ impl ContainerEngineClient for MockContainerEngine {
                 id: format!("id-{name}"),
                 name: name.to_string(),
                 running: *running,
-                d2k_enabled: config.env.iter().any(|value| value == "KUBESOLO_D2K=true"),
+                d2k_enabled: config.env.iter().any(|value| value == "DIORAMA_D2K=true"),
                 exit_code: 0,
                 allocated_ports,
             }))
@@ -235,22 +235,21 @@ fn test_port_parsing_comprehensive() {
 
 #[test]
 fn test_resource_naming_conventions() {
-    // Default / "diorama" / "kubesolo" -> "kubesolo"
-    assert_eq!(container_name(""), "kubesolo");
-    assert_eq!(container_name("diorama"), "kubesolo");
-    assert_eq!(container_name("kubesolo"), "kubesolo");
-    assert_eq!(network_name("diorama"), "kubesolo-net");
-    assert_eq!(volume_name("diorama"), "kubesolo-data");
+    // Default / "diorama" -> "diorama"
+    assert_eq!(container_name(""), "diorama");
+    assert_eq!(container_name("diorama"), "diorama");
+    assert_eq!(network_name("diorama"), "diorama-net");
+    assert_eq!(volume_name("diorama"), "diorama-data");
 
-    // Named cluster "dev" -> "kubesolo-dev"
-    assert_eq!(container_name("dev"), "kubesolo-dev");
-    assert_eq!(network_name("dev"), "kubesolo-dev-net");
-    assert_eq!(volume_name("dev"), "kubesolo-dev-data");
+    // Named cluster "dev" -> "diorama-dev"
+    assert_eq!(container_name("dev"), "diorama-dev");
+    assert_eq!(network_name("dev"), "diorama-dev-net");
+    assert_eq!(volume_name("dev"), "diorama-dev-data");
 
-    // Named cluster "prod-cluster" -> "kubesolo-prod-cluster"
-    assert_eq!(container_name("prod-cluster"), "kubesolo-prod-cluster");
-    assert_eq!(network_name("prod-cluster"), "kubesolo-prod-cluster-net");
-    assert_eq!(volume_name("prod-cluster"), "kubesolo-prod-cluster-data");
+    // Named cluster "prod-cluster" -> "diorama-prod-cluster"
+    assert_eq!(container_name("prod-cluster"), "diorama-prod-cluster");
+    assert_eq!(network_name("prod-cluster"), "diorama-prod-cluster-net");
+    assert_eq!(volume_name("prod-cluster"), "diorama-prod-cluster-data");
 }
 
 // -----------------------------------------------------------------------------
@@ -264,7 +263,7 @@ fn test_multi_cluster_coexistence() {
     // Cluster A
     let params_a = ContainerInstallParams {
         instance_name: "alpha".to_string(),
-        image: "portainer/kubesolo:latest".to_string(),
+        image: "portainer/diorama:latest".to_string(),
         mtu: Some(1450),
         d2k: false,
         container_ports: Some("8080:80".to_string()),
@@ -277,7 +276,7 @@ fn test_multi_cluster_coexistence() {
     // Cluster B
     let params_b = ContainerInstallParams {
         instance_name: "beta".to_string(),
-        image: "portainer/kubesolo:latest".to_string(),
+        image: "portainer/diorama:latest".to_string(),
         mtu: Some(1500),
         d2k: true,
         container_ports: Some("8081:80".to_string()),
@@ -288,16 +287,16 @@ fn test_multi_cluster_coexistence() {
     let res_b = install_container(&mut engine, &params_b).unwrap();
 
     // Verify distinct container names
-    assert_eq!(res_a.container_name, "kubesolo-alpha");
-    assert_eq!(res_b.container_name, "kubesolo-beta");
+    assert_eq!(res_a.container_name, "diorama-alpha");
+    assert_eq!(res_b.container_name, "diorama-beta");
 
     // Verify distinct networks and MTUs
-    assert_eq!(res_a.network_name, "kubesolo-alpha-net");
-    assert_eq!(res_b.network_name, "kubesolo-beta-net");
+    assert_eq!(res_a.network_name, "diorama-alpha-net");
+    assert_eq!(res_b.network_name, "diorama-beta-net");
     assert_eq!(
         engine
             .networks
-            .get("kubesolo-alpha-net")
+            .get("diorama-alpha-net")
             .unwrap()
             .options
             .get("com.docker.network.driver.mtu")
@@ -307,7 +306,7 @@ fn test_multi_cluster_coexistence() {
     assert_eq!(
         engine
             .networks
-            .get("kubesolo-beta-net")
+            .get("diorama-beta-net")
             .unwrap()
             .options
             .get("com.docker.network.driver.mtu")
@@ -316,10 +315,10 @@ fn test_multi_cluster_coexistence() {
     );
 
     // Verify distinct volumes
-    assert_eq!(res_a.volume_name, "kubesolo-alpha-data");
-    assert_eq!(res_b.volume_name, "kubesolo-beta-data");
-    assert!(engine.volumes.contains_key("kubesolo-alpha-data"));
-    assert!(engine.volumes.contains_key("kubesolo-beta-data"));
+    assert_eq!(res_a.volume_name, "diorama-alpha-data");
+    assert_eq!(res_b.volume_name, "diorama-beta-data");
+    assert!(engine.volumes.contains_key("diorama-alpha-data"));
+    assert!(engine.volumes.contains_key("diorama-beta-data"));
 
     // Verify distinct API and D2K ports
     assert_eq!(res_a.apiserver_port, 6443);
@@ -329,8 +328,8 @@ fn test_multi_cluster_coexistence() {
 
     // Both containers are running simultaneously
     assert_eq!(engine.containers.len(), 2);
-    assert!(engine.containers.get("kubesolo-alpha").unwrap().1);
-    assert!(engine.containers.get("kubesolo-beta").unwrap().1);
+    assert!(engine.containers.get("diorama-alpha").unwrap().1);
+    assert!(engine.containers.get("diorama-beta").unwrap().1);
 }
 
 // -----------------------------------------------------------------------------
@@ -342,16 +341,16 @@ fn test_rollback_cleans_only_newly_owned_resources() {
     let mut engine = MockContainerEngine::default();
 
     // Pre-create an existing volume (e.g. from previous run or shared)
-    let pre_existing_vol = CreateVolumeRequest::new("kubesolo-data");
+    let pre_existing_vol = CreateVolumeRequest::new("diorama-data");
     engine.create_volume(&pre_existing_vol).unwrap();
-    assert_eq!(engine.created_volumes, vec!["kubesolo-data"]);
+    assert_eq!(engine.created_volumes, vec!["diorama-data"]);
 
     // Injected failure at container start
     engine.fail_start_container = true;
 
     let params = ContainerInstallParams {
         instance_name: "diorama".to_string(),
-        image: "portainer/kubesolo:latest".to_string(),
+        image: "portainer/diorama:latest".to_string(),
         mtu: None,
         d2k: false,
         container_ports: None,
@@ -364,20 +363,12 @@ fn test_rollback_cleans_only_newly_owned_resources() {
     assert!(result.is_err());
 
     // Newly created network and container must be rolled back
-    assert!(engine.removed_containers.contains(&"kubesolo".to_string()));
-    assert!(
-        engine
-            .removed_networks
-            .contains(&"kubesolo-net".to_string())
-    );
+    assert!(engine.removed_containers.contains(&"diorama".to_string()));
+    assert!(engine.removed_networks.contains(&"diorama-net".to_string()));
 
     // BUT pre-existing volume must NOT be rolled back
-    assert!(
-        !engine
-            .removed_volumes
-            .contains(&"kubesolo-data".to_string())
-    );
-    assert!(engine.volumes.contains_key("kubesolo-data"));
+    assert!(!engine.removed_volumes.contains(&"diorama-data".to_string()));
+    assert!(engine.volumes.contains_key("diorama-data"));
 }
 
 #[test]
@@ -423,25 +414,25 @@ fn test_rollback_on_network_creation_failure() {
 #[test]
 fn test_engine_request_fixtures_matching_api() {
     // Network create serialization
-    let net_req = CreateNetworkRequest::new("kubesolo-net", Some(1450));
+    let net_req = CreateNetworkRequest::new("diorama-net", Some(1450));
     let net_json = serialize_network_create_request(&net_req);
-    assert!(net_json.contains("\"Name\":\"kubesolo-net\""));
+    assert!(net_json.contains("\"Name\":\"diorama-net\""));
     assert!(net_json.contains("\"Driver\":\"bridge\""));
     assert!(net_json.contains("\"com.docker.network.driver.mtu\":\"1450\""));
 
     // Volume create serialization
-    let vol_req = CreateVolumeRequest::new("kubesolo-data");
+    let vol_req = CreateVolumeRequest::new("diorama-data");
     let vol_json = serialize_volume_create_request(&vol_req);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&vol_json).unwrap(),
-        serde_json::json!({"Name":"kubesolo-data", "Driver":"local", "Labels":{}})
+        serde_json::json!({"Name":"diorama-data", "Driver":"local", "Labels":{}})
     );
 
     // Container create serialization
     let mut engine = MockContainerEngine::default();
     let params = ContainerInstallParams {
         instance_name: "test".to_string(),
-        image: "portainer/kubesolo:v1.1.8".to_string(),
+        image: "portainer/diorama:v1.1.8".to_string(),
         mtu: Some(1500),
         d2k: true,
         container_ports: Some("8080:80".to_string()),
@@ -451,15 +442,15 @@ fn test_engine_request_fixtures_matching_api() {
     };
     install_container(&mut engine, &params).unwrap();
 
-    let (cfg, _, _) = engine.containers.get("kubesolo-test").unwrap();
+    let (cfg, _, _) = engine.containers.get("diorama-test").unwrap();
     let container_json = serialize_container_create_request(cfg);
 
-    // Verify key fields required by KubeSolo container contract
+    // Verify key fields required by diorama container contract
     assert!(container_json.contains("\"Privileged\":true"));
     assert!(container_json.contains("\"CgroupnsMode\":\"host\""));
     assert!(container_json.contains("\"RestartPolicy\":{\"Name\":\"unless-stopped\"}"));
-    assert!(container_json.contains("\"Binds\":[\"kubesolo-test-data:/var/lib/diorama\"]"));
-    assert!(container_json.contains("\"NetworkMode\":\"kubesolo-test-net\""));
+    assert!(container_json.contains("\"Binds\":[\"diorama-test-data:/var/lib/diorama\"]"));
+    assert!(container_json.contains("\"NetworkMode\":\"diorama-test-net\""));
     assert!(
         container_json.contains("\"6443/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"6443\"}]")
     );
@@ -469,8 +460,8 @@ fn test_engine_request_fixtures_matching_api() {
     assert!(
         container_json.contains("\"80/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"8080\"}]")
     );
-    assert!(container_json.contains("\"KUBESOLO_CONTAINER_MODE=true\""));
-    assert!(container_json.contains("\"KUBESOLO_NAME=test\""));
+    assert!(container_json.contains("\"DIORAMA_CONTAINER_MODE=true\""));
+    assert!(container_json.contains("\"DIORAMA_NAME=test\""));
     assert!(container_json.contains("\"CUSTOM_VAR=val\""));
 }
 
@@ -488,7 +479,7 @@ fn test_cpu_manager_policy_rejected_in_container_mode() {
         mtu: None,
         d2k: false,
         container_ports: None,
-        extra_env: vec![("KUBESOLO_CPU_MANAGER_POLICY".into(), "static".into())],
+        extra_env: vec![("DIORAMA_CPU_MANAGER_POLICY".into(), "static".into())],
         apiserver_host_port: None,
         d2k_host_port: None,
     };
@@ -547,14 +538,14 @@ fn reinstall_replaces_running_or_stopped_instance_and_reconciles_mtu() {
         params.image = "node:new".into();
         params.mtu = Some(1400);
         params.extra_env = vec![
-            ("KUBESOLO_D2K".into(), "false".into()),
+            ("DIORAMA_D2K".into(), "false".into()),
             ("SPECIAL".into(), "a\"b\\c\n".into()),
         ];
         let result = install_container(&mut engine, &params).unwrap();
         let config = &engine.containers[&cname].0;
         assert_eq!(config.image, "node:new");
-        assert!(config.env.contains(&"KUBESOLO_D2K=true".into()));
-        assert!(!config.env.contains(&"KUBESOLO_D2K=false".into()));
+        assert!(config.env.contains(&"DIORAMA_D2K=true".into()));
+        assert!(!config.env.contains(&"DIORAMA_D2K=false".into()));
         assert_eq!(engine.created_containers.len(), 2);
         assert!(engine.removed_containers.contains(&cname));
         assert_eq!(

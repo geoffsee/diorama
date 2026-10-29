@@ -22,7 +22,7 @@ and the command's earlier detection phase, as in the baseline.
 
 ## Rules and evidence
 
-The source is KubeSolo `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`,
+The source is diorama `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`,
 `internal/cli/preflight/preflight.go`. The order is:
 
 1. **Root:** real UID must equal zero, matching `os.Getuid()`. Effective UID and

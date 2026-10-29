@@ -59,7 +59,7 @@ fn symlink_backup_and_predictable_temp_cannot_overwrite_unrelated_files() {
     symlink(&victim, &backup).unwrap();
     let predictable = dir
         .path()
-        .join(format!(".kubesolo.service.tmp-{}", std::process::id()));
+        .join(format!(".diorama.service.tmp-{}", std::process::id()));
     symlink(&victim, &predictable).unwrap();
     assert!(
         migrate_legacy_service(&service, Some(&config), "v1.3.0", None, &mut Vec::new()).is_err()
@@ -104,7 +104,7 @@ fn library_migration_preserves_a_dangling_destination_link() {
     let absent = directory.path().join("absent.yaml");
     std::os::unix::fs::symlink(&absent, &destination).unwrap();
     assert_eq!(
-        migrate_service_flags("exec kubesolo --debug", Some(&destination), None).unwrap(),
+        migrate_service_flags("exec diorama --debug", Some(&destination), None).unwrap(),
         MigrationOutcome::DestinationConfigExists
     );
     assert_eq!(std::fs::read_link(destination).unwrap(), absent);

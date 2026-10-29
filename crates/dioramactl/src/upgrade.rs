@@ -880,7 +880,7 @@ impl<R: Runner> HostBackend<'_, R> {
 
 impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
     fn validate_snapshot(&mut self, dir: &Path) -> io::Result<()> {
-        if !dir.join("kubesolo.bin").symlink_metadata()?.is_file() {
+        if !dir.join("diorama.bin").symlink_metadata()?.is_file() {
             return Err(io::Error::other("backup binary is not a regular file"));
         }
         if self.service_file.is_some() {
@@ -919,7 +919,7 @@ impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
     }
 
     fn snapshot(&mut self, dir: &Path) -> io::Result<()> {
-        fs::copy(&self.binary, dir.join("kubesolo.bin"))?;
+        fs::copy(&self.binary, dir.join("diorama.bin"))?;
         if let Some(data) = &self.data_path {
             let assets = dir.join("host-assets");
             fs::create_dir(&assets)?;
@@ -991,7 +991,7 @@ impl<R: Runner> TransitionBackend for HostBackend<'_, R> {
 
     fn restore(&mut self, dir: &Path) -> io::Result<()> {
         self.stop()?;
-        atomic_copy_with_mode(&dir.join("kubesolo.bin"), &self.binary, true)?;
+        atomic_copy_with_mode(&dir.join("diorama.bin"), &self.binary, true)?;
         if let Some(data) = &self.data_path
             && dir.join("host-assets").is_dir()
         {
@@ -1135,7 +1135,7 @@ impl ContainerSpec {
             a.extend(["-e".into(), e.clone()]);
         }
         if let Some(mtu) = &self.mtu {
-            a.extend(["-e".into(), format!("KUBESOLO_MTU={mtu}")]);
+            a.extend(["-e".into(), format!("DIORAMA_MTU={mtu}")]);
         }
         a.push(self.image.clone());
         a.extend(self.args.iter().cloned());
@@ -1620,7 +1620,7 @@ fn stage_host_artifact(
     crate::offline::stage(&source, &out).map_err(io::Error::other)?;
     crate::offline::validate(&out, &parsed, diorama_assets::BundleKind::Host)
         .map_err(io::Error::other)?;
-    if let Some(bin) = ["diorama", "bin/diorama", "kubesolo"]
+    if let Some(bin) = ["diorama", "bin/diorama"]
         .iter()
         .map(|relative| out.join(relative))
         .find(|path| path.is_file())
@@ -1772,7 +1772,7 @@ mod tests {
     }
 
     fn host<'a>(d: &Path, runner: &'a mut Fake) -> HostBackend<'a, Fake> {
-        let bin = d.join("kubesolo");
+        let bin = d.join("diorama");
         fs::write(&bin, "old").unwrap();
         let staged = d.join("staged");
         fs::write(&staged, "new").unwrap();
@@ -1807,7 +1807,7 @@ mod tests {
         let d = data_dir();
         let bins = tempfile::tempdir().unwrap();
         let mut r = Fake {
-            version: "kubesolo v1.1.8".into(),
+            version: "diorama v1.1.8".into(),
             ..Fake::default()
         };
         let mut b = host(bins.path(), &mut r);
@@ -1817,7 +1817,7 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(
-            fs::read_to_string(bins.path().join("kubesolo")).unwrap(),
+            fs::read_to_string(bins.path().join("diorama")).unwrap(),
             "new"
         );
         assert_eq!(fs::read_to_string(backup.join("pki/ca.crt")).unwrap(), "CA");
@@ -1826,7 +1826,7 @@ mod tests {
             "DB"
         );
         assert_eq!(
-            fs::read_to_string(backup.join("kubesolo.bin")).unwrap(),
+            fs::read_to_string(backup.join("diorama.bin")).unwrap(),
             "old"
         );
         let log = r.log.join("|");
@@ -1847,7 +1847,7 @@ mod tests {
         };
         r.version = "v1.1.8".into();
         let mut runner = FailFirstStart(r, false);
-        let bin = bins.path().join("kubesolo");
+        let bin = bins.path().join("diorama");
         fs::write(&bin, "old").unwrap();
         let staged = bins.path().join("staged");
         fs::write(&staged, "new").unwrap();
@@ -1903,7 +1903,7 @@ mod tests {
         assert_eq!(out, UpgradeOutcome::Unchanged);
     }
 
-    const SPEC: &str = "name=diorama\nimage=ghcr.io/example/kubesolo:v1.1.8\narg=--debug\nport=6443:6443\nport=9090:9090\nmount=/var/lib/diorama/pki:/var/lib/diorama/pki\nmount=/etc/diorama/registries.yaml:/etc/diorama/registries.yaml:ro\nmtu=1400\n";
+    const SPEC: &str = "name=diorama\nimage=ghcr.io/example/diorama:v1.1.8\narg=--debug\nport=6443:6443\nport=9090:9090\nmount=/var/lib/diorama/pki:/var/lib/diorama/pki\nmount=/etc/diorama/registries.yaml:/etc/diorama/registries.yaml:ro\nmtu=1400\n";
 
     #[test]
     fn offline_container_upgrade_imports_and_inspects_without_pull() {
@@ -1916,7 +1916,7 @@ mod tests {
             runner.log,
             vec![
                 "docker load --input /private/verified.tar.gz",
-                "docker image inspect ghcr.io/example/kubesolo:v1.2.0"
+                "docker image inspect ghcr.io/example/diorama:v1.2.0"
             ]
         );
     }
@@ -1984,18 +1984,18 @@ mod tests {
     #[test]
     fn container_spec_roundtrip_and_preservation() {
         let spec = ContainerSpec::parse(SPEC).unwrap();
-        assert_eq!(spec.repository(), "ghcr.io/example/kubesolo");
+        assert_eq!(spec.repository(), "ghcr.io/example/diorama");
         assert_eq!(spec.tag(), Some("v1.1.8"));
         assert_eq!(ContainerSpec::parse(&spec.render()).unwrap(), spec);
         let next = spec.with_version("v1.2.0");
-        assert_eq!(next.image, "ghcr.io/example/kubesolo:v1.2.0");
+        assert_eq!(next.image, "ghcr.io/example/diorama:v1.2.0");
         let args = next.run_args("diorama").join(" ");
         for needle in [
             "-p 6443:6443",
             "-p 9090:9090",
             "pki:/var/lib/diorama/pki",
             "registries.yaml",
-            "KUBESOLO_MTU=1400",
+            "DIORAMA_MTU=1400",
             "--debug",
         ] {
             assert!(args.contains(needle), "{needle} missing in {args}");
@@ -2020,7 +2020,7 @@ mod tests {
         assert!(matches!(out, UpgradeOutcome::Upgraded { .. }));
         let log = r.log.join("\n");
         assert!(
-            log.starts_with("docker pull ghcr.io/example/kubesolo:v1.2.0"),
+            log.starts_with("docker pull ghcr.io/example/diorama:v1.2.0"),
             "{log}"
         );
         assert!(log.contains("docker stop diorama"));

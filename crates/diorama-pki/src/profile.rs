@@ -80,7 +80,7 @@ pub fn profile(component: Component) -> CertificateParams {
             params
         },
         Component::Admin => {
-            let mut params = CertificateParams::new(vec!["kubesolo-admin".to_string()]).unwrap();
+            let mut params = CertificateParams::new(vec!["diorama-admin".to_string()]).unwrap();
             params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::KeyEncipherment,
@@ -95,7 +95,7 @@ pub fn profile(component: Component) -> CertificateParams {
             params
         },
         Component::Webhook => {
-            let mut params = CertificateParams::new(vec!["kubesolo-webhook".to_string()]).unwrap();
+            let mut params = CertificateParams::new(vec!["diorama-webhook".to_string()]).unwrap();
             params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::KeyEncipherment,
@@ -127,7 +127,7 @@ pub fn profile(component: Component) -> CertificateParams {
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             params
                 .distinguished_name
-                .push(rcgen::DnType::OrganizationName, "kubesolo");
+                .push(rcgen::DnType::OrganizationName, "diorama");
             params
         },
         Component::D2kClient => {
@@ -139,7 +139,7 @@ pub fn profile(component: Component) -> CertificateParams {
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
             params
                 .distinguished_name
-                .push(rcgen::DnType::OrganizationName, "kubesolo");
+                .push(rcgen::DnType::OrganizationName, "diorama");
             params
         },
         Component::DatastoreServer => {

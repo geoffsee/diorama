@@ -8,14 +8,14 @@
       "id": "yes-bool",
       "input": "logging: {debug: yes}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/000/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/000/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -84,14 +84,14 @@
       "id": "number-string",
       "input": "network: {nodeIP: 123}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"123\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/002/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"123\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/002/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -153,14 +153,14 @@
       "id": "bool-string",
       "input": "network: {nodeIP: false}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"false\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/003/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"false\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/003/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -222,14 +222,14 @@
       "id": "octal",
       "input": "network: {mtu: 01400}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 768\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/004/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"network.mtu: 768 is below the IPv6 minimum of 1280; IPv6 pod traffic may fail to fragment correctly\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 768\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/004/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"network.mtu: 768 is below the IPv6 minimum of 1280; IPv6 pod traffic may fail to fragment correctly\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -291,14 +291,14 @@
       "id": "hex",
       "input": "network: {mtu: 0x578}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 1400\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/005/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 1400\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/005/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -360,14 +360,14 @@
       "id": "float-integer",
       "input": "network: {mtu: 1400.0}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 1400\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/006/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 1400\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/006/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -436,14 +436,14 @@
       "id": "null-fields",
       "input": "logging: null\nnetwork: {mtu: null, loadBalancer: {enabled: null}}\nruntime: {containerMode: null}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/008/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/008/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -505,14 +505,14 @@
       "id": "duplicate-leaf",
       "input": "logging: {debug: false, debug: true}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/009/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/009/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/009/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/009/config.yaml contains settings this version of diorama does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -574,14 +574,14 @@
       "id": "duplicate-parent",
       "input": "logging: {debug: true}\nlogging: {pprof: true}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/010/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/010/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 2: key \\\"logging\\\" already set in map\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/010/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/010/config.yaml contains settings this version of diorama does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 2: key \\\"logging\\\" already set in map\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -643,14 +643,14 @@
       "id": "merge",
       "input": "base: &base {debug: true, pprof: true}\nlogging: {<<: *base, debug: false}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/011/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/011/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 2: key \\\"debug\\\" already set in map\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/011/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/011/config.yaml contains settings this version of diorama does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 2: key \\\"debug\\\" already set in map\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -712,14 +712,14 @@
       "id": "alias",
       "input": "logging: &base {debug: true}\nother: *base\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/012/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/012/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error unmarshaling JSON: while decoding JSON: json: unknown field \\\"other\\\"\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/012/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/012/config.yaml contains settings this version of diorama does not recognise, which were ignored: error unmarshaling JSON: while decoding JSON: json: unknown field \\\"other\\\"\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -781,14 +781,14 @@
       "id": "multidoc",
       "input": "logging: {debug: true}\n---\n[ malformed\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/013/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/013/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -850,14 +850,14 @@
       "id": "root-null",
       "input": "null\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/014/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:14Z\",\"message\":\"/fixtures/014/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -933,14 +933,14 @@
       "id": "null-string",
       "input": "portainer: {image: null}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/017/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/017/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1009,14 +1009,14 @@
       "id": "non-string-list",
       "input": "kubernetes: {apiServer: {extraSANs: [1, true, null]}}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    extraSANs:\n    - \"1\"\n    - \"true\"\n    - \"\"\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/019/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    extraSANs:\n    - \"1\"\n    - \"true\"\n    - \"\"\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/019/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1082,14 +1082,14 @@
       "id": "case-fields",
       "input": "Logging: {DEBUG: true}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/020/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/020/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1151,14 +1151,14 @@
       "id": "yaml-directive",
       "input": "%YAML 1.1\n---\nlogging: {debug: ON}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/021/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/021/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1220,14 +1220,14 @@
       "id": "float-string",
       "input": "network: {nodeIP: 1.0}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/022/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/022/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1289,14 +1289,14 @@
       "id": "float-exponent-string",
       "input": "network: {nodeIP: 1e30}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e+30\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/023/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e+30\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/023/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1365,14 +1365,14 @@
       "id": "custom-tag-string",
       "input": "network: {nodeIP: !thing 123}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"123\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/025/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"123\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/025/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1434,14 +1434,14 @@
       "id": "merge-after-explicit",
       "input": "logging: {debug: false, <<: {debug: true, pprof: true}}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/026/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/026/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/026/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/026/config.yaml contains settings this version of diorama does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1503,14 +1503,14 @@
       "id": "merge-sequence",
       "input": "logging: {<<: [{debug: true}, {debug: false, pprof: true}]}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/027/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/027/config.yaml contains settings this version of KubeSolo does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: true\n  pprof: true\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/027/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/027/config.yaml contains settings this version of diorama does not recognise, which were ignored: error converting YAML to JSON: yaml: unmarshal errors:\\n  line 1: key \\\"debug\\\" already set in map\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1572,14 +1572,14 @@
       "id": "null-version",
       "input": "apiVersion: null\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/028/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/028/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1641,14 +1641,14 @@
       "id": "negative-zero",
       "input": "network: {nodeIP: -0.0}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"-0\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/029/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"-0\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/029/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1710,14 +1710,14 @@
       "id": "float-small-string",
       "input": "network: {nodeIP: 0.000001}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e-06\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/030/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e-06\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/030/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"
@@ -1779,14 +1779,14 @@
       "id": "float-tiny-string",
       "input": "network: {nodeIP: 0.0000001}\n",
       "exit_code": 0,
-      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: kubesolo.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e-07\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
-      "stderr": "{\"level\":\"warn\",\"component\":\"kubesolo\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/031/config.yaml does not declare an apiVersion; assuming kubesolo.io/v1alpha1\"}\n",
+      "stdout": "api:\n  enabled: false\n  socketPath: /var/lib/diorama/config.sock\napiVersion: diorama.io/v1alpha1\nd2k:\n  enabled: false\n  namespace: d2k\nkind: Config\nkubernetes:\n  apiServer:\n    startupTimeoutSeconds: 600\n  kubelet:\n    cpuManager:\n      policy: none\n      reservedCPUs: \"\"\nlogging:\n  debug: false\n  pprof: false\nmetrics:\n  bindAddress: 127.0.0.1:9105\n  enabled: false\nnetwork:\n  disableIPv6: false\n  loadBalancer:\n    enabled: true\n    ip: \"\"\n  mtu: 0\n  nodeIP: \"1e-07\"\npath: /var/lib/diorama\nportainer:\n  async: false\n  edgeID: \"\"\n  edgeKey: \"\"\n  image: docker.io/portainer/agent:lts\nruntime:\n  endpoint: \"\"\nstorage:\n  dbWALRepair: false\n  localPath:\n    enabled: true\n    sharedPath: \"\"\n",
+      "stderr": "{\"level\":\"warn\",\"component\":\"diorama\",\"time\":\"2026-09-27T22:11:15Z\",\"message\":\"/fixtures/031/config.yaml does not declare an apiVersion; assuming diorama.io/v1alpha1\"}\n",
       "expected_typed": {
         "api": {
           "enabled": false,
           "socketPath": "/var/lib/diorama/config.sock"
         },
-        "apiVersion": "kubesolo.io/v1alpha1",
+        "apiVersion": "diorama.io/v1alpha1",
         "d2k": {
           "enabled": false,
           "namespace": "d2k"

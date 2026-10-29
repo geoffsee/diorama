@@ -53,7 +53,6 @@ impl FromStr for ProxyMode {
 
 /// Detects whether the host supports iptables or nftables for kube-proxy.
 ///
-/// Matches upstream `KubeSolo` logic:
 /// 1. If `/proc/net/ip_tables_names` exists and `iptables` CLI is usable, select `IpTables`.
 /// 2. If `/proc/net/ip_tables_names` exists but `iptables` binary is unavailable, report an actionable error.
 /// 3. Otherwise, check if `nft` CLI is available. If so, select `Nftables`.
@@ -100,7 +99,7 @@ pub fn detect_proxy_backend(
 
 /// Flushes the nftables nat table before kube-proxy starts when running in nftables mode.
 ///
-/// This matches upstream `KubeSolo` behavior (`flushNftablesNat`) to prevent conflicts
+/// Prevents conflicts
 /// between native nftables rules (e.g. from container runtimes or rootless netavark)
 /// and kube-proxy.
 pub fn flush_nftables_nat(executor: &dyn CommandExecutor) -> Result<(), ProxyError> {

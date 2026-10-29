@@ -63,11 +63,11 @@ fn test_config_path_resolution() {
         "/etc/diorama/config.yaml"
     );
 
-    // KUBESOLO_CONFIG environment variable
+    // DIORAMA_CONFIG environment variable
     stdout.clear();
     let mut env_custom = BTreeMap::new();
     env_custom.insert(
-        "KUBESOLO_CONFIG".to_string(),
+        "DIORAMA_CONFIG".to_string(),
         "/custom/path/config.yaml".to_string(),
     );
     let code = execute(
@@ -126,7 +126,7 @@ fn test_config_schema_fallback() {
     .unwrap();
     assert_eq!(code, 0);
     let output = String::from_utf8_lossy(&stdout);
-    assert!(output.contains("\"apiVersion\": \"kubesolo.io/v1alpha1\""));
+    assert!(output.contains("\"apiVersion\": \"diorama.io/v1alpha1\""));
     assert!(output.contains("\"settings\":"));
     assert!(output.contains("\"network.mtu\""));
 }
@@ -532,7 +532,7 @@ fn test_config_commands_via_socket() {
             let n = stream.read(&mut buf).unwrap();
             let req = String::from_utf8_lossy(&buf[..n]);
             if req.contains("GET /api/v1/config/schema") {
-                let body = "{\"apiVersion\":\"kubesolo.io/v1alpha1\",\"mock\":true}\n";
+                let body = "{\"apiVersion\":\"diorama.io/v1alpha1\",\"mock\":true}\n";
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -626,7 +626,7 @@ fn test_config_commands_via_socket() {
 fn isolated_environment() -> (tempfile::TempDir, BTreeMap<String, String>) {
     let dir = tempfile::tempdir().unwrap();
     let env = BTreeMap::from([(
-        "KUBESOLO_API_SOCKET_PATH".into(),
+        "DIORAMA_API_SOCKET_PATH".into(),
         dir.path().join("absent.sock").to_str().unwrap().into(),
     )]);
     (dir, env)
@@ -634,7 +634,7 @@ fn isolated_environment() -> (tempfile::TempDir, BTreeMap<String, String>) {
 
 #[test]
 fn empty_config_environment_uses_default_and_explicit_file_wins() {
-    let env = BTreeMap::from([("KUBESOLO_CONFIG".into(), String::new())]);
+    let env = BTreeMap::from([("DIORAMA_CONFIG".into(), String::new())]);
     assert_eq!(
         dioramactl::resolve_config_path(None, &env),
         std::path::Path::new("/etc/diorama/config.yaml")
@@ -709,7 +709,7 @@ fn api_get_failures_preserve_file_and_do_not_open_editor() {
             });
             let env = BTreeMap::from([
                 (
-                    "KUBESOLO_API_SOCKET_PATH".into(),
+                    "DIORAMA_API_SOCKET_PATH".into(),
                     socket.to_str().unwrap().into(),
                 ),
                 ("EDITOR".into(), "/nonexistent-editor".into()),
@@ -757,7 +757,7 @@ fn malformed_successful_api_document_is_not_echoed_in_diagnostics() {
         .unwrap();
     });
     let env = BTreeMap::from([(
-        "KUBESOLO_API_SOCKET_PATH".into(),
+        "DIORAMA_API_SOCKET_PATH".into(),
         socket.to_str().unwrap().into(),
     )]);
     let mut stdout = Vec::new();
@@ -788,7 +788,7 @@ fn disabled_api_and_missing_config_do_not_select_host_socket() {
     let socket = dir.path().join("api.sock");
     let _listener = UnixListener::bind(&socket).unwrap();
     let env = BTreeMap::from([(
-        "KUBESOLO_API_SOCKET_PATH".into(),
+        "DIORAMA_API_SOCKET_PATH".into(),
         socket.to_str().unwrap().into(),
     )]);
     write_document(&file, &Config::default()).unwrap();

@@ -5,7 +5,7 @@ startup-only adapter. A normal invocation resolves and validates configuration,
 then launches the supervised node runtime, emitting structured JSONL lifecycle
 diagnostics and executing dependency-aware component supervision.
 
-The adapter preserves the captured KubeSolo ordering: command grammar and
+The adapter preserves the captured diorama ordering: command grammar and
 primitive flag parsing, version/help exit, deprecated `--full` warning, optional
 configuration file, file/environment/explicit-flag resolution, validation,
 warnings, and effective YAML printing. `-v` is the legacy version alias; `-h`

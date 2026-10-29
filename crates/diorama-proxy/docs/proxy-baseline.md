@@ -8,7 +8,7 @@ Tracks [E16.01](https://github.com/geoffsee/diorama/issues/79).
 
 ### Component Boundaries
 
-- **Configuration Generation**: Generates `kubeproxy.config.k8s.io/v1alpha1` `KubeProxyConfiguration` documents matching official Kubernetes v1.35.7 schema and KubeSolo golden fixtures.
+- **Configuration Generation**: Generates `kubeproxy.config.k8s.io/v1alpha1` `KubeProxyConfiguration` documents matching official Kubernetes v1.35.7 schema and diorama golden fixtures.
 - **Backend Detection & Selection**:
   - Automatically identifies whether the host kernel and userland support `iptables` or native `nftables`.
   - On standard hosts where `/proc/net/ip_tables_names` exists and `iptables` runs, selects `iptables` and configures `--masquerade-all=true`.

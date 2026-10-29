@@ -73,7 +73,7 @@ pub fn generate_cni_config_from_cidrs(mtu: u32, cidrs: &[&str]) -> serde_json::V
 
     serde_json::json!({
         "cniVersion": "1.0.0",
-        "name": "kubesolo-net",
+        "name": "diorama-net",
         "plugins": [
             {
                 "type": "bridge",
@@ -360,7 +360,7 @@ mod tests {
     fn test_generate_cni_config_golden() {
         let value = generate_cni_config(1500, None);
         assert_eq!(value["cniVersion"], "1.0.0");
-        assert_eq!(value["name"], "kubesolo-net");
+        assert_eq!(value["name"], "diorama-net");
 
         let plugins = value["plugins"].as_array().expect("plugins array");
         assert_eq!(plugins.len(), 3);
@@ -468,7 +468,7 @@ mod tests {
         assert!(!written_path.is_symlink());
 
         let content = fs::read_to_string(&written_path).expect("read content");
-        assert!(content.contains("kubesolo-net"));
+        assert!(content.contains("diorama-net"));
     }
 
     #[test]

@@ -39,19 +39,19 @@ Per system requirements and architectural decisions:
   - Key-prefix listing and revision-filtered streaming watch notifications (`ADDED`, `MODIFIED`, `DELETED`).
   - WAL (Write-Ahead Log) durability and atomic snapshot checkpoints.
   - Consistent transactional operations (`Txn` / CAS updates).
-- In KubeSolo, Kine was previously used to translate etcd gRPC calls to SQLite. In diorama, `diorama-datastore` provides the native etcd datastore engine, ensuring full Kubernetes storage readiness and eliminating SQLite translation overhead.
+- In diorama, Kine was previously used to translate etcd gRPC calls to SQLite. In diorama, `diorama-datastore` provides the native etcd datastore engine, ensuring full Kubernetes storage readiness and eliminating SQLite translation overhead.
 
 ---
 
 ## 3. Upstream Defaults & Fork Differences (Deviation D09)
 
 In accordance with **Deviation D09** and upstream PR `#166` (commit `35d1093`, KS-68):
-- **No Edge Memory Overrides**: Earlier K3s/KubeSolo forks injected low-memory overrides (e.g. limiting cache sizes, forcing aggressive garbage collection). diorama strictly adheres to official Kubernetes defaults.
+- **No Edge Memory Overrides**: Earlier K3s/diorama forks injected low-memory overrides (e.g. limiting cache sizes, forcing aggressive garbage collection). diorama strictly adheres to official Kubernetes defaults.
 - **Feature Gates**:
-  - Upstream KubeSolo disabled `SizeBasedListCostEstimate` (`SizeBasedListCostEstimate=false`) to silence log warnings generated against early kine shims.
+  - Upstream diorama disabled `SizeBasedListCostEstimate` (`SizeBasedListCostEstimate=false`) to silence log warnings generated against early kine shims.
   - In diorama, feature gate configuration defaults to upstream Kubernetes v1.35.7 standards, while allowing explicit configuration overrides when required.
 - **NodeSetter & Admission**:
-  - Upstream KubeSolo implemented a custom admission plugin (`KubeSoloNodeSetter`) to force unassigned workloads to the single node.
+  - Upstream diorama implemented a custom admission plugin (`NodeSetter`) to force unassigned workloads to the single node.
   - Workload scheduling and admission extensions remain scoped to their respective epics (E14) rather than hardcoded in the core API server startup.
 
 ---

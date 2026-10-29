@@ -1,6 +1,6 @@
 # diorama-dns
 
-CoreDNS deployment and reconciliation for KubeSolo clusters.
+CoreDNS deployment and reconciliation for diorama clusters.
 
 ## Overview
 

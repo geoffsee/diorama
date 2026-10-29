@@ -70,7 +70,7 @@ fn main() -> std::process::ExitCode {
     let mut environment = BTreeMap::new();
     for (key, value) in std::env::vars_os() {
         let Ok(key) = key.into_string() else { continue };
-        if !(key.starts_with("KUBESOLO_")
+        if !(key.starts_with("DIORAMA_")
             || matches!(
                 key.as_str(),
                 "SUDO_USER" | "TEMP_DIR" | "HTTP_PROXY" | "HTTPS_PROXY"

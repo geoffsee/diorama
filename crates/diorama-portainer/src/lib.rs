@@ -5,7 +5,7 @@
 //!
 //! This crate provides configuration types, Kubernetes manifest generators,
 //! create-only bootstrap reconciliation, and supervisor lifecycle management
-//! for the Portainer Edge Agent in diorama / `KubeSolo`.
+//! for the Portainer Edge Agent in `diorama`.
 
 /// Configuration types and constants for Portainer Edge agent.
 pub mod config;

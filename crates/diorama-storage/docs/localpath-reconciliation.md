@@ -1,6 +1,6 @@
 # Local-Path Storage Reconciliation and Optional Deployment
 
-This document describes the reconciliation, lifecycle management, optional deployment, and supervisor integration for the KubeSolo local-path persistent storage provisioner (`diorama-storage`).
+This document describes the reconciliation, lifecycle management, optional deployment, and supervisor integration for the diorama local-path persistent storage provisioner (`diorama-storage`).
 
 ## Overview
 

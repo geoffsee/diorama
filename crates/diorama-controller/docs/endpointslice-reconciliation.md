@@ -6,7 +6,7 @@ The `diorama-controller` crate implements `EndpointSlice` (`discovery.k8s.io/v1`
 
 ## Upstream Batching and Latency Elimination (KS-29 / PR #111)
 
-In early KubeSolo iterations, the controller manager enforced an artificial 5-second batch delay:
+In early diorama iterations, the controller manager enforced an artificial 5-second batch delay:
 - `--endpoint-updates-batch-period=5s`
 - `--endpointslice-updates-batch-period=5s`
 - `--mirroring-endpointslice-updates-batch-period=5s`

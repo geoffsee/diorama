@@ -56,7 +56,7 @@ CoreDNS configuration is rendered by `CoreDnsConfig::generate_corefile()`.
 
 ## Golden Test Parity
 
-Manifest generation matches upstream KubeSolo output character-for-character across all four execution variants:
+Manifest generation matches upstream diorama output character-for-character across all four execution variants:
 - `host-dual`
 - `container-dual`
 - `host-ipv4`

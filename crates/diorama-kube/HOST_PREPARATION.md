@@ -88,7 +88,7 @@ process move-back, init deletion, controller disable, module unload or network u
 
 ## Evidence and remaining qualification
 
-The behavior traces KubeSolo `cmd/kubesolo/main.go` container setup after network
+The behavior traces diorama `cmd/diorama/main.go` container setup after network
 preparation, `internal/system/host.go` SetupContainerMounts/SetupContainerCgroups, and
 `internal/system/mount_linux.go`. The Rust report corrects the baseline's misleading
 successful-delegation log after failed writes. Safe injected tests cover sequence,

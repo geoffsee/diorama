@@ -194,7 +194,7 @@ fn help_version_parse_failure_and_unsupported_preparation_have_no_effects() {
     assert_eq!(
         dioramactl::execute(
             &args(&["check"]),
-            &BTreeMap::from([("KUBESOLO_INSTALL_PREREQS".into(), "yes".into())]),
+            &BTreeMap::from([("DIORAMA_INSTALL_PREREQS".into(), "yes".into())]),
             "v",
             &mut fake,
             &mut output,

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const API_VERSION: &str = "kubesolo.io/v1alpha1";
+pub const API_VERSION: &str = "diorama.io/v1alpha1";
 pub const KIND: &str = "Config";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/diorama/config.yaml";
 

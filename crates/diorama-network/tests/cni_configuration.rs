@@ -27,7 +27,7 @@ fn test_golden_cni_configuration_structure_and_types() {
     let json_val = generate_cni_config(1500, None);
 
     assert_eq!(json_val["cniVersion"], "1.0.0");
-    assert_eq!(json_val["name"], "kubesolo-net");
+    assert_eq!(json_val["name"], "diorama-net");
 
     let plugins = json_val["plugins"].as_array().expect("plugins is an array");
     assert_eq!(plugins.len(), 3);

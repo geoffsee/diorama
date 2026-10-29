@@ -114,8 +114,8 @@ fn every_binding_obeys_file_environment_explicit_flag_precedence() {
 }
 #[test]
 fn environment_can_be_checked_independently_or_explicitly_omitted() {
-    let env = BTreeMap::from([("KUBESOLO_MTU".into(), "bad".into())]);
-    assert_eq!(parse_environment(&env).unwrap_err().path, "KUBESOLO_MTU");
+    let env = BTreeMap::from([("DIORAMA_MTU".into(), "bad".into())]);
+    assert_eq!(parse_environment(&env).unwrap_err().path, "DIORAMA_MTU");
     assert!(
         resolve_layers(
             None,
@@ -371,7 +371,7 @@ fn raw_input_debug_omits_secret_values() {
         "portainer-edge-key".into(),
         secret.into(),
     )]));
-    let environment = BTreeMap::from([("KUBESOLO_PORTAINER_EDGE_KEY".into(), secret.into())]);
+    let environment = BTreeMap::from([("DIORAMA_PORTAINER_EDGE_KEY".into(), secret.into())]);
     let parsed = parse_environment(&environment).unwrap();
     assert!(!format!("{flags:?}").contains(secret));
     assert!(!format!("{parsed:?}").contains(secret));

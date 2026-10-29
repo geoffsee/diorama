@@ -307,7 +307,7 @@ fn incomplete_wrong_platform_and_corrupt_inputs_never_publish_a_bundle() {
             .unwrap(),
             "wrong-tag" => fs::write(
                 assets.join("images/coredns.tar.gz"),
-                image("amd64", "portainer/kubesolo:latest"),
+                image("amd64", "portainer/diorama:latest"),
             )
             .unwrap(),
             "corrupt-image" => {

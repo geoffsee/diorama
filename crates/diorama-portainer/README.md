@@ -1,6 +1,6 @@
 # diorama-portainer
 
-Portainer Edge Agent bootstrap and lifecycle management for KubeSolo clusters.
+Portainer Edge Agent bootstrap and lifecycle management for diorama clusters.
 
 ## Overview
 

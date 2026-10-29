@@ -1,7 +1,7 @@
 # Explicit prerequisite preparation
 
 `dioramactl check --install-prereqs` authorizes two fixed Alpine actions. Existing
-`KUBESOLO_INSTALL_PREREQS` parsing is unchanged; a false flag overrides the environment.
+`DIORAMA_INSTALL_PREREQS` parsing is unchanged; a false flag overrides the environment.
 Help/version/parse errors require neither a Tokio runtime nor signal registration.
 The synchronous `execute` library API remains read-only; the executable selects
 `execute_check_with_preparation` only for an explicitly parsed opt-in.

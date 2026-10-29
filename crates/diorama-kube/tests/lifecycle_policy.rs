@@ -105,7 +105,7 @@ fn apply_changes_only_timeout_and_leaves_graph_validation_to_supervisor() {
 async fn real_layer_override_reaches_exact_component_deadline_and_cleans_partial_startup() {
     let config = resolve(
         "kubernetes:\n  apiServer:\n    startupTimeoutSeconds: 90\n",
-        &BTreeMap::from([("KUBESOLO_STARTUP_TIMEOUT".into(), "11".into())]),
+        &BTreeMap::from([("DIORAMA_STARTUP_TIMEOUT".into(), "11".into())]),
         &ExplicitFlags(BTreeMap::from([("startup-timeout".into(), "2".into())])),
     );
     let policy = LifecyclePolicy::from_config(&config);

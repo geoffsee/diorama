@@ -17,10 +17,10 @@ attempts, decoded chunks and completion probes remain spent on parse/decode fail
 
 ## Pinned source authority and the supported profile
 
-The compatibility reference is KubeSolo `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
-its [downloader](https://github.com/portainer/kubesolo/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/build/download-deps.sh#L164)
+The compatibility reference is diorama `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`:
+its [downloader](https://github.com/geoffsee/diorama/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/build/download-deps.sh#L164)
 invokes `crane pull --platform ...` then gzip. Its
-[consumer](https://github.com/portainer/kubesolo/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/pkg/runtime/containerd/image.go#L63)
+[consumer](https://github.com/geoffsee/diorama/blob/2ef1c4787989f11f868f81bb84ae2afd4a49a81d/pkg/runtime/containerd/image.go#L63)
 gunzips before containerd Import. The downloader selects crane v0.21.5 only when
 crane is absent; it does not verify an already-installed crane's version. These
 sources establish intended behavior, not provenance of unrecorded old payloads.

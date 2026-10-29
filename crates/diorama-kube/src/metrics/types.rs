@@ -321,8 +321,8 @@ mod tests {
     fn test_encode_and_parse_prometheus() {
         let families = vec![
             MetricFamily::new(
-                "kubesolo_build_info",
-                "KubeSolo build information",
+                "diorama_build_info",
+                "diorama build information",
                 MetricType::Gauge,
                 vec![Sample::new(
                     vec![("version", "0.1.0"), ("arch", "arm64")],
@@ -330,7 +330,7 @@ mod tests {
                 )],
             ),
             MetricFamily::new(
-                "kubesolo_uptime_seconds",
+                "diorama_uptime_seconds",
                 "Uptime in seconds",
                 MetricType::Gauge,
                 vec![Sample::without_labels(42.0)],
@@ -338,18 +338,15 @@ mod tests {
         ];
 
         let encoded = encode_prometheus(&families);
-        assert!(encoded.contains("# HELP kubesolo_build_info KubeSolo build information\n"));
-        assert!(encoded.contains("# TYPE kubesolo_build_info gauge\n"));
-        assert!(encoded.contains("kubesolo_build_info{version=\"0.1.0\",arch=\"arm64\"} 1\n"));
-        assert!(encoded.contains("kubesolo_uptime_seconds 42\n"));
+        assert!(encoded.contains("# HELP diorama_build_info diorama build information\n"));
+        assert!(encoded.contains("# TYPE diorama_build_info gauge\n"));
+        assert!(encoded.contains("diorama_build_info{version=\"0.1.0\",arch=\"arm64\"} 1\n"));
+        assert!(encoded.contains("diorama_uptime_seconds 42\n"));
 
         let parsed = parse_scrape(&encoded).expect("parse scrape");
-        assert_eq!(
-            parsed.get_first_value("kubesolo_uptime_seconds"),
-            Some(42.0)
-        );
+        assert_eq!(parsed.get_first_value("diorama_uptime_seconds"), Some(42.0));
         let sample = parsed
-            .get_sample("kubesolo_build_info", "version", "0.1.0")
+            .get_sample("diorama_build_info", "version", "0.1.0")
             .expect("sample found");
         assert_eq!(sample.labels.get("arch").map(String::as_str), Some("arm64"));
         assert_eq!(sample.value, 1.0);
@@ -358,7 +355,7 @@ mod tests {
     #[test]
     fn test_encode_openmetrics_eof() {
         let families = vec![MetricFamily::new(
-            "kubesolo_uptime_seconds",
+            "diorama_uptime_seconds",
             "Uptime in seconds",
             MetricType::Gauge,
             vec![Sample::without_labels(10.0)],

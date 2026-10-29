@@ -1,7 +1,6 @@
 # Versioned distribution configuration
 
-This crate implements the E03.01 desired-state model from KubeSolo
-`2ef1c4787989f11f868f81bb84ae2afd4a49a81d`. The crate also provides pure
+This crate implements the E03.01 desired-state model. The crate also provides pure
 environment/flag precedence and effective YAML rendering (see [LAYERING.md](LAYERING.md)),
 [atomic persistence](PERSISTENCE.md), and [model-derived schema output](SCHEMA.md).
 It does not start components or discover host facts.

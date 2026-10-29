@@ -3,7 +3,7 @@
 # A mounted volume hides paths created at image build time, so this runs at start.
 set -eu
 
-state=${DIORAMA_PATH:-${KUBESOLO_PATH:-/var/lib/diorama}}
+state=${DIORAMA_PATH:-/var/lib/diorama}
 prev=
 for arg in "$@"; do
     if [ "$prev" = "--path" ]; then

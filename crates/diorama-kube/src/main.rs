@@ -71,7 +71,7 @@ fn run() -> io::Result<u8> {
     let environment: BTreeMap<_, _> = std::env::vars_os()
         .filter_map(|(key, value)| {
             key.to_str()
-                .filter(|key| key.starts_with("KUBESOLO_"))
+                .filter(|key| key.starts_with("DIORAMA_"))
                 .map(str::to_owned)
                 .map(|key| (key, value))
         })

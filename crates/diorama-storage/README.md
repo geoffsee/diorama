@@ -1,10 +1,10 @@
 # diorama-storage
 
-Local-path persistent storage provisioner resources and configuration for KubeSolo clusters.
+Local-path persistent storage provisioner resources and configuration for diorama clusters.
 
 ## Overview
 
-`diorama-storage` provides host-backed persistent storage for KubeSolo by generating and managing the `rancher.io/local-path` provisioner components in the dedicated `local-path-storage` namespace.
+`diorama-storage` provides host-backed persistent storage for diorama by generating and managing the `rancher.io/local-path` provisioner components in the dedicated `local-path-storage` namespace.
 
 It generates and manages:
 - **Namespace**: `local-path-storage`
@@ -19,7 +19,7 @@ It generates and manages:
 
 ## Configuration and Defaults
 
-Storage configuration honors upstream KubeSolo contract decisions (including D04):
+Storage configuration honors upstream diorama contract decisions (including D04):
 - **Enabled by Default**: In accordance with D04, storage is enabled by default (`storage.local_path.enabled = true`). Explicitly disabling it prevents resource generation and deployment.
 - **Normal vs. Shared Filesystem Modes**:
   - In normal host mode, `config.json` specifies `nodePathMap` pointing to `<basePath>/local-path-storage` (e.g. `/var/lib/diorama/local-path-storage`).

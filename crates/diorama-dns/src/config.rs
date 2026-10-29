@@ -128,7 +128,7 @@ impl CoreDnsConfig {
         self
     }
 
-    /// Generate the exact Corefile text matching upstream `KubeSolo` contract.
+    /// Generate the exact Corefile text matching the `diorama` contract.
     #[must_use]
     pub fn generate_corefile(&self) -> String {
         let forward = if !self.upstream_resolvers.is_empty() {

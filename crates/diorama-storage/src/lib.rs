@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Kubernetes local-path storage provisioner resources and configuration for KubeSolo/diorama.
+//! Kubernetes local-path storage provisioner resources and configuration for diorama.
 //!
 //! Provides types, manifest generators, and configuration models for deploying
 //! the `rancher.io/local-path` persistent storage provisioner, including RBAC,

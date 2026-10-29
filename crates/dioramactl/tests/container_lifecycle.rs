@@ -74,7 +74,7 @@ impl ContainerEngineClient for Engine {
                 id: format!("id-{n}"),
                 name: n.to_string(),
                 running: *running,
-                d2k_enabled: config.env.iter().any(|value| value == "KUBESOLO_D2K=true"),
+                d2k_enabled: config.env.iter().any(|value| value == "DIORAMA_D2K=true"),
                 exit_code: if *running { 0 } else { 137 },
                 allocated_ports: ports.clone(),
             }))

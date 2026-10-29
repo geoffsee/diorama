@@ -89,7 +89,7 @@ fn backup_refuses_symlinked_datastore_roots_and_ancestors() {
 fn host_binary_replacement_is_executable_without_exposing_config_permissions() {
     use std::os::unix::fs::PermissionsExt;
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let staged = dir.path().join("staged");
     fs::write(&binary, "old").unwrap();
     fs::write(&staged, "new").unwrap();
@@ -98,7 +98,7 @@ fn host_binary_replacement_is_executable_without_exposing_config_permissions() {
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged,
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: None,
@@ -189,11 +189,11 @@ impl Runner for MutatingStart {
 #[test]
 fn host_rollback_restores_all_state_and_removes_migration_created_config() {
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let staged = dir.path().join("staged");
     let service = dir.path().join("node.service");
     let config = dir.path().join("config.yaml");
-    let original = "Description=kubesolo\nExecStart=/usr/local/bin/diorama --debug\n";
+    let original = "Description=diorama\nExecStart=/usr/local/bin/diorama --debug\n";
     fs::write(&binary, "old-binary").unwrap();
     fs::write(&staged, "new-binary").unwrap();
     fs::write(&service, original).unwrap();
@@ -205,7 +205,7 @@ fn host_rollback_restores_all_state_and_removes_migration_created_config() {
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged,
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: Some(service.clone()),
@@ -304,7 +304,7 @@ fn incomplete_snapshot_restarts_old_service_without_receipt_or_replacement() {
         if empty {
             fs::create_dir_all(dir.path().join(relative)).unwrap();
         }
-        let binary = dir.path().join("kubesolo");
+        let binary = dir.path().join("diorama");
         let staged = dir.path().join("staged");
         fs::write(&binary, "old-binary").unwrap();
         fs::write(&staged, "target-binary").unwrap();
@@ -312,7 +312,7 @@ fn incomplete_snapshot_restarts_old_service_without_receipt_or_replacement() {
         let mut backend = HostBackend {
             binary: binary.clone(),
             staged,
-            service: "kubesolo".into(),
+            service: "diorama".into(),
             runner: &mut runner,
             systemd: true,
             service_file: None,
@@ -321,7 +321,7 @@ fn incomplete_snapshot_restarts_old_service_without_receipt_or_replacement() {
         };
         assert!(run_upgrade(&mut backend, dir.path(), None, "v1.3.0", 1, &mut Vec::new()).is_err());
         assert_eq!(fs::read(binary).unwrap(), b"old-binary");
-        assert_eq!(runner.calls.last().unwrap(), "systemctl start kubesolo");
+        assert_eq!(runner.calls.last().unwrap(), "systemctl start diorama");
         assert!(!dir.path().join(".upgrade-pending").exists());
         assert!(
             fs::read_dir(dir.path().join("backups"))
@@ -335,7 +335,7 @@ fn incomplete_snapshot_restarts_old_service_without_receipt_or_replacement() {
 #[test]
 fn host_snapshot_allows_initially_absent_unit_but_rejects_present_nonregular_unit() {
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let staged = dir.path().join("staged");
     fs::write(&binary, "old-binary").unwrap();
     fs::write(&staged, "target-binary").unwrap();
@@ -343,7 +343,7 @@ fn host_snapshot_allows_initially_absent_unit_but_rejects_present_nonregular_uni
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged,
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: Some(dir.path().join("absent-unit")),
@@ -367,7 +367,7 @@ fn host_snapshot_allows_initially_absent_unit_but_rejects_present_nonregular_uni
 fn failed_committing_host_restore_retries_as_rollback_not_commit() {
     use dioramactl::upgrade::{RecoveryOutcome, recover_interrupted_upgrade, seal_backup};
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let config = dir.path().join("missing-parent/config.yaml");
     fs::write(&binary, "old-binary").unwrap();
     let mut runner = MutatingStart {
@@ -378,7 +378,7 @@ fn failed_committing_host_restore_retries_as_rollback_not_commit() {
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged: binary.clone(),
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: None,
@@ -587,7 +587,7 @@ impl Runner for InactiveRunner {
     }
     fn status_code(&mut self, program: &str, args: &[String]) -> io::Result<Option<i32>> {
         assert_eq!(program, "service");
-        assert_eq!(args, ["kubesolo", "status"]);
+        assert_eq!(args, ["diorama", "status"]);
         if self.probe_error {
             Err(io::Error::other("cannot query service"))
         } else {
@@ -608,7 +608,7 @@ fn non_systemd_restore_accepts_only_explicit_inactive_status() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("node");
         fs::write(&binary, "new").unwrap();
-        fs::write(dir.path().join("kubesolo.bin"), "old").unwrap();
+        fs::write(dir.path().join("diorama.bin"), "old").unwrap();
         let mut runner = InactiveRunner {
             status,
             probe_error,
@@ -616,7 +616,7 @@ fn non_systemd_restore_accepts_only_explicit_inactive_status() {
         let mut backend = HostBackend {
             binary: binary.clone(),
             staged: binary.clone(),
-            service: "kubesolo".into(),
+            service: "diorama".into(),
             runner: &mut runner,
             systemd: false,
             service_file: None,
@@ -719,12 +719,12 @@ fn interrupted_upgrade_recovery_restores_pre_upgrade_state_from_pending_receipt(
     };
 
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let staged = dir.path().join("staged");
     let service = dir.path().join("node.service");
     let config = dir.path().join("config.yaml");
 
-    let original_service = "Description=kubesolo\nExecStart=/usr/local/bin/diorama --debug\n";
+    let original_service = "Description=diorama\nExecStart=/usr/local/bin/diorama --debug\n";
     fs::write(&binary, "old-binary").unwrap();
     fs::write(&staged, "new-binary").unwrap();
     fs::write(&service, original_service).unwrap();
@@ -735,7 +735,7 @@ fn interrupted_upgrade_recovery_restores_pre_upgrade_state_from_pending_receipt(
     fs::create_dir_all(backup_dir.join("kine/db")).unwrap();
     fs::write(backup_dir.join("pki/ca.key"), "old-key").unwrap();
     fs::write(backup_dir.join("kine/db/state.db"), "old-db").unwrap();
-    fs::write(backup_dir.join("kubesolo.bin"), "old-binary").unwrap();
+    fs::write(backup_dir.join("diorama.bin"), "old-binary").unwrap();
     fs::write(backup_dir.join("service.unit"), original_service).unwrap();
     #[cfg(unix)]
     {
@@ -748,7 +748,7 @@ fn interrupted_upgrade_recovery_restores_pre_upgrade_state_from_pending_receipt(
     fs::write(&binary, "new-corrupted-binary").unwrap();
     fs::write(
         &service,
-        "Description=kubesolo\nExecStart=/usr/local/bin/diorama --config=/etc/diorama/config.yaml\n",
+        "Description=diorama\nExecStart=/usr/local/bin/diorama --config=/etc/diorama/config.yaml\n",
     )
     .unwrap();
     fs::write(&config, "network:\n  nodeIP: 10.0.0.1\n").unwrap();
@@ -779,7 +779,7 @@ fn interrupted_upgrade_recovery_restores_pre_upgrade_state_from_pending_receipt(
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged,
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: Some(service.clone()),
@@ -827,7 +827,7 @@ fn interrupted_upgrade_recovery_refuses_corrupted_or_missing_backup_without_muta
     };
 
     let dir = data();
-    let binary = dir.path().join("kubesolo");
+    let binary = dir.path().join("diorama");
     let staged = dir.path().join("staged");
     let service = dir.path().join("node.service");
 
@@ -851,7 +851,7 @@ fn interrupted_upgrade_recovery_refuses_corrupted_or_missing_backup_without_muta
     let mut backend = HostBackend {
         binary: binary.clone(),
         staged: staged.clone(),
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: Some(service.clone()),
@@ -916,7 +916,7 @@ fn recovery_prevalidation_rejects_changed_bytes_missing_artifacts_and_unsafe_ent
         "permissions",
     ] {
         let dir = data();
-        let binary = dir.path().join("kubesolo");
+        let binary = dir.path().join("diorama");
         let service = dir.path().join("service");
         fs::write(&binary, "original binary").unwrap();
         fs::write(&service, "original service").unwrap();
@@ -924,7 +924,7 @@ fn recovery_prevalidation_rejects_changed_bytes_missing_artifacts_and_unsafe_ent
         let mut backend = HostBackend {
             binary: binary.clone(),
             staged: binary.clone(),
-            service: "kubesolo".into(),
+            service: "diorama".into(),
             runner: &mut runner,
             systemd: true,
             service_file: Some(service.clone()),
@@ -939,7 +939,7 @@ fn recovery_prevalidation_rejects_changed_bytes_missing_artifacts_and_unsafe_ent
                 fs::write(backup.join("kine/db/state.db"), "corrupt nonempty DB").unwrap();
             },
             "key" => fs::write(backup.join("pki/ca.key"), "invalid nonempty key").unwrap(),
-            "binary" => fs::remove_file(backup.join("kubesolo.bin")).unwrap(),
+            "binary" => fs::remove_file(backup.join("diorama.bin")).unwrap(),
             "service" => fs::remove_file(backup.join("service.unit")).unwrap(),
             "extra" => fs::write(backup.join("pki/unknown"), "foreign").unwrap(),
             #[cfg(unix)]
@@ -1289,7 +1289,7 @@ fn recovery_rejects_foreign_backup_before_backend_calls() {
     let mut backend = HostBackend {
         binary: dir.path().join("binary"),
         staged: PathBuf::new(),
-        service: "kubesolo".into(),
+        service: "diorama".into(),
         runner: &mut runner,
         systemd: true,
         service_file: None,

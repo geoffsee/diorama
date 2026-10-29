@@ -42,7 +42,7 @@ facts. Severe failure/cause records are considered before state details so debug
 traffic cannot consume a batch's space before those facts. Filtering counts records
 intentionally hidden. It does not change component policy, supervision or readiness.
 
-The pinned Go baseline's `cmd/kubesolo/main.go` sets DEBUG in bootstrap at line 495,
+The pinned Go baseline's `cmd/diorama/main.go` sets DEBUG in bootstrap at line 495,
 then unconditionally sets INFO at line 505. Honoring the resolved debug setting here
 is an explicit correction of that reset, not a claim of byte-identical runtime Go
 output. Baseline `internal/logging/logging.go` also supports pretty/no-color/JSON

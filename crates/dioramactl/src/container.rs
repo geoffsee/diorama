@@ -1,6 +1,5 @@
 //! Container lifecycle and Docker/Podman Engine client interaction for container mode.
 //!
-//! Matches Portainer `KubeSolo` `internal/cli/service/container.go` contract at commit `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`.
 //! Manages named containers, dedicated bridge networks, named persistent volumes,
 //! port bindings, and partial-failure cleanup (cleaning only newly created resources).
 
@@ -11,14 +10,14 @@ use std::io;
 
 /// Resolves the Docker container name for a cluster instance.
 ///
-/// If name is "diorama" (default), "kubesolo", or empty, returns "kubesolo".
-/// Otherwise returns "kubesolo-<name>".
+/// If name is "diorama" (default) or empty, returns "diorama".
+/// Otherwise returns "diorama-<name>".
 pub fn container_name(name: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed == "diorama" || trimmed == "kubesolo" {
-        "kubesolo".to_string()
+    if trimmed.is_empty() || trimmed == "diorama" {
+        "diorama".to_string()
     } else {
-        format!("kubesolo-{trimmed}")
+        format!("diorama-{trimmed}")
     }
 }
 
@@ -362,7 +361,7 @@ pub fn build_port_configuration(
     })
 }
 
-/// Executes container creation and startup workflow matching `KubeSolo` container mode contract.
+/// Executes container creation and startup workflow for container mode.
 ///
 /// Steps:
 /// 1. Validate CPU manager policy (must be "none")
@@ -413,7 +412,7 @@ fn install_container_inner(
     if let Some((_, v)) = params
         .extra_env
         .iter()
-        .find(|(k, _)| k == "KUBESOLO_CPU_MANAGER_POLICY")
+        .find(|(k, _)| k == "DIORAMA_CPU_MANAGER_POLICY")
         && v != "none"
         && !v.is_empty()
     {
@@ -522,19 +521,19 @@ fn install_container_inner(
 
         // 5. Build ContainerConfig
         let mut env_vars = vec![
-            "KUBESOLO_CONTAINER_MODE=true".to_string(),
-            format!("KUBESOLO_NAME={}", params.instance_name),
+            "DIORAMA_CONTAINER_MODE=true".to_string(),
+            format!("DIORAMA_NAME={}", params.instance_name),
         ];
         for (k, v) in &params.extra_env {
             if !matches!(
                 k.as_str(),
-                "KUBESOLO_D2K" | "KUBESOLO_CONTAINER_MODE" | "KUBESOLO_NAME"
+                "DIORAMA_D2K" | "DIORAMA_CONTAINER_MODE" | "DIORAMA_NAME"
             ) {
                 env_vars.push(format!("{k}={v}"));
             }
         }
 
-        env_vars.push(format!("KUBESOLO_D2K={}", params.d2k));
+        env_vars.push(format!("DIORAMA_D2K={}", params.d2k));
 
         let container_cfg = ContainerConfig {
             image: params.image.clone(),

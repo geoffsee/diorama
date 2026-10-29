@@ -87,7 +87,7 @@ fn production_cli_inspects_named_container_and_preserves_config_on_engine_failur
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config");
     let docker = dir.path().join("docker");
-    std::fs::write(&docker, "#!/bin/sh\n[ \"$1\" = port ] && [ \"$2\" = kubesolo-dev ] && [ \"$3\" = 6443/tcp ] || exit 9\nprintf '%s\\n' 127.0.0.1:49153\n").unwrap();
+    std::fs::write(&docker, "#!/bin/sh\n[ \"$1\" = port ] && [ \"$2\" = diorama-dev ] && [ \"$3\" = 6443/tcp ] || exit 9\nprintf '%s\\n' 127.0.0.1:49153\n").unwrap();
     std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(&path, document()).unwrap();
     let run = || {

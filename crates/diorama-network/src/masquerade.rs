@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::cni::DEFAULT_POD_CIDR;
 use crate::error::NetworkError;
 
-pub const DEFAULT_NFT_MASQ_TABLE: &str = "kubesolo-masq";
-pub const MASQUERADE_COMMENT: &str = "kubesolo: pod masquerade";
+pub const DEFAULT_NFT_MASQ_TABLE: &str = "diorama-masq";
+pub const MASQUERADE_COMMENT: &str = "diorama: pod masquerade";
 pub const IPTABLES_WAIT_SECONDS: &str = "5";
 
 /// Supported masquerade backend technology.
@@ -161,7 +161,6 @@ pub fn evaluate_egress_traffic(src_ip: &str, dst_ip: &str, pod_cidr: &str) -> Eg
 
 /// Detects whether the host supports iptables or nftables.
 ///
-/// Matches upstream `KubeSolo` logic:
 /// If `/proc/net/ip_tables_names` exists and `iptables` runs, chooses `IpTables`.
 /// Otherwise, falls back to `nft` (nftables).
 pub fn detect_backend(
@@ -351,14 +350,14 @@ fn ensure_nftables_masquerade(
 ) -> Result<(), NetworkError> {
     let family = if pod_cidr.contains(':') { "ip6" } else { "ip" };
 
-    // 1. Ensure table kubesolo-masq
+    // 1. Ensure table diorama-masq
     ensure_nft_object(
         &["list", "table", family, DEFAULT_NFT_MASQ_TABLE],
         &["add", "table", family, DEFAULT_NFT_MASQ_TABLE],
         executor,
     )?;
 
-    // 2. Ensure postrouting chain in kubesolo-masq table
+    // 2. Ensure postrouting chain in diorama-masq table
     ensure_nft_object(
         &[
             "list",
@@ -406,7 +405,7 @@ fn ensure_nftables_masquerade(
         return Ok(());
     }
 
-    // 4. Add rule: nft add rule <family> kubesolo-masq postrouting <family> saddr <pod_cidr> <family> daddr != <pod_cidr> masquerade comment "\"kubesolo: pod masquerade\""
+    // 4. Add rule: nft add rule <family> diorama-masq postrouting <family> saddr <pod_cidr> <family> daddr != <pod_cidr> masquerade comment "\"diorama: pod masquerade\""
     let comment_arg = format!("\"{MASQUERADE_COMMENT}\"");
     let add_rule_args = [
         "add",
@@ -465,7 +464,7 @@ pub fn clean_pod_masquerade(pod_cidr: &str) -> Result<(), NetworkError> {
 ///
 /// Ensures unrelated NAT state is strictly preserved:
 /// - In iptables: only the matching rule is deleted (`-D`); the chain and table are NEVER flushed.
-/// - In nftables: only the owned `kubesolo-masq` table is removed; `table ip nat` and other tables are NEVER touched.
+/// - In nftables: only the owned `diorama-masq` table is removed; `table ip nat` and other tables are NEVER touched.
 pub fn clean_pod_masquerade_with_backend_and_executor(
     pod_cidr: &str,
     backend: MasqueradeBackend,
@@ -537,7 +536,7 @@ fn clean_single_pod_masquerade(
         },
         MasqueradeBackend::Nftables => {
             let family = if pod_cidr.contains(':') { "ip6" } else { "ip" };
-            // Delete our dedicated table `ip/ip6 kubesolo-masq`.
+            // Delete our dedicated table `ip/ip6 diorama-masq`.
             // Crucial: this never flushes or touches system tables such as `table ip nat` or Podman netavark.
             let del_args = ["delete", "table", family, DEFAULT_NFT_MASQ_TABLE];
             let out =
@@ -1275,7 +1274,7 @@ mod tests {
         // Unrelated NAT rules (e.g. table ip nat) are untouched
         assert_eq!(executor.unrelated_nat_rules_count(), 1);
 
-        // Cleanup deletes only kubesolo-masq table, never table ip nat
+        // Cleanup deletes only diorama-masq table, never table ip nat
         clean_pod_masquerade_with_backend_and_executor(
             cidr,
             MasqueradeBackend::Nftables,

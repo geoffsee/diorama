@@ -1,6 +1,5 @@
 //! Container port specification parser and validator.
 //!
-//! Matches Portainer `KubeSolo` `internal/cli/service/ports.go` behavior at commit `2ef1c4787989f11f868f81bb84ae2afd4a49a81d`.
 //! Validates specs before container or network creation and produces normalized port mappings.
 
 use std::collections::HashSet;

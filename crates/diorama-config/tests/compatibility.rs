@@ -488,7 +488,7 @@ fn scalar_signs_and_radix_prefixes_match_captured_go_results() {
 
 #[test]
 fn merge_duplicate_warnings_use_registered_root_and_nested_paths() {
-    let decoded = decode("kind: KubeSoloConfiguration\n<<: {kind: KubeSoloConfiguration}\nlogging: {debug: false, <<: {debug: true}}\n").unwrap();
+    let decoded = decode("kind: DioramaConfiguration\n<<: {kind: DioramaConfiguration}\nlogging: {debug: false, <<: {debug: true}}\n").unwrap();
     let duplicates: Vec<_> = decoded
         .warnings
         .iter()

@@ -1,10 +1,10 @@
 //! Semver comparison and legacy upgrade version gates.
 //!
-//! `KubeSolo` historical versions are compared numerically by `major.minor.patch`.
+//! Historical versions are compared numerically by `major.minor.patch`.
 //! Non-numeric components like `develop` or `latest` return `None`, skipping
 //! version-dependent guards.
 //!
-//! Upstream contract:
+//! Contract:
 //! Binary versions before `v1.3.0` predated `--config` support (`MinConfigFileVersion`).
 //! Upgrades to versions `< v1.3.0` must keep legacy flags in the service definition.
 //! Upgrades to versions `>= v1.3.0` (or unparseable versions like `develop`) support
@@ -12,7 +12,7 @@
 
 use std::cmp::Ordering;
 
-/// Minimum version of `KubeSolo` that supports `--config=/etc/diorama/config.yaml`.
+/// Minimum version of `diorama` that supports `--config=/etc/diorama/config.yaml`.
 pub const MIN_CONFIG_FILE_VERSION: &str = "v1.3.0";
 
 /// A parsed 3-part semantic version (major, minor, patch).

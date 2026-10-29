@@ -582,7 +582,7 @@ fn test_execute_download_failures() {
 #[test]
 fn test_recover_sudo_env_from_bytes() {
     let mut env = BTreeMap::new();
-    let raw_bytes = b"PATH=/usr/bin\x00SUDO_USER=alice\x00KUBESOLO_VERSION=v1.2.0\x00KUBESOLO_PORTAINER_EDGE_KEY=secret_key_abc\x00OTHER=ignored\x00";
+    let raw_bytes = b"PATH=/usr/bin\x00SUDO_USER=alice\x00DIORAMA_VERSION=v1.2.0\x00DIORAMA_PORTAINER_EDGE_KEY=secret_key_abc\x00OTHER=ignored\x00";
 
     // Scenario A: Not running under sudo -> ignored
     recover_sudo_env_from_bytes(&mut env, raw_bytes);
@@ -591,9 +591,9 @@ fn test_recover_sudo_env_from_bytes() {
     // Scenario B: Running under sudo (SUDO_USER present), edge key missing in env -> recovered
     env.insert("SUDO_USER".into(), "alice".into());
     recover_sudo_env_from_bytes(&mut env, raw_bytes);
-    assert!(!env.contains_key("KUBESOLO_VERSION"));
+    assert!(!env.contains_key("DIORAMA_VERSION"));
     assert_eq!(
-        env.get("KUBESOLO_PORTAINER_EDGE_KEY").map(String::as_str),
+        env.get("DIORAMA_PORTAINER_EDGE_KEY").map(String::as_str),
         Some("secret_key_abc")
     );
     assert!(!env.contains_key("OTHER"));
@@ -602,13 +602,13 @@ fn test_recover_sudo_env_from_bytes() {
     // Scenario C: Edge key already present in environment -> does nothing
     let mut env2 = BTreeMap::new();
     env2.insert("SUDO_USER".into(), "bob".into());
-    env2.insert("KUBESOLO_PORTAINER_EDGE_KEY".into(), "existing_key".into());
+    env2.insert("DIORAMA_PORTAINER_EDGE_KEY".into(), "existing_key".into());
     recover_sudo_env_from_bytes(&mut env2, raw_bytes);
     assert_eq!(
-        env2.get("KUBESOLO_PORTAINER_EDGE_KEY").map(String::as_str),
+        env2.get("DIORAMA_PORTAINER_EDGE_KEY").map(String::as_str),
         Some("existing_key")
     );
-    assert!(!env2.contains_key("KUBESOLO_VERSION"));
+    assert!(!env2.contains_key("DIORAMA_VERSION"));
 }
 
 #[test]

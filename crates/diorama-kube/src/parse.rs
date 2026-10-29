@@ -143,7 +143,7 @@ pub(crate) fn parse(
     let mut full = false;
     if !skip_defaults {
         config = env
-            .get("KUBESOLO_CONFIG")
+            .get("DIORAMA_CONFIG")
             .filter(|value| !value.is_empty())
             .cloned()
             .unwrap_or_else(|| "/etc/diorama/config.yaml".into());
@@ -159,7 +159,7 @@ pub(crate) fn parse(
             }
         }
         if !explicit.contains("full")
-            && let Some(value) = env.get("KUBESOLO_FULL").filter(|value| !value.is_empty())
+            && let Some(value) = env.get("DIORAMA_FULL").filter(|value| !value.is_empty())
         {
             full = boolean(value).ok_or_else(|| format!("invalid value {value:?}"))?;
         }

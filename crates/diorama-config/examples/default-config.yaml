@@ -1,7 +1,7 @@
 api:
   enabled: false
   socketPath: ""
-apiVersion: kubesolo.io/v1alpha1
+apiVersion: diorama.io/v1alpha1
 d2k:
   enabled: false
   namespace: d2k

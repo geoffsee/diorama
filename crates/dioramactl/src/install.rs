@@ -383,46 +383,46 @@ pub fn install_container_with_engine(
     }
     let mut extra_env = vec![
         (
-            "KUBESOLO_CPU_MANAGER_POLICY".into(),
+            "DIORAMA_CPU_MANAGER_POLICY".into(),
             options.cpu_manager_policy.clone(),
         ),
         (
-            "KUBESOLO_D2K_NAMESPACE".into(),
+            "DIORAMA_D2K_NAMESPACE".into(),
             options.d2k_namespace.clone(),
         ),
-        ("KUBESOLO_DEBUG".into(), options.debug.to_string()),
+        ("DIORAMA_DEBUG".into(), options.debug.to_string()),
         (
-            "KUBESOLO_LOCAL_STORAGE".into(),
+            "DIORAMA_LOCAL_STORAGE".into(),
             options.local_storage.to_string(),
         ),
         (
-            "KUBESOLO_PPROF_SERVER".into(),
+            "DIORAMA_PPROF_SERVER".into(),
             options.pprof_server.to_string(),
         ),
         (
-            "KUBESOLO_PORTAINER_EDGE_ASYNC".into(),
+            "DIORAMA_PORTAINER_EDGE_ASYNC".into(),
             options.portainer_edge_async.to_string(),
         ),
     ];
     for (key, value) in [
         (
-            "KUBESOLO_APISERVER_EXTRA_SANS",
+            "DIORAMA_APISERVER_EXTRA_SANS",
             &options.apiserver_extra_sans,
         ),
-        ("KUBESOLO_NODE_IP", &options.node_ip),
-        ("KUBESOLO_MTU", &options.mtu),
-        ("KUBESOLO_PORTAINER_EDGE_ID", &options.portainer_edge_id),
-        ("KUBESOLO_PORTAINER_EDGE_KEY", &options.portainer_edge_key),
+        ("DIORAMA_NODE_IP", &options.node_ip),
+        ("DIORAMA_MTU", &options.mtu),
+        ("DIORAMA_PORTAINER_EDGE_ID", &options.portainer_edge_id),
+        ("DIORAMA_PORTAINER_EDGE_KEY", &options.portainer_edge_key),
         (
-            "KUBESOLO_PORTAINER_EDGE_IMAGE",
+            "DIORAMA_PORTAINER_EDGE_IMAGE",
             &options.portainer_edge_image,
         ),
         (
-            "KUBESOLO_CPU_MANAGER_POLICY_OPTIONS",
+            "DIORAMA_CPU_MANAGER_POLICY_OPTIONS",
             &options.cpu_manager_policy_options,
         ),
-        ("KUBESOLO_RESERVED_CPUS", &options.reserved_cpus),
-        ("KUBESOLO_SYSTEM_RESERVED", &options.system_reserved),
+        ("DIORAMA_RESERVED_CPUS", &options.reserved_cpus),
+        ("DIORAMA_SYSTEM_RESERVED", &options.system_reserved),
     ] {
         if let Some(value) = value {
             extra_env.push((key.into(), value.clone()));

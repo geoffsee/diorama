@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 /// Portainer Edge variables stripped by sudo `env_reset`.
 ///
 /// Only triggers when running under sudo (`SUDO_USER` is present) with
-/// `KUBESOLO_PORTAINER_EDGE_KEY` missing from the current process environment.
+/// `DIORAMA_PORTAINER_EDGE_KEY` missing from the current process environment.
 pub fn recover_sudo_env_from_bytes(
     environment: &mut BTreeMap<String, String>,
     environ_bytes: &[u8],
@@ -12,11 +12,11 @@ pub fn recover_sudo_env_from_bytes(
     if !environment.contains_key("SUDO_USER") {
         return;
     }
-    if environment.contains_key("KUBESOLO_PORTAINER_EDGE_KEY") {
+    if environment.contains_key("DIORAMA_PORTAINER_EDGE_KEY") {
         return;
     }
     for chunk in environ_bytes.split(|b| *b == 0) {
-        if chunk.starts_with(b"KUBESOLO_")
+        if chunk.starts_with(b"DIORAMA_")
             && let Some(pos) = chunk.iter().position(|b| *b == b'=')
             && let (Ok(key), Ok(val)) = (
                 std::str::from_utf8(&chunk[..pos]),
@@ -25,10 +25,10 @@ pub fn recover_sudo_env_from_bytes(
         {
             if !matches!(
                 key,
-                "KUBESOLO_PORTAINER_EDGE_ID"
-                    | "KUBESOLO_PORTAINER_EDGE_KEY"
-                    | "KUBESOLO_PORTAINER_EDGE_ASYNC"
-                    | "KUBESOLO_PORTAINER_EDGE_IMAGE"
+                "DIORAMA_PORTAINER_EDGE_ID"
+                    | "DIORAMA_PORTAINER_EDGE_KEY"
+                    | "DIORAMA_PORTAINER_EDGE_ASYNC"
+                    | "DIORAMA_PORTAINER_EDGE_IMAGE"
             ) {
                 continue;
             }

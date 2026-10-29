@@ -158,7 +158,7 @@ impl NodeSetterHandler {
                 };
 
                 // If spec is not an object (e.g. malformed_typed_object where spec is "invalid"),
-                // upstream KubeSolo unmarshal fails and logs an error, returning no patch.
+                // unmarshal fails and logs an error, returning no patch.
                 let Some(spec) = obj.get("spec") else {
                     return Ok((Some(self.node_name_patch_b64.clone()), false));
                 };
@@ -409,7 +409,7 @@ impl WebhookHandler for NodeSetterHandler {
 
         let (patch_opt, _) = self.evaluate_mutation(&req_json).await.map_err(|reason| {
             ApiserverError::WebhookFailure {
-                webhook: "webhook.kubesolo.io".to_string(),
+                webhook: "webhook.diorama.io".to_string(),
                 reason,
             }
         })?;

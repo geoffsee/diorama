@@ -1,6 +1,6 @@
 # Integer scalar capture
 
-These 17 observations execute KubeSolo `config.Read` at revision
+These 17 observations execute diorama `config.Read` at revision
 `2ef1c4787989f11f868f81bb84ae2afd4a49a81d` in disposable Linux arm64 containers.
 The two directories preserve the exact capture sources, build/run logs, cleanup
 receipts, source hashes and raw results. Those receipts identify the historical

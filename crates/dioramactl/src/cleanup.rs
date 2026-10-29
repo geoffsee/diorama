@@ -1159,7 +1159,7 @@ mod tests {
         );
     }
 
-    const SPEC: &str = "name=diorama\nimage=x/kubesolo:v1.2.0\nmount=/srv/volumes:/data\n";
+    const SPEC: &str = "name=diorama\nimage=x/diorama:v1.2.0\nmount=/srv/volumes:/data\n";
 
     #[test]
     fn container_uninstall_touches_only_named_container_and_keeps_custom_volume() {

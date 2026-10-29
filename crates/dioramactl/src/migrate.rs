@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn test_version_gate_preserves_legacy_flags_for_old_version() {
         let mut stderr = Vec::new();
-        let service_path = Path::new("/nonexistent/kubesolo.service");
+        let service_path = Path::new("/nonexistent/diorama.service");
         let result =
             migrate_legacy_service(service_path, None, "v1.2.0", None, &mut stderr).unwrap();
 
@@ -341,13 +341,13 @@ mod tests {
     fn test_migrate_legacy_service_workflow() {
         let dir = std::env::temp_dir().join(format!("diorama-mig-srv-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        let service_file = dir.join("kubesolo.service");
+        let service_file = dir.join("diorama.service");
         let config_file = dir.join("config.yaml");
 
         let initial_service = r"[Unit]
-Description=KubeSolo
+Description=diorama
 [Service]
-ExecStart=/usr/local/bin/diorama --node-ip=10.0.0.100 --debug --path=/var/lib/mykubesolo
+ExecStart=/usr/local/bin/diorama --node-ip=10.0.0.100 --debug --path=/var/lib/mydiorama
 Restart=always
 ";
         fs::write(&service_file, initial_service).unwrap();
@@ -362,7 +362,7 @@ Restart=always
         )
         .unwrap();
 
-        let service_backup = dir.join("kubesolo.service.bak");
+        let service_backup = dir.join("diorama.service.bak");
         assert_eq!(
             result,
             ServiceMigrationResult::Migrated {
@@ -378,7 +378,7 @@ Restart=always
         let config_str = fs::read_to_string(&config_file).unwrap();
         assert!(config_str.contains("nodeIP: 10.0.0.100"));
         assert!(config_str.contains("debug: true"));
-        assert!(config_str.contains("path: /var/lib/mykubesolo"));
+        assert!(config_str.contains("path: /var/lib/mydiorama"));
 
         // Verify service backup was created with exact initial content
         assert!(service_backup.exists());
@@ -406,7 +406,7 @@ Restart=always
     fn test_existing_config_skips_and_does_not_overwrite() {
         let dir = std::env::temp_dir().join(format!("diorama-mig-srv-skip-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        let service_file = dir.join("kubesolo.service");
+        let service_file = dir.join("diorama.service");
         let config_file = dir.join("config.yaml");
 
         fs::write(&config_file, "original custom yaml").unwrap();
