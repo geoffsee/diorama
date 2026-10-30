@@ -99,14 +99,28 @@ fn run() -> io::Result<u8> {
             config,
             config_path,
             host,
+            token_file,
+            join_token,
         } => {
             drop(stdout);
             drop(stderr);
+            let resolved_token = match (join_token, token_file) {
+                (Some(tok), _) => Some(tok),
+                (None, Some(path)) => Some(std::fs::read_to_string(path)?),
+                (None, None) => None,
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             runtime.block_on(async move {
-                match diorama::NodeRuntime::from_config_with_context(*config, config_path, host) {
+                match diorama::NodeRuntime::from_config_with_join(
+                    *config,
+                    config_path,
+                    host,
+                    resolved_token,
+                )
+                .await
+                {
                     Ok(node) => node.run_to_completion().await,
                     Err(error) => {
                         // Assembly failed before a supervisor existed. Keep the

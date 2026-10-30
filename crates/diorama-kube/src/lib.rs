@@ -22,6 +22,8 @@ pub enum StartupAction {
         config: Box<ValidatedConfig>,
         config_path: PathBuf,
         host: HostContext,
+        token_file: Option<PathBuf>,
+        join_token: Option<String>,
     },
 }
 impl std::fmt::Debug for StartupAction {
@@ -179,6 +181,8 @@ pub fn execute(
         config: Box::new(resolved.validated),
         config_path: PathBuf::from(parsed.config),
         host,
+        token_file: parsed.token_file.map(PathBuf::from),
+        join_token: parsed.join_token,
     })
 }
 

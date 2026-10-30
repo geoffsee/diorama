@@ -1,0 +1,26 @@
+# muxox.toml -- Run 2 isolated diorama instances in Podman containers.
+#
+# Start both instances (with embedded MCP server enabled at http://127.0.0.1:9900/mcp):
+#   muxox          # Web UI + MCP server
+#   muxox --raw    # Plain log streaming + MCP server
+
+[mcp]
+enabled = true
+port = 9900
+bind = "127.0.0.1"
+
+[hooks]
+before_start = "make image"
+after_stop = "podman rm -f diorama-1 diorama-2"
+
+[[service]]
+name = "diorama-1"
+cmd = "podman run --rm --replace --privileged --hostname diorama-1 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-1:/var/lib/diorama -p 6443:6443 --name diorama-1 ${IMAGE:-localhost/diorama:latest}"
+log_capacity = 5000
+hooks = { before_start = "make image && podman rm -f diorama-1", after_stop = "podman rm -f diorama-1" }
+
+[[service]]
+name = "diorama-2"
+cmd = "podman run --rm --replace --privileged --hostname diorama-2 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-2:/var/lib/diorama -p 6444:6443 --name diorama-2 ${IMAGE:-localhost/diorama:latest}"
+log_capacity = 5000
+hooks = { before_start = "make image && podman rm -f diorama-2", after_stop = "podman rm -f diorama-2" }

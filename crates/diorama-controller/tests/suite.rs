@@ -1,5 +1,7 @@
 #[path = "controller_config.rs"]
 mod controller_config;
+#[path = "controller_ha_leader_election.rs"]
+mod controller_ha_leader_election;
 #[path = "controller_supervisor.rs"]
 mod controller_supervisor;
 #[path = "endpointslice_reconciliation.rs"]

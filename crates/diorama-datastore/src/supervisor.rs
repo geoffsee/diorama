@@ -21,6 +21,7 @@ pub struct DatastoreAdapter {
     config: DatastoreConfig,
     engine: Option<DatastoreEngine>,
     bound_addr: Arc<Mutex<Option<SocketAddr>>>,
+    peer_bound_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl DatastoreAdapter {
@@ -29,6 +30,7 @@ impl DatastoreAdapter {
             config,
             engine: None,
             bound_addr: Arc::new(Mutex::new(None)),
+            peer_bound_addr: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -37,6 +39,7 @@ impl DatastoreAdapter {
             config: engine.config().clone(),
             engine: Some(engine),
             bound_addr: Arc::new(Mutex::new(None)),
+            peer_bound_addr: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -46,6 +49,14 @@ impl DatastoreAdapter {
 
     pub fn bound_addr_handle(&self) -> Arc<Mutex<Option<SocketAddr>>> {
         self.bound_addr.clone()
+    }
+
+    pub fn peer_bound_addr(&self) -> Option<SocketAddr> {
+        *self.peer_bound_addr.lock().unwrap()
+    }
+
+    pub fn peer_bound_addr_handle(&self) -> Arc<Mutex<Option<SocketAddr>>> {
+        self.peer_bound_addr.clone()
     }
 
     pub fn registration(
@@ -206,6 +217,25 @@ async fn wait_for_stop(context: &mut AdapterContext, engine: &DatastoreEngine) {
     }
 }
 
+fn spawn_configured_peer_connections(
+    config: &DatastoreConfig,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    engine: &DatastoreEngine,
+) {
+    for (&peer_id, &remote_addr) in &config.peers {
+        if !config.dial_all_peers && peer_id <= config.node_id {
+            continue;
+        }
+        let eng = engine.clone();
+        let c = Some(cert.to_path_buf());
+        let k = Some(key.to_path_buf());
+        tokio::spawn(async move {
+            let _ = crate::quic::connect_quic_peer(peer_id, remote_addr, c, k, eng).await;
+        });
+    }
+}
+
 impl Adapter for DatastoreAdapter {
     fn run(self: Box<Self>, mut context: AdapterContext) -> AdapterFuture {
         Box::pin(async move {
@@ -232,6 +262,25 @@ impl Adapter for DatastoreAdapter {
             } else {
                 None
             };
+
+            if let (Some(peer_addr), Some(cert), Some(key)) = (
+                self.config.listen_peer_addr,
+                self.config.cert_file.clone(),
+                self.config.key_file.clone(),
+            ) {
+                let bound_peer = crate::quic::start_quic_server(
+                    peer_addr,
+                    cert.clone(),
+                    key.clone(),
+                    engine.clone(),
+                )
+                .await
+                .map_err(|err| AdapterError {
+                    code: err.diagnostic_code(),
+                })?;
+                *self.peer_bound_addr.lock().unwrap() = Some(bound_peer);
+                spawn_configured_peer_connections(&self.config, &cert, &key, &engine);
+            }
 
             if !context.ready() {
                 return Err(AdapterError {

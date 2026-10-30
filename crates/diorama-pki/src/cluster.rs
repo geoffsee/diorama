@@ -260,8 +260,20 @@ impl ClusterPki {
         )?;
 
         // Datastore Server
-        let ds_server_dns = vec!["localhost".to_string()];
-        let ds_server_ips = vec!["127.0.0.1".parse().unwrap()];
+        let mut ds_server_dns = vec!["localhost".to_string()];
+        let mut ds_server_ips = vec!["127.0.0.1".parse().unwrap()];
+        if !ds_server_ips.contains(&self.config.node_ip) {
+            ds_server_ips.push(self.config.node_ip);
+        }
+        for san in &self.config.extra_sans {
+            if let Ok(ip) = san.parse::<IpAddr>() {
+                if !ds_server_ips.contains(&ip) {
+                    ds_server_ips.push(ip);
+                }
+            } else if !ds_server_dns.contains(san) {
+                ds_server_dns.push(san.clone());
+            }
+        }
         handle_leaf(
             "datastore-server",
             Component::DatastoreServer,
@@ -272,8 +284,8 @@ impl ClusterPki {
         )?;
 
         // Datastore Client
-        let ds_client_dns = vec!["localhost".to_string()];
-        let ds_client_ips = vec!["127.0.0.1".parse().unwrap()];
+        let ds_client_dns = ds_server_dns;
+        let ds_client_ips = ds_server_ips;
         handle_leaf(
             "datastore-client",
             Component::DatastoreClient,
@@ -326,5 +338,190 @@ impl ClusterPki {
             let _ = write!(hex, "{b:02x}");
         }
         Ok(hex)
+    }
+
+    /// Exports shared CA and service-account signing keys for a joining `controller` node.
+    pub fn export_controller_join_material(
+        pki_dir: &Path,
+        assigned_node_id: u64,
+        peers: std::collections::BTreeMap<u64, std::net::SocketAddr>,
+    ) -> Result<crate::token::ControllerJoinMaterial, PkiError> {
+        Ok(crate::token::ControllerJoinMaterial {
+            assigned_node_id,
+            peers,
+            ca_cert_pem: std::fs::read_to_string(pki_dir.join("ca.crt"))?,
+            ca_key_pem: std::fs::read_to_string(pki_dir.join("ca.key"))?,
+            request_header_ca_cert_pem: std::fs::read_to_string(
+                pki_dir.join("request-header-ca.crt"),
+            )?,
+            request_header_ca_key_pem: std::fs::read_to_string(
+                pki_dir.join("request-header-ca.key"),
+            )?,
+            datastore_ca_cert_pem: std::fs::read_to_string(pki_dir.join("datastore-ca.crt"))?,
+            datastore_ca_key_pem: std::fs::read_to_string(pki_dir.join("datastore-ca.key"))?,
+            service_account_key_pem: std::fs::read_to_string(pki_dir.join("service-account.key"))?,
+        })
+    }
+
+    /// Installs shared CA and service-account keys into `pki_dir` before `reconcile()` runs
+    /// on a joining `controller` node.
+    pub fn install_controller_join_material(
+        pki_dir: &Path,
+        material: &crate::token::ControllerJoinMaterial,
+    ) -> Result<(), PkiError> {
+        std::fs::create_dir_all(pki_dir)?;
+        validate_pki_dir(pki_dir)?;
+        crate::atomic_write(
+            &pki_dir.join("ca.crt"),
+            material.ca_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("ca.key"),
+            material.ca_key_pem.as_bytes(),
+            0o600,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("request-header-ca.crt"),
+            material.request_header_ca_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("request-header-ca.key"),
+            material.request_header_ca_key_pem.as_bytes(),
+            0o600,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("datastore-ca.crt"),
+            material.datastore_ca_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("datastore-ca.key"),
+            material.datastore_ca_key_pem.as_bytes(),
+            0o600,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("service-account.key"),
+            material.service_account_key_pem.as_bytes(),
+            0o600,
+        )?;
+        Ok(())
+    }
+
+    /// Issues least-privilege worker credentials signed by the seed controller's CA without
+    /// exposing any CA private keys to the worker node.
+    pub fn issue_worker_join_material(
+        seed_pki_dir: &Path,
+        worker_node_name: &str,
+        worker_node_ip: IpAddr,
+        api_endpoint: &str,
+    ) -> Result<crate::token::WorkerJoinMaterial, PkiError> {
+        let scratch = tempfile::tempdir()?;
+        for file in [
+            "ca.crt",
+            "ca.key",
+            "request-header-ca.crt",
+            "request-header-ca.key",
+            "datastore-ca.crt",
+            "datastore-ca.key",
+            "service-account.key",
+        ] {
+            std::fs::copy(seed_pki_dir.join(file), scratch.path().join(file))?;
+        }
+        let worker_pki = ClusterPki::new(ClusterPkiConfig::new(
+            scratch.path().to_path_buf(),
+            worker_node_name.to_string(),
+            worker_node_ip,
+        ));
+        worker_pki.reconcile()?;
+
+        Ok(crate::token::WorkerJoinMaterial {
+            api_endpoint: api_endpoint.to_string(),
+            ca_cert_pem: std::fs::read_to_string(scratch.path().join("ca.crt"))?,
+            kubelet_cert_pem: std::fs::read_to_string(scratch.path().join("kubelet.crt"))?,
+            kubelet_key_pem: std::fs::read_to_string(scratch.path().join("kubelet.key"))?,
+            kube_proxy_cert_pem: std::fs::read_to_string(scratch.path().join("kube-proxy.crt"))?,
+            kube_proxy_key_pem: std::fs::read_to_string(scratch.path().join("kube-proxy.key"))?,
+            datastore_ca_cert_pem: std::fs::read_to_string(
+                scratch.path().join("datastore-ca.crt"),
+            )?,
+            datastore_server_cert_pem: std::fs::read_to_string(
+                scratch.path().join("datastore-server.crt"),
+            )?,
+            datastore_server_key_pem: std::fs::read_to_string(
+                scratch.path().join("datastore-server.key"),
+            )?,
+        })
+    }
+
+    /// Installs signed worker certificates and kubeconfigs pointing at the controller API server.
+    pub fn install_worker_join_material(
+        pki_dir: &Path,
+        material: &crate::token::WorkerJoinMaterial,
+    ) -> Result<(), PkiError> {
+        std::fs::create_dir_all(pki_dir)?;
+        validate_pki_dir(pki_dir)?;
+        crate::atomic_write(
+            &pki_dir.join("ca.crt"),
+            material.ca_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("kubelet.crt"),
+            material.kubelet_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("kubelet.key"),
+            material.kubelet_key_pem.as_bytes(),
+            0o600,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("kube-proxy.crt"),
+            material.kube_proxy_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("kube-proxy.key"),
+            material.kube_proxy_key_pem.as_bytes(),
+            0o600,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("datastore-ca.crt"),
+            material.datastore_ca_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("datastore-server.crt"),
+            material.datastore_server_cert_pem.as_bytes(),
+            0o644,
+        )?;
+        crate::atomic_write(
+            &pki_dir.join("datastore-server.key"),
+            material.datastore_server_key_pem.as_bytes(),
+            0o600,
+        )?;
+
+        let ca_b64 = BASE64_STANDARD.encode(material.ca_cert_pem.as_bytes());
+        write_kubeconfig(
+            &pki_dir.join("kubelet.kubeconfig"),
+            &material.api_endpoint,
+            "diorama",
+            "kubelet",
+            &ca_b64,
+            &BASE64_STANDARD.encode(material.kubelet_cert_pem.as_bytes()),
+            &BASE64_STANDARD.encode(material.kubelet_key_pem.as_bytes()),
+        )?;
+        write_kubeconfig(
+            &pki_dir.join("kube-proxy.kubeconfig"),
+            &material.api_endpoint,
+            "diorama",
+            "system:kube-proxy",
+            &ca_b64,
+            &BASE64_STANDARD.encode(material.kube_proxy_cert_pem.as_bytes()),
+            &BASE64_STANDARD.encode(material.kube_proxy_key_pem.as_bytes()),
+        )?;
+        Ok(())
     }
 }

@@ -10,6 +10,7 @@ use crate::config::DatastoreConfig;
 use crate::error::DatastoreError;
 use crate::lock::DatastoreLock;
 use crate::model::{DatastoreOp, KeyValue, WatchEvent, WatchEventType, WatchReceiver};
+use crate::raft::{ProposalCommand, RaftHandle};
 use crate::wal::{Wal, WalSummary};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RUBXSNP1";
@@ -36,12 +37,14 @@ impl std::fmt::Debug for EngineState {
 pub struct DatastoreEngine {
     state: Arc<RwLock<EngineState>>,
     config: DatastoreConfig,
+    raft: RaftHandle,
 }
 
 impl std::fmt::Debug for DatastoreEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatastoreEngine")
             .field("config", &self.config)
+            .field("raft", &self.raft)
             .finish_non_exhaustive()
     }
 }
@@ -106,6 +109,8 @@ impl DatastoreEngine {
         }
 
         let (notifier, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let peer_ids: Vec<u64> = config.peers.keys().copied().collect();
+        let raft = RaftHandle::new(config.node_id, &peer_ids, revision);
 
         let engine = Self {
             state: Arc::new(RwLock::new(EngineState {
@@ -116,6 +121,7 @@ impl DatastoreEngine {
                 notifier,
             })),
             config,
+            raft,
         };
 
         Ok((engine, summary))
@@ -123,6 +129,11 @@ impl DatastoreEngine {
 
     pub fn config(&self) -> &DatastoreConfig {
         &self.config
+    }
+
+    #[must_use]
+    pub fn raft(&self) -> &RaftHandle {
+        &self.raft
     }
 
     pub async fn current_revision(&self) -> u64 {
@@ -146,37 +157,52 @@ impl DatastoreEngine {
     }
 
     pub async fn create(&self, key: &str, value: Vec<u8>) -> Result<KeyValue, DatastoreError> {
-        let mut state = self.state.write().await;
-        if state.kv.contains_key(key) {
-            return Err(DatastoreError::KeyAlreadyExists(key.to_string()));
+        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+            return self
+                .raft
+                .forward_proposal(ProposalCommand::Create {
+                    key: key.to_string(),
+                    value,
+                })
+                .await?
+                .into_kv_result();
         }
 
-        let next_rev = state.revision + 1;
-        state.wal.append(
-            next_rev,
-            DatastoreOp::Put {
-                key: key.to_string(),
-                value: value.clone(),
-            },
-        )?;
-
-        state.revision = next_rev;
-        let kv = KeyValue {
+        let op = DatastoreOp::Put {
             key: key.to_string(),
-            value,
-            create_revision: next_rev,
-            mod_revision: next_rev,
-            version: 1,
+            value: value.clone(),
+        };
+        let (kv, next_rev) = {
+            let mut state = self.state.write().await;
+            if state.kv.contains_key(key) {
+                return Err(DatastoreError::KeyAlreadyExists(key.to_string()));
+            }
+
+            let next_rev = state.revision + 1;
+            state.wal.append(next_rev, op.clone())?;
+
+            state.revision = next_rev;
+            let kv = KeyValue {
+                key: key.to_string(),
+                value,
+                create_revision: next_rev,
+                mod_revision: next_rev,
+                version: 1,
+            };
+
+            state.kv.insert(key.to_string(), kv.clone());
+
+            let event = WatchEvent {
+                event_type: WatchEventType::Put,
+                kv: kv.clone(),
+                prev_kv: None,
+            };
+            let _ = state.notifier.send(event);
+            (kv, next_rev)
         };
 
-        state.kv.insert(key.to_string(), kv.clone());
-
-        let event = WatchEvent {
-            event_type: WatchEventType::Put,
-            kv: kv.clone(),
-            prev_kv: None,
-        };
-        let _ = state.notifier.send(event);
+        let term = self.raft.current_term().await;
+        self.raft.record_local_commit(term, next_rev, op).await;
 
         Ok(kv)
     }
@@ -187,51 +213,67 @@ impl DatastoreEngine {
         value: Vec<u8>,
         expected_mod_revision: Option<u64>,
     ) -> Result<KeyValue, DatastoreError> {
-        let mut state = self.state.write().await;
-        let existing = state
-            .kv
-            .get(key)
-            .ok_or_else(|| DatastoreError::KeyNotFound(key.to_string()))?;
-
-        if let Some(expected) = expected_mod_revision
-            && existing.mod_revision != expected
-        {
-            return Err(DatastoreError::RevisionMismatch {
-                expected,
-                actual: existing.mod_revision,
-            });
+        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+            return self
+                .raft
+                .forward_proposal(ProposalCommand::Update {
+                    key: key.to_string(),
+                    value,
+                    expected_mod_revision,
+                })
+                .await?
+                .into_kv_result();
         }
 
-        let next_rev = state.revision + 1;
-        let prev_kv = existing.clone();
-        let create_rev = existing.create_revision;
-        let next_ver = existing.version + 1;
-
-        state.wal.append(
-            next_rev,
-            DatastoreOp::Put {
-                key: key.to_string(),
-                value: value.clone(),
-            },
-        )?;
-
-        state.revision = next_rev;
-        let kv = KeyValue {
+        let op = DatastoreOp::Put {
             key: key.to_string(),
-            value,
-            create_revision: create_rev,
-            mod_revision: next_rev,
-            version: next_ver,
+            value: value.clone(),
+        };
+        let (kv, next_rev) = {
+            let mut state = self.state.write().await;
+            let existing = state
+                .kv
+                .get(key)
+                .ok_or_else(|| DatastoreError::KeyNotFound(key.to_string()))?;
+
+            if let Some(expected) = expected_mod_revision
+                && existing.mod_revision != expected
+            {
+                return Err(DatastoreError::RevisionMismatch {
+                    expected,
+                    actual: existing.mod_revision,
+                });
+            }
+
+            let next_rev = state.revision + 1;
+            let prev_kv = existing.clone();
+            let create_rev = existing.create_revision;
+            let next_ver = existing.version + 1;
+
+            state.wal.append(next_rev, op.clone())?;
+
+            state.revision = next_rev;
+            let kv = KeyValue {
+                key: key.to_string(),
+                value,
+                create_revision: create_rev,
+                mod_revision: next_rev,
+                version: next_ver,
+            };
+
+            state.kv.insert(key.to_string(), kv.clone());
+
+            let event = WatchEvent {
+                event_type: WatchEventType::Put,
+                kv: kv.clone(),
+                prev_kv: Some(prev_kv),
+            };
+            let _ = state.notifier.send(event);
+            (kv, next_rev)
         };
 
-        state.kv.insert(key.to_string(), kv.clone());
-
-        let event = WatchEvent {
-            event_type: WatchEventType::Put,
-            kv: kv.clone(),
-            prev_kv: Some(prev_kv),
-        };
-        let _ = state.notifier.send(event);
+        let term = self.raft.current_term().await;
+        self.raft.record_local_commit(term, next_rev, op).await;
 
         Ok(kv)
     }
@@ -241,39 +283,138 @@ impl DatastoreEngine {
         key: &str,
         expected_mod_revision: Option<u64>,
     ) -> Result<Option<KeyValue>, DatastoreError> {
-        let mut state = self.state.write().await;
-        let Some(existing) = state.kv.get(key).cloned() else {
-            return Ok(None);
-        };
-
-        if let Some(expected) = expected_mod_revision
-            && existing.mod_revision != expected
-        {
-            return Err(DatastoreError::RevisionMismatch {
-                expected,
-                actual: existing.mod_revision,
-            });
+        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+            return self
+                .raft
+                .forward_proposal(ProposalCommand::Delete {
+                    key: key.to_string(),
+                    expected_mod_revision,
+                })
+                .await?
+                .into_delete_result();
         }
 
-        let next_rev = state.revision + 1;
-        state.wal.append(
-            next_rev,
-            DatastoreOp::Delete {
-                key: key.to_string(),
-            },
-        )?;
-
-        state.revision = next_rev;
-        state.kv.remove(key);
-
-        let event = WatchEvent {
-            event_type: WatchEventType::Delete,
-            kv: existing.clone(),
-            prev_kv: Some(existing.clone()),
+        let op = DatastoreOp::Delete {
+            key: key.to_string(),
         };
-        let _ = state.notifier.send(event);
+        let (existing, next_rev) = {
+            let mut state = self.state.write().await;
+            let Some(existing) = state.kv.get(key).cloned() else {
+                return Ok(None);
+            };
+
+            if let Some(expected) = expected_mod_revision
+                && existing.mod_revision != expected
+            {
+                return Err(DatastoreError::RevisionMismatch {
+                    expected,
+                    actual: existing.mod_revision,
+                });
+            }
+
+            let next_rev = state.revision + 1;
+            state.wal.append(next_rev, op.clone())?;
+
+            state.revision = next_rev;
+            state.kv.remove(key);
+
+            let event = WatchEvent {
+                event_type: WatchEventType::Delete,
+                kv: existing.clone(),
+                prev_kv: Some(existing.clone()),
+            };
+            let _ = state.notifier.send(event);
+            (existing, next_rev)
+        };
+
+        let term = self.raft.current_term().await;
+        self.raft.record_local_commit(term, next_rev, op).await;
 
         Ok(Some(existing))
+    }
+
+    pub async fn apply_replicated_record(
+        &self,
+        revision: u64,
+        op: DatastoreOp,
+    ) -> Result<(), DatastoreError> {
+        let mut state = self.state.write().await;
+        if revision <= state.revision {
+            return Ok(());
+        }
+        state.wal.append(revision, op.clone())?;
+        state.revision = revision;
+        match op {
+            DatastoreOp::Put { key, value } => {
+                let prev_kv = state.kv.get(&key).cloned();
+                let (create_revision, version) = match &prev_kv {
+                    Some(prev) => (prev.create_revision, prev.version + 1),
+                    None => (revision, 1),
+                };
+                let kv = KeyValue {
+                    key: key.clone(),
+                    value,
+                    create_revision,
+                    mod_revision: revision,
+                    version,
+                };
+                state.kv.insert(key, kv.clone());
+                let _ = state.notifier.send(WatchEvent {
+                    event_type: WatchEventType::Put,
+                    kv,
+                    prev_kv,
+                });
+            },
+            DatastoreOp::Delete { key } => {
+                if let Some(existing) = state.kv.remove(&key) {
+                    let _ = state.notifier.send(WatchEvent {
+                        event_type: WatchEventType::Delete,
+                        kv: existing.clone(),
+                        prev_kv: Some(existing),
+                    });
+                }
+            },
+        }
+        Ok(())
+    }
+
+    pub async fn install_replicated_snapshot(
+        &self,
+        revision: u64,
+        kv: BTreeMap<String, KeyValue>,
+    ) -> Result<(), DatastoreError> {
+        {
+            let mut state = self.state.write().await;
+            state.kv = kv;
+            state.revision = revision;
+        }
+        self.checkpoint_snapshot().await
+    }
+
+    pub async fn replicate_snapshot_to_peer(&self, peer_id: u64) -> Result<(), DatastoreError> {
+        let (revision, kv) = {
+            let state = self.state.read().await;
+            (state.revision, state.kv.clone())
+        };
+        let term = self.raft.current_term().await;
+        let sent = self
+            .raft
+            .send_to_peer(
+                peer_id,
+                crate::raft::RaftMessage::InstallSnapshot {
+                    term,
+                    leader_id: self.raft.node_id(),
+                    revision,
+                    kv,
+                },
+            )
+            .await;
+        if !sent {
+            return Err(DatastoreError::Fatal(format!(
+                "peer {peer_id} is not connected for snapshot transfer"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn watch(&self, prefix: &str) -> WatchReceiver {

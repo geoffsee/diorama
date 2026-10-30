@@ -17,8 +17,9 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs
 diorama-datastore = { version = "=0.1.0", path = "../diorama-datastore" }
 diorama-pki = { version = "=0.1.0", path = "../diorama-pki" }
 diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
-futures-util = { version = "=0.3.34", default-features = false, features = ["sink"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+tokio-quiche = { version = "=0.20.1", default-features = false }
 tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
 saphyr-parser = { version = "=0.0.11", default-features = false }
 serde = { version = "=1.0.228", features = ["derive"] }
