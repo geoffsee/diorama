@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 shlex = "=2.0.1"
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
+diorama-datastore = { version = "=0.1.0", path = "../diorama-datastore" }
 diorama-pki = { version = "=0.1.0", path = "../diorama-pki" }
 diorama-platform = { version = "=0.1.0", path = "../diorama-platform" }
 diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }

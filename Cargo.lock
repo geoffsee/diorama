@@ -1328,6 +1328,7 @@ version = "0.1.0"
 dependencies = [
  "diorama-assets",
  "diorama-config",
+ "diorama-datastore",
  "diorama-pki",
  "diorama-platform",
  "diorama-supervisor",

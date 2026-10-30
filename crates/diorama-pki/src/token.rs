@@ -173,6 +173,82 @@ impl JoinToken {
         let payload = self.signing_payload();
         verify_rsa_signature_with_cert(&self.ca_cert_pem, &sig, payload.as_bytes())
     }
+
+    /// Returns the Kubernetes Secret name (`bootstrap-token-<token_id>`) in `kube-system`.
+    #[must_use]
+    pub fn secret_name(&self) -> String {
+        format!("bootstrap-token-{}", self.token_id)
+    }
+
+    /// Materializes a Kubernetes `v1/Secret` (`type: bootstrap.kubernetes.io/token`) in `kube-system`.
+    #[must_use]
+    pub fn to_bootstrap_secret_json(&self) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "token-id".to_string(),
+            serde_json::Value::String(BASE64_STANDARD.encode(self.token_id.as_bytes())),
+        );
+        data.insert(
+            "usage-bootstrap-authentication".to_string(),
+            serde_json::Value::String(BASE64_STANDARD.encode(b"true")),
+        );
+        data.insert(
+            "usage-diorama-role".to_string(),
+            serde_json::Value::String(BASE64_STANDARD.encode(self.role.as_str().as_bytes())),
+        );
+        if let Some(exp) = self.expires_at {
+            data.insert(
+                "expiration".to_string(),
+                serde_json::Value::String(BASE64_STANDARD.encode(exp.to_string().as_bytes())),
+            );
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "bootstrap.kubernetes.io/token",
+            "metadata": {
+                "name": self.secret_name(),
+                "namespace": "kube-system"
+            },
+            "data": data
+        })
+    }
+
+    /// Parses a `BootstrapTokenRecord` from a `bootstrap.kubernetes.io/token` Secret JSON object.
+    #[must_use]
+    pub fn from_bootstrap_secret_json(secret: &serde_json::Value) -> Option<BootstrapTokenRecord> {
+        if secret.get("type")?.as_str()? != "bootstrap.kubernetes.io/token" {
+            return None;
+        }
+        let data = secret.get("data")?.as_object()?;
+        let token_id_b64 = data.get("token-id")?.as_str()?;
+        let token_id = String::from_utf8(BASE64_STANDARD.decode(token_id_b64).ok()?).ok()?;
+        let role = if let Some(role_b64) = data.get("usage-diorama-role").and_then(|v| v.as_str()) {
+            let role_str = String::from_utf8(BASE64_STANDARD.decode(role_b64).ok()?).ok()?;
+            JoinRole::from_str(&role_str).ok()?
+        } else {
+            JoinRole::Worker
+        };
+        let expires_at = data
+            .get("expiration")
+            .and_then(|v| v.as_str())
+            .and_then(|b64| BASE64_STANDARD.decode(b64).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        Some(BootstrapTokenRecord {
+            token_id,
+            role,
+            expires_at,
+        })
+    }
+}
+
+/// Metadata decoded from a `bootstrap.kubernetes.io/token` Secret in `kube-system`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapTokenRecord {
+    pub token_id: String,
+    pub role: JoinRole,
+    pub expires_at: Option<u64>,
 }
 
 /// Shared cluster PKI and Raft topology material returned when a `controller` node joins.
@@ -204,6 +280,10 @@ impl fmt::Debug for ControllerJoinMaterial {
 /// Signed node credentials returned when a `worker` node joins.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerJoinMaterial {
+    #[serde(default = "default_worker_node_id")]
+    pub assigned_node_id: u64,
+    #[serde(default)]
+    pub peer_addr: Option<SocketAddr>,
     pub api_endpoint: String,
     pub ca_cert_pem: String,
     pub kubelet_cert_pem: String,
@@ -215,9 +295,15 @@ pub struct WorkerJoinMaterial {
     pub datastore_server_key_pem: String,
 }
 
+fn default_worker_node_id() -> u64 {
+    2
+}
+
 impl fmt::Debug for WorkerJoinMaterial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerJoinMaterial")
+            .field("assigned_node_id", &self.assigned_node_id)
+            .field("peer_addr", &self.peer_addr)
             .field("api_endpoint", &self.api_endpoint)
             .field("kubelet_key_pem", &"<redacted>")
             .field("kube_proxy_key_pem", &"<redacted>")

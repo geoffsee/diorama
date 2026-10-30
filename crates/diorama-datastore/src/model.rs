@@ -28,6 +28,41 @@ pub struct WatchEvent {
     pub prev_kv: Option<KeyValue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteKvRequest {
+    CurrentRevision,
+    Get {
+        key: String,
+    },
+    List {
+        prefix: String,
+    },
+    Create {
+        key: String,
+        value: Vec<u8>,
+    },
+    Update {
+        key: String,
+        value: Vec<u8>,
+        expected_mod_revision: Option<u64>,
+    },
+    Delete {
+        key: String,
+        expected_mod_revision: Option<u64>,
+    },
+    Watch {
+        prefix: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteKvResponse {
+    Revision(u64),
+    Value(Option<KeyValue>),
+    List(Vec<KeyValue>),
+    Mutated(crate::raft::ProposalOutcome),
+}
+
 #[derive(Debug)]
 pub struct WatchReceiver {
     rx: tokio::sync::mpsc::Receiver<WatchEvent>,

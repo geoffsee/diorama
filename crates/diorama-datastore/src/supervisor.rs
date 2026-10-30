@@ -264,9 +264,9 @@ impl Adapter for DatastoreAdapter {
             };
 
             if let (Some(peer_addr), Some(cert), Some(key)) = (
-                self.config.listen_peer_addr,
-                self.config.cert_file.clone(),
-                self.config.key_file.clone(),
+                engine.config().listen_peer_addr,
+                engine.config().cert_file.clone(),
+                engine.config().key_file.clone(),
             ) {
                 let bound_peer = crate::quic::start_quic_server(
                     peer_addr,
@@ -279,10 +279,15 @@ impl Adapter for DatastoreAdapter {
                     code: err.diagnostic_code(),
                 })?;
                 *self.peer_bound_addr.lock().unwrap() = Some(bound_peer);
-                spawn_configured_peer_connections(&self.config, &cert, &key, &engine);
+                spawn_configured_peer_connections(engine.config(), &cert, &key, &engine);
             }
 
+            let ticker_handle = engine
+                .raft()
+                .start_election_ticker(Duration::from_millis(150), Duration::from_millis(300));
+
             if !context.ready() {
+                ticker_handle.abort();
                 return Err(AdapterError {
                     code: "datastore-readiness-rejected",
                 });
@@ -293,6 +298,7 @@ impl Adapter for DatastoreAdapter {
             } else {
                 wait_for_stop(&mut context, &engine).await;
             }
+            ticker_handle.abort();
 
             Ok(())
         })

@@ -42,6 +42,24 @@ pub struct PodExecResult {
     pub stderr: Vec<u8>,
 }
 
+/// Frame sent from the client into an interactive `exec -it` session.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecStreamInput {
+    Stdin(Vec<u8>),
+    Resize { width: u16, height: u16 },
+    Close,
+}
+
+/// Frame emitted from a container during an interactive `exec -it` session.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecStreamOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ResizeAck { width: u16, height: u16 },
+    Exit(i32),
+    Error(String),
+}
+
 /// Runs a command in one container of a stored Pod object.
 #[async_trait]
 pub trait PodExec: std::fmt::Debug + Send + Sync {
@@ -51,6 +69,49 @@ pub trait PodExec: std::fmt::Debug + Send + Sync {
         container: &str,
         command: &[String],
     ) -> Result<PodExecResult, ApiserverError>;
+
+    /// Opens a bidirectional interactive `exec -it` stream for `pod`/`container`.
+    async fn stream_exec_in_pod(
+        &self,
+        pod: &Value,
+        container: &str,
+        command: &[String],
+        tty: bool,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<ExecStreamInput>,
+            tokio::sync::mpsc::Receiver<ExecStreamOutput>,
+        ),
+        ApiserverError,
+    > {
+        let _ = tty;
+        let res = self.exec_in_pod(pod, container, command).await?;
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(32);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            if !res.stdout.is_empty() {
+                let _ = out_tx.send(ExecStreamOutput::Stdout(res.stdout)).await;
+            }
+            if !res.stderr.is_empty() {
+                let _ = out_tx.send(ExecStreamOutput::Stderr(res.stderr)).await;
+            }
+            while let Some(frame) = in_rx.recv().await {
+                match frame {
+                    ExecStreamInput::Stdin(data) => {
+                        let _ = out_tx.send(ExecStreamOutput::Stdout(data)).await;
+                    },
+                    ExecStreamInput::Resize { width, height } => {
+                        let _ = out_tx
+                            .send(ExecStreamOutput::ResizeAck { width, height })
+                            .await;
+                    },
+                    ExecStreamInput::Close => break,
+                }
+            }
+            let _ = out_tx.send(ExecStreamOutput::Exit(res.exit_code)).await;
+        });
+        Ok((in_tx, out_rx))
+    }
 }
 
 /// Decoded `exec` query parameters.

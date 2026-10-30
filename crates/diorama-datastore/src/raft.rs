@@ -23,6 +23,47 @@ pub enum RaftRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRaftState {
+    pub node_id: u64,
+    pub peers: BTreeMap<u64, std::net::SocketAddr>,
+    pub current_term: u64,
+    pub voted_for: Option<u64>,
+}
+
+impl PersistedRaftState {
+    pub fn load(path: &std::path::Path) -> Result<Option<Self>, DatastoreError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)?;
+        let parsed: Self = serde_json::from_slice(&bytes)?;
+        Ok(Some(parsed))
+    }
+
+    pub fn save_atomic(&self, path: &std::path::Path) -> Result<(), DatastoreError> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(parent)?;
+        let tmp = parent.join("raft-state.json.tmp");
+        let payload = serde_json::to_vec_pretty(self)?;
+        std::fs::write(&tmp, payload)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
+fn current_epoch_micros() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalCommand {
     Create {
         key: String,
@@ -298,6 +339,9 @@ pub struct RaftHandle {
     node_id: u64,
     total_voters: Arc<std::sync::atomic::AtomicUsize>,
     dynamic_peers: Arc<RwLock<BTreeMap<u64, std::net::SocketAddr>>>,
+    next_worker_id: Arc<AtomicU64>,
+    persist_path: Option<std::path::PathBuf>,
+    last_heartbeat_micros: Arc<AtomicU64>,
     state: Arc<RwLock<RaftState>>,
     peer_senders: Arc<PeerSenders>,
     pending_proposals: Arc<PendingProposals>,
@@ -315,11 +359,120 @@ impl RaftHandle {
             node_id,
             total_voters: Arc::new(std::sync::atomic::AtomicUsize::new(peer_ids.len() + 1)),
             dynamic_peers: Arc::new(RwLock::new(BTreeMap::new())),
+            next_worker_id: Arc::new(AtomicU64::new(10)),
+            persist_path: None,
+            last_heartbeat_micros: Arc::new(AtomicU64::new(current_epoch_micros())),
             state: Arc::new(RwLock::new(state)),
             peer_senders: Arc::new(RwLock::new(BTreeMap::new())),
             pending_proposals: Arc::new(Mutex::new(BTreeMap::new())),
             next_request_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[must_use]
+    pub fn new_persistent(
+        node_id: u64,
+        peers: BTreeMap<u64, std::net::SocketAddr>,
+        initial_revision: u64,
+        current_term: u64,
+        voted_for: Option<u64>,
+        persist_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let mut state = RaftState::new(node_id, initial_revision);
+        state.current_term = current_term.max(1);
+        state.voted_for = voted_for;
+        if peers.is_empty() {
+            state.promote_to_leader(std::iter::empty());
+        }
+        if let Some(path) = &persist_path {
+            let persisted = PersistedRaftState {
+                node_id,
+                peers: peers.clone(),
+                current_term: state.current_term,
+                voted_for: state.voted_for,
+            };
+            let _ = persisted.save_atomic(path);
+        }
+        Self {
+            node_id,
+            total_voters: Arc::new(std::sync::atomic::AtomicUsize::new(peers.len() + 1)),
+            dynamic_peers: Arc::new(RwLock::new(peers)),
+            next_worker_id: Arc::new(AtomicU64::new(10)),
+            persist_path,
+            last_heartbeat_micros: Arc::new(AtomicU64::new(current_epoch_micros())),
+            state: Arc::new(RwLock::new(state)),
+            peer_senders: Arc::new(RwLock::new(BTreeMap::new())),
+            pending_proposals: Arc::new(Mutex::new(BTreeMap::new())),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub async fn persist_state(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let peers = self.dynamic_peers.read().await.clone();
+        let (current_term, voted_for) = {
+            let state = self.state.read().await;
+            (state.current_term, state.voted_for)
+        };
+        let snapshot = PersistedRaftState {
+            node_id: self.node_id,
+            peers,
+            current_term,
+            voted_for,
+        };
+        let _ = snapshot.save_atomic(path);
+    }
+
+    pub fn record_heartbeat(&self) {
+        self.last_heartbeat_micros
+            .store(current_epoch_micros(), Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn start_election_ticker(
+        &self,
+        min_timeout: std::time::Duration,
+        max_timeout: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let handle = self.clone();
+        let min_us = u64::try_from(min_timeout.as_micros())
+            .unwrap_or(150_000)
+            .max(20_000);
+        let max_us = u64::try_from(max_timeout.as_micros())
+            .unwrap_or(300_000)
+            .max(min_us + 10_000);
+        let span_us = (max_us - min_us).max(1);
+        let heartbeat_interval = std::time::Duration::from_micros((min_us / 3).max(10_000));
+        tokio::spawn(async move {
+            let mut tick: u64 = 0;
+            loop {
+                tokio::time::sleep(heartbeat_interval).await;
+                tick = tick.wrapping_add(1);
+                if handle.total_voters.load(Ordering::Relaxed) <= 1 {
+                    continue;
+                }
+                if handle.is_leader().await {
+                    handle.broadcast_heartbeat().await;
+                    handle.record_heartbeat();
+                    continue;
+                }
+                let jitter = (handle
+                    .node_id
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(tick.wrapping_mul(1_442_695_040_888_963_407)))
+                    % span_us;
+                let timeout_us = min_us + jitter;
+                let elapsed_us = current_epoch_micros()
+                    .saturating_sub(handle.last_heartbeat_micros.load(Ordering::Relaxed));
+                if elapsed_us >= timeout_us {
+                    handle.record_heartbeat();
+                    let peers: Vec<u64> = handle.dynamic_peers().await.keys().copied().collect();
+                    let _ = handle.trigger_election(&peers).await;
+                }
+            }
+        })
     }
 
     #[must_use]
@@ -330,6 +483,11 @@ impl RaftHandle {
     #[must_use]
     pub fn quorum_size(&self) -> usize {
         (self.total_voters.load(Ordering::Relaxed) / 2) + 1
+    }
+
+    #[must_use]
+    pub fn has_peers(&self) -> bool {
+        self.total_voters.load(Ordering::Relaxed) > 1
     }
 
     /// Dynamically registers a peer in the Raft voter set and returns the updated peer map.
@@ -348,6 +506,7 @@ impl RaftHandle {
             .match_revision
             .entry(peer_id)
             .or_insert(0);
+        self.persist_state().await;
     }
 
     /// Allocates a `node_id` for a joining controller peer, registers it in the Raft voter set,
@@ -388,11 +547,17 @@ impl RaftHandle {
             .match_revision
             .entry(assigned_id)
             .or_insert(0);
+        self.persist_state().await;
         (assigned_id, joiner_peers)
     }
 
     pub async fn dynamic_peers(&self) -> BTreeMap<u64, std::net::SocketAddr> {
         self.dynamic_peers.read().await.clone()
+    }
+
+    #[must_use]
+    pub fn allocate_worker_id(&self) -> u64 {
+        self.next_worker_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn role(&self) -> RaftRole {
@@ -436,15 +601,21 @@ impl RaftHandle {
     }
 
     pub async fn trigger_election(&self, peer_ids: &[u64]) -> RaftRole {
-        let vote_req = {
+        let (vote_req, single_voter) = {
             let mut state = self.state.write().await;
             let req = state.start_election();
             if self.quorum_size() <= 1 {
                 state.promote_to_leader(peer_ids.iter().copied());
-                return RaftRole::Leader;
+                (req, true)
+            } else {
+                (req, false)
             }
-            req
         };
+        self.record_heartbeat();
+        self.persist_state().await;
+        if single_voter {
+            return RaftRole::Leader;
+        }
         self.broadcast(&vote_req).await;
         self.role().await
     }
@@ -631,44 +802,65 @@ impl RaftHandle {
         last_log_revision: u64,
         last_log_term: u64,
     ) -> RaftMessage {
-        let mut state = self.state.write().await;
-        if term > state.current_term {
-            state.become_follower(term, None);
+        let (reply, should_persist) = {
+            let mut state = self.state.write().await;
+            let prev_term = state.current_term;
+            let prev_voted = state.voted_for;
+            if term > state.current_term {
+                state.become_follower(term, None);
+            }
+            let (local_rev, local_term) = state.last_log_revision_and_term();
+            let up_to_date = last_log_term > local_term
+                || (last_log_term == local_term && last_log_revision >= local_rev);
+            let can_vote = state.voted_for.is_none() || state.voted_for == Some(candidate_id);
+            let vote_granted = term == state.current_term && can_vote && up_to_date;
+            if vote_granted {
+                state.voted_for = Some(candidate_id);
+                self.record_heartbeat();
+            }
+            let changed = state.current_term != prev_term || state.voted_for != prev_voted;
+            (
+                RaftMessage::RequestVoteReply {
+                    term: state.current_term,
+                    from_id: self.node_id,
+                    vote_granted,
+                },
+                changed,
+            )
+        };
+        if should_persist {
+            self.persist_state().await;
         }
-        let (local_rev, local_term) = state.last_log_revision_and_term();
-        let up_to_date = last_log_term > local_term
-            || (last_log_term == local_term && last_log_revision >= local_rev);
-        let can_vote = state.voted_for.is_none() || state.voted_for == Some(candidate_id);
-        let vote_granted = term == state.current_term && can_vote && up_to_date;
-        if vote_granted {
-            state.voted_for = Some(candidate_id);
-        }
-        RaftMessage::RequestVoteReply {
-            term: state.current_term,
-            from_id: self.node_id,
-            vote_granted,
-        }
+        reply
     }
 
     async fn on_vote_reply(&self, term: u64, from_id: u64, vote_granted: bool, peer_ids: &[u64]) {
-        let became_leader = {
+        let (became_leader, stepped_down) = {
             let mut state = self.state.write().await;
             if term > state.current_term {
                 state.become_follower(term, None);
+                (false, true)
+            } else if state.role != RaftRole::Candidate
+                || term != state.current_term
+                || !vote_granted
+            {
                 return;
-            }
-            if state.role != RaftRole::Candidate || term != state.current_term || !vote_granted {
-                return;
-            }
-            state.votes_received.insert(from_id);
-            if state.votes_received.len() >= self.quorum_size() {
-                state.promote_to_leader(peer_ids.iter().copied());
-                true
             } else {
-                false
+                state.votes_received.insert(from_id);
+                if state.votes_received.len() >= self.quorum_size() {
+                    state.promote_to_leader(peer_ids.iter().copied());
+                    (true, false)
+                } else {
+                    (false, false)
+                }
             }
         };
+        if stepped_down {
+            self.persist_state().await;
+            return;
+        }
         if became_leader {
+            self.record_heartbeat();
             self.broadcast_heartbeat().await;
         }
     }
@@ -681,7 +873,7 @@ impl RaftHandle {
         entries: Vec<LogEntry>,
         leader_commit: u64,
     ) -> RaftMessage {
-        let current_term = {
+        let (current_term, term_changed) = {
             let mut state = self.state.write().await;
             if term < state.current_term {
                 return RaftMessage::AppendEntriesAck {
@@ -691,12 +883,17 @@ impl RaftHandle {
                     success: false,
                 };
             }
+            let prev_term = state.current_term;
             state.become_follower(term, Some(leader_id));
+            self.record_heartbeat();
             for entry in &entries {
                 state.log.insert(entry.revision, entry.clone());
             }
-            state.current_term
+            (state.current_term, state.current_term != prev_term)
         };
+        if term_changed {
+            self.persist_state().await;
+        }
 
         for entry in entries {
             let _ = engine
@@ -720,16 +917,23 @@ impl RaftHandle {
     }
 
     async fn on_append_ack(&self, term: u64, from_id: u64, match_revision: u64, success: bool) {
-        let mut state = self.state.write().await;
-        if term > state.current_term {
-            state.become_follower(term, None);
-            return;
-        }
-        if state.role == RaftRole::Leader && success {
-            let prev = state.match_revision.get(&from_id).copied().unwrap_or(0);
-            if match_revision > prev {
-                state.match_revision.insert(from_id, match_revision);
+        let stepped_down = {
+            let mut state = self.state.write().await;
+            if term > state.current_term {
+                state.become_follower(term, None);
+                true
+            } else {
+                if state.role == RaftRole::Leader && success {
+                    let prev = state.match_revision.get(&from_id).copied().unwrap_or(0);
+                    state
+                        .match_revision
+                        .insert(from_id, match_revision.max(prev));
+                }
+                false
             }
+        };
+        if stepped_down {
+            self.persist_state().await;
         }
     }
 
@@ -741,11 +945,17 @@ impl RaftHandle {
         revision: u64,
         kv: BTreeMap<String, KeyValue>,
     ) -> RaftMessage {
-        {
+        let term_changed = {
             let mut state = self.state.write().await;
+            let prev_term = state.current_term;
             if term >= state.current_term {
                 state.become_follower(term, Some(leader_id));
+                self.record_heartbeat();
             }
+            state.current_term != prev_term
+        };
+        if term_changed {
+            self.persist_state().await;
         }
         let _ = engine.install_replicated_snapshot(revision, kv).await;
         let mut state = self.state.write().await;

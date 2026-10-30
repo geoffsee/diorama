@@ -437,6 +437,8 @@ impl ClusterPki {
         worker_pki.reconcile()?;
 
         Ok(crate::token::WorkerJoinMaterial {
+            assigned_node_id: 2,
+            peer_addr: None,
             api_endpoint: api_endpoint.to_string(),
             ca_cert_pem: std::fs::read_to_string(scratch.path().join("ca.crt"))?,
             kubelet_cert_pem: std::fs::read_to_string(scratch.path().join("kubelet.crt"))?,

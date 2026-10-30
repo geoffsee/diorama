@@ -308,3 +308,171 @@ async fn test_k0s_style_controller_and_worker_join_over_quic() {
     assert!(worker_pki.join("kubelet.kubeconfig").exists());
     assert!(!worker_pki.join("ca.key").exists());
 }
+
+#[tokio::test]
+async fn test_raft_state_persistence_and_automatic_election_ticker() {
+    let tmp = tempdir().unwrap();
+    let pki_dir = tmp.path().join("pki");
+    std::fs::create_dir_all(&pki_dir).unwrap();
+    ClusterPki::new(ClusterPkiConfig::new(
+        pki_dir.clone(),
+        "node-1".to_string(),
+        "127.0.0.1".parse().unwrap(),
+    ))
+    .reconcile()
+    .unwrap();
+    let cert_path = pki_dir.join("datastore-server.crt");
+    let key_path = pki_dir.join("datastore-server.key");
+
+    let addr1: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut peers2 = BTreeMap::new();
+    let placeholder_peer: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+    peers2.insert(1, placeholder_peer);
+
+    // Open node 2 with cluster config and trigger an election so term & voted_for advance
+    let db2_dir = tmp.path().join("node2-db");
+    {
+        let cfg2 = DatastoreConfig::new(&db2_dir)
+            .with_cluster(2, addr1, peers2.clone())
+            .with_dynamic_join(true);
+        let (engine2, _) = DatastoreEngine::open(cfg2).unwrap();
+        engine2.raft().trigger_election(&[1]).await;
+        assert_eq!(engine2.raft().current_term().await, 2);
+    }
+
+    // Reopen node 2 with a bare DatastoreConfig (no --token-file / no cluster flags)
+    // and verify raft-state.json restored node_id, peers, current_term, and voted_for.
+    let (reopened2, _) = DatastoreEngine::open(DatastoreConfig::new(&db2_dir)).unwrap();
+    assert_eq!(reopened2.config().node_id, 2);
+    assert_eq!(reopened2.config().peers.get(&1), Some(&placeholder_peer));
+    assert_eq!(reopened2.raft().current_term().await, 2);
+
+    // Verify automatic election ticker elects a leader when two live nodes connect and heartbeats time out
+    let mut live_peers1 = BTreeMap::new();
+    live_peers1.insert(2, placeholder_peer);
+    let (e1, _) = DatastoreEngine::open(
+        DatastoreConfig::new(tmp.path().join("ticker-1"))
+            .with_cluster(1, addr1, live_peers1)
+            .with_dynamic_join(true),
+    )
+    .unwrap();
+    let bound1 = start_quic_server(addr1, cert_path.clone(), key_path.clone(), e1.clone())
+        .await
+        .unwrap();
+
+    let mut live_peers2 = BTreeMap::new();
+    live_peers2.insert(1, bound1);
+    let (e2, _) = DatastoreEngine::open(
+        DatastoreConfig::new(tmp.path().join("ticker-2"))
+            .with_cluster(2, addr1, live_peers2)
+            .with_dynamic_join(true),
+    )
+    .unwrap();
+    connect_quic_peer(1, bound1, Some(cert_path), Some(key_path), e2.clone())
+        .await
+        .unwrap();
+
+    // Start randomized election ticker on node 2 with short timeout (60..100ms)
+    let _ticker = e2
+        .raft()
+        .start_election_ticker(Duration::from_millis(60), Duration::from_millis(100));
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if e2.raft().is_leader().await {
+            break;
+        }
+    }
+    assert!(
+        e2.raft().is_leader().await,
+        "election ticker should automatically elect node 2 when no leader heartbeats arrive"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_datastore_client_and_bootstrap_token_revocation() {
+    use diorama_datastore::request_cluster_join;
+    use diorama_pki::token::{JoinRequest, JoinResponse, JoinRole, JoinToken};
+
+    let tmp = tempdir().unwrap();
+    let localhost: IpAddr = "127.0.0.1".parse().unwrap();
+    let (seed_pki, seed_engine, seed_peer_addr) = start_seed_controller(tmp.path()).await;
+
+    // 1. Verify Remote DatastoreClient over tokio-quiche (create, get, list, update, delete, watch)
+    let remote_client = DatastoreClient::new_remote(
+        seed_peer_addr,
+        Some(seed_pki.join("datastore-server.crt")),
+        Some(seed_pki.join("datastore-server.key")),
+    );
+    let mut watch_rx = remote_client.watch("/registry/nodes/").await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let created = remote_client
+        .create("/registry/nodes/worker-1", b"ready-v1".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(created.value, b"ready-v1");
+
+    let watched = tokio::time::timeout(Duration::from_secs(3), watch_rx.recv())
+        .await
+        .expect("remote watch timed out")
+        .expect("watch channel closed");
+    assert_eq!(watched.kv.key, "/registry/nodes/worker-1");
+
+    let updated = remote_client
+        .update(
+            "/registry/nodes/worker-1",
+            b"ready-v2".to_vec(),
+            Some(created.mod_revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.value, b"ready-v2");
+
+    let listed = remote_client.list("/registry/nodes/").await.unwrap();
+    assert_eq!(listed.len(), 1);
+
+    let deleted = remote_client
+        .delete("/registry/nodes/worker-1", Some(updated.mod_revision))
+        .await
+        .unwrap();
+    assert!(deleted.is_some());
+
+    // 2. Verify Bootstrap Token Secret backing, listing, and revocation
+    let tok1 = JoinToken::create_from_pki_dir(
+        &seed_pki,
+        JoinRole::Worker,
+        "https://127.0.0.1:6443".into(),
+        seed_peer_addr,
+        Some(3600),
+    )
+    .unwrap();
+    seed_engine.register_bootstrap_token(&tok1).await.unwrap();
+
+    let listed_tokens = seed_engine.list_bootstrap_tokens().await.unwrap();
+    assert_eq!(listed_tokens.len(), 1);
+    assert_eq!(listed_tokens[0].token_id, tok1.token_id);
+
+    // Revoke tok1 via invalidate_bootstrap_token and verify join is rejected
+    seed_engine
+        .invalidate_bootstrap_token(&tok1.token_id)
+        .await
+        .unwrap();
+    assert_eq!(seed_engine.list_bootstrap_tokens().await.unwrap().len(), 0);
+
+    let resp = request_cluster_join(
+        seed_peer_addr,
+        &JoinRequest {
+            token: tok1,
+            node_name: "worker-revoked".to_string(),
+            node_ip: localhost,
+            listen_peer_addr: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(resp, JoinResponse::Rejected(ref msg) if msg.contains("revoked")),
+        "expected revoked rejection, got {resp:?}"
+    );
+}

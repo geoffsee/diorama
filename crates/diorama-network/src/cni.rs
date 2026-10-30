@@ -11,6 +11,13 @@ pub const DEFAULT_STANDARD_CNI_BIN_DIR: &str = "/opt/cni/bin";
 pub const REQUIRED_CNI_PLUGINS: [&str; 4] = ["bridge", "host-local", "portmap", "loopback"];
 pub const CNI_CONFIG_EXTENSIONS: [&str; 3] = [".conf", ".conflist", ".json"];
 
+/// Allocates a unique `/24` `PodCIDR` subnet for `node_id` (`10.42.<node_id>.0/24`).
+#[must_use]
+pub fn pod_cidr_for_node(node_id: u64) -> String {
+    let octet = u8::try_from(node_id % 255).unwrap_or(0);
+    format!("10.42.{octet}.0/24")
+}
+
 /// Results of inspecting the CNI configuration directory ordering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CniOrderingInspection {

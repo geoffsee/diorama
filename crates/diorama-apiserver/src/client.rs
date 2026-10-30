@@ -380,6 +380,61 @@ impl KubernetesApiClient {
     }
 
     #[must_use]
+    pub fn new_remote_node(
+        storage: KubernetesStorage,
+        node_name: &str,
+        client_ca_file: std::path::PathBuf,
+    ) -> Self {
+        let mut cfg = ApiserverConfig::default_for_pki(
+            client_ca_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        cfg.client_ca_file = client_ca_file;
+        Self::new(
+            storage,
+            ClientIdentity::User {
+                username: format!("system:node:{node_name}"),
+                groups: vec![
+                    "system:nodes".to_string(),
+                    "system:authenticated".to_string(),
+                ],
+            },
+            Arc::new(RbacAuthorizer::new()),
+            None,
+            Arc::new(AdmissionEngine::new()),
+            Arc::new(AggregationManager::new()),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            &cfg,
+        )
+    }
+
+    #[must_use]
+    pub fn new_remote_admin(
+        storage: KubernetesStorage,
+        client_ca_file: std::path::PathBuf,
+    ) -> Self {
+        let mut cfg = ApiserverConfig::default_for_pki(
+            client_ca_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        cfg.client_ca_file = client_ca_file;
+        Self::new(
+            storage,
+            ClientIdentity::AdminCertificate,
+            Arc::new(RbacAuthorizer::new()),
+            None,
+            Arc::new(AdmissionEngine::new()),
+            Arc::new(AggregationManager::new()),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            &cfg,
+        )
+    }
+
+    #[must_use]
     pub fn service_cluster_ip_range(&self) -> &str {
         &self.service_cluster_ip_range
     }

@@ -10,7 +10,7 @@ use crate::config::DatastoreConfig;
 use crate::error::DatastoreError;
 use crate::lock::DatastoreLock;
 use crate::model::{DatastoreOp, KeyValue, WatchEvent, WatchEventType, WatchReceiver};
-use crate::raft::{ProposalCommand, RaftHandle};
+use crate::raft::{PersistedRaftState, ProposalCommand, RaftHandle};
 use crate::wal::{Wal, WalSummary};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RUBXSNP1";
@@ -55,7 +55,7 @@ impl DatastoreEngine {
         crate::client::DatastoreClient::new(self.clone())
     }
 
-    pub fn open(config: DatastoreConfig) -> Result<(Self, WalSummary), DatastoreError> {
+    pub fn open(mut config: DatastoreConfig) -> Result<(Self, WalSummary), DatastoreError> {
         config.validate()?;
 
         // Ensure data directory exists
@@ -63,6 +63,25 @@ impl DatastoreEngine {
 
         // Acquire lock
         let lock = DatastoreLock::acquire(&config.data_dir)?;
+
+        let raft_state_path = config.raft_state_path();
+        let persisted_raft = PersistedRaftState::load(&raft_state_path)?;
+        let (initial_term, initial_voted_for) = if let Some(persisted) = persisted_raft {
+            if config.peers.is_empty() && config.node_id == 1 {
+                config.node_id = persisted.node_id;
+            }
+            for (peer_id, peer_addr) in persisted.peers {
+                if peer_id != config.node_id {
+                    config.peers.entry(peer_id).or_insert(peer_addr);
+                }
+            }
+            if !config.peers.is_empty() {
+                config.dial_all_peers = true;
+            }
+            (persisted.current_term, persisted.voted_for)
+        } else {
+            (1, None)
+        };
 
         // Load snapshot if present
         let snapshot_path = config.snapshot_path();
@@ -109,8 +128,14 @@ impl DatastoreEngine {
         }
 
         let (notifier, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let peer_ids: Vec<u64> = config.peers.keys().copied().collect();
-        let raft = RaftHandle::new(config.node_id, &peer_ids, revision);
+        let raft = RaftHandle::new_persistent(
+            config.node_id,
+            config.peers.clone(),
+            revision,
+            initial_term,
+            initial_voted_for,
+            Some(raft_state_path),
+        );
 
         let engine = Self {
             state: Arc::new(RwLock::new(EngineState {
@@ -157,7 +182,7 @@ impl DatastoreEngine {
     }
 
     pub async fn create(&self, key: &str, value: Vec<u8>) -> Result<KeyValue, DatastoreError> {
-        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+        if self.raft.has_peers() && !self.raft.is_leader().await {
             return self
                 .raft
                 .forward_proposal(ProposalCommand::Create {
@@ -213,7 +238,7 @@ impl DatastoreEngine {
         value: Vec<u8>,
         expected_mod_revision: Option<u64>,
     ) -> Result<KeyValue, DatastoreError> {
-        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+        if self.raft.has_peers() && !self.raft.is_leader().await {
             return self
                 .raft
                 .forward_proposal(ProposalCommand::Update {
@@ -283,7 +308,7 @@ impl DatastoreEngine {
         key: &str,
         expected_mod_revision: Option<u64>,
     ) -> Result<Option<KeyValue>, DatastoreError> {
-        if !self.config.peers.is_empty() && !self.raft.is_leader().await {
+        if self.raft.has_peers() && !self.raft.is_leader().await {
             return self
                 .raft
                 .forward_proposal(ProposalCommand::Delete {
@@ -540,6 +565,94 @@ impl DatastoreEngine {
         }
 
         Ok(meta)
+    }
+
+    pub const BOOTSTRAP_SECRET_PREFIX: &'static str =
+        "/registry/secrets/kube-system/bootstrap-token-";
+    pub const BOOTSTRAP_ISSUED_PREFIX: &'static str = "/registry/bootstrap-tokens-issued/";
+    pub const BOOTSTRAP_REVOKED_PREFIX: &'static str = "/registry/bootstrap-tokens-revoked/";
+
+    pub async fn register_bootstrap_token(
+        &self,
+        token: &diorama_pki::token::JoinToken,
+    ) -> Result<KeyValue, DatastoreError> {
+        let issued_key = format!("{}{}", Self::BOOTSTRAP_ISSUED_PREFIX, token.token_id);
+        match self.create(&issued_key, b"issued".to_vec()).await {
+            Ok(_) | Err(DatastoreError::KeyAlreadyExists(_)) => {},
+            Err(err) => return Err(err),
+        }
+        let key = format!("{}{}", Self::BOOTSTRAP_SECRET_PREFIX, token.token_id);
+        let value = serde_json::to_vec(&token.to_bootstrap_secret_json())?;
+        match self.create(&key, value.clone()).await {
+            Ok(kv) => Ok(kv),
+            Err(DatastoreError::KeyAlreadyExists(_)) => self.update(&key, value, None).await,
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn list_bootstrap_tokens(
+        &self,
+    ) -> Result<Vec<diorama_pki::token::BootstrapTokenRecord>, DatastoreError> {
+        let items = self.list(Self::BOOTSTRAP_SECRET_PREFIX).await?;
+        let mut records = Vec::new();
+        for kv in items {
+            let Ok(secret) = serde_json::from_slice::<serde_json::Value>(&kv.value) else {
+                continue;
+            };
+            let Some(rec) = diorama_pki::token::JoinToken::from_bootstrap_secret_json(&secret)
+            else {
+                continue;
+            };
+            let revoked_key = format!("{}{}", Self::BOOTSTRAP_REVOKED_PREFIX, rec.token_id);
+            if self.get(&revoked_key).await?.is_none() {
+                records.push(rec);
+            }
+        }
+        Ok(records)
+    }
+
+    pub async fn invalidate_bootstrap_token(&self, token_id: &str) -> Result<bool, DatastoreError> {
+        let secret_key = format!("{}{token_id}", Self::BOOTSTRAP_SECRET_PREFIX);
+        let deleted = self.delete(&secret_key, None).await?.is_some();
+        let revoked_key = format!("{}{token_id}", Self::BOOTSTRAP_REVOKED_PREFIX);
+        match self.create(&revoked_key, b"revoked".to_vec()).await {
+            Ok(_) | Err(DatastoreError::KeyAlreadyExists(_)) => {},
+            Err(err) => return Err(err),
+        }
+        Ok(deleted)
+    }
+
+    pub async fn verify_bootstrap_token(
+        &self,
+        token: &diorama_pki::token::JoinToken,
+        now_secs: u64,
+    ) -> Result<(), String> {
+        let revoked_key = format!("{}{}", Self::BOOTSTRAP_REVOKED_PREFIX, token.token_id);
+        if self.get(&revoked_key).await.ok().flatten().is_some() {
+            return Err("join token has been revoked".to_string());
+        }
+        let secret_key = format!("{}{}", Self::BOOTSTRAP_SECRET_PREFIX, token.token_id);
+        if let Some(kv) = self.get(&secret_key).await.ok().flatten() {
+            let secret: serde_json::Value = serde_json::from_slice(&kv.value)
+                .map_err(|_| "corrupt bootstrap token secret".to_string())?;
+            let rec = diorama_pki::token::JoinToken::from_bootstrap_secret_json(&secret)
+                .ok_or_else(|| "invalid bootstrap token secret".to_string())?;
+            if rec.role != token.role {
+                return Err("join token role mismatch with bootstrap secret".to_string());
+            }
+            if let Some(exp) = rec.expires_at
+                && now_secs > exp
+            {
+                return Err("join token secret has expired".to_string());
+            }
+            return Ok(());
+        }
+        let issued_key = format!("{}{}", Self::BOOTSTRAP_ISSUED_PREFIX, token.token_id);
+        if self.get(&issued_key).await.ok().flatten().is_some() {
+            return Err("join token secret was deleted or invalidated".to_string());
+        }
+        let _ = self.register_bootstrap_token(token).await;
+        Ok(())
     }
 
     fn read_snapshot(path: &Path) -> Result<(BTreeMap<String, KeyValue>, u64), DatastoreError> {
