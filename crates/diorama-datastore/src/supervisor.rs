@@ -222,7 +222,8 @@ fn spawn_configured_peer_connections(
     cert: &std::path::Path,
     key: &std::path::Path,
     engine: &DatastoreEngine,
-) {
+) -> JoinSet<()> {
+    let mut peer_tasks = JoinSet::new();
     for (&peer_id, &remote_addr) in &config.peers {
         if !config.dial_all_peers && peer_id <= config.node_id {
             continue;
@@ -230,10 +231,11 @@ fn spawn_configured_peer_connections(
         let eng = engine.clone();
         let c = Some(cert.to_path_buf());
         let k = Some(key.to_path_buf());
-        tokio::spawn(async move {
+        peer_tasks.spawn(async move {
             let _ = crate::quic::connect_quic_peer(peer_id, remote_addr, c, k, eng).await;
         });
     }
+    peer_tasks
 }
 
 impl Adapter for DatastoreAdapter {
@@ -263,12 +265,14 @@ impl Adapter for DatastoreAdapter {
                 None
             };
 
+            let mut quic_server_handle = None;
+            let mut peer_tasks = JoinSet::new();
             if let (Some(peer_addr), Some(cert), Some(key)) = (
                 engine.config().listen_peer_addr,
                 engine.config().cert_file.clone(),
                 engine.config().key_file.clone(),
             ) {
-                let bound_peer = crate::quic::start_quic_server(
+                let (bound_peer, handle) = crate::quic::start_quic_server_with_handle(
                     peer_addr,
                     cert.clone(),
                     key.clone(),
@@ -279,7 +283,9 @@ impl Adapter for DatastoreAdapter {
                     code: err.diagnostic_code(),
                 })?;
                 *self.peer_bound_addr.lock().unwrap() = Some(bound_peer);
-                spawn_configured_peer_connections(engine.config(), &cert, &key, &engine);
+                quic_server_handle = Some(handle);
+                peer_tasks =
+                    spawn_configured_peer_connections(engine.config(), &cert, &key, &engine);
             }
 
             let ticker_handle = engine
@@ -288,6 +294,11 @@ impl Adapter for DatastoreAdapter {
 
             if !context.ready() {
                 ticker_handle.abort();
+                if let Some(handle) = quic_server_handle {
+                    handle.abort();
+                }
+                peer_tasks.abort_all();
+                engine.release_lock().await;
                 return Err(AdapterError {
                     code: "datastore-readiness-rejected",
                 });
@@ -299,6 +310,11 @@ impl Adapter for DatastoreAdapter {
                 wait_for_stop(&mut context, &engine).await;
             }
             ticker_handle.abort();
+            if let Some(handle) = quic_server_handle {
+                handle.abort();
+            }
+            peer_tasks.abort_all();
+            engine.release_lock().await;
 
             Ok(())
         })

@@ -90,6 +90,7 @@ impl RenderedBatch {
         fields["schema"] = 1.into();
         fields["level"] = level.name().into();
         fields["event"] = event.into();
+        sort_json_keys(&mut fields);
         let mut line = fields.to_string();
         line.push('\n');
         if line.len() > MAX_FRAME_BYTES || line.len() > MAX_BATCH_BYTES - self.bytes {
@@ -98,6 +99,25 @@ impl RenderedBatch {
             self.bytes += line.len();
             self.frames.push(LogFrame(line));
         }
+    }
+}
+
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, Value> =
+                std::mem::take(map).into_iter().collect();
+            for (k, mut v) in sorted {
+                sort_json_keys(&mut v);
+                map.insert(k, v);
+            }
+        },
+        Value::Array(items) => {
+            for item in items {
+                sort_json_keys(item);
+            }
+        },
+        _ => {},
     }
 }
 

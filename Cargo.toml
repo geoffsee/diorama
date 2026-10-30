@@ -44,7 +44,7 @@ must_use_candidate = "allow"
 [profile.dev]
 incremental = true
 debug = "line-tables-only"
-codegen-backend = "cranelift"
+codegen-backend = "llvm"
 
 # Optimize dependencies in dev so runtime isn't a debug build of the world.
 # Workspace crates are reset below so editing them stays at opt-level 0.

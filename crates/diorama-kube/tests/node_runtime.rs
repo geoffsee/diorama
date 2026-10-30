@@ -636,6 +636,10 @@ async fn test_portainer_wiring_and_object_preservation_across_runs() {
                 .get_configmap("portainer", "portainer-agent-edge")
                 .await
                 .is_ok()
+                && client
+                    .get_deployment("portainer", "portainer-agent")
+                    .await
+                    .is_ok()
             {
                 break;
             }
@@ -643,7 +647,7 @@ async fn test_portainer_wiring_and_object_preservation_across_runs() {
         }
     })
     .await
-    .expect("portainer configmap is reconciled");
+    .expect("portainer resources are reconciled");
 
     assert_all_portainer_resources_exist(&client).await;
     mutate_portainer_configmap(&client).await;

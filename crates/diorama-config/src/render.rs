@@ -46,7 +46,9 @@ fn mapping(value: &Value, indent: usize, out: &mut String) -> Result<(), ConfigE
     let map = value
         .as_object()
         .ok_or_else(|| failure("expected document mapping"))?;
-    for (key, value) in map {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(a, _)| *a);
+    for (key, value) in entries {
         out.push_str(&" ".repeat(indent));
         out.push_str(&inline_string(key)?);
         out.push(':');

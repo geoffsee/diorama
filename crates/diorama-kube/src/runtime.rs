@@ -676,7 +676,7 @@ impl NodeRuntime {
         let token = diorama_pki::token::JoinToken::decode(&raw_token)?;
         let state_dir = PathBuf::from(&config.config().path);
         detect_workload_runtime(config.config(), &state_dir)?;
-        std::fs::create_dir_all(&state_dir)?;
+        tokio::fs::create_dir_all(&state_dir).await?;
 
         let candidates = diorama_network::discover_host_interfaces();
         let node_ip = node_ip_for_config(&config.config().network.node_ip, &candidates);

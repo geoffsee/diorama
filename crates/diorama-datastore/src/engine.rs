@@ -20,7 +20,7 @@ pub struct EngineState {
     pub(crate) kv: BTreeMap<String, KeyValue>,
     pub(crate) revision: u64,
     pub(crate) wal: Wal,
-    pub(crate) _lock: DatastoreLock,
+    pub(crate) lock: Option<DatastoreLock>,
     pub(crate) notifier: broadcast::Sender<WatchEvent>,
 }
 
@@ -53,6 +53,10 @@ impl DatastoreEngine {
     #[must_use]
     pub fn client(&self) -> crate::client::DatastoreClient {
         crate::client::DatastoreClient::new(self.clone())
+    }
+
+    pub(crate) async fn release_lock(&self) {
+        self.state.write().await.lock = None;
     }
 
     pub fn open(mut config: DatastoreConfig) -> Result<(Self, WalSummary), DatastoreError> {
@@ -142,7 +146,7 @@ impl DatastoreEngine {
                 kv,
                 revision,
                 wal,
-                _lock: lock,
+                lock: Some(lock),
                 notifier,
             })),
             config,

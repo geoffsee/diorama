@@ -38,6 +38,7 @@ pub struct ApiserverService {
 
 impl ApiserverService {
     pub fn new(config: ApiserverConfig, storage: KubernetesStorage) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let rbac = Arc::new(RbacAuthorizer::new());
         let token_service = Arc::new(RwLock::new(None));
         let admission = Arc::new(AdmissionEngine::new());

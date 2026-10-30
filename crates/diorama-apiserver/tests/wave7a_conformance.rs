@@ -110,6 +110,7 @@ impl TestServer {
         content_type: Option<&str>,
         body: &str,
     ) -> (u16, String) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut roots = RootCertStore::empty();
         let ca_bytes = std::fs::read(self.pki_dir.join("ca.crt")).unwrap();
         for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_bytes) {

@@ -49,6 +49,17 @@ pub async fn start_quic_server(
     key_file: PathBuf,
     engine: DatastoreEngine,
 ) -> Result<SocketAddr, DatastoreError> {
+    let (local_addr, _handle) =
+        start_quic_server_with_handle(listen_addr, cert_file, key_file, engine).await?;
+    Ok(local_addr)
+}
+
+pub(crate) async fn start_quic_server_with_handle(
+    listen_addr: SocketAddr,
+    cert_file: PathBuf,
+    key_file: PathBuf,
+    engine: DatastoreEngine,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), DatastoreError> {
     let udp = match UdpSocket::bind(listen_addr).await {
         Ok(sock) => sock,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -70,11 +81,12 @@ pub async fn start_quic_server(
     let mut listeners = listen([udp], params, DefaultMetrics)?;
     let mut accept_stream = listeners.remove(0);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         while let Some(Ok(conn)) = accept_stream.next().await {
             let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
             let quic_conn = conn.start(driver);
-            tokio::spawn(handle_server_connection(
+            connections.spawn(handle_server_connection(
                 engine.clone(),
                 local_addr,
                 controller,
@@ -83,7 +95,7 @@ pub async fn start_quic_server(
         }
     });
 
-    Ok(local_addr)
+    Ok((local_addr, handle))
 }
 
 async fn handle_server_connection<T: Send + 'static>(
@@ -93,12 +105,13 @@ async fn handle_server_connection<T: Send + 'static>(
     quic_conn: T,
 ) {
     let _keep_alive = quic_conn;
+    let mut streams = tokio::task::JoinSet::new();
     while let Some(event) = controller.event_receiver_mut().recv().await {
         if let ServerH3Event::Headers {
             incoming_headers, ..
         } = event
         {
-            tokio::spawn(handle_server_stream(
+            streams.spawn(handle_server_stream(
                 engine.clone(),
                 local_addr,
                 incoming_headers,
@@ -489,7 +502,7 @@ async fn evaluate_join_request(
     let Some(pki_dir) = ca_file.parent() else {
         return JoinResponse::Rejected("invalid seed node PKI directory".into());
     };
-    let Ok(ca_cert_pem) = std::fs::read_to_string(pki_dir.join("ca.crt")) else {
+    let Ok(ca_cert_pem) = tokio::fs::read_to_string(pki_dir.join("ca.crt")).await else {
         return JoinResponse::Rejected("failed to read seed cluster ca.crt".into());
     };
     let now_secs = std::time::SystemTime::now()
