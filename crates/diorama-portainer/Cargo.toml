@@ -12,7 +12,7 @@ diorama-apiserver = { version = "=0.1.0", path = "../diorama-apiserver" }
 diorama-config = { version = "=0.1.0", path = "../diorama-config" }
 diorama-platform = { version = "=0.1.0", path = "../diorama-platform" }
 diorama-supervisor = { version = "=0.1.0", path = "../diorama-supervisor" }
-serde = { version = "=1.0.228", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 thiserror = "=2.0.18"
 tokio = { version = "=1.54.1", features = ["rt", "macros", "sync", "time"] }
