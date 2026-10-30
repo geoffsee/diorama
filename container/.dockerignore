@@ -1,5 +1,6 @@
 .git
 target
 third_party/saphyr-parser/target
+third_party/datagram-socket/target
 *.qcow2
 libnull.rlib

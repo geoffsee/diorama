@@ -19,12 +19,12 @@ after_stop = "podman rm -f diorama-1 diorama-2"
 
 [[service]]
 name = "diorama-1"
-cmd = "podman run --rm --replace --privileged --network diorama-net --hostname diorama-1 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-1:/var/lib/diorama -p 6443:6443 --name diorama-1 ${IMAGE:-localhost/diorama:latest} --container-mode --node-name=diorama-1"
+cmd = "podman run --rm --replace --privileged --network diorama-net --hostname diorama-1 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-1:/var/lib/diorama -p 6443:6443 -e DIORAMA_NODE_NAME=diorama-1 --name diorama-1 ${IMAGE:-localhost/diorama:latest} --container-mode"
 log_capacity = 5000
 hooks = { before_start = "(podman network exists diorama-net || podman network create diorama-net) && podman rm -f diorama-1", after_stop = "podman rm -f diorama-1" }
 
 [[service]]
 name = "diorama-2"
-cmd = "until podman exec diorama-1 dioramactl token list >/dev/null 2>&1 && TOKEN=$(podman exec diorama-1 dioramactl token create --role controller 2>/dev/null) && [ -n \"$TOKEN\" ]; do sleep 1; done && exec podman run --rm --replace --privileged --network diorama-net --hostname diorama-2 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-2:/var/lib/diorama -p 6444:6443 -e DIORAMA_JOIN_TOKEN=\"$TOKEN\" --name diorama-2 ${IMAGE:-localhost/diorama:latest} --container-mode --node-name=diorama-2"
+cmd = "until podman exec diorama-1 dioramactl token list >/dev/null 2>&1 && TOKEN=$(podman exec diorama-1 dioramactl token create --role controller 2>/dev/null) && [ -n \"$TOKEN\" ]; do sleep 1; done && exec podman run --rm --replace --privileged --network diorama-net --hostname diorama-2 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-2:/var/lib/diorama -p 6444:6443 -e DIORAMA_NODE_NAME=diorama-2 -e DIORAMA_JOIN_TOKEN=\"$TOKEN\" --name diorama-2 ${IMAGE:-localhost/diorama:latest} --container-mode"
 log_capacity = 5000
 hooks = { before_start = "(podman network exists diorama-net || podman network create diorama-net) && podman rm -f diorama-2", after_stop = "podman rm -f diorama-2" }

@@ -122,25 +122,53 @@ pub fn parse(args: &[String]) -> Result<TokenOptions, crate::ParseError> {
     Ok(options)
 }
 
+fn parse_kubeconfig_server(
+    kubeconfig: &str,
+    default_peer: SocketAddr,
+) -> Option<(String, SocketAddr, bool)> {
+    for line in kubeconfig.lines() {
+        let Some(server) = line.trim().strip_prefix("server:") else {
+            continue;
+        };
+        let api = server.trim().trim_matches('"').to_string();
+        if let Some(host_port) = api.strip_prefix("https://")
+            && let Ok(sock) = host_port.parse::<SocketAddr>()
+        {
+            return Some((
+                api,
+                SocketAddr::new(sock.ip(), 2380),
+                !sock.ip().is_loopback(),
+            ));
+        }
+        return Some((api, default_peer, false));
+    }
+    None
+}
+
 fn discover_endpoints_from_pki(pki_dir: &Path) -> (String, SocketAddr) {
     let default_api = "https://127.0.0.1:6443".to_string();
     let default_peer: SocketAddr = "127.0.0.1:2380".parse().unwrap();
+    let mut fallback: Option<(String, SocketAddr)> = None;
 
-    let Ok(kubeconfig) = std::fs::read_to_string(pki_dir.join("admin.kubeconfig")) else {
-        return (default_api, default_peer);
-    };
-    for line in kubeconfig.lines() {
-        if let Some(server) = line.trim().strip_prefix("server:") {
-            let api = server.trim().trim_matches('"').to_string();
-            if let Some(host_port) = api.strip_prefix("https://")
-                && let Ok(sock) = host_port.parse::<SocketAddr>()
-            {
-                return (api, SocketAddr::new(sock.ip(), 2380));
+    for filename in [
+        "kubelet.kubeconfig",
+        "kube-controller-manager.kubeconfig",
+        "admin.kubeconfig",
+    ] {
+        let Ok(kubeconfig) = std::fs::read_to_string(pki_dir.join(filename)) else {
+            continue;
+        };
+        if let Some((api, peer, non_loopback)) = parse_kubeconfig_server(&kubeconfig, default_peer)
+        {
+            if non_loopback {
+                return (api, peer);
             }
-            return (api, default_peer);
+            if fallback.is_none() {
+                fallback = Some((api, peer));
+            }
         }
     }
-    (default_api, default_peer)
+    fallback.unwrap_or((default_api, default_peer))
 }
 
 fn open_token_datastore_client(
