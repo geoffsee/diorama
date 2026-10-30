@@ -375,14 +375,24 @@ impl RuntimeBuilder {
         runtime_component: impl Into<String>,
     ) -> Self {
         let log_reader: Arc<dyn PodLogReader> = Arc::new(kubelet.log_source());
-        if let Some(apiserver) = &self.apiserver {
-            apiserver.set_pod_log_reader(log_reader.clone());
-        }
-        self.kubelet_log_reader = Some(log_reader);
         let exec: Arc<dyn PodExec> = Arc::new(kubelet.exec_source());
         if let Some(apiserver) = &self.apiserver {
-            apiserver.set_pod_exec(exec.clone());
+            let router = Arc::new(
+                diorama_apiserver::ClusterPodRouter::new(
+                    kubelet.options().node_name.clone(),
+                    apiserver.storage().clone(),
+                )
+                .with_local_log_reader(log_reader.clone())
+                .with_local_exec(exec.clone())
+                .with_client_tls(
+                    apiserver.config().tls_cert_file.clone(),
+                    apiserver.config().tls_private_key_file.clone(),
+                ),
+            );
+            apiserver.set_pod_log_reader(router.clone());
+            apiserver.set_pod_exec(router);
         }
+        self.kubelet_log_reader = Some(log_reader);
         self.kubelet_exec = Some(exec);
 
         let timeout = self.policy.startup_timeout();
@@ -539,11 +549,9 @@ impl NodeRuntime {
         let client = apiserver_service.admin_client();
 
         let controller_cfg = ControllerManagerConfig::default_for_pki(&pki_dir, node_ip);
-        let mut controller_service =
-            ControllerManagerService::new(controller_cfg, apiserver_service.clone());
-        if !peer_routes.is_empty() {
-            controller_service = controller_service.with_leader_election(node_name.clone(), 15);
-        }
+        let controller_service =
+            ControllerManagerService::new(controller_cfg, apiserver_service.clone())
+                .with_leader_election(node_name.clone(), 15);
 
         let dns_config = CoreDnsConfig::new();
         let dns_service = CoreDnsService::new(dns_config, Arc::new(client.clone()));

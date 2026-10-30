@@ -43,6 +43,23 @@ fn default_quic_settings() -> QuicSettings {
     settings
 }
 
+fn client_bind_addr(peer_addr: SocketAddr) -> SocketAddr {
+    match peer_addr {
+        SocketAddr::V4(v4) if v4.ip().is_loopback() => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+        },
+        SocketAddr::V4(_) => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        },
+        SocketAddr::V6(v6) if v6.ip().is_loopback() => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0)
+        },
+        SocketAddr::V6(_) => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        },
+    }
+}
+
 pub async fn start_quic_server(
     listen_addr: SocketAddr,
     cert_file: PathBuf,
@@ -321,12 +338,7 @@ pub async fn execute_remote_kv_rpc(
     key_file: Option<&std::path::Path>,
     request: &RemoteKvRequest,
 ) -> Result<RemoteKvResponse, DatastoreError> {
-    let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "[::1]:0".parse().unwrap()
-    };
-    let udp = UdpSocket::bind(bind_addr).await?;
+    let udp = UdpSocket::bind(client_bind_addr(peer_addr)).await?;
     udp.connect(peer_addr).await?;
     let socket = Socket::try_from(udp)?;
 
@@ -399,12 +411,7 @@ async fn run_remote_kv_watch_stream(
     prefix: String,
     tx: mpsc::Sender<crate::model::WatchEvent>,
 ) -> Result<(), DatastoreError> {
-    let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "[::1]:0".parse().unwrap()
-    };
-    let udp = UdpSocket::bind(bind_addr).await?;
+    let udp = UdpSocket::bind(client_bind_addr(peer_addr)).await?;
     udp.connect(peer_addr).await?;
     let socket = Socket::try_from(udp)?;
 
@@ -555,12 +562,7 @@ pub async fn request_cluster_join(
     peer_addr: SocketAddr,
     request: &JoinRequest,
 ) -> Result<JoinResponse, DatastoreError> {
-    let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "[::1]:0".parse().unwrap()
-    };
-    let udp = UdpSocket::bind(bind_addr).await?;
+    let udp = UdpSocket::bind(client_bind_addr(peer_addr)).await?;
     udp.connect(peer_addr).await?;
     let socket = Socket::try_from(udp)?;
 
@@ -629,12 +631,7 @@ pub async fn connect_quic_peer(
     key_file: Option<PathBuf>,
     engine: DatastoreEngine,
 ) -> Result<(), DatastoreError> {
-    let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "[::1]:0".parse().unwrap()
-    };
-    let udp = UdpSocket::bind(bind_addr).await?;
+    let udp = UdpSocket::bind(client_bind_addr(peer_addr)).await?;
     udp.connect(peer_addr).await?;
     let socket = Socket::try_from(udp)?;
 

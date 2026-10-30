@@ -670,10 +670,18 @@ impl RaftHandle {
         &self,
         command: ProposalCommand,
     ) -> Result<ProposalOutcome, DatastoreError> {
-        let leader = self
-            .leader_id()
-            .await
-            .ok_or_else(|| DatastoreError::Fatal("no active raft leader".into()))?;
+        let mut leader_opt = self.leader_id().await;
+        if leader_opt.is_none() {
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                leader_opt = self.leader_id().await;
+                if leader_opt.is_some() {
+                    break;
+                }
+            }
+        }
+        let leader =
+            leader_opt.ok_or_else(|| DatastoreError::Fatal("no active raft leader".into()))?;
         let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending_proposals.lock().await.insert(req_id, tx);

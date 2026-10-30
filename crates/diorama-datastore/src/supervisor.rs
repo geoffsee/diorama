@@ -238,6 +238,18 @@ fn spawn_configured_peer_connections(
     peer_tasks
 }
 
+async fn wait_for_configured_peer_leader(engine: &DatastoreEngine) {
+    if engine.config().peers.is_empty() {
+        return;
+    }
+    for _ in 0..100 {
+        if engine.raft().leader_id().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 impl Adapter for DatastoreAdapter {
     fn run(self: Box<Self>, mut context: AdapterContext) -> AdapterFuture {
         Box::pin(async move {
@@ -286,6 +298,7 @@ impl Adapter for DatastoreAdapter {
                 quic_server_handle = Some(handle);
                 peer_tasks =
                     spawn_configured_peer_connections(engine.config(), &cert, &key, &engine);
+                wait_for_configured_peer_leader(&engine).await;
             }
 
             let ticker_handle = engine

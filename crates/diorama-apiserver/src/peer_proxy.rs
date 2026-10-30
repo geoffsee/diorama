@@ -152,19 +152,27 @@ impl ClusterPodRouter {
         if let Some(addr) = self.peer_endpoints.read().unwrap().get(node_name).copied() {
             return Ok(addr);
         }
-        let key = format!("/registry/minions/{node_name}");
-        let kv = self
-            .storage
-            .client()
-            .get(&key)
-            .await
-            .map_err(|e| ApiserverError::Internal {
+        let primary_key = format!("{}/nodes/{node_name}", self.storage.prefix());
+        let fallback_key = format!("/registry/minions/{node_name}");
+        let kv = match self.storage.client().get(&primary_key).await.map_err(|e| {
+            ApiserverError::Internal {
                 reason: format!("failed to query node {node_name}: {e}"),
-            })?
-            .ok_or_else(|| ApiserverError::NotFound {
-                resource: "nodes".into(),
-                name: node_name.to_string(),
-            })?;
+            }
+        })? {
+            Some(found) => found,
+            None => self
+                .storage
+                .client()
+                .get(&fallback_key)
+                .await
+                .map_err(|e| ApiserverError::Internal {
+                    reason: format!("failed to query node {node_name}: {e}"),
+                })?
+                .ok_or_else(|| ApiserverError::NotFound {
+                    resource: "nodes".into(),
+                    name: node_name.to_string(),
+                })?,
+        };
         let node_doc: Value =
             serde_json::from_slice(&kv.value).map_err(|e| ApiserverError::Internal {
                 reason: format!("corrupt node document for {node_name}: {e}"),
@@ -206,10 +214,15 @@ impl ClusterPodRouter {
         ),
         ApiserverError,
     > {
-        let bind_addr: SocketAddr = if peer_addr.is_ipv4() {
-            "127.0.0.1:0".parse().unwrap()
-        } else {
-            "[::1]:0".parse().unwrap()
+        let bind_addr: SocketAddr = match peer_addr {
+            SocketAddr::V4(v4) if v4.ip().is_loopback() => {
+                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+            },
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(v6) if v6.ip().is_loopback() => {
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0)
+            },
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
         };
         let udp = UdpSocket::bind(bind_addr)
             .await

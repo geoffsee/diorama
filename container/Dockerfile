@@ -53,6 +53,7 @@ RUN printf '%s\n' \
     done
 
 COPY --chmod=755 dist/diorama /usr/local/bin/diorama
+COPY --chmod=755 dist/dioramactl /usr/local/bin/dioramactl
 COPY --chmod=755 container/entrypoint.sh /usr/local/bin/diorama-entrypoint
 
 VOLUME ["/var/lib/diorama"]

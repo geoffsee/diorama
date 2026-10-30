@@ -309,6 +309,17 @@ impl KubeletService {
         self.registration.register_or_update().await?;
         self.registration.update_lease().await?;
         self.running.store(true, Ordering::SeqCst);
+        if let Ok(ip) = self.options.node_ip.parse::<std::net::IpAddr>()
+            && !ip.is_loopback()
+        {
+            let _ = self
+                .start_quic_proxy_server(
+                    SocketAddr::new(ip, 10255),
+                    self.options.cert_file.clone(),
+                    self.options.key_file.clone(),
+                )
+                .await;
+        }
         Ok(())
     }
 

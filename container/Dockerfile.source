@@ -29,9 +29,10 @@ RUN set -eu; \
     rustup target add "$target"; \
     cc_var=CC_$(printf '%s' "$target" | tr '-' '_'); \
     export "$cc_var=musl-gcc"; \
-    cargo build --locked --release --target "$target" -p diorama; \
+    cargo build --locked --release --target "$target" -p diorama -p dioramactl; \
     mkdir -p /out; \
-    cp "target/$target/release/diorama" /out/diorama
+    cp "target/$target/release/diorama" /out/diorama; \
+    cp "target/$target/release/dioramactl" /out/dioramactl
 
 FROM alpine:3.22
 
@@ -57,6 +58,7 @@ RUN printf '%s\n' \
     done
 
 COPY --from=build --chmod=755 /out/diorama /usr/local/bin/diorama
+COPY --from=build --chmod=755 /out/dioramactl /usr/local/bin/dioramactl
 COPY --chmod=755 container/entrypoint.sh /usr/local/bin/diorama-entrypoint
 
 VOLUME ["/var/lib/diorama"]
