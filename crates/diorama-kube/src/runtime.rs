@@ -158,6 +158,7 @@ pub struct RuntimeBuilder {
     client: Option<KubernetesApiClient>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     datastore_bound_addr: Option<Arc<Mutex<Option<SocketAddr>>>>,
+    datastore_peer_bound_addr: Option<Arc<Mutex<Option<SocketAddr>>>>,
     kubelet_log_reader: Option<Arc<dyn PodLogReader>>,
     kubelet_exec: Option<Arc<dyn PodExec>>,
     registrations: Vec<Registration>,
@@ -177,6 +178,7 @@ impl RuntimeBuilder {
             client: None,
             metrics_registry: None,
             datastore_bound_addr: None,
+            datastore_peer_bound_addr: None,
             kubelet_log_reader: None,
             kubelet_exec: None,
             registrations: Vec::new(),
@@ -354,12 +356,12 @@ impl RuntimeBuilder {
             proxy = proxy.with_client(Arc::new(client));
         }
         let timeout = self.policy.startup_timeout();
-        let reg = ProxyAdapter::registration(
-            COMPONENT_PROXY,
-            proxy,
-            vec![COMPONENT_APISERVER.to_string()],
-            timeout,
-        );
+        let prerequisites = if self.apiserver.is_some() {
+            vec![COMPONENT_APISERVER.to_string()]
+        } else {
+            Vec::new()
+        };
+        let reg = ProxyAdapter::registration(COMPONENT_PROXY, proxy, prerequisites, timeout);
         self.register_component(reg)
     }
 
@@ -373,23 +375,33 @@ impl RuntimeBuilder {
         runtime_component: impl Into<String>,
     ) -> Self {
         let log_reader: Arc<dyn PodLogReader> = Arc::new(kubelet.log_source());
-        if let Some(apiserver) = &self.apiserver {
-            apiserver.set_pod_log_reader(log_reader.clone());
-        }
-        self.kubelet_log_reader = Some(log_reader);
         let exec: Arc<dyn PodExec> = Arc::new(kubelet.exec_source());
         if let Some(apiserver) = &self.apiserver {
-            apiserver.set_pod_exec(exec.clone());
+            let router = Arc::new(
+                diorama_apiserver::ClusterPodRouter::new(
+                    kubelet.options().node_name.clone(),
+                    apiserver.storage().clone(),
+                )
+                .with_local_log_reader(log_reader.clone())
+                .with_local_exec(exec.clone())
+                .with_client_tls(
+                    apiserver.config().tls_cert_file.clone(),
+                    apiserver.config().tls_private_key_file.clone(),
+                ),
+            );
+            apiserver.set_pod_log_reader(router.clone());
+            apiserver.set_pod_exec(router);
         }
+        self.kubelet_log_reader = Some(log_reader);
         self.kubelet_exec = Some(exec);
 
         let timeout = self.policy.startup_timeout();
-        let reg = KubeletAdapter::registration(
-            COMPONENT_KUBELET,
-            kubelet,
-            vec![COMPONENT_APISERVER.to_string(), runtime_component.into()],
-            timeout,
-        );
+        let mut prerequisites = Vec::new();
+        if self.apiserver.is_some() {
+            prerequisites.push(COMPONENT_APISERVER.to_string());
+        }
+        prerequisites.push(runtime_component.into());
+        let reg = KubeletAdapter::registration(COMPONENT_KUBELET, kubelet, prerequisites, timeout);
         self.register_component(reg)
     }
 
@@ -416,6 +428,15 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_datastore_peer_bound_addr(
+        mut self,
+        bound_addr: Arc<Mutex<Option<SocketAddr>>>,
+    ) -> Self {
+        self.datastore_peer_bound_addr = Some(bound_addr);
+        self
+    }
+
     /// Builds the supervised node runtime.
     pub fn build(self) -> Result<NodeRuntime, RuntimeError> {
         let component_ids: Vec<String> = self
@@ -432,6 +453,7 @@ impl RuntimeBuilder {
             client: self.client,
             metrics_registry: self.metrics_registry,
             datastore_bound_addr: self.datastore_bound_addr,
+            datastore_peer_bound_addr: self.datastore_peer_bound_addr,
             component_ids,
             supervisor,
             observer,
@@ -449,6 +471,7 @@ pub struct NodeRuntime {
     client: Option<KubernetesApiClient>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     datastore_bound_addr: Option<Arc<Mutex<Option<SocketAddr>>>>,
+    datastore_peer_bound_addr: Option<Arc<Mutex<Option<SocketAddr>>>>,
     component_ids: Vec<String>,
     supervisor: Supervisor,
     observer: LifecycleObserver,
@@ -488,6 +511,10 @@ impl NodeRuntime {
         detect_workload_runtime(config.config(), &state_dir)?;
         std::fs::create_dir_all(&state_dir)?;
 
+        if let Some(worker_state) = load_persisted_worker_state(&state_dir) {
+            return assemble_worker_runtime(config, config_path, host, &state_dir, &worker_state);
+        }
+
         let (node_ip, pki_dir, node_name) = initialize_pki(&state_dir, &config)?;
 
         let datastore_dir = state_dir.join("datastore");
@@ -497,11 +524,19 @@ impl NodeRuntime {
             pki_dir.join("datastore-server.crt"),
             pki_dir.join("datastore-server.key"),
         );
+        datastore_cfg.listen_peer_addr = Some(SocketAddr::new(node_ip, 2380));
         if config.config().storage.db_wal_repair {
             datastore_cfg = datastore_cfg.with_wal_repair(true);
         }
 
         let (engine, _) = DatastoreEngine::open(datastore_cfg.clone())?;
+        let assigned_node_id = engine.config().node_id;
+        let peer_routes: Vec<(u64, IpAddr)> = engine
+            .config()
+            .peers
+            .iter()
+            .map(|(&id, addr)| (id, addr.ip()))
+            .collect();
         let storage = KubernetesStorage::new(engine.client(), "/registry");
 
         let mut apiserver_cfg = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
@@ -515,7 +550,8 @@ impl NodeRuntime {
 
         let controller_cfg = ControllerManagerConfig::default_for_pki(&pki_dir, node_ip);
         let controller_service =
-            ControllerManagerService::new(controller_cfg, apiserver_service.clone());
+            ControllerManagerService::new(controller_cfg, apiserver_service.clone())
+                .with_leader_election(node_name.clone(), 15);
 
         let dns_config = CoreDnsConfig::new();
         let dns_service = CoreDnsService::new(dns_config, Arc::new(client.clone()));
@@ -525,11 +561,13 @@ impl NodeRuntime {
 
         let datastore_adapter = DatastoreAdapter::from_engine(engine);
         let datastore_bound_handle = datastore_adapter.bound_addr_handle();
+        let datastore_peer_handle = datastore_adapter.peer_bound_addr_handle();
 
         let mut builder = RuntimeBuilder::new(config)
             .with_apiserver(apiserver_service.clone())
             .with_client(client.clone())
-            .with_datastore_bound_addr(datastore_bound_handle);
+            .with_datastore_bound_addr(datastore_bound_handle)
+            .with_datastore_peer_bound_addr(datastore_peer_handle);
 
         let datastore_reg = DatastoreAdapter::registration_with_adapter(
             COMPONENT_DATASTORE,
@@ -558,39 +596,16 @@ impl NodeRuntime {
             pki_dir: &pki_dir,
             node_name: &node_name,
             node_ip,
+            assigned_node_id,
+            peer_routes: &peer_routes,
             host: &host,
             apiserver_service: &apiserver_service,
             dns_service,
         };
         builder = register_workload_path(builder, workload_ctx)?;
-
-        if builder.config().config().storage.local_path.enabled {
-            let managed_containerd = builder
-                .registrations()
-                .iter()
-                .any(|registration| registration.spec.id == COMPONENT_CONTAINERD);
-            let storage_config = local_path_config(builder.config().config(), managed_containerd);
-            let storage_service = LocalPathService::new(storage_config, Arc::new(client.clone()));
-            let storage_reg = LocalPathAdapter::registration(
-                COMPONENT_LOCAL_PATH,
-                storage_service,
-                vec![COMPONENT_APISERVER.to_string()],
-                timeout,
-            );
-            builder = builder.register_component(storage_reg);
-        }
-
+        builder = register_local_path_if_enabled(builder, &client, timeout);
         builder = register_operational_metrics(builder, &datastore_cfg, &pki_dir, timeout);
-        if builder.config().config().api.enabled {
-            let socket_path = if builder.config().config().api.socket_path.is_empty() {
-                state_dir.join("config.sock")
-            } else {
-                PathBuf::from(&builder.config().config().api.socket_path)
-            };
-            let server = crate::config_api::ConfigApiServer::new(socket_path, config_path, host);
-            builder = builder.register_config_api(server);
-        }
-
+        builder = register_config_api_if_enabled(builder, &state_dir, config_path, host);
         builder = register_portainer_if_enabled(builder, client);
 
         builder.build()
@@ -647,6 +662,70 @@ impl NodeRuntime {
     #[must_use]
     pub fn datastore_bound_addr_handle(&self) -> Option<Arc<Mutex<Option<SocketAddr>>>> {
         self.datastore_bound_addr.clone()
+    }
+
+    #[must_use]
+    pub fn datastore_peer_bound_addr(&self) -> Option<SocketAddr> {
+        self.datastore_peer_bound_addr
+            .as_ref()
+            .and_then(|a| *a.lock().unwrap())
+    }
+
+    /// Assembles a node runtime, performing a k0s-style QUIC cluster join when a join token is provided.
+    pub async fn from_config_with_join(
+        config: ValidatedConfig,
+        config_path: PathBuf,
+        host: diorama_config::HostContext,
+        join_token: Option<String>,
+    ) -> Result<Self, RuntimeError> {
+        let Some(raw_token) = join_token.filter(|s| !s.trim().is_empty()) else {
+            return Self::from_config_with_context(config, config_path, host);
+        };
+        let token = diorama_pki::token::JoinToken::decode(&raw_token)?;
+        let state_dir = PathBuf::from(&config.config().path);
+        detect_workload_runtime(config.config(), &state_dir)?;
+        tokio::fs::create_dir_all(&state_dir).await?;
+
+        let candidates = diorama_network::discover_host_interfaces();
+        let node_ip = node_ip_for_config(&config.config().network.node_ip, &candidates);
+        let node_name = if config.config().kubernetes.node_name.is_empty() {
+            "diorama-node".to_string()
+        } else {
+            config.config().kubernetes.node_name.clone()
+        };
+        let listen_peer_addr = SocketAddr::new(node_ip, 2380);
+
+        let join_req = diorama_pki::token::JoinRequest {
+            token,
+            node_name: node_name.clone(),
+            node_ip,
+            listen_peer_addr: Some(listen_peer_addr),
+        };
+        let join_resp =
+            diorama_datastore::request_cluster_join(join_req.token.peer_addr, &join_req).await?;
+
+        match join_resp {
+            diorama_pki::token::JoinResponse::Controller(material) => assemble_joined_controller(
+                config,
+                config_path,
+                host,
+                node_ip,
+                &node_name,
+                listen_peer_addr,
+                &material,
+            ),
+            diorama_pki::token::JoinResponse::Worker(material) => assemble_joined_worker(
+                config,
+                config_path,
+                host,
+                &state_dir,
+                (&node_name, node_ip, join_req.token.peer_addr),
+                &material,
+            ),
+            diorama_pki::token::JoinResponse::Rejected(reason) => Err(RuntimeError::Io(
+                io::Error::new(io::ErrorKind::PermissionDenied, reason),
+            )),
+        }
     }
 
     #[must_use]
@@ -864,6 +943,298 @@ fn initialize_pki(
     Ok((node_ip, pki_dir, node_name))
 }
 
+fn assemble_joined_controller(
+    config: ValidatedConfig,
+    config_path: PathBuf,
+    host: diorama_config::HostContext,
+    node_ip: IpAddr,
+    node_name: &str,
+    listen_peer_addr: SocketAddr,
+    material: &diorama_pki::token::ControllerJoinMaterial,
+) -> Result<NodeRuntime, RuntimeError> {
+    let state_dir = PathBuf::from(&config.config().path);
+    let pki_dir = state_dir.join("pki");
+    ClusterPki::install_controller_join_material(&pki_dir, material)?;
+    ClusterPki::new(ClusterPkiConfig::new(
+        pki_dir.clone(),
+        node_name.to_string(),
+        node_ip,
+    ))
+    .reconcile()?;
+
+    let datastore_dir = state_dir.join("datastore");
+    std::fs::create_dir_all(&datastore_dir)?;
+    let datastore_cfg = DatastoreConfig::new(datastore_dir)
+        .with_client_tls(
+            pki_dir.join("datastore-ca.crt"),
+            pki_dir.join("datastore-server.crt"),
+            pki_dir.join("datastore-server.key"),
+        )
+        .with_cluster(
+            material.assigned_node_id,
+            listen_peer_addr,
+            material.peers.clone(),
+        )
+        .with_dynamic_join(true)
+        .with_wal_repair(config.config().storage.db_wal_repair);
+
+    let (engine, _) = DatastoreEngine::open(datastore_cfg.clone())?;
+    let storage = KubernetesStorage::new(engine.client(), "/registry");
+
+    let mut apiserver_cfg = ApiserverConfig::default_for_pki(&pki_dir, node_ip);
+    apiserver_cfg.etcd_servers = vec!["https://127.0.0.1:2379".to_string()];
+    apiserver_cfg.etcd_ca_file = Some(pki_dir.join("datastore-ca.crt"));
+    apiserver_cfg.etcd_cert_file = Some(pki_dir.join("datastore-client.crt"));
+    apiserver_cfg.etcd_key_file = Some(pki_dir.join("datastore-client.key"));
+
+    let apiserver_service = Arc::new(ApiserverService::new(apiserver_cfg, storage));
+    let client = apiserver_service.admin_client();
+
+    let controller_cfg = ControllerManagerConfig::default_for_pki(&pki_dir, node_ip);
+    let controller_service =
+        ControllerManagerService::new(controller_cfg, apiserver_service.clone())
+            .with_leader_election(node_name.to_string(), 15);
+
+    let dns_service = CoreDnsService::new(CoreDnsConfig::new(), Arc::new(client.clone()));
+    let policy = LifecyclePolicy::from_config(&config);
+    let timeout = policy.startup_timeout();
+
+    let datastore_adapter = DatastoreAdapter::from_engine(engine);
+    let datastore_bound_handle = datastore_adapter.bound_addr_handle();
+    let datastore_peer_handle = datastore_adapter.peer_bound_addr_handle();
+
+    let mut builder = RuntimeBuilder::new(config)
+        .with_apiserver(apiserver_service.clone())
+        .with_client(client.clone())
+        .with_datastore_bound_addr(datastore_bound_handle)
+        .with_datastore_peer_bound_addr(datastore_peer_handle)
+        .register_component(DatastoreAdapter::registration_with_adapter(
+            COMPONENT_DATASTORE,
+            datastore_adapter,
+            timeout,
+        ))
+        .register_component(ApiserverAdapter::registration(
+            COMPONENT_APISERVER,
+            (*apiserver_service).clone(),
+            vec![COMPONENT_DATASTORE.to_string()],
+            timeout,
+        ))
+        .register_component(ControllerManagerAdapter::registration(
+            COMPONENT_CONTROLLER_MANAGER,
+            controller_service,
+            vec![COMPONENT_APISERVER.to_string()],
+            timeout,
+        ));
+
+    let peer_routes: Vec<(u64, IpAddr)> = material
+        .peers
+        .iter()
+        .map(|(&id, addr)| (id, addr.ip()))
+        .collect();
+    builder = register_workload_path(
+        builder,
+        WorkloadContext {
+            state_dir: &state_dir,
+            pki_dir: &pki_dir,
+            node_name,
+            node_ip,
+            assigned_node_id: material.assigned_node_id,
+            peer_routes: &peer_routes,
+            host: &host,
+            apiserver_service: &apiserver_service,
+            dns_service,
+        },
+    )?;
+    builder = register_operational_metrics(builder, &datastore_cfg, &pki_dir, timeout);
+    if builder.config().config().api.enabled {
+        let socket_path = if builder.config().config().api.socket_path.is_empty() {
+            state_dir.join("config.sock")
+        } else {
+            PathBuf::from(&builder.config().config().api.socket_path)
+        };
+        builder = builder.register_config_api(crate::config_api::ConfigApiServer::new(
+            socket_path,
+            config_path,
+            host,
+        ));
+    }
+    builder.build()
+}
+
+#[derive(Debug, Clone)]
+struct PersistedWorkerState {
+    assigned_node_id: u64,
+    peer_addr: SocketAddr,
+    node_name: String,
+    node_ip: IpAddr,
+}
+
+fn load_persisted_worker_state(state_dir: &Path) -> Option<PersistedWorkerState> {
+    let bytes = std::fs::read(state_dir.join("worker-state.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(PersistedWorkerState {
+        assigned_node_id: val.get("assigned_node_id")?.as_u64()?,
+        peer_addr: val.get("peer_addr")?.as_str()?.parse().ok()?,
+        node_name: val.get("node_name")?.as_str()?.to_string(),
+        node_ip: val.get("node_ip")?.as_str()?.parse().ok()?,
+    })
+}
+
+fn assemble_joined_worker(
+    config: ValidatedConfig,
+    config_path: PathBuf,
+    host: diorama_config::HostContext,
+    state_dir: &Path,
+    node_identity: (&str, IpAddr, SocketAddr),
+    material: &diorama_pki::token::WorkerJoinMaterial,
+) -> Result<NodeRuntime, RuntimeError> {
+    let pki_dir = state_dir.join("pki");
+    ClusterPki::install_worker_join_material(&pki_dir, material)?;
+    std::fs::write(state_dir.join(".cluster-role"), b"worker\n")?;
+    let (node_name, node_ip, fallback_peer_addr) = node_identity;
+    let peer_addr = material.peer_addr.unwrap_or(fallback_peer_addr);
+    let worker_state = PersistedWorkerState {
+        assigned_node_id: material.assigned_node_id,
+        peer_addr,
+        node_name: node_name.to_string(),
+        node_ip,
+    };
+    let doc = serde_json::json!({
+        "assigned_node_id": worker_state.assigned_node_id,
+        "peer_addr": worker_state.peer_addr.to_string(),
+        "node_name": worker_state.node_name,
+        "node_ip": worker_state.node_ip.to_string(),
+    });
+    if let Ok(encoded) = serde_json::to_vec_pretty(&doc) {
+        let _ = std::fs::write(state_dir.join("worker-state.json"), encoded);
+    }
+    assemble_worker_runtime(config, config_path, host, state_dir, &worker_state)
+}
+
+fn assemble_worker_runtime(
+    config: ValidatedConfig,
+    config_path: PathBuf,
+    host: diorama_config::HostContext,
+    state_dir: &Path,
+    worker_state: &PersistedWorkerState,
+) -> Result<NodeRuntime, RuntimeError> {
+    let pki_dir = state_dir.join("pki");
+    let allocated_cidr = diorama_network::pod_cidr_for_node(worker_state.assigned_node_id);
+    let _ = diorama_network::ensure_cross_node_routes(
+        worker_state.assigned_node_id,
+        &[(1, worker_state.peer_addr.ip())],
+        &diorama_network::SystemCommandExecutor,
+    );
+    let remote_ds = diorama_datastore::DatastoreClient::new_remote(
+        worker_state.peer_addr,
+        Some(pki_dir.join("datastore-server.crt")),
+        Some(pki_dir.join("datastore-server.key")),
+    );
+    let remote_storage = KubernetesStorage::new(remote_ds, "/registry");
+    let node_client = KubernetesApiClient::new_remote_node(
+        remote_storage.clone(),
+        &worker_state.node_name,
+        pki_dir.join("ca.crt"),
+    );
+    let admin_client =
+        KubernetesApiClient::new_remote_admin(remote_storage, pki_dir.join("ca.crt"));
+
+    let mut builder = RuntimeBuilder::new(config).with_client(admin_client.clone());
+    if let Some((runtime_id, socket_path)) =
+        detect_workload_runtime(builder.config().config(), state_dir)?
+    {
+        let mtu = u32::try_from(builder.config().config().network.mtu)
+            .ok()
+            .filter(|&m| m > 0)
+            .unwrap_or(diorama_network::DEFAULT_MTU);
+        builder = register_container_runtime(
+            builder,
+            state_dir,
+            &socket_path,
+            runtime_id,
+            mtu,
+            Some(allocated_cidr.as_str()),
+        )?;
+
+        let is_container = builder
+            .config()
+            .config()
+            .runtime
+            .container_mode
+            .unwrap_or(host.detected_container_mode);
+        let executor = diorama_network::SystemCommandExecutor;
+        let proxy_mode =
+            diorama_proxy::detect_proxy_backend(None, &executor).unwrap_or(ProxyMode::IpTables);
+        let proxy_opts = KubeProxyOptions::new(
+            pki_dir.join("kube-proxy.kubeconfig"),
+            is_container,
+            proxy_mode,
+        );
+        builder = builder
+            .register_proxy(ProxyService::new(proxy_opts).with_client(Arc::new(admin_client)));
+
+        let kubelet_dir = state_dir.join("kubelet");
+        std::fs::create_dir_all(&kubelet_dir)?;
+        let mut kubelet_opts = KubeletConfigOptions::default_for_pki(
+            &pki_dir,
+            worker_state.node_name.clone(),
+            worker_state.node_ip.to_string(),
+            &kubelet_dir,
+        );
+        kubelet_opts.runtime_endpoint = format!("unix://{}", socket_path.display());
+        kubelet_opts.container_mode = is_container;
+        let runtime_provider: Arc<dyn RuntimeProvider> =
+            Arc::new(CriRuntimeProvider::new(socket_path));
+        let kubelet_service =
+            KubeletService::from_client(kubelet_opts, Arc::new(node_client), runtime_provider)
+                .with_multi_node(true);
+        builder = builder.register_kubelet(kubelet_service, runtime_id);
+    }
+    builder = register_config_api_if_enabled(builder, state_dir, config_path, host);
+    builder.build()
+}
+
+fn register_local_path_if_enabled(
+    builder: RuntimeBuilder,
+    client: &KubernetesApiClient,
+    timeout: std::time::Duration,
+) -> RuntimeBuilder {
+    if !builder.config().config().storage.local_path.enabled {
+        return builder;
+    }
+    let managed_containerd = builder
+        .registrations()
+        .iter()
+        .any(|registration| registration.spec.id == COMPONENT_CONTAINERD);
+    let storage_config = local_path_config(builder.config().config(), managed_containerd);
+    let storage_service = LocalPathService::new(storage_config, Arc::new(client.clone()));
+    let storage_reg = LocalPathAdapter::registration(
+        COMPONENT_LOCAL_PATH,
+        storage_service,
+        vec![COMPONENT_APISERVER.to_string()],
+        timeout,
+    );
+    builder.register_component(storage_reg)
+}
+
+fn register_config_api_if_enabled(
+    builder: RuntimeBuilder,
+    state_dir: &Path,
+    config_path: PathBuf,
+    host: diorama_config::HostContext,
+) -> RuntimeBuilder {
+    if !builder.config().config().api.enabled {
+        return builder;
+    }
+    let socket_path = if builder.config().config().api.socket_path.is_empty() {
+        state_dir.join("config.sock")
+    } else {
+        PathBuf::from(&builder.config().config().api.socket_path)
+    };
+    let server = crate::config_api::ConfigApiServer::new(socket_path, config_path, host);
+    builder.register_config_api(server)
+}
+
 fn register_portainer_if_enabled(
     mut builder: RuntimeBuilder,
     client: KubernetesApiClient,
@@ -889,6 +1260,8 @@ struct WorkloadContext<'a> {
     pki_dir: &'a Path,
     node_name: &'a str,
     node_ip: IpAddr,
+    assigned_node_id: u64,
+    peer_routes: &'a [(u64, IpAddr)],
     host: &'a diorama_config::HostContext,
     apiserver_service: &'a Arc<ApiserverService>,
     dns_service: CoreDnsService,
@@ -1074,7 +1447,7 @@ fn register_workload_path(
             .ok()
             .filter(|&m| m > 0)
             .unwrap_or(diorama_network::DEFAULT_MTU);
-        let pod_cidr = Some(diorama_network::DEFAULT_POD_CIDR);
+        let allocated_cidr = diorama_network::pod_cidr_for_node(ctx.assigned_node_id);
 
         builder = register_container_runtime(
             builder,
@@ -1082,7 +1455,7 @@ fn register_workload_path(
             &socket_path,
             runtime_id,
             mtu,
-            pod_cidr,
+            Some(allocated_cidr.as_str()),
         )?;
 
         let proxy_kubeconfig = ctx.pki_dir.join("kube-proxy.kubeconfig");
@@ -1093,6 +1466,13 @@ fn register_workload_path(
             .container_mode
             .unwrap_or(ctx.host.detected_container_mode);
         let executor = diorama_network::SystemCommandExecutor;
+        if !ctx.peer_routes.is_empty() {
+            let _ = diorama_network::ensure_cross_node_routes(
+                ctx.assigned_node_id,
+                ctx.peer_routes,
+                &executor,
+            );
+        }
         let proxy_mode =
             diorama_proxy::detect_proxy_backend(None, &executor).unwrap_or(ProxyMode::IpTables);
         let proxy_opts = KubeProxyOptions::new(proxy_kubeconfig, is_container, proxy_mode);
@@ -1112,11 +1492,14 @@ fn register_workload_path(
         kubelet_opts.container_mode = is_container;
         let runtime_provider: Arc<dyn RuntimeProvider> =
             Arc::new(CriRuntimeProvider::new(socket_path));
-        let kubelet_service = KubeletService::new(
+        let mut kubelet_service = KubeletService::new(
             kubelet_opts,
             ctx.apiserver_service.clone(),
             runtime_provider,
         );
+        if ctx.assigned_node_id > 1 || !ctx.peer_routes.is_empty() {
+            kubelet_service = kubelet_service.with_multi_node(true);
+        }
         builder = builder.register_kubelet(kubelet_service, runtime_id);
 
         Ok(builder.register_coredns(

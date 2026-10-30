@@ -1,0 +1,30 @@
+# muxox.toml -- Run a 2-node multi-node HA diorama cluster in Podman containers.
+#
+# Start the cluster (with embedded MCP server enabled at http://127.0.0.1:9900/mcp):
+#   muxox          # Web UI + MCP server
+#   muxox --raw    # Plain log streaming + MCP server
+#
+# Nodes:
+#   diorama-1 (seed controller)   -> https://127.0.0.1:6443
+#   diorama-2 (joined controller) -> https://127.0.0.1:6444
+
+[mcp]
+enabled = true
+port = 9900
+bind = "127.0.0.1"
+
+[hooks]
+before_start = "make image && (podman network exists diorama-net || podman network create diorama-net)"
+after_stop = "podman rm -f diorama-1 diorama-2"
+
+[[service]]
+name = "diorama-1"
+cmd = "podman run --rm --replace --privileged --network diorama-net --hostname diorama-1 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-1:/var/lib/diorama -p 6443:6443 -e DIORAMA_NODE_NAME=diorama-1 --name diorama-1 ${IMAGE:-localhost/diorama:latest} --container-mode"
+log_capacity = 5000
+hooks = { before_start = "(podman network exists diorama-net || podman network create diorama-net) && podman rm -f diorama-1", after_stop = "podman rm -f diorama-1" }
+
+[[service]]
+name = "diorama-2"
+cmd = "until podman exec diorama-1 dioramactl token list >/dev/null 2>&1 && TOKEN=$(podman exec diorama-1 dioramactl token create --role controller 2>/dev/null) && [ -n \"$TOKEN\" ]; do sleep 1; done && exec podman run --rm --replace --privileged --network diorama-net --hostname diorama-2 --security-opt seccomp=unconfined --tmpfs /tmp --tmpfs /run -v diorama-data-2:/var/lib/diorama -p 6444:6443 -e DIORAMA_NODE_NAME=diorama-2 -e DIORAMA_JOIN_TOKEN=\"$TOKEN\" --name diorama-2 ${IMAGE:-localhost/diorama:latest} --container-mode"
+log_capacity = 5000
+hooks = { before_start = "(podman network exists diorama-net || podman network create diorama-net) && podman rm -f diorama-2", after_stop = "podman rm -f diorama-2" }

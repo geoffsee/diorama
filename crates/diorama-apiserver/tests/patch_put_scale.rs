@@ -56,6 +56,7 @@ async fn request(
     content_type: Option<&str>,
     body: &str,
 ) -> (u16, String) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = RootCertStore::empty();
     for cert in load_certs(&pki.join("ca.crt")) {
         roots.add(cert).unwrap();

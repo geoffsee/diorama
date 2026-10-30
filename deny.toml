@@ -35,6 +35,24 @@ skip = [
     { name = "crypto-common" },
     { name = "digest" },
     { name = "getrandom" },
+    # tokio-quiche / foundations transitive dependency graph versions.
+    { name = "darling" },
+    { name = "darling_core" },
+    { name = "darling_macro" },
+    { name = "erased-serde" },
+    { name = "foldhash" },
+    { name = "hashbrown" },
+    { name = "indexmap" },
+    { name = "itertools" },
+    { name = "linux-raw-sys" },
+    { name = "object" },
+    { name = "rand" },
+    { name = "rand_core" },
+    { name = "rustix" },
+    { name = "shlex" },
+    { name = "synstructure" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
 ]
 skip-tree = []
 

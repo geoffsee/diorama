@@ -10,6 +10,8 @@ mod kubelet_lifecycle_and_volumes;
 mod kubelet_nested_fixture;
 #[path = "kubelet_observed_runtime.rs"]
 mod kubelet_observed_runtime;
+#[path = "kubelet_quic_ha.rs"]
+mod kubelet_quic_ha;
 #[path = "kubelet_registration.rs"]
 mod kubelet_registration;
 #[path = "kubelet_supervisor.rs"]

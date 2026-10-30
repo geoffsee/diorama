@@ -154,6 +154,7 @@ impl rustls::client::danger::ServerCertVerifier for AnyCertVerifier {
 }
 
 pub(crate) fn tls_connector_for_ca(ca_bundle_pem: Option<&str>) -> tokio_rustls::TlsConnector {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client_config = if let Some(pem_str) = ca_bundle_pem {
         let mut root_store = RootCertStore::empty();
         for cert in CertificateDer::pem_slice_iter(pem_str.as_bytes()).flatten() {

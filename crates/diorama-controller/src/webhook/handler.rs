@@ -21,6 +21,7 @@ pub struct NodeSetterHandler {
     node_name: String,
     load_balancer_ip: String,
     load_balancer: bool,
+    multi_node: bool,
     node_name_patch_b64: String,
     node_selector_patch_b64: String,
     pvc_annotation_patch_b64: String,
@@ -37,6 +38,7 @@ impl std::fmt::Debug for NodeSetterHandler {
             .field("node_name", &self.node_name)
             .field("load_balancer_ip", &self.load_balancer_ip)
             .field("load_balancer", &self.load_balancer)
+            .field("multi_node", &self.multi_node)
             .field("max_steps", &self.max_steps)
             .field("base_duration", &self.base_duration)
             .field("lock_release_delay", &self.lock_release_delay)
@@ -85,6 +87,7 @@ impl NodeSetterHandler {
             node_name: node_name.to_string(),
             load_balancer_ip: load_balancer_ip.to_string(),
             load_balancer,
+            multi_node: false,
             node_name_patch_b64,
             node_selector_patch_b64,
             pvc_annotation_patch_b64,
@@ -94,6 +97,17 @@ impl NodeSetterHandler {
             base_duration: std::time::Duration::from_millis(50),
             lock_release_delay: std::time::Duration::from_millis(100),
         }
+    }
+
+    #[must_use]
+    pub fn with_multi_node(mut self, multi_node: bool) -> Self {
+        self.multi_node = multi_node;
+        self
+    }
+
+    #[must_use]
+    pub fn is_multi_node(&self) -> bool {
+        self.multi_node
     }
 
     #[must_use]
@@ -152,6 +166,7 @@ impl NodeSetterHandler {
         let object = request.get("object");
 
         match kind {
+            "Pod" | "PersistentVolumeClaim" | "Job" if self.multi_node => Ok((None, false)),
             "Pod" => {
                 let Some(obj) = object else {
                     return Ok((None, false));

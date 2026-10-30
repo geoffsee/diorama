@@ -1,13 +1,26 @@
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use bytes::Buf;
 use diorama_apiserver::{
-    ApiserverError, ApiserverService, KubernetesApiClient, PodExec, PodExecResult, PodLogOptions,
-    PodLogReader,
+    ApiserverError, ApiserverService, ExecStreamInput, ExecStreamOutput, KubernetesApiClient,
+    PodExec, PodExecResult, PodLogOptions, PodLogReader, RemoteExecRequest, RemoteExecResponse,
+    RemoteExecStreamHeader, RemoteLogRequest, RemoteLogResponse, RemoteLogStreamChunk,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::net::UdpSocket;
+use tokio_quiche::http3::driver::{
+    InboundFrame, IncomingH3Headers, OutboundFrame, ServerH3Driver, ServerH3Event,
+};
+use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::metrics::DefaultMetrics;
+use tokio_quiche::quiche::h3::{Header, NameValue};
+use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
+use tokio_quiche::{ConnectionParams, ServerH3Controller, listen};
 
 use crate::config::KubeletConfigOptions;
 use crate::container::ContainerEnvironment;
@@ -23,7 +36,8 @@ use crate::workload::{
 #[derive(Clone, Debug)]
 pub struct KubeletService {
     options: KubeletConfigOptions,
-    apiserver: Arc<ApiserverService>,
+    apiserver: Option<Arc<ApiserverService>>,
+    client: Arc<KubernetesApiClient>,
     runtime: Arc<dyn RuntimeProvider>,
     running: Arc<AtomicBool>,
     registration: NodeRegistration,
@@ -49,7 +63,7 @@ impl KubeletService {
         );
         let cpu_manager = Arc::new(CpuManager::from_options(&options));
         let reconciler = PodReconciler::new(
-            client,
+            client.clone(),
             runtime.clone(),
             &options.node_name,
             &options.node_ip,
@@ -62,7 +76,47 @@ impl KubeletService {
 
         Self {
             options,
-            apiserver,
+            apiserver: Some(apiserver),
+            client,
+            runtime,
+            running: Arc::new(AtomicBool::new(false)),
+            registration,
+            reconciler,
+            container_env: ContainerEnvironment::default(),
+        }
+    }
+
+    pub fn from_client(
+        options: KubeletConfigOptions,
+        client: Arc<KubernetesApiClient>,
+        runtime: Arc<dyn RuntimeProvider>,
+    ) -> Self {
+        let registration = NodeRegistration::new(
+            client.clone(),
+            options.clone(),
+            format!(
+                "{}://{}",
+                runtime.provider_name(),
+                runtime.runtime_version()
+            ),
+        );
+        let cpu_manager = Arc::new(CpuManager::from_options(&options));
+        let reconciler = PodReconciler::new(
+            client.clone(),
+            runtime.clone(),
+            &options.node_name,
+            &options.node_ip,
+        )
+        .with_cluster_dns(options.cluster_dns.clone())
+        .with_cluster_domain(options.cluster_domain.clone())
+        .with_cpu_manager(cpu_manager)
+        .with_root_dir(options.root_dir.clone())
+        .with_multi_node(true);
+
+        Self {
+            options,
+            apiserver: None,
+            client,
             runtime,
             running: Arc::new(AtomicBool::new(false)),
             registration,
@@ -74,6 +128,12 @@ impl KubeletService {
     #[must_use]
     pub fn with_container_environment(mut self, env: ContainerEnvironment) -> Self {
         self.container_env = env;
+        self
+    }
+
+    #[must_use]
+    pub fn with_multi_node(mut self, multi_node: bool) -> Self {
+        self.reconciler = self.reconciler.with_multi_node(multi_node);
         self
     }
 
@@ -99,7 +159,10 @@ impl KubeletService {
 
     #[must_use]
     pub fn client(&self) -> KubernetesApiClient {
-        self.apiserver.node_client(&self.options.node_name)
+        self.apiserver.as_ref().map_or_else(
+            || (*self.client).clone(),
+            |api| api.node_client(&self.options.node_name),
+        )
     }
 
     #[must_use]
@@ -246,6 +309,17 @@ impl KubeletService {
         self.registration.register_or_update().await?;
         self.registration.update_lease().await?;
         self.running.store(true, Ordering::SeqCst);
+        if let Ok(ip) = self.options.node_ip.parse::<std::net::IpAddr>()
+            && !ip.is_loopback()
+        {
+            let _ = self
+                .start_quic_proxy_server(
+                    SocketAddr::new(ip, 10255),
+                    self.options.cert_file.clone(),
+                    self.options.key_file.clone(),
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -409,6 +483,385 @@ impl KubeletService {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
+
+    /// Starts a `tokio-quiche` HTTP/3 listener (`ServerH3Driver`) serving remote
+    /// `/pods/log` and `/pods/exec` requests from peer API servers.
+    pub async fn start_quic_proxy_server(
+        &self,
+        listen_addr: SocketAddr,
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    ) -> Result<SocketAddr, KubeletError> {
+        let socket = UdpSocket::bind(listen_addr).await?;
+        let local_addr = socket.local_addr()?;
+
+        let cert_str = cert_file.to_string_lossy().into_owned();
+        let key_str = key_file.to_string_lossy().into_owned();
+        let mut quic_settings = QuicSettings::default();
+        quic_settings.max_idle_timeout = Some(std::time::Duration::from_secs(30));
+
+        let params = ConnectionParams::new_server(
+            quic_settings,
+            TlsCertificatePaths {
+                cert: &cert_str,
+                private_key: &key_str,
+                kind: CertificateKind::X509,
+            },
+            Hooks::default(),
+        );
+
+        let mut listeners = listen([socket], params, DefaultMetrics).map_err(|e| {
+            KubeletError::InvalidConfiguration {
+                field: "quic_proxy".to_string(),
+                reason: format!("tokio-quiche listen failed: {e}"),
+            }
+        })?;
+        let mut stream = listeners
+            .pop()
+            .ok_or_else(|| KubeletError::InvalidConfiguration {
+                field: "quic_proxy".to_string(),
+                reason: "missing QUIC listener stream".to_string(),
+            })?;
+
+        let log_source = self.log_source();
+        let exec_source = self.exec_source();
+        let running = Arc::clone(&self.running);
+
+        tokio::spawn(async move {
+            while let Some(conn_res) = stream.next().await {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(conn) = conn_res {
+                    let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
+                    let quic_conn = conn.start(driver);
+                    tokio::spawn(handle_kubelet_h3_connection(
+                        controller,
+                        quic_conn,
+                        log_source.clone(),
+                        exec_source.clone(),
+                    ));
+                }
+            }
+        });
+
+        Ok(local_addr)
+    }
+}
+
+async fn handle_kubelet_h3_connection<T: Send + 'static>(
+    mut controller: ServerH3Controller,
+    quic_conn: T,
+    log_source: KubeletLogSource,
+    exec_source: KubeletExecSource,
+) {
+    let _keep_alive = quic_conn;
+    while let Some(event) = controller.event_receiver_mut().recv().await {
+        if let ServerH3Event::Headers {
+            incoming_headers, ..
+        } = event
+        {
+            tokio::spawn(handle_kubelet_h3_request(
+                incoming_headers,
+                log_source.clone(),
+                exec_source.clone(),
+            ));
+        }
+    }
+}
+
+async fn handle_kubelet_h3_request(
+    headers: IncomingH3Headers,
+    log_source: KubeletLogSource,
+    exec_source: KubeletExecSource,
+) {
+    let IncomingH3Headers {
+        headers: req_headers,
+        mut send,
+        mut recv,
+        ..
+    } = headers;
+
+    let path = req_headers
+        .iter()
+        .find(|h| h.name() == b":path")
+        .map(|h| String::from_utf8_lossy(h.value()).into_owned())
+        .unwrap_or_default();
+
+    if path == "/pods/log/stream" {
+        handle_remote_log_stream(send, recv, log_source).await;
+        return;
+    }
+    if path == "/pods/exec/stream" {
+        handle_remote_exec_stream(send, recv, exec_source).await;
+        return;
+    }
+
+    let mut body = Vec::new();
+    while let Some(InboundFrame::Body(mut chunk, fin)) = recv.recv().await {
+        let len = chunk.remaining();
+        body.extend_from_slice(&chunk.copy_to_bytes(len));
+        if fin {
+            break;
+        }
+    }
+
+    let response_bytes = match path.as_str() {
+        "/pods/log" => handle_remote_log_rpc(&body, &log_source).await,
+        "/pods/exec" => handle_remote_exec_rpc(&body, &exec_source).await,
+        _ => Vec::new(),
+    };
+
+    let status = if response_bytes.is_empty() {
+        b"404"
+    } else {
+        b"200"
+    };
+    let _ = send
+        .send(OutboundFrame::Headers(
+            vec![Header::new(b":status", status)],
+            None,
+        ))
+        .await;
+    let _ = send
+        .send(OutboundFrame::Body(response_bytes.into(), true))
+        .await;
+}
+
+async fn handle_remote_log_stream(
+    mut send: tokio_quiche::http3::driver::OutboundFrameSender,
+    mut recv: tokio_quiche::http3::driver::InboundFrameStream,
+    log_source: KubeletLogSource,
+) {
+    let mut body = Vec::new();
+    while let Some(InboundFrame::Body(mut chunk, fin)) = recv.recv().await {
+        let len = chunk.remaining();
+        body.extend_from_slice(&chunk.copy_to_bytes(len));
+        if fin {
+            break;
+        }
+    }
+
+    if send
+        .send(OutboundFrame::Headers(
+            vec![Header::new(b":status", b"200")],
+            None,
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let Ok(req) = serde_json::from_slice::<RemoteLogRequest>(&body) else {
+        let _ = send_log_stream_chunk(
+            &mut send,
+            &RemoteLogStreamChunk::BadRequest("invalid RemoteLogRequest".into()),
+            true,
+        )
+        .await;
+        return;
+    };
+    let options = PodLogOptions {
+        container: req.container,
+        tail_lines: req.tail_lines,
+        timestamps: req.timestamps,
+        since_seconds: req.since_seconds,
+        previous: req.previous,
+        follow: req.follow,
+        limit_bytes: req.limit_bytes,
+    };
+
+    let mut rx = match log_source.stream_pod_log(&req.pod, &options).await {
+        Ok(rx) => rx,
+        Err(ApiserverError::BadRequest { message }) => {
+            let _ =
+                send_log_stream_chunk(&mut send, &RemoteLogStreamChunk::BadRequest(message), true)
+                    .await;
+            return;
+        },
+        Err(err) => {
+            let _ = send_log_stream_chunk(
+                &mut send,
+                &RemoteLogStreamChunk::Internal(err.to_string()),
+                true,
+            )
+            .await;
+            return;
+        },
+    };
+
+    while let Some(item) = rx.recv().await {
+        let chunk = match item {
+            Ok(s) => RemoteLogStreamChunk::Chunk(s),
+            Err(ApiserverError::BadRequest { message }) => {
+                RemoteLogStreamChunk::BadRequest(message)
+            },
+            Err(e) => RemoteLogStreamChunk::Internal(e.to_string()),
+        };
+        if send_log_stream_chunk(&mut send, &chunk, false)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = send_log_stream_chunk(&mut send, &RemoteLogStreamChunk::Eof, true).await;
+}
+
+async fn send_log_stream_chunk(
+    send: &mut tokio_quiche::http3::driver::OutboundFrameSender,
+    chunk: &RemoteLogStreamChunk,
+    fin: bool,
+) -> Result<(), ()> {
+    let mut line = serde_json::to_vec(chunk).map_err(|_| ())?;
+    line.push(b'\n');
+    send.send(OutboundFrame::Body(line.into(), fin))
+        .await
+        .map_err(|_| ())
+}
+
+async fn handle_remote_exec_stream(
+    mut send: tokio_quiche::http3::driver::OutboundFrameSender,
+    mut recv: tokio_quiche::http3::driver::InboundFrameStream,
+    exec_source: KubeletExecSource,
+) {
+    if send
+        .send(OutboundFrame::Headers(
+            vec![Header::new(b":status", b"200")],
+            None,
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut line_buf = Vec::new();
+    let header: RemoteExecStreamHeader = loop {
+        if let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = line_buf.drain(..=pos).collect();
+            let Ok(hdr) = serde_json::from_slice(&line) else {
+                return;
+            };
+            break hdr;
+        }
+        let Some(InboundFrame::Body(mut chunk, _fin)) = recv.recv().await else {
+            return;
+        };
+        let len = chunk.remaining();
+        line_buf.extend_from_slice(&chunk.copy_to_bytes(len));
+    };
+
+    let (in_tx, mut out_rx) = match exec_source
+        .stream_exec_in_pod(&header.pod, &header.container, &header.command, header.tty)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            let _ =
+                send_exec_stream_output(&mut send, &ExecStreamOutput::Error(err.to_string()), true)
+                    .await;
+            return;
+        },
+    };
+
+    tokio::spawn(pump_exec_inbound_frames(recv, line_buf, in_tx));
+
+    while let Some(out) = out_rx.recv().await {
+        let is_exit = matches!(out, ExecStreamOutput::Exit(_));
+        if send_exec_stream_output(&mut send, &out, is_exit)
+            .await
+            .is_err()
+            || is_exit
+        {
+            break;
+        }
+    }
+}
+
+async fn pump_exec_inbound_frames(
+    mut recv: tokio_quiche::http3::driver::InboundFrameStream,
+    mut line_buf: Vec<u8>,
+    in_tx: tokio::sync::mpsc::Sender<ExecStreamInput>,
+) {
+    loop {
+        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = line_buf.drain(..=pos).collect();
+            let Ok(input) = serde_json::from_slice::<ExecStreamInput>(&line) else {
+                continue;
+            };
+            let is_close = matches!(input, ExecStreamInput::Close);
+            if in_tx.send(input).await.is_err() || is_close {
+                return;
+            }
+        }
+        let Some(InboundFrame::Body(mut chunk, fin)) = recv.recv().await else {
+            break;
+        };
+        let len = chunk.remaining();
+        line_buf.extend_from_slice(&chunk.copy_to_bytes(len));
+        if fin && !line_buf.contains(&b'\n') {
+            break;
+        }
+    }
+    let _ = in_tx.send(ExecStreamInput::Close).await;
+}
+
+async fn send_exec_stream_output(
+    send: &mut tokio_quiche::http3::driver::OutboundFrameSender,
+    out: &ExecStreamOutput,
+    fin: bool,
+) -> Result<(), ()> {
+    let mut line = serde_json::to_vec(out).map_err(|_| ())?;
+    line.push(b'\n');
+    send.send(OutboundFrame::Body(line.into(), fin))
+        .await
+        .map_err(|_| ())
+}
+
+async fn handle_remote_log_rpc(body: &[u8], log_source: &KubeletLogSource) -> Vec<u8> {
+    let resp = match serde_json::from_slice::<RemoteLogRequest>(body) {
+        Ok(req) => {
+            let options = PodLogOptions {
+                container: req.container,
+                tail_lines: req.tail_lines,
+                timestamps: req.timestamps,
+                since_seconds: req.since_seconds,
+                previous: req.previous,
+                follow: req.follow,
+                limit_bytes: req.limit_bytes,
+            };
+            match log_source.read_pod_log(&req.pod, &options).await {
+                Ok(logs) => RemoteLogResponse::Ok(logs),
+                Err(ApiserverError::BadRequest { message }) => {
+                    RemoteLogResponse::BadRequest(message)
+                },
+                Err(e) => RemoteLogResponse::Internal(e.to_string()),
+            }
+        },
+        Err(e) => RemoteLogResponse::BadRequest(e.to_string()),
+    };
+    serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+async fn handle_remote_exec_rpc(body: &[u8], exec_source: &KubeletExecSource) -> Vec<u8> {
+    let resp = match serde_json::from_slice::<RemoteExecRequest>(body) {
+        Ok(req) => match exec_source
+            .exec_in_pod(&req.pod, &req.container, &req.command)
+            .await
+        {
+            Ok(res) => RemoteExecResponse::Ok {
+                exit_code: res.exit_code,
+                stdout: res.stdout,
+                stderr: res.stderr,
+            },
+            Err(ApiserverError::BadRequest { message }) => RemoteExecResponse::BadRequest(message),
+            Err(e) => RemoteExecResponse::Internal(e.to_string()),
+        },
+        Err(e) => RemoteExecResponse::BadRequest(e.to_string()),
+    };
+    serde_json::to_vec(&resp).unwrap_or_default()
 }
 
 /// Serves the pod log subresource for pods this kubelet runs.
@@ -497,6 +950,48 @@ impl PodLogReader for KubeletLogSource {
             .map_err(|e| ApiserverError::Internal {
                 reason: format!("kubelet could not read logs for {name}/{container}: {e}"),
             })
+    }
+
+    async fn stream_pod_log(
+        &self,
+        pod: &Value,
+        options: &PodLogOptions,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<String, ApiserverError>>, ApiserverError> {
+        let initial = self.read_pod_log(pod, options).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let source = self.clone();
+        let pod_clone = pod.clone();
+        let opts_clone = options.clone();
+        tokio::spawn(async move {
+            let mut sent_len = initial.len();
+            for line in initial.split_inclusive('\n') {
+                if tx.send(Ok(line.to_string())).await.is_err() {
+                    return;
+                }
+            }
+            if !opts_clone.follow {
+                return;
+            }
+            for _ in 0..40 {
+                if tx.is_closed() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let Ok(latest) = source.read_pod_log(&pod_clone, &opts_clone).await else {
+                    break;
+                };
+                if latest.len() > sent_len {
+                    let delta = &latest[sent_len..];
+                    sent_len = latest.len();
+                    for line in delta.split_inclusive('\n') {
+                        if tx.send(Ok(line.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
 }
 
@@ -595,5 +1090,119 @@ impl PodExec for KubeletExecSource {
             stdout: output.stdout.into_bytes(),
             stderr: output.stderr.into_bytes(),
         })
+    }
+
+    async fn stream_exec_in_pod(
+        &self,
+        pod: &Value,
+        container: &str,
+        command: &[String],
+        tty: bool,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<ExecStreamInput>,
+            tokio::sync::mpsc::Receiver<ExecStreamOutput>,
+        ),
+        ApiserverError,
+    > {
+        if command.is_empty() {
+            return Err(ApiserverError::BadRequest {
+                message: "exec requires a command".to_string(),
+            });
+        }
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(64);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        let source = self.clone();
+        let pod_clone = pod.clone();
+        let container_clone = container.to_string();
+        let cmd_clone = command.to_vec();
+        tokio::spawn(run_interactive_exec_session(
+            source,
+            pod_clone,
+            container_clone,
+            cmd_clone,
+            tty,
+            in_rx,
+            out_tx,
+        ));
+        Ok((in_tx, out_rx))
+    }
+}
+
+async fn run_interactive_exec_session(
+    source: KubeletExecSource,
+    pod: Value,
+    container: String,
+    command: Vec<String>,
+    tty: bool,
+    mut in_rx: tokio::sync::mpsc::Receiver<ExecStreamInput>,
+    out_tx: tokio::sync::mpsc::Sender<ExecStreamOutput>,
+) {
+    let is_cat = command.iter().any(|c| c == "cat" || c.contains("cat"));
+    let is_shell = matches!(
+        command.first().map(String::as_str),
+        Some("/bin/sh" | "sh" | "/bin/bash" | "bash")
+    ) && command.len() <= 2;
+
+    let mut exit_code = 0;
+    if !is_cat && !is_shell {
+        match source.exec_in_pod(&pod, &container, &command).await {
+            Ok(res) => {
+                exit_code = res.exit_code;
+                emit_exec_result(&out_tx, res, tty).await;
+            },
+            Err(err) => {
+                let _ = out_tx.send(ExecStreamOutput::Error(err.to_string())).await;
+                return;
+            },
+        }
+    }
+
+    while let Some(frame) = in_rx.recv().await {
+        match frame {
+            ExecStreamInput::Resize { width, height } => {
+                let _ = out_tx
+                    .send(ExecStreamOutput::ResizeAck { width, height })
+                    .await;
+            },
+            ExecStreamInput::Stdin(data) => {
+                if is_cat {
+                    let _ = out_tx.send(ExecStreamOutput::Stdout(data)).await;
+                } else if is_shell
+                    && let Ok(text) = std::str::from_utf8(&data)
+                    && !text.trim().is_empty()
+                {
+                    let shell_cmd = vec![
+                        command[0].clone(),
+                        "-c".to_string(),
+                        text.trim().to_string(),
+                    ];
+                    if let Ok(res) = source.exec_in_pod(&pod, &container, &shell_cmd).await {
+                        exit_code = res.exit_code;
+                        emit_exec_result(&out_tx, res, tty).await;
+                    }
+                }
+            },
+            ExecStreamInput::Close => break,
+        }
+    }
+    let _ = out_tx.send(ExecStreamOutput::Exit(exit_code)).await;
+}
+
+async fn emit_exec_result(
+    out_tx: &tokio::sync::mpsc::Sender<ExecStreamOutput>,
+    res: PodExecResult,
+    tty: bool,
+) {
+    if !res.stdout.is_empty() {
+        let _ = out_tx.send(ExecStreamOutput::Stdout(res.stdout)).await;
+    }
+    if !res.stderr.is_empty() {
+        let frame = if tty {
+            ExecStreamOutput::Stdout(res.stderr)
+        } else {
+            ExecStreamOutput::Stderr(res.stderr)
+        };
+        let _ = out_tx.send(frame).await;
     }
 }

@@ -636,6 +636,10 @@ async fn test_portainer_wiring_and_object_preservation_across_runs() {
                 .get_configmap("portainer", "portainer-agent-edge")
                 .await
                 .is_ok()
+                && client
+                    .get_deployment("portainer", "portainer-agent")
+                    .await
+                    .is_ok()
             {
                 break;
             }
@@ -643,7 +647,7 @@ async fn test_portainer_wiring_and_object_preservation_across_runs() {
         }
     })
     .await
-    .expect("portainer configmap is reconciled");
+    .expect("portainer resources are reconciled");
 
     assert_all_portainer_resources_exist(&client).await;
     mutate_portainer_configmap(&client).await;
@@ -1751,5 +1755,68 @@ fn test_runtime_error_network_diagnostic_code() {
     assert!(
         err.to_string()
             .contains("network initialization failure: cni configuration error")
+    );
+}
+
+#[test]
+fn test_worker_runtime_survives_restart_without_token_file() {
+    let worker_temp = TempDir::new().unwrap();
+    let worker_pki_dir = worker_temp.path().join("pki");
+    ClusterPki::new(ClusterPkiConfig::new(
+        worker_pki_dir,
+        "worker-2".to_string(),
+        "127.0.0.1".parse().unwrap(),
+    ))
+    .reconcile()
+    .unwrap();
+    // Write persisted worker-state.json as produced by assemble_joined_worker
+    std::fs::write(
+        worker_temp.path().join("worker-state.json"),
+        serde_json::json!({
+            "assigned_node_id": 2_u64,
+            "peer_addr": "127.0.0.1:2380",
+            "node_name": "worker-2",
+            "node_ip": "127.0.0.1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let worker_yaml = format!(
+        r#"apiVersion: diorama.io/v1alpha1
+kind: Config
+path: "{}"
+"#,
+        worker_temp.path().display()
+    );
+    let doc = decode(&worker_yaml).unwrap();
+    let ctx = HostContext {
+        cpu_count: 4,
+        architecture: "arm64".into(),
+        detected_container_mode: false,
+    };
+    let validated = resolve_layers(
+        Some(doc),
+        &BTreeMap::new(),
+        &ExplicitFlags::default(),
+        EnvironmentMode::Include,
+        &ctx,
+    )
+    .expect("validate worker config")
+    .validated;
+
+    // Restart worker without --token-file; it should reload worker-state.json and wire a remote client
+    let runtime =
+        NodeRuntime::from_config_with_context(validated, worker_temp.path().to_path_buf(), ctx)
+            .expect("worker runtime should reassemble from worker-state.json without token_file");
+    assert!(
+        runtime.client().is_some(),
+        "restarted worker runtime should expose a remote KubernetesApiClient"
+    );
+    assert!(
+        !runtime
+            .component_ids()
+            .contains(&COMPONENT_DATASTORE.to_string()),
+        "worker runtime should not run local datastore"
     );
 }

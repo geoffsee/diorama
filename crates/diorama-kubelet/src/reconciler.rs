@@ -2517,6 +2517,7 @@ pub struct PodReconciler {
     pod_certificates: PodCertificateCache,
     started_pods: Arc<Mutex<BTreeSet<String>>>,
     observed_taint_times: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+    multi_node: bool,
 }
 
 type CachedPodCertificateKey = diorama_pki::PodCertificateKeyData;
@@ -2568,7 +2569,19 @@ impl PodReconciler {
             pod_certificates: Arc::new(Mutex::new(BTreeMap::new())),
             started_pods: Arc::new(Mutex::new(BTreeSet::new())),
             observed_taint_times: Arc::new(Mutex::new(BTreeMap::new())),
+            multi_node: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_multi_node(mut self, multi_node: bool) -> Self {
+        self.multi_node = multi_node;
+        self
+    }
+
+    #[must_use]
+    pub fn is_multi_node(&self) -> bool {
+        self.multi_node
     }
 
     #[must_use]
@@ -2711,6 +2724,9 @@ impl PodReconciler {
     pub fn is_managed_node(&self, name: &str) -> bool {
         if name.is_empty() {
             return false;
+        }
+        if self.multi_node {
+            return name == self.node_name;
         }
         if name == self.node_name
             || name == self.companion_node_name()
@@ -3657,6 +3673,9 @@ impl PodReconciler {
                 );
                 Self::update_known_pod(all_current_pods, bound.clone());
 
+                if !self.is_managed_node(&target_node) {
+                    continue;
+                }
                 let outcome = self.sync_pod(&namespace, &bound).await;
                 match outcome {
                     Ok(()) => report.synced += 1,
@@ -3695,7 +3714,10 @@ impl PodReconciler {
             .unwrap_or_default();
 
         for pod in &items {
-            if let Some(uid) = pod.pointer("/metadata/uid").and_then(Value::as_str) {
+            let assigned = pod.pointer("/spec/nodeName").and_then(Value::as_str);
+            if assigned.is_none_or(|n| n.is_empty() || self.is_managed_node(n))
+                && let Some(uid) = pod.pointer("/metadata/uid").and_then(Value::as_str)
+            {
                 live_uids.insert(uid.to_string());
             }
         }

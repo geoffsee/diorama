@@ -602,6 +602,35 @@ pub fn prepare_node_network(
     })
 }
 
+/// Programs host routing table entries (`ip route replace <peer_pod_cidr> via <peer_node_ip>`)
+/// for remote cluster nodes so cross-node pod-to-pod traffic routes across node subnets.
+pub fn ensure_cross_node_routes(
+    local_node_id: u64,
+    peer_routes: &[(u64, std::net::IpAddr)],
+    executor: &dyn CommandExecutor,
+) -> Result<usize, NetworkError> {
+    let mut programmed = 0;
+    for &(peer_id, peer_ip) in peer_routes {
+        if peer_id == local_node_id {
+            continue;
+        }
+        let subnet = crate::cni::pod_cidr_for_node(peer_id);
+        let via = peer_ip.to_string();
+        let out = executor
+            .run("ip", &["route", "replace", &subnet, "via", &via])
+            .map_err(|e| NetworkError::MasqueradeError {
+                reason: format!("failed to program cross-node route for {subnet} via {via}: {e}"),
+            })?;
+        if !out.success {
+            return Err(NetworkError::MasqueradeError {
+                reason: format!("ip route replace {subnet} via {via} failed: {}", out.stderr),
+            });
+        }
+        programmed += 1;
+    }
+    Ok(programmed)
+}
+
 /// In-memory mock command executor for simulating iptables and nftables operations.
 #[derive(Debug, Default)]
 pub struct MockCommandExecutor {
@@ -1088,6 +1117,11 @@ impl CommandExecutor for MockCommandExecutor {
             "iptables" | "ip6tables" => self.handle_iptables(args, &cmd_str),
             "iptables-save" => self.handle_iptables_save(),
             "nft" => self.handle_nft(args, &cmd_str),
+            "ip" => Ok(CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "unsupported mock command",
@@ -1292,5 +1326,20 @@ mod tests {
         )
         .expect("repeated cleanup");
         assert_eq!(executor.unrelated_nat_rules_count(), 1);
+    }
+
+    #[test]
+    fn per_node_pod_cidr_and_cross_node_routes() {
+        let executor = MockCommandExecutor::new_iptables_host();
+        let peers = vec![
+            (1u64, "10.0.0.1".parse().unwrap()),
+            (2u64, "10.0.0.2".parse().unwrap()),
+            (3u64, "10.0.0.3".parse().unwrap()),
+        ];
+        ensure_cross_node_routes(1, &peers, &executor).expect("cross-node routes");
+        let calls = executor.command_log.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "ip route replace 10.42.2.0/24 via 10.0.0.2");
+        assert_eq!(calls[1], "ip route replace 10.42.3.0/24 via 10.0.0.3");
     }
 }

@@ -1183,3 +1183,97 @@ fn container_download_selects_the_core_container_pack_and_matching_install_comma
     .unwrap();
     assert!(matches!(parsed, Command::Download(options) if options.run_mode == "container"));
 }
+
+#[test]
+fn token_create_list_and_invalidate_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let pki_dir = root.path().join("pki");
+    diorama_pki::cluster::ClusterPki::new(diorama_pki::cluster::ClusterPkiConfig::new(
+        pki_dir,
+        "controller-1".to_string(),
+        "127.0.0.1".parse().unwrap(),
+    ))
+    .reconcile()
+    .unwrap();
+
+    let mut inputs = TestInputs::default();
+    let mut create_out = Vec::new();
+    let mut create_err = Vec::new();
+    let code = execute(
+        &args(&[
+            "token",
+            "create",
+            "--role",
+            "worker",
+            "--expiry",
+            "1h",
+            "--path",
+            root.path().to_str().unwrap(),
+        ]),
+        &BTreeMap::new(),
+        "v1.3.0",
+        &mut inputs,
+        &mut create_out,
+        &mut create_err,
+    )
+    .unwrap();
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&create_err));
+    let encoded_token = String::from_utf8(create_out).unwrap();
+    let decoded = diorama_pki::token::JoinToken::decode(encoded_token.trim()).unwrap();
+
+    let mut list_out = Vec::new();
+    let mut list_err = Vec::new();
+    let list_code = execute(
+        &args(&["token", "list", "--path", root.path().to_str().unwrap()]),
+        &BTreeMap::new(),
+        "v1.3.0",
+        &mut inputs,
+        &mut list_out,
+        &mut list_err,
+    )
+    .unwrap();
+    assert_eq!(
+        list_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&list_err)
+    );
+    let list_str = String::from_utf8(list_out).unwrap();
+    assert!(list_str.contains(&decoded.token_id), "list: {list_str}");
+    assert!(list_str.contains("worker"), "list: {list_str}");
+
+    let mut inv_out = Vec::new();
+    let mut inv_err = Vec::new();
+    let inv_code = execute(
+        &args(&[
+            "token",
+            "invalidate",
+            &decoded.token_id,
+            "--path",
+            root.path().to_str().unwrap(),
+        ]),
+        &BTreeMap::new(),
+        "v1.3.0",
+        &mut inputs,
+        &mut inv_out,
+        &mut inv_err,
+    )
+    .unwrap();
+    assert_eq!(inv_code, 0, "stderr: {}", String::from_utf8_lossy(&inv_err));
+
+    let mut list_after_out = Vec::new();
+    execute(
+        &args(&["token", "list", "--path", root.path().to_str().unwrap()]),
+        &BTreeMap::new(),
+        "v1.3.0",
+        &mut inputs,
+        &mut list_after_out,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let list_after_str = String::from_utf8(list_after_out).unwrap();
+    assert!(
+        !list_after_str.contains(&decoded.token_id),
+        "token should be removed after invalidate: {list_after_str}"
+    );
+}

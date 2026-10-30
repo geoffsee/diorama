@@ -64,6 +64,22 @@ pub trait PodLogReader: std::fmt::Debug + Send + Sync {
         pod: &Value,
         options: &PodLogOptions,
     ) -> Result<String, ApiserverError>;
+
+    /// Streams live log chunks (`kubectl logs -f`) for one container of `pod`.
+    async fn stream_pod_log(
+        &self,
+        pod: &Value,
+        options: &PodLogOptions,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<String, ApiserverError>>, ApiserverError> {
+        let initial = self.read_pod_log(pod, options).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        if !initial.is_empty() {
+            for line in initial.split_inclusive('\n') {
+                let _ = tx.send(Ok(line.to_string())).await;
+            }
+        }
+        Ok(rx)
+    }
 }
 
 #[cfg(test)]

@@ -108,11 +108,13 @@ fn test_node_ip_change_rotates_affected_leaves() {
     let pki2 = ClusterPki::new(config2);
     let report = pki2.reconcile().unwrap();
 
-    // Apiserver and kubelet have node_ip in SANs, so they must rotate
+    // Apiserver, kubelet, and datastore certs have node_ip in SANs, so they must rotate
     assert!(report.rotated.contains(&"kube-apiserver".to_string()));
     assert!(report.rotated.contains(&"kubelet".to_string()));
+    assert!(report.rotated.contains(&"datastore-server".to_string()));
+    assert!(report.rotated.contains(&"datastore-client".to_string()));
 
-    // Admin, webhook, controller-manager, request-header-client, d2k, datastore do not have node IP in SANs
+    // Admin, webhook, controller-manager, request-header-client, d2k do not have node IP in SANs
     assert!(report.preserved.contains(&"admin".to_string()));
     assert!(report.preserved.contains(&"webhook".to_string()));
     assert!(
@@ -125,8 +127,6 @@ fn test_node_ip_change_rotates_affected_leaves() {
             .preserved
             .contains(&"request-header-client".to_string())
     );
-    assert!(report.preserved.contains(&"datastore-server".to_string()));
-    assert!(report.preserved.contains(&"datastore-client".to_string()));
 
     // CA fingerprint and existing admin cert survive
     let ca_fp_after = pki2.ca_fingerprint().unwrap();

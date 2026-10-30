@@ -23,6 +23,7 @@ pub enum HelpTopic {
     Kubeconfig,
     D2k,
     Addon,
+    Token,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -42,6 +43,7 @@ pub enum Command {
     Kubeconfig(KubeconfigOptions),
     D2k(D2kOptions),
     Addon(crate::addon::AddonOptions),
+    Token(crate::token::TokenOptions),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +113,12 @@ pub fn parse_command(
             return Ok(Command::Help(HelpTopic::Addon));
         }
         return crate::addon::parse(&args[1..]).map(Command::Addon);
+    }
+    if args.first().map(String::as_str) == Some("token") {
+        if args.len() == 1 || args.iter().any(|a| a == "--help" || a == "-h") {
+            return Ok(Command::Help(HelpTopic::Token));
+        }
+        return crate::token::parse(&args[1..]).map(Command::Token);
     }
     let mut topic = HelpTopic::Root;
     let mut command_index = None;
@@ -538,12 +546,14 @@ pub fn parse_command(
             Some("kubeconfig") => Command::Help(HelpTopic::Kubeconfig),
             Some("d2k") => Command::Help(HelpTopic::D2k),
             Some("addon") => Command::Help(HelpTopic::Addon),
+            Some("token") => Command::Help(HelpTopic::Token),
             _ => Command::UnknownHelp,
         });
     }
 
     Ok(match topic {
         HelpTopic::Addon => Command::Help(HelpTopic::Addon),
+        HelpTopic::Token => Command::Help(HelpTopic::Token),
         HelpTopic::Check => Command::Check(check_opts),
         HelpTopic::Version => Command::Version,
         HelpTopic::Root => Command::Help(HelpTopic::Root),

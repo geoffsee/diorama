@@ -13,6 +13,7 @@ mod http;
 pub mod logs;
 pub mod openapi;
 pub mod pdb;
+pub mod peer_proxy;
 pub mod pki;
 pub mod quota;
 pub mod rbac;
@@ -40,9 +41,13 @@ pub use config::{
     parse_port_range,
 };
 pub use error::ApiserverError;
-pub use exec::{PodExec, PodExecOptions, PodExecResult};
+pub use exec::{ExecStreamInput, ExecStreamOutput, PodExec, PodExecOptions, PodExecResult};
 pub use health::{HealthReport, check_apiserver_readiness};
 pub use logs::{PodLogOptions, PodLogReader};
+pub use peer_proxy::{
+    ClusterPodRouter, DEFAULT_KUBELET_QUIC_PORT, RemoteExecRequest, RemoteExecResponse,
+    RemoteExecStreamHeader, RemoteLogRequest, RemoteLogResponse, RemoteLogStreamChunk,
+};
 pub use pki::validate_pki_prerequisites;
 pub use rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding, Subject,

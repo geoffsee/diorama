@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use crate::error::DatastoreError;
@@ -17,6 +19,10 @@ pub struct DatastoreConfig {
     pub key_file: Option<PathBuf>,
     pub quota_backend_bytes: u64,
     pub auto_repair_wal: bool,
+    pub node_id: u64,
+    pub listen_peer_addr: Option<SocketAddr>,
+    pub peers: BTreeMap<u64, SocketAddr>,
+    pub dial_all_peers: bool,
 }
 
 impl DatastoreConfig {
@@ -31,7 +37,30 @@ impl DatastoreConfig {
             key_file: None,
             quota_backend_bytes: DEFAULT_QUOTA_BYTES,
             auto_repair_wal: false,
+            node_id: 1,
+            listen_peer_addr: None,
+            peers: BTreeMap::new(),
+            dial_all_peers: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_cluster(
+        mut self,
+        node_id: u64,
+        listen_peer_addr: SocketAddr,
+        peers: BTreeMap<u64, SocketAddr>,
+    ) -> Self {
+        self.node_id = node_id;
+        self.listen_peer_addr = Some(listen_peer_addr);
+        self.peers = peers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_dynamic_join(mut self, enabled: bool) -> Self {
+        self.dial_all_peers = enabled;
+        self
     }
 
     #[must_use]
@@ -62,6 +91,11 @@ impl DatastoreConfig {
     #[must_use]
     pub fn snapshot_path(&self) -> PathBuf {
         self.data_dir.join("snapshot.db")
+    }
+
+    #[must_use]
+    pub fn raft_state_path(&self) -> PathBuf {
+        self.data_dir.join("raft-state.json")
     }
 
     pub fn validate(&self) -> Result<(), DatastoreError> {

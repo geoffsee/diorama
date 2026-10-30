@@ -5,6 +5,8 @@ use diorama_config::{ExplicitFlags, FIELDS, FieldType, INPUT_BINDINGS};
 pub(crate) struct Parsed {
     pub flags: ExplicitFlags,
     pub config: String,
+    pub token_file: Option<String>,
+    pub join_token: Option<String>,
     pub version: bool,
     pub print: bool,
     pub full: bool,
@@ -23,7 +25,7 @@ fn definition(name: &str) -> Option<(&str, Kind)> {
     if matches!(name, "version" | "help" | "print-config" | "full") {
         return Some((name, Kind::Bool));
     }
-    if name == "config" {
+    if matches!(name, "config" | "token-file") {
         return Some((name, Kind::Text));
     }
     let binding = INPUT_BINDINGS
@@ -192,6 +194,15 @@ pub(crate) fn parse(
     if let Some(value) = values.remove("full") {
         full = value == "true";
     }
+    let token_file = values.remove("token-file").or_else(|| {
+        env.get("DIORAMA_TOKEN_FILE")
+            .filter(|v| !v.is_empty())
+            .cloned()
+    });
+    let join_token = env
+        .get("DIORAMA_JOIN_TOKEN")
+        .filter(|v| !v.is_empty())
+        .cloned();
     let version = values
         .remove("version")
         .is_some_and(|value| value == "true");
@@ -201,6 +212,8 @@ pub(crate) fn parse(
     Ok(ParseResult::Parsed(Parsed {
         flags: ExplicitFlags(values),
         config,
+        token_file,
+        join_token,
         version,
         print,
         full,
