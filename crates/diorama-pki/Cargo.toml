@@ -8,7 +8,7 @@ autotests = false
 
 [dependencies]
 pem = "4.0.0"
-pkcs8 = { version = "0.10.2", features = ["pem", "alloc"] }
+pkcs8 = { version = "0.11.0", features = ["pem", "alloc"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tempfile = "3.8"
 x509-parser = "0.18.1"
